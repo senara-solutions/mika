@@ -9,12 +9,73 @@
 //! `crate::auto_pull::gh_list_open_issues` verbatim (env `GH_TOKEN`,
 //! `stdin::null`, `kill_on_drop(true)`). No new GitHub client dep.
 
+use super::plan_size;
+use super::pool::{PlanSizeReading, PoolCandidate, ReadyTicket, UnreadCause};
 use super::types::{
-    CiState, IssueState, MilestoneRef, MilestoneState, ProgressCounts, RecentActivity, SubIssue,
+    CiState, IssueState, MergedPrReading, MilestoneReadAudit, MilestoneRef, MilestoneState,
+    PrLinkSource, ProgressCounts, RecentActivity, SubIssue,
 };
+use crate::auto_pull::extract_branch_name;
+use crate::plan_callout::{FenceHandling, plan_callout};
+use crate::webhook_dispatch::READY_LABEL;
 use anyhow::{Result, anyhow};
+use mika_common::forge_identity::is_reviewer_forge_login;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// Combien d'issues ouvertes la lecture **hors milestone cible** rapporte au
+/// plus (mika#2699, vol 2).
+///
+/// C'est la borne du `--limit` de la cinquième lecture `gh`, et c'est aussi le
+/// seuil de sa garde de troncature : une page pleine ne dit pas « voici les
+/// candidats », elle dit « il y en avait peut-être d'autres ». Le dépôt en porte
+/// aujourd'hui quelques centaines d'ouvertes, donc la page pleine est le cas
+/// nominal et non l'exception — raison pour laquelle la garde existe ici alors
+/// que [`compose_ready_pool`] s'en passe (son ensemble cible 2–4).
+///
+/// Public parce que le rapporteur l'épelle dans la ligne de troncature : le
+/// nombre que l'opérateur lit doit être celui que la lecture a demandé, jamais
+/// une copie qui peut dériver.
+pub const OUTSIDE_READ_LIMIT: usize = 100;
+
+/// Combien de tickets la lecture **du milestone cible** rapporte au plus
+/// (mika#2969).
+///
+/// C'est la borne du `--limit` de la deuxième lecture `gh`, et c'est aussi le
+/// seuil de la garde de troncature de [`MilestoneReadAudit::truncated`].
+///
+/// **Pourquoi une borne nommée et non une pagination par curseur.** Mesuré le
+/// 2026-10-29 sur le milestone 33, 192 items annoncés par l'API :
+/// `--limit 100` rend 100 tickets en ≈2,5 s pour **1** appel `gh` ;
+/// `--limit 1000` rend les 117 issues du milestone en 2,6–3,0 s pour **1**
+/// appel `gh` — `gh issue list` pagine en interne, une invocation quel que soit
+/// `N`. Le changement de borne coûte donc **zéro appel `gh` de plus par cycle**
+/// et ≈0,1–0,5 s, là où une pagination écrite à la main coûterait un appel par
+/// page et un curseur à tenir. La mesure est celle que mika#2924 a faite pour
+/// son champ, sur le même appel.
+///
+/// **Pourquoi 1000.** ≈8,5× la taille du plus gros milestone du dépôt
+/// aujourd'hui. Une borne n'est pas une pagination : elle peut être atteinte, et
+/// c'est pourquoi elle est **dite** quand elle l'est — une page pleine ne passe
+/// jamais pour un milestone complet.
+///
+/// Public pour la même raison qu'[`OUTSIDE_READ_LIMIT`] : le rapporteur l'épelle,
+/// et le nombre que l'opérateur lit doit être celui que la lecture a demandé.
+pub const MILESTONE_READ_LIMIT: usize = 1000;
+
+/// Taille de page demandée au `timeline` REST (mika#2924, vol 2).
+///
+/// La page par défaut est de **30** et #2698 en portait **36** le 2026-10-27 :
+/// le ticket le plus actif du vivier est précisément celui sur lequel la
+/// réponse serait silencieusement fausse sans ce paramètre.
+pub const TIMELINE_PAGE_SIZE: usize = 100;
+
+/// Nombre de tickets dont la timeline est lue par cycle (mika#2924, vol 2).
+///
+/// Vaut 1 parce que la ligne « Next » ne nomme qu'**un** ticket : la borne
+/// exprime la forme de ce qui consomme la sonde, pas un budget posé sur une
+/// population. Coût mesuré : ≤ 17 appels `gh` par cycle avant, ≤ 18 après.
+pub const TIMELINE_PROBE_MAX: usize = 1;
 
 /// Reader — owns the `gh` invocations and composes `MilestoneState`.
 ///
@@ -142,6 +203,22 @@ impl Reader {
             .await?;
 
         // 2. Sub-issue enumeration (issues attached to this milestone).
+        //
+        //    `closedByPullRequestsReferences` est la référence de clôture que
+        //    GitHub tient **côté issue** (mika#2924). Elle est demandée ici, sur
+        //    une lecture déjà émise, parce que le milestone est rattaché au
+        //    ticket et jamais à la PR : la liste des PR du milestone (appel 3)
+        //    ne voit aucune PR de la boucle autonome, et 87 tickets fermés du
+        //    milestone 33 rendaient `closed (no linked PR)` dont 73 avaient une
+        //    PR de clôture. Le coût en appels `gh` par cycle est **inchangé** —
+        //    mesuré le 2026-10-26 sur le dépôt réel : 1 appel avant, 1 après
+        //    (1,639 s → 1,795 s).
+        //
+        //    La borne est nommée (`MILESTONE_READ_LIMIT`, mika#2969) : elle
+        //    valait `100` en littéral, et le milestone 33 en portait 192 items
+        //    — 17 tickets du milestone, dont les ouverts #1721 et #1727,
+        //    sortaient de `sub_issues` sans laisser de trace. Une page pleine
+        //    se dit maintenant au rapport, par `compose_read_audit` ci-dessous.
         let issues_json = runner
             .run(&[
                 "issue",
@@ -153,9 +230,9 @@ impl Reader {
                 "--state",
                 "all",
                 "--json",
-                "number,title,state,body,labels,updatedAt",
+                "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
                 "--limit",
-                "100",
+                &MILESTONE_READ_LIMIT.to_string(),
             ])
             .await?;
 
@@ -180,8 +257,457 @@ impl Reader {
             ])
             .await?;
 
-        compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)
+        // 4. Le bassin `ready`, à l'échelle du **dépôt** (mika#2699). Pas de
+        //    `--milestone` ici, et c'est la décision : le webhook `ready`
+        //    dispatche sur tout le dépôt, donc un bassin compté sur les seules
+        //    issues du milestone serait sous-compté et la recommandation fausse
+        //    exactement le jour où elle compte.
+        let ready_json = runner
+            .run(&[
+                "issue",
+                "list",
+                "--repo",
+                &milestone_ref.repo,
+                "--state",
+                "open",
+                "--label",
+                READY_LABEL,
+                "--json",
+                "number,labels",
+                "--limit",
+                "100",
+            ])
+            .await?;
+
+        // 5. Les candidats **hors milestone cible** (mika#2699, vol 2).
+        //    Dépôt-large comme la lecture du bassin, et pour la même raison : le
+        //    2e critère de tri du point 1 (« dans le milestone cible, avant le
+        //    reste ») n'a de sens que s'il existe un « reste » à comparer.
+        //    L'exclusion du milestone cible se fait **côté client**, dans
+        //    `compose_outside_candidates` : la syntaxe de recherche GitHub
+        //    n'exclut un milestone que par son *titre*, qu'un opérateur peut
+        //    renommer entre deux cycles, alors que les numéros déjà lus en 2 sont
+        //    exacts.
+        let outside_json = runner
+            .run(&[
+                "issue",
+                "list",
+                "--repo",
+                &milestone_ref.repo,
+                "--state",
+                "open",
+                "--json",
+                "number,body,labels,state",
+                "--limit",
+                &OUTSIDE_READ_LIMIT.to_string(),
+            ])
+            .await?;
+
+        // `compose_from_gh_outputs` garde sa signature à quatre arguments : ni le
+        // bassin ni les candidats du dehors ne sont une propriété du milestone, et
+        // l'eval `manager_loop_resistance` l'appelle de l'extérieur. Les deux sont
+        // donc posés ici, après composition. L'audit de lecture (mika#2969) suit
+        // la même règle, pour une raison de plus : il a besoin de la borne que
+        // l'appel 2 vient de demander, que le composeur ne reçoit pas.
+        let mut state =
+            compose_from_gh_outputs(milestone_ref, &milestone_json, &issues_json, &pr_json)?;
+        state.milestone_read_audit = Some(compose_read_audit(
+            &milestone_json,
+            &issues_json,
+            MILESTONE_READ_LIMIT,
+        )?);
+        state.ready_pool = compose_ready_pool(&ready_json)?;
+        let (outside, truncated) = compose_outside_candidates(&outside_json, &state.sub_issues)?;
+        state.outside_candidates = outside;
+        state.outside_read_truncated = Some(truncated);
+
+        // 6. La taille annoncée par le plan de chaque candidat pressenti
+        //    (mika#2699 vol 3). N+1 lectures, donc bornées deux fois : par
+        //    `numbers_needing_size`, qui n'en désigne que
+        //    `PLAN_SIZE_READ_MAX`, et par le filtre d'admission lui-même, qui
+        //    ne retient que les candidats déjà recevables sur la forme. Un
+        //    ticket sans plan groomé est refusé avant d'avoir coûté un appel.
+        //
+        //    Qui est candidat se décide **au même endroit** qu'au jugement :
+        //    `assessor::milestone_pool_candidates` sur l'état qu'on vient de
+        //    composer, puis `pool::numbers_needing_size`. Rejouer le filtre ici
+        //    rendrait les deux réponses identiques aujourd'hui et muettes le
+        //    jour où l'une des deux change.
+        let milestone_candidates = super::assessor::milestone_pool_candidates(&state);
+        let wanted = super::pool::numbers_needing_size(
+            &state.ready_pool,
+            &milestone_candidates,
+            &state.outside_candidates,
+        );
+        if !wanted.is_empty() {
+            let bodies = compose_candidate_bodies(&issues_json, &outside_json)?;
+            state.plan_sizes = read_plan_sizes(runner, &milestone_ref.repo, &wanted, &bodies).await;
+        }
+
+        // 7. L'état des PR du candidat que le palier 2 nommerait (mika#2924, vol 2).
+        //    Au plus `TIMELINE_PROBE_MAX` lecture, et zéro quand le palier 1
+        //    l'emporte. La cible est désignée par `assessor::timeline_probe_target`
+        //    sur l'état qu'on vient de composer — même site qu'au jugement, pour la
+        //    même raison que la lecture 6.
+        read_timeline_probe(runner, &milestone_ref.repo, &mut state).await;
+
+        Ok(state)
     }
+}
+
+/// Lit la timeline du candidat désigné et pose le résultat sur son `SubIssue`
+/// (mika#2924, vol 2).
+///
+/// **Bornée au site d'appel, pas seulement dans le type.** La cible est un
+/// `Option<u64>`, mais le `.take(TIMELINE_PROBE_MAX)` est écrit ici pour que la
+/// borne se lise à l'endroit où les appels partent : élargir
+/// `timeline_probe_target` à plusieurs cibles ne suffirait pas à élargir le
+/// coût sans toucher cette ligne.
+///
+/// **Un échec ne refuse pas le cycle et ne se tait pas** — même politique que
+/// [`read_one_plan_size`] : le fait porte sur *un* ticket, et faire échouer le
+/// cycle pour lui priverait l'opérateur du rapport sur tous les autres.
+async fn read_timeline_probe<R: GhRunner>(runner: &R, repo: &str, state: &mut MilestoneState) {
+    let target = super::assessor::timeline_probe_target(state);
+    for number in target.into_iter().take(TIMELINE_PROBE_MAX) {
+        let path = format!("/repos/{repo}/issues/{number}/timeline?per_page={TIMELINE_PAGE_SIZE}");
+        let (reading, events_read) = match runner.run(&["api", &path]).await {
+            Ok(json) => {
+                let events = serde_json::from_str::<Vec<Value>>(&json)
+                    .map(|v| v.len())
+                    .ok();
+                match compose_merged_prs(&json) {
+                    Ok(r) => (r, events),
+                    // Une sortie illisible n'est pas une absence de PR : c'est
+                    // une lecture qui n'a pas conclu, et elle le dit.
+                    Err(_) => (MergedPrReading::IndeterminateFetchFailed, events),
+                }
+            }
+            Err(_) => (MergedPrReading::IndeterminateFetchFailed, None),
+        };
+        log_timeline_probe(Some(number), Some(&reading), events_read);
+        if let Some(s) = state.sub_issues.iter_mut().find(|s| s.number == number) {
+            s.merged_prs = Some(reading);
+        }
+    }
+    if target.is_none() {
+        log_timeline_probe(None, None, None);
+    }
+}
+
+/// Une ligne INFO par cycle, sur **toutes** les branches — celle où rien n'est
+/// émis comprise (mika#2924, vol 2).
+///
+/// Sans la branche muette, « le palier 1 l'emportait » et « le binaire déployé
+/// n'a pas la sonde » rendent le même journal : zéro ligne. L'opérateur qui
+/// compte les lignes par cycle doit pouvoir distinguer les deux.
+///
+/// `candidate` et `events_read` sont **absents** plutôt qu'à `0` quand ils
+/// n'ont pas été mesurés : un `0` affirmerait une mesure qui n'a pas eu lieu
+/// (motif mika#2331).
+fn log_timeline_probe(
+    candidate: Option<u64>,
+    reading: Option<&MergedPrReading>,
+    events_read: Option<usize>,
+) {
+    let outcome = match reading {
+        Some(MergedPrReading::Citing(_)) => "citing",
+        Some(MergedPrReading::NoneCiting) => "none_citing",
+        Some(MergedPrReading::IndeterminatePageFull) => "indeterminate_page_full",
+        Some(MergedPrReading::IndeterminateFetchFailed) => "indeterminate_fetch_failed",
+        None => "not_emitted",
+    };
+    let citing_prs = match reading {
+        Some(MergedPrReading::Citing(prs)) => Some(prs.len()),
+        _ => None,
+    };
+    tracing::info!(
+        target: "mika::milestone_manager",
+        event = "manager_timeline_probe",
+        outcome,
+        candidate,
+        events_read,
+        citing_prs,
+        "sonde de timeline du candidat « Next »"
+    );
+}
+
+/// Réduit une sortie `gh api …/timeline` aux PR **mergées** qui citent le
+/// ticket — fonction pure, pendant de [`compose_ready_pool`] pour la lecture 7
+/// (mika#2924, vol 2).
+///
+/// Trois filtres, chacun mesuré le 2026-10-27 :
+/// - `event == "cross-referenced"` ;
+/// - `source.issue.pull_request != null` — une citation peut venir d'une issue
+///   (#2698 en porte trois : #2886, #2924, #2930) ;
+/// - `source.issue.pull_request.merged_at != null` — #1727 cite 10 PR dont 2
+///   non mergées, #2934 n'en cite qu'une et elle n'est pas mergée.
+///
+/// **Une page pleine rend `IndeterminatePageFull`, même quand aucune PR n'a été
+/// trouvée** : à [`TIMELINE_PAGE_SIZE`] événements lus, l'absence n'est pas
+/// attestée (mika#2930 AC2). Une page pleine **avec** des PR trouvées rend
+/// `Citing` — la réponse est déjà sûre, et la troncature ne peut que l'allonger.
+///
+/// **`cross-referenced` est plus large que « la PR qui livre ce ticket. »**
+/// #2929 et #2931 citent #2698 sans le livrer. C'est pourquoi le libellé dit
+/// « des PR mergées le citent » et jamais « livré » : la sonde nomme ce qu'elle
+/// a vu, et l'opérateur garde la lecture.
+pub fn compose_merged_prs(timeline_json: &str) -> Result<MergedPrReading> {
+    let events: Vec<Value> = serde_json::from_str(timeline_json)
+        .map_err(|e| anyhow!("failed to parse timeline json: {e}"))?;
+    let page_full = events.len() >= TIMELINE_PAGE_SIZE;
+
+    // Dédoublonnage par numéro de PR : la timeline porte une entrée par
+    // citation, et une même PR peut citer le ticket deux fois.
+    let mut merged: BTreeMap<u64, String> = BTreeMap::new();
+    for e in &events {
+        if e.get("event").and_then(Value::as_str) != Some("cross-referenced") {
+            continue;
+        }
+        let Some(issue) = e.get("source").and_then(|s| s.get("issue")) else {
+            continue;
+        };
+        let Some(number) = issue.get("number").and_then(Value::as_u64) else {
+            continue;
+        };
+        // `pull_request` absent **ou** `null` : la citation vient d'une issue.
+        let Some(pr) = issue.get("pull_request").filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let Some(merged_at) = pr.get("merged_at").and_then(Value::as_str) else {
+            continue;
+        };
+        merged.insert(number, merged_at.to_string());
+    }
+
+    if merged.is_empty() {
+        return Ok(if page_full {
+            MergedPrReading::IndeterminatePageFull
+        } else {
+            MergedPrReading::NoneCiting
+        });
+    }
+
+    // Tri par `merged_at` **décroissant**, numéro décroissant en second pour
+    // que deux PR mergées au même instant gardent un ordre stable d'un cycle à
+    // l'autre — sans quoi deux rapports sur le même état différeraient.
+    let mut by_recency: Vec<(u64, String)> = merged.into_iter().collect();
+    by_recency.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+    Ok(MergedPrReading::Citing(
+        by_recency.into_iter().map(|(n, _)| n).collect(),
+    ))
+}
+
+/// Le corps de chaque issue lue à ce cycle, indexé par numéro — fonction
+/// **pure** (mika#2699 vol 3).
+///
+/// Les deux sorties `gh` déjà en main portent `body` ; rien n'est relu à la
+/// forge pour le retrouver. Le milestone est parcouru en second et **écrase**
+/// le dehors sur un numéro présent dans les deux : c'est la même précédence
+/// que celle de [`super::pool::assess_pool`], qui juge un tel ticket
+/// `Milestone`.
+pub fn compose_candidate_bodies(
+    issues_json: &str,
+    outside_json: &str,
+) -> Result<HashMap<u64, String>> {
+    let mut bodies = HashMap::new();
+    for (json, what) in [(outside_json, "outside"), (issues_json, "milestone")] {
+        let issues: Vec<Value> = serde_json::from_str(json)
+            .map_err(|e| anyhow!("failed to parse {what} json for bodies: {e}"))?;
+        for i in issues {
+            let Some(number) = i.get("number").and_then(Value::as_u64) else {
+                continue;
+            };
+            let body = i.get("body").and_then(Value::as_str).unwrap_or_default();
+            bodies.insert(number, body.to_string());
+        }
+    }
+    Ok(bodies)
+}
+
+/// Lit le plan de chaque candidat désigné, **au ref de sa branche**, et le
+/// réduit au jeton de taille que l'admission consultera (mika#2699 vol 3).
+///
+/// **Pourquoi au ref de la branche et non sur `main`.** Le plan d'un ticket
+/// groomé est commité sur la branche du ticket ; sur `main` il n'existe
+/// généralement pas encore. Lire `main` répondrait « plan introuvable » pour
+/// tout candidat correctement groomé — c'est-à-dire exactement pour ceux que la
+/// borne doit juger.
+///
+/// **Un échec ne refuse pas et ne se tait pas.** Chaque branche d'échec porte sa
+/// propre cause ([`super::pool::UnreadCause`]), parce que les remèdes sont
+/// opposés : un callout manquant se corrige sur le ticket, un `404` au ref se
+/// corrige en poussant la branche. Les confondre serait la classe mika#2205.
+/// Aucune des deux n'est une estimation « au-delà de la borne », donc aucune ne
+/// produit le refus — le rapport les nomme à la place.
+///
+/// **Rien n'est propagé en `Err`.** Un plan illisible est un fait sur *un*
+/// candidat ; faire échouer le cycle entier pour lui priverait l'opérateur du
+/// rapport sur tous les autres.
+async fn read_plan_sizes<R: GhRunner>(
+    runner: &R,
+    repo: &str,
+    wanted: &[u64],
+    bodies: &HashMap<u64, String>,
+) -> BTreeMap<u64, PlanSizeReading> {
+    let mut out = BTreeMap::new();
+    for number in wanted {
+        out.insert(
+            *number,
+            read_one_plan_size(runner, repo, *number, bodies).await,
+        );
+    }
+    out
+}
+
+async fn read_one_plan_size<R: GhRunner>(
+    runner: &R,
+    repo: &str,
+    number: u64,
+    bodies: &HashMap<u64, String>,
+) -> PlanSizeReading {
+    let Some(body) = bodies.get(&number) else {
+        return PlanSizeReading::Unread(UnreadCause::NoCallout);
+    };
+    // Les deux lecteurs stricts du dépôt, réutilisés tels quels : `plan_callout`
+    // rend un chemin **relatif à la racine du sous-dépôt** (son premier segment
+    // est retiré), qui est précisément ce que `/contents/` attend. Les
+    // tolérances larges de `plan_callout_present` ne conviendraient pas ici —
+    // elles répondent « il y a un callout », pas « voici le chemin ».
+    let Some(callout) = plan_callout(body, FenceHandling::Strip) else {
+        return PlanSizeReading::Unread(UnreadCause::NoCallout);
+    };
+    let Some(branch) = extract_branch_name(body) else {
+        return PlanSizeReading::Unread(UnreadCause::NoCallout);
+    };
+    let path = format!(
+        "/repos/{repo}/contents/{}?ref={}",
+        callout.normalized, branch
+    );
+    // `Accept: …raw` rend le fichier tel quel plutôt que l'enveloppe JSON
+    // base64 : un décodage de moins, et le contrat de parse porté du bash
+    // travaille sur le texte du plan.
+    match runner
+        .run(&["api", &path, "-H", "Accept: application/vnd.github.raw"])
+        .await
+    {
+        Ok(plan) => match plan_size::plan_size_total_loc(&plan) {
+            plan_size::PlanSizeTotal::Total(n) => PlanSizeReading::Measured(n),
+            plan_size::PlanSizeTotal::SectionAbsent => PlanSizeReading::SectionAbsent,
+            plan_size::PlanSizeTotal::Unparsable => PlanSizeReading::Unparsable,
+        },
+        Err(_) => PlanSizeReading::Unread(UnreadCause::FetchFailed),
+    }
+}
+
+/// Compose le bassin `ready` depuis la sortie de `gh issue list --json
+/// number,labels` — fonction **pure**, pendant de `compose_from_gh_outputs`
+/// pour la quatrième lecture (mika#2699).
+///
+/// Pas de garde de troncature au vol 1, et c'est délibéré : à `--limit 100`
+/// contre un bassin dont la cible est 2–4, une page pleine ne serait pas une
+/// troncature mais une pathologie qui se voit déjà dans la profondeur rapportée
+/// (« 100 ready » ne se lit pas comme un état sain). La garde devient utile au
+/// vol 3, où le nombre lu décide d'une écriture.
+pub fn compose_ready_pool(ready_json: &str) -> Result<Vec<ReadyTicket>> {
+    let issues: Vec<Value> = serde_json::from_str(ready_json)
+        .map_err(|e| anyhow!("failed to parse ready-pool json: {e}"))?;
+    Ok(issues
+        .iter()
+        .filter_map(|i| {
+            let number = i.get("number")?.as_u64()?;
+            Some(ReadyTicket {
+                number,
+                labels: extract_labels(i),
+            })
+        })
+        .collect())
+}
+
+/// Compose les candidats **hors milestone cible** depuis la sortie de
+/// `gh issue list --json number,body,labels,state` — fonction **pure**,
+/// pendant de [`compose_ready_pool`] pour la cinquième lecture (mika#2699,
+/// vol 2).
+///
+/// Rend `(candidats, tronqué)`. Trois décisions, chacune pour une raison que la
+/// forme seule ne dit pas :
+///
+/// 1. **Une page pleine vide l'ensemble.** À `--limit OUTSIDE_READ_LIMIT`
+///    contre un dépôt de plusieurs centaines d'ouvertes, la page pleine est le
+///    cas nominal. Rendre les candidats de cette page affirmerait un ordre non
+///    mesuré : le p0 qui devait passer devant est peut-être en page 2. Le motif
+///    est celui de `scripts/pr-origin-report.sh` — *refuser plutôt que mal
+///    répondre* — et il est ici le seul qui ne mente pas, puisque le tri du
+///    point 1 porte précisément sur un ordre global.
+/// 2. **Les `sub_issues` sont retirées ici.** Elles arrivent déjà par
+///    `MilestoneState::sub_issues`, et les porter deux fois alourdirait chaque
+///    blob du sink hors-ligne d'un doublon par ticket du milestone.
+///    [`super::pool::assess_pool`] déduplique quand même, pour sa propre
+///    correction : une fonction pure ne doit pas dépendre de la prudence de son
+///    appelant.
+/// 3. **La troncature est mesurée sur la page lue, pas sur le reste.** Le
+///    booléen rendu dit « la lecture a ramené une page pleine », avant
+///    l'exclusion des `sub_issues` — sinon un milestone de 100 tickets rendrait
+///    « non tronqué » sur une page pleine.
+pub fn compose_outside_candidates(
+    outside_json: &str,
+    subs: &[SubIssue],
+) -> Result<(Vec<PoolCandidate>, bool)> {
+    let issues: Vec<Value> = serde_json::from_str(outside_json)
+        .map_err(|e| anyhow!("failed to parse outside-candidates json: {e}"))?;
+    let truncated = issues.len() >= OUTSIDE_READ_LIMIT;
+    if truncated {
+        return Ok((Vec::new(), true));
+    }
+    let in_milestone: std::collections::HashSet<u64> = subs.iter().map(|s| s.number).collect();
+    let candidates = issues
+        .iter()
+        .filter_map(|i| {
+            let number = i.get("number")?.as_u64()?;
+            if in_milestone.contains(&number) {
+                return None;
+            }
+            let body = i.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            let labels = extract_labels(i);
+            let state = match i.get("state").and_then(|v| v.as_str()) {
+                Some(s) if s.eq_ignore_ascii_case("closed") => IssueState::Closed,
+                _ => IssueState::Open,
+            };
+            Some(PoolCandidate {
+                number,
+                state,
+                priority_rank: priority_from_labels(&labels),
+                plan_present: plan_callout_present(body),
+                // Une seule lecture du corps, quatre questions (mika#2952,
+                // mika#2956) : le booléen lâche que mika#2608 a figé, la lecture
+                // à trois états dont le bassin tire son refus, la dormance, et
+                // les trois signaux que le gate du dispatch exige. Posées **ici**
+                // et sur le chemin milestone, parce qu'un prédicat aveugle par
+                // origine est la classe mika#2205 réintroduite.
+                plan_reading: Some(crate::plan_callout::plan_reading(body)),
+                dormancy: Some(crate::milestone_manager::pool::dormancy_reading(body)),
+                missing_grooming_signals: Some(crate::auto_pull::missing_grooming_signals(body)),
+                labels,
+            })
+        })
+        .collect();
+    Ok((candidates, false))
+}
+
+/// Les noms de labels d'une issue telle que `gh issue list --json labels` la
+/// rend. Un seul site d'épellation du chemin `labels[].name`, partagé par les
+/// trois lectures d'issues (sub-issues du milestone, bassin `ready`, candidats
+/// hors milestone).
+fn extract_labels(issue: &Value) -> Vec<String> {
+    issue
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Priority ranks from label — pure function, easy to test.
@@ -265,6 +791,44 @@ pub fn priority_from_labels(labels: &[String]) -> Option<u8> {
 /// mesure ne l'établit**. Suivi nommé, avec sa précondition : un rapport dont
 /// `plan_present` est mesurément faux. Armer un resserrement sur une population
 /// non mesurée est ce que mika#2520 refuse.
+///
+/// # La précondition a été remplie, et la levée n'est PAS ici (mika#2952)
+///
+/// Le rapport du sink du 2026-10-28T17:06:59 **est** cette mesure : quatre
+/// candidats « à admettre » dont le seul `docs/plans/` restant était une ligne
+/// `Plan antérieur :`, écrite par la porte d'auto-pull (mika#2839) *parce que*
+/// le vol avait été livré. La seconde branche les lisait comme portant un
+/// callout vivant.
+///
+/// La levée a pris la forme d'une **séparation**, et ce prédicat est
+/// **inchangé** : mika#2608 reste en vigueur, ses deux tests sont verts sans
+/// édition, et les quatre consommateurs du booléen gardent leur tolérance. Le
+/// bassin reçoit à côté [`crate::plan_callout::plan_reading`], qui rend trois
+/// états. La propriété de sur-ensemble épinglée au § 1 est précisément ce qui
+/// rend l'état intermédiaire bien défini : `lâche \ stricte` est non vide, et
+/// c'est la population mesurée.
+///
+/// # Le bassin ne DÉCIDE plus sur ce booléen (mika#2956)
+///
+/// Et ce prédicat est, de nouveau, **inchangé**. Le rapport du sink du
+/// 2026-10-29T10:11:41 a mesuré la seconde moitié de la population du § ci-dessus :
+/// #2194, admise « à admettre » alors que le même rapport disait d'elle
+/// « callout de plan ou de branche absent ». Son corps *cite* `docs/plans/` dans
+/// une ligne de prose citée, donc la seconde branche rend `true`, et le gate du
+/// dispatch (`executor::check_grooming_markers`) l'aurait refusée en
+/// `dispatch_no_grooming_marker` — un dispatch vide, la classe que mika#2952 a
+/// voulu fermer.
+///
+/// Depuis mika#2956, `well_formed_candidates` admet sur
+/// [`crate::auto_pull::missing_grooming_signals`], le prédicat **strict** que le
+/// gate accepte par construction. Ce booléen-ci garde une voix, mais une seule :
+/// il choisit entre deux **libellés** de refus — « plan groomé absent » quand
+/// rien ne cite de plan, « grooming incomplet » quand un plan est cité et que
+/// les trois signaux n'y sont pas. Il nomme, il ne décide plus.
+///
+/// Ses quatre autres consommateurs gardent leur tolérance, `tier2_pick` et le
+/// tier 3 du « Next » inclus : ils lisent `SubIssue::plan_present` et jamais le
+/// champ mesuré (AC3 de mika#2956, fermée par non-modification).
 pub fn plan_callout_present(body: &str) -> bool {
     // Canonical callout shape: `> - **Plan:** docs/plans/...`.
     // Loose form: any occurrence of `docs/plans/` in a callout blockquote.
@@ -367,6 +931,399 @@ pub fn classify_ci_state(rollup: &Value) -> CiState {
     }
 }
 
+/// Ce qu'une lecture **par numéro** sait d'une PR (mika#2968, vol 2a).
+///
+/// `state` est écrit tel que `gh` le rend — `OPEN`, `MERGED`, `CLOSED` — et
+/// n'est pas normalisé ici : [`super::evaluator`] le compose en
+/// `PrStateKnowledge::Read`, dont le rapport épelle la valeur.
+///
+/// **`ci` à `None` est une propriété de la lecture, pas une CI absente.** Le
+/// second appel `gh` ne demande le `statusCheckRollup` que des PR `--state
+/// open`, donc une PR fusionnée ou fermée n'a jamais été lue sur cet axe ; et
+/// quand ce second appel échoue, une PR **ouverte** se retrouve elle aussi à
+/// `None`. Les deux populations sont distinguées par le composeur, qui lit
+/// `state` d'abord : `CiUnreadCause::PrNotOpen` pour la première,
+/// `CiUnreadCause::ReadFailed` pour la seconde. Aucune des deux ne passe pour
+/// une CI verte.
+/// `head_oid` et `review` à `None` se lisent **exactement comme `ci`** : ils
+/// sortent du même second appel, donc ils portent la même propriété de lecture
+/// et les mêmes causes de non-lecture. C'est ce qui justifie l'alias
+/// `HeadUnreadCause = CiUnreadCause` côté composeur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlightPrRead {
+    /// L'état de la PR, tel que `gh` l'écrit.
+    pub state: String,
+    /// L'état CI de la tête — `Some` seulement pour une PR ouverte dont le
+    /// second appel a abouti.
+    pub ci: Option<CiState>,
+    /// Le commit de tête (`headRefOid`), contre lequel le commit revu est
+    /// comparé. Son absence ne peut jamais compter pour une égalité.
+    pub head_oid: Option<String>,
+    /// La dernière revue du relecteur attendu — voir [`classify_head_review`].
+    pub review: Option<HeadReview>,
+    /// `reviewDecision` tel que la forge l'agrège (`APPROVED`,
+    /// `REVIEW_REQUIRED`, `CHANGES_REQUESTED`, ou vide).
+    ///
+    /// **Pour le rapport seul.** Il ne fonde aucune décision, parce qu'il ne
+    /// dit pas *sur quel commit* : une approbation sur un commit antérieur à la
+    /// tête le laisse à `APPROVED`. C'est en revanche l'information qu'un
+    /// opérateur lit sur la PR, donc le rapport la lui rend.
+    pub review_decision: Option<String>,
+}
+
+/// La **dernière** revue du relecteur attendu, par `submittedAt`
+/// (mika#2968, vol 2b).
+///
+/// Les champs sont écrits tels que `gh` les rend ; c'est [`super::evaluator`]
+/// qui en tire l'état décisionnel, lui seul comparant `commit` à `head_oid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadReview {
+    /// `APPROVED`, `COMMENTED`, `CHANGES_REQUESTED`, `DISMISSED`…
+    pub state: String,
+    /// Le commit que **cette** revue visait. Absent sur une revue que la forge
+    /// ne rattache à aucun commit.
+    pub commit: Option<String>,
+    /// L'instant de soumission, qui est aussi la clé de tri.
+    pub submitted_at: String,
+    /// Le motif d'un `VERDICT: hold[<motif>]` porté par le corps de **cette**
+    /// revue, pour le rapport.
+    ///
+    /// **La frontière décision / rapport passe ici.** La décision ne lit que
+    /// des champs structurés — `state`, l'auteur, `commit` — donc une revue
+    /// `COMMENTED` n'est jamais une approbation, quel que soit son texte. Le
+    /// corps n'est lu que pour *nommer* ce que l'opérateur verrait en ouvrant
+    /// la PR : le `hold[review]` mesuré sur mika#2972 était la seule trace du
+    /// tour coupé à 30 steps.
+    pub hold_reason: Option<String>,
+}
+
+/// Retient la dernière revue du relecteur attendu, par `submittedAt`
+/// (mika#2968, vol 2b).
+///
+/// Trois règles de lecture, chacune pour une raison qui ne se devine pas :
+///
+/// 1. **Le filtre sur l'auteur passe par
+///    [`is_reviewer_forge_login`]**, le comparateur canonique (mika#2667) — pas
+///    un huitième. La revue d'un autre auteur n'entre dans **aucune** des deux
+///    populations : ni dans l'approbation, ni dans le « aucune revue ». Elle est
+///    simplement hors sujet.
+/// 2. **Le tri est explicite.** L'ordre dans lequel `gh` rend le tableau n'est
+///    pas un contrat ; `submittedAt` est en ISO 8601 UTC à largeur fixe, donc la
+///    comparaison lexicographique est chronologique.
+/// 3. **`hold_reason` vient du corps de *cette* revue**, pas d'un balayage du
+///    tableau : un `hold` posé sur un commit antérieur ne décrit pas la tête.
+///
+/// `None` signifie « le relecteur attendu n'a posé aucune revue » — sur un
+/// tableau **lu**. Une lecture qui n'a pas eu lieu n'arrive jamais ici : elle
+/// est portée par [`RepoPrRead::Failed`] ou par l'absence du champ.
+///
+/// Pourquoi `reviews` et non `latestReviews` : mesuré le 2026-10-30 sur
+/// `senara-solutions/mika`, `latestReviews[].commit.oid` revient **vide**
+/// (`gh pr view 2972 --json latestReviews` rend une revue `APPROVED` avec
+/// `commit: ""`, et `gh pr list --json latestReviews --limit 10` rend cinq PR
+/// toutes à `commit: ""`), alors que `reviews[].commit.oid` est renseigné. Un
+/// champ qui ne porte pas le commit ne peut pas répondre à « approuvée sur la
+/// tête ? ».
+pub fn classify_head_review(reviews: &Value) -> Option<HeadReview> {
+    let arr = reviews.as_array()?;
+    arr.iter()
+        .filter(|r| {
+            r.get("author")
+                .and_then(|a| a.get("login"))
+                .and_then(|v| v.as_str())
+                .is_some_and(is_reviewer_forge_login)
+        })
+        .max_by(|a, b| {
+            let cle = |r: &Value| {
+                r.get("submittedAt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            cle(a).cmp(&cle(b))
+        })
+        .map(|r| HeadReview {
+            state: r
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            commit: r
+                .get("commit")
+                .and_then(|c| c.get("oid"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            submitted_at: r
+                .get("submittedAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            hold_reason: r
+                .get("body")
+                .and_then(|v| v.as_str())
+                .and_then(hold_reason_from_body),
+        })
+}
+
+/// Le motif d'une ligne `VERDICT: hold[<motif>]`, s'il y en a une
+/// (mika#2968, vol 2b).
+///
+/// Lecture **par ligne**, et non un `contains` sur tout le corps : une revue qui
+/// cite la forme du verdict en prose — « j'aurais dû poser `VERDICT:
+/// hold[review]` » — n'en pose pas un. Seul un `hold` compte ici : un `block[…]`
+/// ou un `pass` ne sont pas des motifs de suspension, et de toute façon aucun
+/// des deux ne change la décision, qui ne lit que `state`.
+fn hold_reason_from_body(body: &str) -> Option<String> {
+    for ligne in body.lines() {
+        let Some(reste) = ligne.trim().strip_prefix("VERDICT:") else {
+            continue;
+        };
+        let Some(motif) = reste
+            .trim()
+            .strip_prefix("hold[")
+            .and_then(|r| r.strip_suffix(']'))
+        else {
+            continue;
+        };
+        if !motif.is_empty() {
+            return Some(motif.to_string());
+        }
+    }
+    None
+}
+
+/// Ce qu'**un dépôt** a rendu à la lecture par numéro (mika#2968, vol 2a).
+///
+/// « Lu » et « pas lu » sont une distinction de **type**, jamais une map vide :
+/// un dépôt dont la lecture a échoué et un dépôt sans aucune PR rendraient les
+/// mêmes octets alors qu'ils disent le contraire l'un de l'autre (classe
+/// mika#2205). Le composeur en tire `CiUnreadCause::ReadFailed` d'un côté et
+/// `CiUnreadCause::NotFound` de l'autre.
+///
+/// `Failed` porte sur **un** dépôt : les autres sont lus quand même, et le
+/// cycle n'échoue pas — même politique que [`read_timeline_probe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoPrRead {
+    /// Les PR lues, indexées par numéro.
+    Read(HashMap<u64, FlightPrRead>),
+    /// Le premier appel n'a pas abouti : rien n'est su de ce dépôt.
+    Failed,
+}
+
+/// Combien de PR la lecture par numéro rapporte au plus, **par dépôt**
+/// (mika#2968, vol 2a).
+///
+/// C'est la borne du `--limit` des deux appels de [`read_flight_prs`], et elle
+/// est nommée pour la même raison que [`OUTSIDE_READ_LIMIT`] : une page pleine
+/// ne dit pas « voici toutes les PR », elle dit « il y en avait peut-être
+/// d'autres ».
+///
+/// **Pourquoi une page récente et non une lecture par PR.** La population visée
+/// est celle des PR que les vols du cycle viennent d'ouvrir. Mesuré le
+/// 2026-10-29 sur `senara-solutions/mika`, la boucle du jour en a ouvert
+/// **cinq** — #2960, #2962, #2964, #2966, #2967 — et **aucune** ne portait le
+/// milestone cible, ce qui est la raison d'être de cette lecture : la requête
+/// `--search milestone:33` du lecteur de milestone n'en voyait pas une.
+/// `gh pr list` les rend toutes en **un** appel, là où un `gh pr view` par vol
+/// en coûterait un par vol. Le coût est donc en `2 × |dépôts|`, indépendant du
+/// nombre de vols.
+///
+/// **Pourquoi deux appels et non un.** `statusCheckRollup` est le champ qui
+/// coûte, et une PR fusionnée ou fermée n'a pas de CI à lire pour la
+/// recommandation : le premier appel prend l'état de toutes les PR sans le
+/// rollup, le second le rollup des seules PR ouvertes.
+///
+/// **Une borne peut être atteinte, et c'est pourquoi elle se dit.** Un numéro
+/// absent de la page lue ne passe jamais pour une CI verte : il rend
+/// `CiUnreadCause::NotFound`, « PR hors de la page lue », que le rapport épelle.
+pub const FLIGHT_PR_READ_LIMIT: usize = 100;
+
+/// Lit l'état des PR de chaque dépôt et l'état de leur tête — CI et revue —,
+/// **par numéro** et non par milestone (mika#2968, vols 2a et 2b).
+///
+/// Deux appels `gh` par dépôt, dans cet ordre :
+/// 1. `pr list --state all --json number,state` — l'état de toutes les PR ;
+/// 2. `pr list --state open --json number,statusCheckRollup,headRefOid,reviewDecision,reviews`
+///    — la tête des seules PR ouvertes, **jointe au premier par le numéro**.
+///
+/// Le vol 2b (mika#2968) n'ajoute **aucun appel** : la revue voyage dans l'appel
+/// 2, qui demandait déjà le rollup de la même tête. Le coût reste
+/// `2 × |dépôts|`, et la mesure du 2026-10-30 le chiffre à +0,45 s par dépôt
+/// (1,73 s → 2,18 s sur `senara-solutions/mika`).
+///
+/// La jointure est volontairement un `get_mut` : une PR rendue par l'appel 2 et
+/// absente de la page de l'appel 1 — possible si plus de
+/// [`FLIGHT_PR_READ_LIMIT`] PR ont été ouvertes depuis — n'est pas inventée.
+/// Elle rend `NotFound` au composeur, qui le dit, plutôt qu'une demi-lecture.
+///
+/// **Échec par dépôt, jamais par cycle.** L'appel 1 en échec rend
+/// [`RepoPrRead::Failed`] pour ce dépôt seul, avec un WARN nommé ; les autres
+/// dépôts sont lus. L'appel 2 en échec rend `Read(map)` avec tous les `ci` à
+/// `None` — l'état des PR reste lu, la CI ne l'est pas, et c'est exactement ce
+/// que `ci: None` sur une PR ouverte signifie.
+///
+/// `classify_ci_state` reste le **seul** réducteur de `statusCheckRollup` du
+/// module, et [`classify_head_review`] est le seul lecteur du tableau `reviews`
+/// (mika#2201).
+pub async fn read_flight_prs(
+    runner: &dyn GhRunner,
+    repos: &BTreeSet<String>,
+) -> HashMap<String, RepoPrRead> {
+    let mut out = HashMap::with_capacity(repos.len());
+    for repo in repos {
+        out.insert(repo.clone(), read_one_repo_flight_prs(runner, repo).await);
+    }
+    out
+}
+
+/// La lecture d'**un** dépôt — les deux appels, la jointure, et la ligne qui
+/// dit ce qui a été lu sur toutes les branches.
+async fn read_one_repo_flight_prs(runner: &dyn GhRunner, repo: &str) -> RepoPrRead {
+    let limite = FLIGHT_PR_READ_LIMIT.to_string();
+
+    // Appel 1 — l'état de toutes les PR, sans le champ qui coûte.
+    let states = runner
+        .run(&[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--json",
+            "number,state",
+            "--limit",
+            &limite,
+        ])
+        .await
+        .and_then(|json| {
+            serde_json::from_str::<Vec<Value>>(&json)
+                .map_err(|e| anyhow!("failed to parse flight pr states: {e}"))
+        });
+    let states = match states {
+        Ok(v) => v,
+        Err(_) => {
+            log_flight_pr_read(repo, "state_read_failed", None, None);
+            return RepoPrRead::Failed;
+        }
+    };
+
+    let mut map: HashMap<u64, FlightPrRead> = HashMap::new();
+    for pr in &states {
+        let Some(number) = pr.get("number").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(state) = pr.get("state").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        map.insert(
+            number,
+            FlightPrRead {
+                state: state.to_string(),
+                ci: None,
+                head_oid: None,
+                review: None,
+                review_decision: None,
+            },
+        );
+    }
+
+    // Appel 2 — la tête des seules PR ouvertes : son rollup et sa revue.
+    let rollups = runner
+        .run(&[
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "open",
+            "--json",
+            "number,statusCheckRollup,headRefOid,reviewDecision,reviews",
+            "--limit",
+            &limite,
+        ])
+        .await
+        .and_then(|json| {
+            serde_json::from_str::<Vec<Value>>(&json)
+                .map_err(|e| anyhow!("failed to parse flight pr rollups: {e}"))
+        });
+    let rollups = match rollups {
+        Ok(v) => v,
+        Err(_) => {
+            log_flight_pr_read(repo, "rollup_read_failed", Some(map.len()), None);
+            return RepoPrRead::Read(map);
+        }
+    };
+
+    let mut ci_read = 0usize;
+    for pr in &rollups {
+        let Some(number) = pr.get("number").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if let Some(entry) = map.get_mut(&number) {
+            entry.ci = Some(
+                pr.get("statusCheckRollup")
+                    .map(classify_ci_state)
+                    .unwrap_or(CiState::None),
+            );
+            entry.head_oid = pr
+                .get("headRefOid")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            entry.review = pr.get("reviews").and_then(classify_head_review);
+            entry.review_decision = pr
+                .get("reviewDecision")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            ci_read += 1;
+        }
+    }
+
+    log_flight_pr_read(repo, "read", Some(map.len()), Some(ci_read));
+    RepoPrRead::Read(map)
+}
+
+/// Une ligne par dépôt lu, sur **toutes** les branches — les deux échecs
+/// comprises (mika#2968, vol 2a).
+///
+/// Même nom d'événement partout, et le niveau porte l'issue : `WARN` pour un
+/// échec, `INFO` pour une lecture aboutie. Un dépôt en échec est donc **nommé**
+/// (la politique du vol : un échec `gh` ne tue pas le cycle, mais il ne se tait
+/// pas), et la branche saine reste émise — sans elle, « le manager ne lit aucune
+/// PR par numéro » et « le binaire servi est antérieur à ce vol » rendraient le
+/// même journal : zéro ligne (motif mika#2340).
+///
+/// `prs_read` et `ci_read` sont **absents** plutôt qu'à `0` quand ils n'ont pas
+/// été mesurés : un `0` affirmerait un comptage qui n'a pas eu lieu (motif
+/// mika#2331). Un appel 1 en échec n'a compté aucune PR ; un appel 2 en échec
+/// n'a compté aucune CI.
+fn log_flight_pr_read(repo: &str, outcome: &str, prs_read: Option<usize>, ci_read: Option<usize>) {
+    if outcome == "read" {
+        tracing::info!(
+            target: "mika::milestone_manager",
+            event = "manager_flight_pr_read",
+            repo,
+            outcome,
+            prs_read,
+            ci_read,
+            "lecture des PR des vols, par numéro"
+        );
+    } else {
+        tracing::warn!(
+            target: "mika::milestone_manager",
+            event = "manager_flight_pr_read",
+            repo,
+            outcome,
+            prs_read,
+            ci_read,
+            "lecture des PR des vols en échec : ce dépôt reste non lu"
+        );
+    }
+}
+
 /// Pure composition: given the three JSON blobs, produce a `MilestoneState`.
 ///
 /// Split out from `read()` so tests can exercise the parsing chain with
@@ -443,15 +1400,7 @@ pub fn compose_from_gh_outputs(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let labels: Vec<String> = issue
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let labels: Vec<String> = extract_labels(issue);
         let updated_at = issue
             .get("updatedAt")
             .and_then(|v| v.as_str())
@@ -465,14 +1414,69 @@ pub fn compose_from_gh_outputs(
         }
 
         let plan_present = plan_callout_present(&body);
+        // Le même corps, les trois autres questions (mika#2952, mika#2956) —
+        // voir le site jumeau dans `compose_outside_candidates`.
+        let plan_reading = Some(crate::plan_callout::plan_reading(&body));
+        let dormancy = Some(crate::milestone_manager::pool::dormancy_reading(&body));
+        let missing_grooming_signals = Some(crate::auto_pull::missing_grooming_signals(&body));
         let branch_present = branch_callout_present(&body);
         let blockers = extract_blockers(&body);
         let priority_rank = priority_from_labels(&labels);
-        let (pr_number, pr_state, ci_state) = pr_by_issue
-            .get(&number)
-            .cloned()
-            .map(|(n, s, c)| (Some(n), Some(s), c))
-            .unwrap_or((None, None, CiState::None));
+        // La PR de clôture, et **d'où** on la tient (mika#2924).
+        //
+        // L'index des PR du milestone passe en premier et reste inchangé : il
+        // est le seul porteur de `pr_state` et de `ci_state`, dont dépendent
+        // `is_in_flight()`, le palier 1 de `pick_next_action`, `is_hard_blocked()`
+        // et surtout `detect_silent_progress`, qui exige
+        // `state == Open && pr_state == Some("merged")`.
+        // La référence côté issue ne vient **qu'en comblement** : c'est une
+        // union, pas un remplacement. Elle répond pour les PR que la boucle
+        // produit — le pilote rattache le milestone au ticket, jamais à la PR,
+        // donc l'index ci-dessus est vide pour elles — mais elle ne dit rien de
+        // l'état de la PR ni de sa CI, et les deviner serait affirmer une mesure
+        // qui n'a pas eu lieu (mika#2331).
+        let mut pr_number: Option<u64> = None;
+        let mut pr_state: Option<String> = None;
+        let mut pr_url: Option<String> = None;
+        let mut pr_link_source: Option<PrLinkSource> = None;
+        let mut ci_state = CiState::None;
+        if let Some((n, s, c)) = pr_by_issue.get(&number).cloned() {
+            pr_number = Some(n);
+            pr_state = Some(s);
+            ci_state = c;
+            // Posé même ici, où la provenance pourrait se déduire de la seule
+            // présence d'un numéro : sans ça, `None` voudrait dire à la fois
+            // « liste du milestone » et « blob d'un binaire antérieur », et la
+            // sonde AC3 ne pourrait plus séparer les deux (mika#2340).
+            pr_link_source = Some(PrLinkSource::MilestonePrList);
+        } else if let Some(r) = issue
+            .get("closedByPullRequestsReferences")
+            .and_then(|v| v.as_array())
+            // Première entrée retenue, comme l'index ci-dessus : un ticket peut
+            // être fermé par plusieurs PR (un vol en deux temps), et un choix
+            // dépendant de l'ordre de la page rendrait deux rapports différents
+            // sur le même état.
+            .and_then(|a| a.first())
+        {
+            // Les **deux** champs sont exigés, et le numéro seul ne suffit pas :
+            // la référence peut porter une PR d'un autre dépôt, et recomposer
+            // `{repo}/pull/{n}` rendrait alors un lien vers une PR qui n'existe
+            // pas — plus difficile à démentir qu'une absence de lien. Sans `url`
+            // la ligne garde donc son `closed (no linked PR)`, qui est vrai de ce
+            // que l'on sait.
+            if let (Some(n), Some(url)) = (
+                r.get("number").and_then(|v| v.as_u64()),
+                r.get("url").and_then(|v| v.as_str()),
+            ) {
+                pr_number = Some(n);
+                pr_url = Some(url.to_string());
+                pr_link_source = Some(PrLinkSource::IssueClosingRef);
+                // `pr_state` et `ci_state` restent volontairement vides : ce
+                // chemin n'a pas vu la PR. `detect_silent_progress` exige
+                // `pr_state == Some("merged")` et doit continuer de ne le tenir
+                // que de la liste du milestone.
+            }
+        }
 
         sub_issues.push(SubIssue {
             number,
@@ -480,9 +1484,18 @@ pub fn compose_from_gh_outputs(
             state: state.clone(),
             priority_rank,
             plan_present,
+            plan_reading,
+            dormancy,
+            missing_grooming_signals,
             branch_present,
             pr_number,
             pr_state,
+            pr_url,
+            pr_link_source,
+            // La sonde de timeline (lecture 7) est émise **après** la
+            // composition, sur l'état qu'on vient de bâtir : ici elle n'a pas
+            // encore parlé, et `None` dit exactement cela.
+            merged_prs: None,
             ci_state,
             blockers,
             updated_at: updated_at.clone(),
@@ -553,6 +1566,65 @@ pub fn compose_from_gh_outputs(
         progress,
         recent_activity,
         executor_healthy: None,
+        // Vide ici par construction : le bassin est une lecture dépôt-large que
+        // cette fonction ne reçoit pas. `Reader::read_with_runner` le pose après
+        // composition — voir `compose_ready_pool`.
+        ready_pool: Vec::new(),
+        // Idem pour les candidats hors milestone (mika#2699, vol 2) : dépôt-large
+        // eux aussi, posés après composition par `compose_outside_candidates`.
+        // `None` et non `Some(false)` : à ce point la question de la troncature
+        // n'a pas été posée (mika#2331).
+        outside_candidates: Vec::new(),
+        outside_read_truncated: None,
+        // Idem pour les tailles de plan (mika#2699, vol 3) : elles dépendent du
+        // bassin et du dehors, qu'on n'a pas ici. Vide, donc « non mesuré » pour
+        // chaque candidat — jamais « de taille nulle ».
+        plan_sizes: BTreeMap::new(),
+        // Idem pour l'audit de la lecture (mika#2969) : il a besoin de la borne
+        // qu'a demandée l'appel 2, que cette fonction ne reçoit pas. Posé après
+        // composition par `compose_read_audit`. `None` et non un audit à zéro :
+        // un `returned: 0, limit: 0` se lirait « complète » (mika#2331).
+        milestone_read_audit: None,
+    })
+}
+
+/// L'audit de la deuxième lecture : ce qu'elle a rendu, ce qu'elle demandait, et
+/// ce que l'API du milestone annonce (mika#2969). Fonction pure.
+///
+/// Les trois nombres sortent de deux blobs **déjà lus** — l'appel 1 pour le
+/// compte de l'API, l'appel 2 pour les tickets : aucun appel `gh` de plus par
+/// cycle. C'est la raison pour laquelle l'écart se rapporte au lieu d'être
+/// résolu par une décomposition `gh api graphql` : elle serait redondante avec
+/// le prédicat de complétude, coûterait un appel de plus, et `gh api graphql`
+/// est refusé par la permission-policy du bac à sable de la boucle.
+///
+/// **`api_item_total` n'est pas de la même population que `returned`.** L'API du
+/// milestone compte ses *items* — issues **et** PR —, `gh issue list` ne rend
+/// que les *issues*. Sur le milestone 33 au 2026-10-29 : 192 items annoncés,
+/// 117 issues rendues, et l'écart de 75 vaut exactement le nombre de PR du
+/// milestone. Il est structurel et permanent, donc sans pouvoir de détection
+/// (classe mika#2205) : le signal de complétude est
+/// [`MilestoneReadAudit::truncated`], exact par construction, et jamais
+/// l'égalité des deux comptes.
+///
+/// `open_issues` ou `closed_issues` absent vaut `0` : une réponse de l'API du
+/// milestone en porte toujours les deux, et un `0` rapporté à côté d'un compte
+/// lu non nul se dénonce de lui-même au rapport, là où une erreur ferait échouer
+/// tout le cycle pour une ligne d'observabilité.
+fn compose_read_audit(
+    milestone_json: &str,
+    issues_json: &str,
+    limit: usize,
+) -> Result<MilestoneReadAudit> {
+    let m: Value = serde_json::from_str(milestone_json)
+        .map_err(|e| anyhow!("failed to parse milestone json for read audit: {e}"))?;
+    let count = |field: &str| m.get(field).and_then(|v| v.as_u64()).unwrap_or(0);
+    let issues: Vec<Value> = serde_json::from_str(issues_json)
+        .map_err(|e| anyhow!("failed to parse issues json for read audit: {e}"))?;
+    Ok(MilestoneReadAudit {
+        returned: issues.len(),
+        limit,
+        api_item_total: count("open_issues") + count("closed_issues"),
     })
 }
 
@@ -878,6 +1950,424 @@ mod tests {
         assert_eq!(closed.pr_number, Some(1929));
     }
 
+    /// La sortie `gh` réellement capturée sur le milestone 33 le 2026-10-26,
+    /// filtrée sur les deux contrôles de l'AC1 de mika#2924. Les deux vivent
+    /// dans le **même** document, parce que c'est ainsi qu'ils arrivent en
+    /// production — le composeur ne lit pas deux fichiers. Provenance, commande
+    /// de capture et fidélités : `tests/fixtures/mika2924/README.md`.
+    const FIXTURE_MILESTONE_33: &str =
+        include_str!("../../tests/fixtures/mika2924/issues-milestone-33.json");
+
+    /// mika#2924 R2/R3 — la situation de **production**, celle qui a produit les
+    /// 87 lignes `closed (no linked PR)` : la liste des PR du milestone est
+    /// vide, parce que le pilote rattache le milestone au ticket et jamais à la
+    /// PR. La référence de clôture côté issue comble alors le trou.
+    ///
+    /// Les deux contrôles de l'AC1 sont dans ce test, sur le même document :
+    /// #2886 fermé par #2892 (contrôle positif) et #1680 fermé à la main,
+    /// `closedByPullRequestsReferences` à `[]` (contrôle négatif). Sans le
+    /// second, un lecteur qui peuplerait `pr_number` pour tout ticket fermé
+    /// passerait le premier.
+    #[test]
+    fn mika2924_la_reference_cote_issue_comble_lindex_vide_du_milestone() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        // `[]` : aucune PR de la boucle n'est rattachée au milestone.
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, "[]").unwrap();
+
+        let s2886 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 2886)
+            .expect("#2886 présent dans l'énumération");
+        assert_eq!(s2886.state, IssueState::Closed);
+        assert_eq!(s2886.pr_number, Some(2892));
+        // L'URL est celle que la référence porte, jamais une recomposition :
+        // l'entrée porte un objet `repository` imbriqué, donc elle peut nommer
+        // un autre dépôt (R3).
+        assert_eq!(
+            s2886.pr_url.as_deref(),
+            Some("https://github.com/senara-solutions/mika/pull/2892")
+        );
+        assert_eq!(s2886.pr_link_source, Some(PrLinkSource::IssueClosingRef));
+        // Ce chemin ne porte ni l'état de la PR ni celui de la CI — la
+        // référence côté issue ne les transporte pas, et les inventer serait
+        // rendre deux populations en octets identiques (mika#2205).
+        assert_eq!(s2886.pr_state, None);
+        assert_eq!(s2886.ci_state, CiState::None);
+
+        let s1680 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1680)
+            .expect("#1680 présent dans l'énumération");
+        assert_eq!(s1680.state, IssueState::Closed);
+        assert_eq!(s1680.pr_number, None);
+        assert_eq!(s1680.pr_url, None);
+        assert_eq!(
+            s1680.pr_link_source, None,
+            "aucune provenance : le ticket a été fermé à la main, les deux \
+             chemins ont été essayés et aucun n'a répondu"
+        );
+    }
+
+    /// mika#2924 R2 — l'**ordre** de l'union, qui n'est pas symétrique :
+    /// l'index inverse des PR du milestone passe en premier parce qu'il est le
+    /// seul porteur de `pr_state` et `ci_state`. Si la référence côté issue
+    /// gagnait, un milestone dont les PR *sont* rattachées perdrait l'état de
+    /// sa CI sans qu'aucune autre assertion ne rougisse.
+    #[test]
+    fn mika2924_lindex_du_milestone_garde_la_priorite_sur_la_reference_cote_issue() {
+        let milestone_json = r#"{"title": "M33", "description": "sink", "state": "open", "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#;
+        // Le même #2886, cette fois atteignable par les deux chemins.
+        let pr_json = r#"[
+            {"number": 2892, "state": "MERGED", "closingIssuesReferences": [{"number": 2886}], "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}
+        ]"#;
+        let r = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state =
+            compose_from_gh_outputs(&r, milestone_json, FIXTURE_MILESTONE_33, pr_json).unwrap();
+
+        let s2886 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 2886)
+            .expect("#2886 présent dans l'énumération");
+        assert_eq!(s2886.pr_number, Some(2892));
+        assert_eq!(s2886.pr_state.as_deref(), Some("merged"));
+        assert_eq!(s2886.ci_state, CiState::Success);
+        assert_eq!(
+            s2886.pr_link_source,
+            Some(PrLinkSource::MilestonePrList),
+            "l'index du milestone a répondu : c'est lui qui nomme la provenance"
+        );
+        assert_eq!(
+            s2886.pr_url, None,
+            "ce chemin ne porte pas d'URL — le rapport la recompose depuis le \
+             dépôt et le numéro, ce qui est correct ici puisque l'index \
+             inverse est construit sur les PR du dépôt du milestone"
+        );
+        // Le contrôle négatif reste négatif quel que soit le chemin pris par
+        // son voisin.
+        let s1680 = state
+            .sub_issues
+            .iter()
+            .find(|s| s.number == 1680)
+            .expect("#1680 présent dans l'énumération");
+        assert_eq!(s1680.pr_number, None);
+        assert_eq!(s1680.pr_link_source, None);
+    }
+
+    // -----------------------------------------------------------------
+    // mika#2924, vol 2 — la lecture 7 : la timeline d'un ticket ouvert.
+    // -----------------------------------------------------------------
+
+    /// La timeline **réellement capturée** de #2698 le 2026-10-27, réduite aux
+    /// trois chemins JSON que le composeur lit. 36 événements, dont 6 PR
+    /// mergées et 3 citations d'*issues*. Provenance, commande de capture et
+    /// fidélités : `tests/fixtures/mika2924/README.md`.
+    const FIXTURE_TIMELINE_2698: &str =
+        include_str!("../../tests/fixtures/mika2924/timeline-2698.json");
+
+    /// Le contrôle négatif, lui aussi capturé le 2026-10-27 : #2934 ne cite
+    /// qu'**une** PR, #2936, et elle n'est pas mergée. Un document distinct
+    /// parce qu'un ticket n'a qu'une timeline — les deux contrôles ne peuvent
+    /// pas tenir dans le même fichier comme ceux de l'AC1.
+    const FIXTURE_TIMELINE_2934: &str =
+        include_str!("../../tests/fixtures/mika2924/timeline-2934.json");
+
+    /// Fabrique une page de `n` événements dont `merged` PR mergées, pour les
+    /// cas que la forge ne fournit pas (une page pleine n'existe pas encore sur
+    /// le vivier : #1727, le plus actif, en porte 50).
+    fn timeline_page(n: usize, merged: &[u64]) -> String {
+        let mut events: Vec<String> = merged
+            .iter()
+            .map(|pr| {
+                format!(
+                    r#"{{"event":"cross-referenced","source":{{"issue":{{"number":{pr},"pull_request":{{"merged_at":"2026-10-{:02}T00:00:00Z"}}}}}}}}"#,
+                    10 + (pr % 10)
+                )
+            })
+            .collect();
+        while events.len() < n {
+            events.push(r#"{"event":"labeled","source":null}"#.to_string());
+        }
+        format!("[{}]", events.join(","))
+    }
+
+    /// mika#2924 AC2, R4 — la sonde rend les PR mergées qui citent le ticket,
+    /// triées par `merged_at` décroissant, et le contrôle négatif est dans le
+    /// même test.
+    ///
+    /// Le contrôle positif part de la forme exacte qui a produit le défaut :
+    /// #2698, ouvert, dont `closedByPullRequestsReferences` rend `[]` (vol 1) et
+    /// dont seule la timeline répond.
+    #[test]
+    fn mika2924_la_timeline_rend_les_pr_mergees_qui_citent_le_ticket() {
+        let reading = compose_merged_prs(FIXTURE_TIMELINE_2698).unwrap();
+        assert_eq!(
+            reading,
+            MergedPrReading::Citing(vec![2931, 2929, 2892, 2706, 2704, 2712]),
+            "l'ordre est celui des `merged_at` décroissants, et #2712 l'atteste : \
+             mergée le 2026-10-15, elle porte le plus grand numéro des trois \
+             dernières et arrive pourtant dernière — un tri replié sur le numéro \
+             de PR rougirait ici"
+        );
+
+        // Contrôle négatif, même instrument : une PR citée mais **non mergée**.
+        // Sans le filtre `merged_at`, « Next » dirait à l'opérateur que son
+        // travail est déjà livré alors que sa PR est encore ouverte.
+        assert_eq!(
+            compose_merged_prs(FIXTURE_TIMELINE_2934).unwrap(),
+            MergedPrReading::NoneCiting,
+            "#2934 ne cite que #2936, ouverte — et la timeline a été lue en \
+             entier (12 événements), donc l'absence est attestée"
+        );
+    }
+
+    /// mika#2930 AC2 — à `TIMELINE_PAGE_SIZE` événements lus, l'absence de PR
+    /// n'est **pas** attestée : la page est peut-être tronquée.
+    ///
+    /// Les deux moitiés comptent. Une page pleine **sans** PR trouvée est
+    /// indéterminée ; une page pleine **avec** des PR trouvées rend `Citing`,
+    /// parce que la réponse est déjà sûre et que la troncature ne peut que
+    /// l'allonger. Replier les deux sur `IndeterminatePageFull` priverait le
+    /// rapport de la seule information utile qu'il tienne.
+    #[test]
+    fn mika2924_une_page_pleine_est_une_troncature_et_jamais_une_absence() {
+        assert_eq!(
+            compose_merged_prs(&timeline_page(TIMELINE_PAGE_SIZE, &[])).unwrap(),
+            MergedPrReading::IndeterminatePageFull
+        );
+        // Un événement de moins : la timeline a été lue en entier.
+        assert_eq!(
+            compose_merged_prs(&timeline_page(TIMELINE_PAGE_SIZE - 1, &[])).unwrap(),
+            MergedPrReading::NoneCiting,
+            "la garde est sur la page pleine, pas sur « beaucoup d'événements »"
+        );
+        assert_eq!(
+            compose_merged_prs(&timeline_page(TIMELINE_PAGE_SIZE, &[2704])).unwrap(),
+            MergedPrReading::Citing(vec![2704]),
+            "une page pleine qui a trouvé une PR mergée répond quand même"
+        );
+    }
+
+    /// mika#2924 R4 — un événement qui n'est pas une PR ne compte pas, et le
+    /// fixture réel en porte trois.
+    ///
+    /// #2886, #2924 et #2930 citent #2698 : ce sont des *issues*, leur
+    /// `pull_request` est `null`. Sans le second filtre, la sonde les nommerait
+    /// comme des PR mergées — des numéros que l'opérateur irait chercher sous
+    /// `/pull/` et qui n'y sont pas.
+    #[test]
+    fn mika2924_un_evenement_qui_nest_pas_une_pr_ne_compte_pas() {
+        let MergedPrReading::Citing(prs) = compose_merged_prs(FIXTURE_TIMELINE_2698).unwrap()
+        else {
+            panic!("le fixture porte des PR mergées");
+        };
+        for issue in [2886u64, 2924, 2930] {
+            assert!(
+                !prs.contains(&issue),
+                "#{issue} cite #2698 sans être une PR — obtenu : {prs:?}"
+            );
+        }
+        // Et les deux autres filtres restent portés par le même document : un
+        // `labeled` n'est pas une citation, une PR non mergée n'est pas livrée.
+        assert_eq!(prs.len(), 6, "six PR mergées et rien d'autre : {prs:?}");
+    }
+
+    /// mika#2924 R4 — un échec de lecture n'est pas une absence de PR.
+    ///
+    /// Une sortie illisible et une sortie vide rendent des variantes
+    /// **différentes** : la première se corrige à la forge, la seconde dit que
+    /// l'implémentation est le pas suivant. Les confondre est la classe
+    /// mika#2205, et c'est la confusion qui remettrait le défaut en place.
+    #[test]
+    fn mika2924_une_sortie_illisible_nest_pas_une_absence_de_pr() {
+        assert!(
+            compose_merged_prs("pas du json").is_err(),
+            "le composeur rend l'erreur ; c'est l'appelant qui la classe en \
+             IndeterminateFetchFailed, et il est le seul à savoir qu'un échec \
+             ne refuse pas le cycle"
+        );
+        assert_eq!(
+            compose_merged_prs("[]").unwrap(),
+            MergedPrReading::NoneCiting,
+            "une timeline vide a bien été lue en entier"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // mika#2924 R7 — la résolution du lien de PR a un lecteur unique.
+    // -----------------------------------------------------------------
+
+    /// Les trois aiguilles de la résolution du lien ticket ↔ PR de clôture.
+    ///
+    /// Trois, pas une : la régression redoutée n'a pas de forme canonique. Un
+    /// second site peut rebâtir l'index inverse (`pr_by_issue`), relire le
+    /// champ côté PR (`closingIssuesReferences`) ou relire celui côté issue
+    /// (`closedByPullRequestsReferences`) — et le troisième est le plus
+    /// probable, puisque c'est le chemin que ce ticket vient d'ouvrir. Un filet
+    /// posé sur une seule des trois serait vert le jour où il compte.
+    const AIGUILLES_DE_RESOLUTION: &[&str] = &[
+        "pr_by_issue",
+        "closingIssuesReferences",
+        "closedByPullRequestsReferences",
+    ];
+
+    /// Les fonctions dont le corps porte l'une des aiguilles, dans un corpus
+    /// `(fichier, source)` quelconque — l'ensemble trié et dédoublonné.
+    ///
+    /// Le découpage passe par [`crate::source_scan::fn_bodies`], qui retire les
+    /// commentaires **avant** de découper : la prose de ce module *nomme* les
+    /// trois champs à six endroits (le doc-comment de `PrLinkSource`, celui de
+    /// `SubIssue::pr_number`, celui de `write_completed`, trois commentaires du
+    /// composeur), et une mention n'est pas une lecture. C'est le motif
+    /// mika#2050 signal S, et la raison pour laquelle
+    /// `mika2425_identity_context_history_has_a_single_reader` ancre sur les
+    /// lignes non commentaires.
+    fn fonctions_portant_une_aiguille(corpus: &[(String, String)]) -> Vec<String> {
+        let mut trouvees: Vec<String> = Vec::new();
+        for (_, source) in corpus {
+            for (nom, corps) in crate::source_scan::fn_bodies(source) {
+                if AIGUILLES_DE_RESOLUTION.iter().any(|a| corps.contains(a)) {
+                    trouvees.push(nom);
+                }
+            }
+        }
+        trouvees.sort();
+        trouvees.dedup();
+        trouvees
+    }
+
+    /// La moitié production de `src/milestone_manager/`, fichier par fichier.
+    ///
+    /// Passe par [`crate::source_scan::production_files`], qui compose déjà les
+    /// deux écartements du code de test demandés par le plan — par le chemin
+    /// ([`crate::source_scan::is_test_source_path`]) puis par la troncature
+    /// ([`crate::source_scan::production_half`]). L'API déjà en place, prise là
+    /// où elle est déjà composée : une troisième énumération du répertoire
+    /// serait un second prédicat pour une seule question (mika#2158), et celle
+    /// de `mod.rs` est plate là où celle-ci est récursive — un futur
+    /// sous-répertoire du module y échapperait en silence.
+    fn production_du_module() -> Vec<(String, String)> {
+        let corpus: Vec<(String, String)> = crate::source_scan::production_files()
+            .into_iter()
+            .filter(|(rel, _)| rel.starts_with("milestone_manager/"))
+            .collect();
+        assert!(
+            corpus.len() >= 10,
+            "le corpus du module est anormalement petit ({} fichiers) — le \
+             filtre de chemin ne mord plus, et le scan ne regarde presque rien",
+            corpus.len()
+        );
+        corpus
+    }
+
+    /// mika#2924 R7 — **l'ensemble** des fonctions de production qui résolvent
+    /// le lien ticket ↔ PR de clôture, par égalité d'ensembles et non par
+    /// `contains`.
+    ///
+    /// Ce que ça refuse : un second site qui résout le lien à côté du premier.
+    /// La classe est celle de mika#2158 — un second site correct *aujourd'hui*
+    /// qui rate l'élargissement de demain, sans qu'aucune assertion de
+    /// comportement ne rougisse, parce que les deux sites rendent les mêmes
+    /// octets jusqu'au jour où l'un des deux change.
+    ///
+    /// **Deux noms attendus, et chacun pour sa raison** — le plan en annonçait
+    /// un, n'ayant pas compté le site de *demande* :
+    ///
+    /// - `compose_from_gh_outputs` **résout** : c'est lui qui décide, pour un
+    ///   ticket, quelle PR l'a fermé et d'où vient cette réponse.
+    /// - `read_with_runner` **demande** : il nomme les deux champs dans ses
+    ///   listes `--json`. Il ne répond pas à la question, il la rend posable —
+    ///   la même distinction que mika#2305 a dû écrire pour son résolveur de
+    ///   portée (« amended, not excepted … it *produces* the answer »).
+    ///
+    /// Quand ce test rougit : **router le site par `compose_from_gh_outputs`**,
+    /// ne pas ajouter de ligne à l'allowlist (doctrine mika#2201). Si le
+    /// nouveau site est un troisième *demandeur* légitime, l'attendu s'amende
+    /// en nommant sa raison, comme les deux lignes ci-dessus.
+    #[test]
+    fn mika2924_la_resolution_de_pr_de_cloture_a_un_lecteur_unique() {
+        /// Aucune exception. Livrée vide, et son vide est épinglé juste en
+        /// dessous : une allowlist qui se remplit sans bruit est le mécanisme
+        /// que mika#2309 condamne.
+        const ALLOWLIST: &[&str] = &[];
+        assert!(
+            ALLOWLIST.is_empty(),
+            "une exception a été ajoutée à ce scan. Ce n'est pas la \
+             réparation : router le site par `compose_from_gh_outputs` l'est \
+             (mika#2201). Si une exception est vraiment la bonne réponse, \
+             ouvrir un ticket qui porte sa raison et le citer ici."
+        );
+
+        let trouvees = fonctions_portant_une_aiguille(&production_du_module());
+
+        // Anti-vacuité : un prédicat qui ne trouve plus rien passerait toutes
+        // les égalités d'ensembles qu'on lui demanderait, y compris celle-ci si
+        // l'attendu venait à se vider par un refactor.
+        assert!(
+            !trouvees.is_empty(),
+            "le scan ne trouve plus aucune lecture — les aiguilles ont cessé de \
+             mordre (champ renommé, découpage cassé), et le filet est décoratif"
+        );
+
+        assert_eq!(
+            trouvees,
+            vec![
+                "compose_from_gh_outputs".to_string(),
+                "read_with_runner".to_string(),
+            ],
+            "l'ensemble des fonctions qui touchent au lien de PR de clôture a \
+             changé. Lire le doc-comment de ce test avant de toucher à \
+             l'attendu."
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : sur une source **synthétique**
+    /// portant un second résolveur, le prédicat doit rougir.
+    ///
+    /// Sans lui, un scan dont le découpage s'est cassé — aiguille renommée,
+    /// `fn_bodies` qui rend des corps vides — resterait vert pour toujours, et
+    /// son vert se lirait comme « un seul lecteur » au lieu de « je ne vois
+    /// plus rien ». L'anti-vacuité du test précédent couvre le corpus réel ;
+    /// celui-ci couvre le prédicat lui-même, sur une entrée dont on connaît la
+    /// réponse.
+    #[test]
+    fn mika2924_le_scan_rougit_sur_un_second_lecteur() {
+        let synthetique = r#"
+/// Cette prose nomme `closedByPullRequestsReferences` et `pr_by_issue` sans
+/// les lire : elle ne doit pas être comptée.
+fn seulement_de_la_prose() {
+    let _ = 1;
+}
+
+fn un_second_resolveur(issue: &Value) -> Option<u64> {
+    issue
+        .get("closedByPullRequestsReferences")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("number"))
+        .and_then(|v| v.as_u64())
+}
+"#;
+        let corpus = vec![("synthetique.rs".to_string(), synthetique.to_string())];
+        let trouvees = fonctions_portant_une_aiguille(&corpus);
+        assert_eq!(
+            trouvees,
+            vec!["un_second_resolveur".to_string()],
+            "le prédicat doit voir le second résolveur, et lui seul — une \
+             prose qui nomme le champ n'est pas une lecture"
+        );
+    }
+
     /// mika#1975 D5/D8 — the typed error renders **exactly** the legacy
     /// `anyhow!("gh {} failed: {}", args.join(" "), stderr)` string.
     ///
@@ -988,14 +2478,20 @@ mod tests {
     #[test]
     fn compute_progress_all_completed() {
         let subs = vec![SubIssue {
+            missing_grooming_signals: None,
             number: 1,
             title: "t".into(),
             state: IssueState::Closed,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "".into(),
@@ -1005,6 +2501,101 @@ mod tests {
         assert_eq!(p.completed, 1);
         assert_eq!(p.total, 1);
     }
+
+    // -- mika#2969 : l'audit de la lecture du milestone --
+
+    /// Un blob de milestone à la forme de l'API, avec ses deux comptes d'items.
+    fn milestone_blob(open: u64, closed: u64) -> String {
+        format!(
+            r#"{{"title": "Substrat de boucle", "description": "", "state": "open",
+                 "created_at": "2026-08-01T00:00:00Z", "due_on": null,
+                 "open_issues": {open}, "closed_issues": {closed}}}"#
+        )
+    }
+
+    /// Une énumération de `n` tickets ouverts, numérotés à partir de 1.
+    fn issues_blob(n: usize) -> String {
+        let items: Vec<String> = (1..=n)
+            .map(|i| {
+                format!(
+                    r#"{{"number": {i}, "title": "t", "state": "OPEN", "body": "", "labels": []}}"#
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// **T1** — l'audit rend les trois nombres, et la complétude est un prédicat
+    /// sur le couple `(returned, limit)`.
+    ///
+    /// La borne est **paramétrée** plutôt que prise à [`MILESTONE_READ_LIMIT`] :
+    /// le prédicat se teste alors sur trois tickets au lieu de mille, et le test
+    /// garde son sens le jour où la constante bouge. C'est la constante elle-même
+    /// que `mika2969_la_lecture_des_tickets_demande_la_borne_nommee_et_laudit_porte_la_meme`
+    /// épingle, sur le vecteur d'arguments.
+    #[test]
+    fn mika2969_laudit_dit_le_lu_la_borne_et_le_compte_de_lapi() {
+        // Page non pleine : la lecture est complète, et l'écart avec le compte
+        // de l'API ne la rend pas tronquée — ce sont deux populations.
+        let audit = compose_read_audit(&milestone_blob(1, 1), &issues_blob(2), 3)
+            .expect("l'audit doit se composer sur du JSON bien formé");
+        assert_eq!(audit.returned, 2);
+        assert_eq!(audit.limit, 3);
+        assert_eq!(audit.api_item_total, 2);
+        assert!(
+            !audit.truncated(),
+            "deux tickets rendus pour une borne de trois : la lecture est complète"
+        );
+
+        // Page pleine : tronquée, même si le compte de l'API tombe juste.
+        let pleine = compose_read_audit(&milestone_blob(2, 1), &issues_blob(3), 3)
+            .expect("l'audit doit se composer sur du JSON bien formé");
+        assert_eq!(pleine.returned, 3);
+        assert!(
+            pleine.truncated(),
+            "une page pleine ne dit pas « voici tout le milestone »"
+        );
+
+        // L'écart entre les deux comptes n'est pas un signal de troncature : ici
+        // l'API annonce 192 items (PR comprises) pour 2 issues rendues sur une
+        // borne de 3, et la lecture est **complète**. C'est la classe mika#2205 —
+        // deux populations sous un même nom ne se soustraient pas.
+        let ecart = compose_read_audit(&milestone_blob(14, 178), &issues_blob(2), 3)
+            .expect("l'audit doit se composer sur du JSON bien formé");
+        assert_eq!(ecart.api_item_total, 192);
+        assert!(
+            !ecart.truncated(),
+            "l'écart avec le compte de l'API vaut les PR du milestone, pas des \
+             tickets manquants"
+        );
+    }
+
+    /// Les milestones pour lesquels l'implication « page non pleine ⇒ lecture
+    /// complète » est connue fausse.
+    ///
+    /// **Livrée vide, et c'est une mesure, pas un optimisme** : le prédicat de
+    /// page pleine ne peut rougir qu'à partir de [`MILESTONE_READ_LIMIT`]
+    /// tickets rendus, et le plus grand milestone du dépôt en compte 117
+    /// (mesuré le 2026-10-29 sous `7df2c1e1c`). Il n'existe donc aucune
+    /// violation existante à excepter.
+    ///
+    /// Une entrée ici est une dette nommée, jamais une exemption confortable :
+    /// elle nomme son milestone, référence son ticket de suivi, et l'assertion
+    /// ci-dessous la fait rougir dès qu'elle devient stale.
+    const MILESTONE_READ_COMPLETENESS_EXCEPTIONS: &[&str] = &[];
+
+    /// La garde auto-nettoyante du § Fire-Disposition de mika#2969.
+    #[test]
+    fn mika2969_lallowlist_de_completude_est_vide_et_le_reste_tant_quelle_na_pas_dentree() {
+        // Une exception qui n'excepte plus rien est du bruit qui survit à son
+        // motif. Cette assertion rougit dans les deux sens : à l'ajout d'une
+        // entrée (qui doit alors citer son ticket) et au retrait de son motif.
+        assert!(
+            MILESTONE_READ_COMPLETENESS_EXCEPTIONS.is_empty(),
+            "une exception a été ajoutée : elle doit nommer son milestone et son ticket \
+             de suivi, et ce test doit être amendé pour l'attester — pas élargi"
+        );
+    }
 }
 
 /// Injection-verified arg-capture guards (mika#1933 AC6, plan § S4).
@@ -1012,8 +2603,9 @@ mod tests {
 /// **What this guards:** the `gh` invocation contract in `Reader::read_with_runner`.
 /// The AC1/AC2 lock-in (closed sub-issues included in the denominator) depends
 /// on TWO adjacent-pair arg tokens on the `issue list` call — `"--state", "all"`
-/// and `"--limit", "100"` — plus the matching `"--state", "all"` on the `pr list`
-/// call. A regression that reverts either token (e.g. someone re-defaulting to
+/// and `"--limit", "1000"` (the named [`MILESTONE_READ_LIMIT`] since mika#2969;
+/// it was a `"100"` literal before) — plus the matching `"--state", "all"` on
+/// the `pr list` call. A regression that reverts either token (e.g. someone re-defaulting to
 /// `--state open`, which is the ticket body's original hypothesis and the pre-PR#1932
 /// state) would silently take the Reader back to reste-à-faire semantics.
 ///
@@ -1046,11 +2638,54 @@ mod gh_arg_capture_tests {
     /// panics — the guard fails LOUD on an unmapped call. This docstring lives
     /// on the struct itself (not inside the match wildcard) so it surfaces at
     /// the most likely edit surface for the maintainer wiring the new call.
+    ///
+    /// **Extension performed twice (mika#2699).** The fourth and fifth calls
+    /// *are* `issue list`s, so routing on the first arg alone would have served
+    /// them `issues_json` in silence — a recorder that answers the wrong
+    /// question without failing. The `issue` arms therefore disambiguate on a
+    /// token each call site owns alone: `--label` for the ready pool,
+    /// `--milestone` for the sub-issues, and the exact `--json` field list for
+    /// the outside-candidate read. The trailing `issue` arm is an **error**, not
+    /// a default: a sixth `issue`-shaped call must extend this match on a token
+    /// of its own rather than inherit someone else's answer.
+    ///
+    /// **Extension performed a third time (mika#2699 vol 3).** The sixth call is
+    /// an `api`, like the first. Both `api` arms now discriminate on the path
+    /// (`/milestones/` vs `/contents/`), and neither is a fallback — a seventh
+    /// `api`-shaped call lands on the error arm rather than being served the
+    /// milestone metadata.
+    ///
+    /// **Extension performed a fourth time (mika#2924 vol 2).** The seventh call
+    /// is a third `api`, discriminating on `/timeline`. It is the first call the
+    /// reader emits **conditionally** — zero when tier 1 wins — so an arm that
+    /// never answers is not evidence of a missing call site; the bound test
+    /// `mika2924_la_sonde_est_bornee_a_une_lecture_par_cycle` is what reads the
+    /// absence as a result.
     struct RecordingGhRunner {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
         milestone_json: String,
         issues_json: String,
         pr_json: String,
+        ready_json: String,
+        outside_json: String,
+        /// Le texte servi à la **sixième** lecture (mika#2699 vol 3), ou `None`
+        /// pour simuler le `404` au ref de la branche.
+        ///
+        /// Même raison que pour les arms `issue` ci-dessus, un cran plus loin :
+        /// la sixième lecture est elle aussi un `api`, donc l'arm `api` nu lui
+        /// aurait servi les métadonnées du milestone — un plan sans section de
+        /// taille, donc `SectionAbsent`, donc un test vert qui ne prouve rien.
+        /// Les deux arms `api` discriminent sur le chemin.
+        plan_text: Option<String>,
+        /// Le texte servi à la **septième** lecture (mika#2924, vol 2), ou
+        /// `None` pour simuler l'échec de l'appel.
+        ///
+        /// Troisième `api` du lecteur, donc troisième arm discriminant sur le
+        /// chemin, et pour la même raison que les deux premières : sans elle,
+        /// la sonde recevrait les métadonnées du milestone, `compose_merged_prs`
+        /// rendrait une erreur de parse, et le test de borne compterait un
+        /// appel en croyant mesurer une lecture.
+        timeline_json: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1058,22 +2693,67 @@ mod gh_arg_capture_tests {
         async fn run(&self, args: &[&str]) -> Result<String> {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             self.calls.lock().unwrap().push(owned.clone());
-            // Route by the first arg — matches the three call sites in
-            // `Reader::read_with_runner`.
+            let has = |flag: &str| owned.iter().any(|a| a == flag);
+            let path = owned.get(1).cloned().unwrap_or_default();
+            let json_fields = owned
+                .windows(2)
+                .find(|w| w[0] == "--json")
+                .map(|w| w[1].clone())
+                .unwrap_or_default();
+            let limite = owned
+                .windows(2)
+                .find(|w| w[0] == "--limit")
+                .and_then(|w| w[1].parse::<usize>().ok());
             match owned.first().map(String::as_str) {
-                Some("api") => Ok(self.milestone_json.clone()),
-                Some("issue") => Ok(self.issues_json.clone()),
+                Some("api") if path.contains("/timeline") => self
+                    .timeline_json
+                    .clone()
+                    .ok_or_else(|| anyhow!("RecordingGhRunner: échec de la lecture de timeline")),
+                Some("api") if path.contains("/contents/") => self
+                    .plan_text
+                    .clone()
+                    .ok_or_else(|| anyhow!("RecordingGhRunner: 404 au ref de la branche")),
+                Some("api") if path.contains("/milestones/") => Ok(self.milestone_json.clone()),
+                Some("issue") if has("--label") => Ok(self.ready_json.clone()),
+                Some("issue") if has("--milestone") => servir_borne(&self.issues_json, limite),
+                Some("issue") if json_fields == "number,body,labels,state" => {
+                    Ok(self.outside_json.clone())
+                }
                 Some("pr") => Ok(self.pr_json.clone()),
-                // NOTE: extending `Reader::read_with_runner` with a fourth `gh`
+                // NOTE: extending `Reader::read_with_runner` with an eighth `gh`
                 // call (e.g., `gh auth status`, per-issue `gh issue view`) also
                 // requires extending this match — the guard covers only the
-                // three current call sites' arg contracts (mika#1933 testing F1).
+                // seven current call sites' arg contracts (mika#1933 testing F1).
                 _ => Err(anyhow!(
-                    "RecordingGhRunner: unexpected first arg in {:?}",
+                    "RecordingGhRunner: unexpected call shape in {:?}",
                     owned
                 )),
             }
         }
+    }
+
+    /// Sert une énumération d'issues **tronquée à la borne que l'appel a
+    /// demandée**, comme `gh issue list --limit N` le fait (mika#2969).
+    ///
+    /// Sans cela le fixture rendrait les 117 tickets quelle que soit la borne,
+    /// et le test de bout en bout de l'AC2 serait vert avec le `--limit "100"`
+    /// littéral d'avant ce vol : le mock fournirait le résultat que le code est
+    /// censé produire. Avec cela, ramener la borne à 100 rougit
+    /// `mika2969_un_ticket_au_dela_du_centieme_est_une_sous_issue` — vérifié par
+    /// mutation avant de poser le vol.
+    ///
+    /// Posé sur l'arm `--milestone` seul, parce que c'est la lecture que ce vol
+    /// borne. Un test qui aurait besoin de la borne d'un autre arm l'y étendra
+    /// alors — pas d'avance.
+    fn servir_borne(json: &str, limite: Option<usize>) -> Result<String> {
+        let Some(limite) = limite else {
+            return Ok(json.to_string());
+        };
+        let items: Vec<Value> = serde_json::from_str(json)
+            .map_err(|e| anyhow!("RecordingGhRunner: énumération mal formée : {e}"))?;
+        let gardes: Vec<Value> = items.into_iter().take(limite).collect();
+        serde_json::to_string(&gardes)
+            .map_err(|e| anyhow!("RecordingGhRunner: ré-sérialisation impossible : {e}"))
     }
 
     fn build_recorder() -> (Arc<Mutex<Vec<Vec<String>>>>, RecordingGhRunner) {
@@ -1083,9 +2763,17 @@ mod gh_arg_capture_tests {
             // Minimal well-shaped JSON — composer runs to completion without
             // meaningful state, which is fine because these tests assert only
             // on the captured argument vectors.
-            milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null}"#.into(),
+            // `open_issues` et `closed_issues` sont ceux que l'API du milestone
+            // rend toujours (mika#2969) : le fixture porte la forme réelle,
+            // pour que le chemin par défaut de `compose_read_audit` ne soit
+            // jamais celui que les gardes d'arguments exercent.
+            milestone_json: r#"{"title": "T", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null, "open_issues": 0, "closed_issues": 0}"#.into(),
             issues_json: "[]".into(),
             pr_json: "[]".into(),
+            ready_json: "[]".into(),
+            outside_json: "[]".into(),
+            plan_text: None,
+            timeline_json: None,
         };
         (calls, runner)
     }
@@ -1119,14 +2807,28 @@ mod gh_arg_capture_tests {
         );
     }
 
+    /// L'appel 2 demande `--state all` et la borne **nommée** de mika#2969, et
+    /// l'audit transporte celle que l'appel a réellement demandée.
+    ///
+    /// Renommé de `reader_issue_list_uses_state_all_and_limit_100` : le nom
+    /// épelait `100`, la borne vaut maintenant [`MILESTONE_READ_LIMIT`], et un
+    /// nom qui dit un autre nombre que son assertion est le premier endroit où
+    /// un lecteur se trompe.
+    ///
+    /// La deuxième moitié n'est pas tautologique : la borne comparée est lue
+    /// dans le **vecteur d'arguments capturé**, pas dans la constante. Un
+    /// correctif qui changerait la constante sans changer l'appel, ou qui
+    /// poserait sur l'audit une borne tierce, rougirait ici — alors qu'une
+    /// assertion `audit.limit == MILESTONE_READ_LIMIT` passerait dans les deux
+    /// cas.
     #[tokio::test]
-    async fn reader_issue_list_uses_state_all_and_limit_100() {
+    async fn mika2969_la_lecture_des_tickets_demande_la_borne_nommee_et_laudit_porte_la_meme() {
         let (calls, runner) = build_recorder();
         let mref = MilestoneRef {
             repo: "senara-solutions/mika".into(),
             number: 31,
         };
-        Reader::new(None)
+        let state = Reader::new(None)
             .read_with_runner(&mref, &runner)
             .await
             .expect("read_with_runner should succeed on canned JSON");
@@ -1137,11 +2839,26 @@ mod gh_arg_capture_tests {
             .find(|c| c.first().map(String::as_str) == Some("issue"))
             .expect("issue list call captured");
         // Adjacent-pair assertions — a sed-inject that re-adds `--state open`
-        // or drops `--limit 100` would fail here.
+        // or drops the named bound would fail here.
         assert_adjacent_pair(issue_call, "--state", "all");
-        assert_adjacent_pair(issue_call, "--limit", "100");
+        assert_adjacent_pair(issue_call, "--limit", "1000");
         // Sanity: the milestone number is threaded through.
         assert_adjacent_pair(issue_call, "--milestone", "31");
+
+        let demandee: usize = issue_call
+            .windows(2)
+            .find(|w| w[0] == "--limit")
+            .and_then(|w| w[1].parse().ok())
+            .expect("la borne demandée doit se lire dans les arguments capturés");
+        let audit = state
+            .milestone_read_audit
+            .as_ref()
+            .expect("un cycle qui a lu le milestone doit porter son audit");
+        assert_eq!(
+            audit.limit, demandee,
+            "l'audit doit porter la borne que l'appel a demandée, sinon le rapport \
+             épelle un nombre que la lecture n'a jamais utilisé"
+        );
     }
 
     #[tokio::test]
@@ -1167,5 +2884,1409 @@ mod gh_arg_capture_tests {
         // would render `closed (no linked PR)` in every case.
         assert_adjacent_pair(pr_call, "--state", "all");
         assert_adjacent_pair(pr_call, "--limit", "100");
+    }
+
+    // -- mika#2924 : la référence de clôture côté issue, sans appel de plus --
+
+    /// **V5** — la deuxième lecture demande `closedByPullRequestsReferences`, et
+    /// le **nombre** d'appels `gh` ne bouge pas.
+    ///
+    /// Les deux moitiés portent la décision, et elles sont distinctes :
+    ///
+    /// - le champ, parce que sans lui la référence côté issue n'arrive jamais et
+    ///   le correctif est décoratif — l'index des PR du milestone reste vide
+    ///   pour toute PR de la boucle, qui rattache le milestone au ticket ;
+    /// - le compte, parce que la réparation évidente — un `gh` par ticket fermé
+    ///   — coûterait 87 appels par cycle sur le milestone 33 là où ce champ en
+    ///   coûte zéro. La lecture était déjà émise ; on lui demande une colonne de
+    ///   plus.
+    ///
+    /// L'assertion de compte double celle de `mika2699_la_cinquieme_lecture_est_depot_large`
+    /// **à dessein** : elle y est un contrôle de non-régression du vol 2, elle est
+    /// ici la moitié mesurée du § coût du plan. Les deux rougiraient ensemble, et
+    /// c'est ce qu'on veut — un sixième appel ajouté pour servir ce champ serait
+    /// exactement la régression que ce test refuse.
+    #[tokio::test]
+    async fn mika2924_la_lecture_des_tickets_demande_la_reference_de_cloture_sans_appel_de_plus() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let calls = calls.lock().unwrap();
+        let issue_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue")
+                    && c.iter().any(|a| a == "--milestone")
+            })
+            .expect("l'appel d'énumération des sous-tickets doit être capturé");
+        assert_adjacent_pair(
+            issue_call,
+            "--json",
+            "number,title,state,body,labels,updatedAt,closedByPullRequestsReferences",
+        );
+        assert_eq!(
+            calls.len(),
+            5,
+            "la référence de clôture arrive sur une lecture déjà émise — aucun \
+             sixième appel `gh` par cycle : {calls:?}"
+        );
+    }
+
+    // -- mika#2924, vol 2 : la septième lecture, et sa borne --
+
+    /// Un corps de ticket groomé — plan **et** branche, les deux encarts que le
+    /// composeur lit.
+    const BODY_GROOME: &str = "> - **Plan:** `docs/plans/2026-10-27-002-foo-plan.md`\n\
+                               > - **Branch:** `fix/2698/foo`\n";
+
+    /// L'énumération des sous-tickets : #2698 ouvert et groomé, plus un voisin
+    /// ouvert sans plan pour que le palier 2 ait un rang à trier.
+    fn issues_du_milestone() -> String {
+        let body = serde_json::to_string(BODY_GROOME).unwrap();
+        format!(
+            r#"[
+              {{"number": 2698, "title": "t", "state": "OPEN", "body": {body},
+                "labels": [], "updatedAt": "2026-10-27T00:00:00Z",
+                "closedByPullRequestsReferences": []}},
+              {{"number": 2699, "title": "u", "state": "OPEN", "body": "",
+                "labels": [], "updatedAt": "2026-10-27T00:00:00Z",
+                "closedByPullRequestsReferences": []}}
+            ]"#
+        )
+    }
+
+    /// mika#2924 AC2, Fire-Disposition — **le** détecteur du vol : la sonde
+    /// coûte au plus `TIMELINE_PROBE_MAX` appel par cycle, et **zéro** quand le
+    /// palier 1 l'emporte.
+    ///
+    /// Les deux moitiés sont dans le même test parce qu'elles décident ensemble
+    /// du coût : une sonde bornée à un appel mais émise à chaque cycle, et une
+    /// sonde gratuite sur un milestone en vol, ne sont pas la même borne. Le
+    /// coût mesuré du cycle passe de ≤ 17 à ≤ 18 appels `gh` (+5,9 %), et à
+    /// ≤ 17 inchangé dès qu'un ticket du milestone porte une PR.
+    ///
+    /// L'assertion lit `TIMELINE_PROBE_MAX` plutôt qu'un `1` littéral : élargir
+    /// la borne sans toucher au test est possible, et c'est voulu — ce que le
+    /// détecteur refuse, c'est qu'elle s'élargisse **sans** être écrite.
+    #[tokio::test]
+    async fn mika2924_la_sonde_est_bornee_a_une_lecture_par_cycle() {
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+
+        // Moitié 1 — le palier 2 décide : exactement une lecture de timeline,
+        // sur le ticket que « Next » nommera, et à la page demandée.
+        let (calls, mut runner) = build_recorder();
+        runner.issues_json = issues_du_milestone();
+        runner.timeline_json = Some(FIXTURE_TIMELINE_2698_BORNE.to_string());
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let captured = calls.lock().unwrap().clone();
+        let timelines: Vec<&Vec<String>> = captured
+            .iter()
+            .filter(|c| c.iter().any(|a| a.contains("/timeline")))
+            .collect();
+        assert_eq!(
+            timelines.len(),
+            TIMELINE_PROBE_MAX,
+            "au plus TIMELINE_PROBE_MAX lecture de timeline par cycle : {captured:?}"
+        );
+        assert!(
+            timelines[0][1].contains("/issues/2698/timeline"),
+            "la cible est celle que le palier 2 nommerait, pas la première de \
+             l'énumération : {:?}",
+            timelines[0]
+        );
+        assert!(
+            timelines[0][1].contains(&format!("per_page={TIMELINE_PAGE_SIZE}")),
+            "sans `per_page`, la forge en rend 30 et #2698 en portait 36 le \
+             2026-10-27 : la réponse serait silencieusement fausse sur le \
+             ticket le plus actif du vivier — obtenu : {:?}",
+            timelines[0]
+        );
+        assert_eq!(
+            state
+                .sub_issues
+                .iter()
+                .find(|s| s.number == 2698)
+                .and_then(|s| s.merged_prs.clone()),
+            Some(MergedPrReading::Citing(vec![2704])),
+            "le résultat est posé sur le `SubIssue` du candidat, et sur lui seul"
+        );
+        assert_eq!(
+            state
+                .sub_issues
+                .iter()
+                .find(|s| s.number == 2699)
+                .and_then(|s| s.merged_prs.clone()),
+            None,
+            "le voisin non désigné garde `None` — « sonde non émise », et \
+             surtout pas « aucune PR »"
+        );
+
+        // Moitié 2 — le palier 1 l'emporte : **aucun** appel de timeline ne
+        // part. Un milestone en vol ne paie rien de plus.
+        let (calls, mut runner) = build_recorder();
+        runner.issues_json = issues_du_milestone();
+        runner.timeline_json = Some(FIXTURE_TIMELINE_2698_BORNE.to_string());
+        runner.pr_json = r#"[{"number": 2704, "state": "OPEN",
+            "closingIssuesReferences": [{"number": 2699}],
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]}]"#
+            .into();
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let captured = calls.lock().unwrap().clone();
+        assert!(
+            !captured
+                .iter()
+                .any(|c| c.iter().any(|a| a.contains("/timeline"))),
+            "palier 1 vainqueur ⇒ zéro appel de timeline : {captured:?}"
+        );
+    }
+
+    /// Une timeline minimale : une PR mergée qui cite le ticket. Les trois
+    /// filtres du composeur sont éprouvés sur le fixture **réel** par
+    /// `mika2924_la_timeline_rend_les_pr_mergees_qui_citent_le_ticket` ; ici
+    /// seule la plomberie est en jeu, et un document court rend l'assertion de
+    /// borne lisible.
+    const FIXTURE_TIMELINE_2698_BORNE: &str = r#"[
+        {"event": "labeled", "source": null},
+        {"event": "cross-referenced",
+         "source": {"issue": {"number": 2704,
+                              "pull_request": {"merged_at": "2026-10-16T07:04:43Z"}}}}
+    ]"#;
+
+    // -- mika#2699 Phase 2 (a) vol 1 : la quatrième lecture --
+
+    /// Cas 9 — la lecture du bassin est **dépôt-large** et ciblée sur `ready`.
+    ///
+    /// Les deux assertions qui portent la décision : `--label ready` (c'est bien
+    /// le bassin qu'on lit) et **l'absence de `--milestone`** (le webhook `ready`
+    /// dispatche sur tout le dépôt, donc un bassin compté sur le seul milestone
+    /// serait sous-compté et la recommandation fausse le jour où elle compte).
+    /// `--state open` parce qu'un ticket `ready` fermé n'occupe aucun rail.
+    #[tokio::test]
+    async fn mika2699_la_lecture_du_bassin_est_depot_large_et_sur_ready() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner should succeed on canned JSON");
+
+        let calls = calls.lock().unwrap();
+        let ready_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue") && c.iter().any(|a| a == "--label")
+            })
+            .expect("l'appel du bassin ready doit être capturé");
+        assert_adjacent_pair(ready_call, "--label", "ready");
+        assert_adjacent_pair(ready_call, "--state", "open");
+        assert_adjacent_pair(ready_call, "--json", "number,labels");
+        assert_adjacent_pair(ready_call, "--limit", "100");
+        assert_adjacent_pair(ready_call, "--repo", "senara-solutions/mika");
+        assert!(
+            !ready_call.iter().any(|a| a == "--milestone"),
+            "le bassin est dépôt-large : aucun --milestone ici — {ready_call:?}"
+        );
+    }
+
+    /// Cas 10 — `compose_ready_pool` sur une sortie `gh` réelle, et sur `[]`.
+    ///
+    /// Le fixture est l'état mesuré le 2026-10-15 : deux issues `ready` ouvertes,
+    /// **les deux** portant `dispatch:loop`. Il porte aussi un label sans `name`
+    /// exploitable, pour que la lecture ne s'effondre pas sur une forme que la
+    /// forge peut rendre.
+    #[test]
+    fn mika2699_compose_ready_pool_lit_numeros_et_labels() {
+        let json = r#"[
+            {"number": 2699, "labels": [{"name":"ready"},{"name":"dispatch:loop"}]},
+            {"number": 2687, "labels": [{"name":"ready"},{"name":"dispatch:loop"},{"id":"x"}]}
+        ]"#;
+        let pool = compose_ready_pool(json).expect("une sortie gh valide doit se composer");
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool[0].number, 2699);
+        assert_eq!(
+            pool[0].labels,
+            vec!["ready".to_string(), "dispatch:loop".to_string()]
+        );
+        assert!(
+            pool.iter().all(|t| t.holds_dispatch_seat()),
+            "les deux portaient un siège le 2026-10-15 — {pool:?}"
+        );
+        assert_eq!(
+            pool[1].labels.len(),
+            2,
+            "un label sans `name` est ignoré, il ne fait pas échouer la lecture"
+        );
+
+        let empty = compose_ready_pool("[]").expect("un bassin vide est une réponse valide");
+        assert!(
+            empty.is_empty(),
+            "`[]` donne un bassin vide, pas une erreur"
+        );
+    }
+
+    // -- mika#2699 vol 2 : la cinquième lecture --
+
+    /// Cas 11 — la lecture hors milestone est **dépôt-large** et n'ouvre aucune
+    /// autorité.
+    ///
+    /// L'assertion qui porte le sens est l'absence de `--milestone` : avec elle,
+    /// la cinquième lecture rendrait le même périmètre que la deuxième et le
+    /// « reste » du 2e critère de tri serait vide à chaque cycle — un vol 2 vert
+    /// qui ne mesure rien. L'absence de `--label` compte autant : filtrer sur
+    /// `ready` ne ramènerait que des tickets déjà dans le bassin.
+    #[tokio::test]
+    async fn mika2699_la_cinquieme_lecture_est_depot_large() {
+        let (calls, runner) = build_recorder();
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        let calls = calls.lock().unwrap();
+        let outside_call = calls
+            .iter()
+            .find(|c| {
+                c.first().map(String::as_str) == Some("issue")
+                    && c.windows(2)
+                        .any(|w| w[0] == "--json" && w[1] == "number,body,labels,state")
+            })
+            .expect("l'appel des candidats hors milestone doit être capturé");
+        assert_adjacent_pair(outside_call, "--state", "open");
+        assert_adjacent_pair(outside_call, "--json", "number,body,labels,state");
+        assert_adjacent_pair(outside_call, "--limit", "100");
+        assert_adjacent_pair(outside_call, "--repo", "senara-solutions/mika");
+        assert!(
+            !outside_call.iter().any(|a| a == "--milestone"),
+            "sans cette absence, le « reste » serait vide à chaque cycle — {outside_call:?}"
+        );
+        assert!(
+            !outside_call.iter().any(|a| a == "--label"),
+            "filtrer sur `ready` ne ramènerait que le bassin — {outside_call:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            5,
+            "cinq lectures, pas une de plus : chaque appel `gh` est un coût par \
+             cycle — {calls:?}"
+        );
+    }
+
+    /// Cas 12 — le composeur dérive priorité et plan, et retire le milestone.
+    ///
+    /// Le fixture oppose les trois choses qu'un candidat du dehors doit porter
+    /// pour que le tri du point 1 soit juste : un rang venu des labels, un
+    /// `plan_present` venu du corps, et un état. Le ticket du milestone (#1802)
+    /// est dans la page lue par construction — la lecture est dépôt-large — et
+    /// doit en sortir.
+    #[test]
+    fn mika2699_compose_outside_candidates_derive_et_retire_le_milestone() {
+        let json = r#"[
+            {"number": 1700, "body": "> - **Plan:** docs/plans/x.md", "state": "OPEN",
+             "labels": [{"name":"p0-critical"}]},
+            {"number": 1701, "body": "pas de plan ici", "state": "OPEN", "labels": []},
+            {"number": 1802, "body": "> - **Plan:** docs/plans/y.md", "state": "OPEN",
+             "labels": [{"name":"p1-important"}]}
+        ]"#;
+        let subs = vec![SubIssue {
+            missing_grooming_signals: None,
+            number: 1802,
+            title: "déjà dans sub_issues".into(),
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: true,
+            plan_reading: None,
+            dormancy: None,
+            branch_present: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
+            merged_prs: None,
+            ci_state: CiState::None,
+            blockers: vec![],
+            updated_at: "2026-10-15T00:00:00Z".into(),
+            labels: vec!["p1-important".into()],
+        }];
+
+        let (cands, truncated) =
+            compose_outside_candidates(json, &subs).expect("une sortie gh valide se compose");
+        assert!(!truncated, "3 issues sur 100 : la page n'est pas pleine");
+        assert_eq!(
+            cands.iter().map(|c| c.number).collect::<Vec<_>>(),
+            vec![1700, 1701],
+            "le ticket du milestone sort, les autres restent — {cands:?}"
+        );
+        assert_eq!(
+            cands[0].priority_rank,
+            Some(0),
+            "p0-critical vaut le rang 0"
+        );
+        assert!(cands[0].plan_present, "le callout de plan est lu");
+        assert_eq!(cands[1].priority_rank, None, "aucun label ⇒ non priorisé");
+        assert!(!cands[1].plan_present);
+
+        let (vide, t) = compose_outside_candidates("[]", &subs).expect("`[]` est valide");
+        assert!(vide.is_empty());
+        assert!(!t, "une page vide n'est pas une page pleine");
+    }
+
+    /// Les **deux** chemins de composition posent la même lecture sur le même
+    /// corps (mika#2952).
+    ///
+    /// Un candidat du milestone et un candidat du dehors arrivent au bassin par
+    /// deux fonctions différentes, et le bassin les juge dans la même boucle. Un
+    /// écart de lecture entre les deux origines serait la classe mika#2205
+    /// réintroduite : le même ticket serait refusé ou admis selon le chemin par
+    /// lequel il est entré, et le rapport ne dirait pas lequel.
+    ///
+    /// Le corps est celui que la porte d'auto-pull écrit — donc `PriorOnly` — et
+    /// le contrôle positif est dans le même test : un corps portant un callout
+    /// vivant rend `Live` par les deux chemins. Sans lui, deux `Absent` par
+    /// défaut passeraient pour un accord.
+    #[test]
+    fn mika2952_les_deux_chemins_de_composition_posent_la_meme_lecture() {
+        use crate::plan_callout::PlanReading;
+
+        let livre = "> Plan antérieur : `docs/plans/2026-10-27-001-fix-2943-plan.md` — \
+                     la branche `fix/2943/x` a été supprimée par le merge de #2945.";
+        let vivant = "> - **Plan:** `docs/plans/2026-10-28-009-feat-x-plan.md`";
+
+        for (corps, attendu) in [(livre, PlanReading::PriorOnly), (vivant, PlanReading::Live)] {
+            let body = serde_json::to_string(corps).expect("un corps s'échappe en JSON");
+
+            // Chemin A — le milestone, par `compose_from_gh_outputs`.
+            let issues_json = format!(
+                r#"[{{"number": 2943, "title": "t", "state": "OPEN", "body": {body},
+                      "labels": [{{"name":"p1-important"}}],
+                      "updatedAt": "2026-10-28T00:00:00Z"}}]"#
+            );
+            let r = MilestoneRef {
+                repo: "senara-solutions/mika".into(),
+                number: 33,
+            };
+            let state = compose_from_gh_outputs(
+                &r,
+                r#"{"title": "m", "description": "", "state": "open",
+                    "created_at": "2026-10-01T00:00:00Z", "due_on": null}"#,
+                &issues_json,
+                "[]",
+            )
+            .expect("une sortie gh valide se compose");
+            let du_milestone = state.sub_issues[0].plan_reading;
+
+            // Chemin B — le dehors, par `compose_outside_candidates`.
+            let outside_json =
+                format!(r#"[{{"number": 2943, "state": "OPEN", "body": {body}, "labels": []}}]"#);
+            let (cands, _) =
+                compose_outside_candidates(&outside_json, &[]).expect("idem pour le dehors");
+            let du_dehors = cands[0].plan_reading;
+
+            assert_eq!(
+                du_milestone,
+                Some(attendu),
+                "le chemin du milestone doit lire {attendu:?}"
+            );
+            assert_eq!(
+                du_dehors, du_milestone,
+                "les deux origines lisent le même corps : un écart serait \
+                 un verdict dépendant du chemin d'entrée"
+            );
+        }
+    }
+
+    /// Cas 13 — une page pleine vide l'ensemble et le **déclare**.
+    ///
+    /// C'est le contrôle négatif de la garde : sans elle, le manager
+    /// recommanderait le meilleur candidat de la page lue en affirmant un ordre
+    /// global qu'il n'a pas mesuré. Et le booléen porte sur la page **avant**
+    /// l'exclusion du milestone, sinon un milestone de cent tickets rendrait
+    /// « non tronqué » sur une page saturée.
+    #[test]
+    fn mika2699_une_page_pleine_vide_lensemble_et_se_declare() {
+        let page: Vec<String> = (1..=100)
+            .map(|n| format!(r#"{{"number": {n}, "body": "", "state": "OPEN", "labels": []}}"#))
+            .collect();
+        let json = format!("[{}]", page.join(","));
+
+        let (cands, truncated) =
+            compose_outside_candidates(&json, &[]).expect("une page pleine reste du JSON valide");
+        assert!(truncated, "100 issues à la borne 100 : page pleine");
+        assert!(
+            cands.is_empty(),
+            "refuser plutôt que mal répondre : aucun candidat retenu — {} retenus",
+            cands.len()
+        );
+    }
+
+    // -- mika#2699 vol 3 : la sixième lecture, le plan au ref de sa branche --
+
+    /// Un corps d'issue groomée : les **trois** signaux du prédicat du dispatch,
+    /// et rien d'autre. `\n` littéraux — c'est du JSON.
+    ///
+    /// Le marqueur `Grooming history` a été ajouté par mika#2956, et il n'est
+    /// pas décoratif : depuis ce vol l'admission exige les trois signaux, donc
+    /// un corps qui n'en porte que deux n'est plus candidat du tout et
+    /// `numbers_needing_size` ne le désigne pas — la sixième lecture ne partait
+    /// plus, et ces deux cas mesuraient une population vide. La fixture mérite
+    /// désormais son nom : avant, « groomée » y voulait dire « ce que la
+    /// sixième lecture épelle », pas « ce que le dispatch accepte ».
+    const CORPS_GROOME: &str = "> - **Branch:** `feat/1700/x`\\n\
+         > - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md` \
+         (committed on branch @ `abc1234`)\\n\
+         > - **Grooming history:** mika-arch first-pass (READY) → \
+         second-pass (GROOMED)";
+
+    const PLAN_DE_500: &str = "# Plan\n\n## Taille estimée\n\nTotal estimé : 500 lignes\n";
+
+    fn outside_json_un_candidat(corps: &str) -> String {
+        format!(
+            r#"[{{"number": 1700, "body": "{corps}", "state": "OPEN",
+                 "labels": [{{"name": "p0-critical"}}]}}]"#
+        )
+    }
+
+    /// Cas 14 — la sixième lecture épelle `/contents/<chemin>?ref=<branche>`, et
+    /// son total atterrit dans l'état.
+    ///
+    /// Trois décisions tiennent dans cet argv, et chacune est invisible depuis
+    /// `pool.rs`. **`?ref=<branche>`** : le plan d'un ticket groomé est commité
+    /// sur *sa* branche — lire `main` répondrait « introuvable » pour tout
+    /// candidat correctement groomé, c'est-à-dire exactement ceux que la borne
+    /// doit juger. **Le chemin normalisé** : `plan_callout` retire le segment de
+    /// tête (`mika/…`), qui est le préfixe du dépôt dans le monorepo et n'existe
+    /// pas à l'intérieur du sous-dépôt que `/contents/` adresse. **`Accept:
+    /// …raw`** : sans lui la forge rend une enveloppe JSON base64, et le contrat
+    /// de parse porté du bash travaillerait sur du base64 — `SectionAbsent` sur
+    /// tous les plans du monde, silencieusement.
+    #[tokio::test]
+    async fn mika2699_la_sixieme_lecture_lit_le_plan_au_ref_de_sa_branche() {
+        let (calls, mut runner) = build_recorder();
+        runner.outside_json = outside_json_un_candidat(CORPS_GROOME);
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("la lecture doit aboutir");
+
+        let calls = calls.lock().unwrap();
+        let plan_call = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a.contains("/contents/")))
+            .expect("la sixième lecture doit être capturée");
+        assert_eq!(
+            plan_call,
+            &[
+                "api",
+                "/repos/senara-solutions/mika/contents/\
+                 docs/plans/2026-10-01-001-feat-1700-x-plan.md?ref=feat/1700/x",
+                "-H",
+                "Accept: application/vnd.github.raw",
+            ]
+        );
+        assert_eq!(
+            state.plan_sizes.get(&1700),
+            Some(&PlanSizeReading::Measured(500)),
+            "le total lu entre dans l'état, mesuré : {:?}",
+            state.plan_sizes
+        );
+    }
+
+    /// Cas 15 — un `404` au ref se nomme, et ne se confond pas avec un plan non
+    /// dimensionné.
+    ///
+    /// Contrôle négatif du cas précédent **et** séparation de deux populations
+    /// dont les remèdes sont opposés (classe mika#2205) : un plan introuvable se
+    /// corrige en poussant la branche, un plan sans section de taille en
+    /// l'éditant. Confondre les deux enverrait l'opérateur au mauvais endroit —
+    /// et confondre l'un ou l'autre avec « au-delà de la borne » refuserait un
+    /// ticket que personne n'a mesuré.
+    #[tokio::test]
+    async fn mika2699_un_plan_introuvable_au_ref_se_nomme_et_ne_refuse_pas() {
+        let (_calls, mut runner) = build_recorder();
+        runner.outside_json = outside_json_un_candidat(CORPS_GROOME);
+        runner.plan_text = None; // le `404`
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("un plan introuvable ne fait pas échouer le cycle");
+
+        assert_eq!(
+            state.plan_sizes.get(&1700),
+            Some(&PlanSizeReading::Unread(UnreadCause::FetchFailed)),
+            "la cause dit quel geste corrige : {:?}",
+            state.plan_sizes
+        );
+    }
+
+    /// Cas 16 — un candidat sans callout de branche ne coûte aucun appel.
+    ///
+    /// Le ticket porte bien un callout de plan — `plan_callout_present` le voit
+    /// — mais pas de quoi désigner un ref. La lecture ne part pas.
+    ///
+    /// **Ce que mika#2956 a changé, et pourquoi l'assertion de queue a bougé.**
+    /// Jusqu'à ce vol, ce corps passait le filtre d'admission (qui ne lisait que
+    /// `plan_present`), entrait donc dans `numbers_needing_size`, et
+    /// `read_one_plan_size` l'arrêtait sur son troisième garde en répondant
+    /// `Unread(NoCallout)`. Depuis mika#2956 l'admission exige les trois
+    /// signaux du prédicat du dispatch : il manque ici le callout de branche et
+    /// le marqueur GROOMED, donc le candidat est refusé **avant** la lecture et
+    /// `plan_sizes` ne porte aucune entrée pour lui. L'économie d'appel est la
+    /// même, obtenue un cran plus haut — et le `None` n'est pas un zéro : il dit
+    /// que la question de la taille n'a pas été posée, parce que l'admission
+    /// avait déjà répondu non (motif mika#2331).
+    ///
+    /// Le garde en profondeur de `read_one_plan_size` reste en place et reste
+    /// attesté — par `mika2956_le_garde_en_profondeur_de_la_sixieme_lecture_tient`
+    /// ci-dessous, qui l'appelle directement puisque le bassin ne lui envoie
+    /// plus personne.
+    #[tokio::test]
+    async fn mika2699_sans_callout_de_branche_aucun_appel_ne_part() {
+        let (calls, mut runner) = build_recorder();
+        runner.outside_json = outside_json_un_candidat(
+            "> - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md` \
+             (committed on branch @ `abc1234`)",
+        );
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 31,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("la lecture doit aboutir");
+
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.iter().any(|a| a.contains("/contents/"))),
+            "aucune lecture de plan sans ref à lire"
+        );
+        assert_eq!(
+            state.plan_sizes.get(&1700),
+            None,
+            "l'admission a refusé avant que la taille soit une question : {:?}",
+            state.plan_sizes
+        );
+    }
+
+    /// mika#2956 — le troisième garde de `read_one_plan_size` tient, même si le
+    /// bassin ne lui envoie plus personne.
+    ///
+    /// Depuis que l'admission exige les trois signaux, un candidat désigné par
+    /// `numbers_needing_size` porte **par construction** un callout de branche
+    /// et un callout de plan stricts : les deux gardes de forme de
+    /// `read_one_plan_size` sont devenus inatteignables par ce chemin. Les
+    /// retirer serait pourtant un couplage silencieux — cette fonction ne lit
+    /// pas le filtre d'admission, et un futur appelant (le puits hors ligne, une
+    /// lecture ciblée) peut lui tendre n'importe quel corps. Le garde est donc
+    /// attesté ici **en appel direct**, à sa seule propriété propre : il nomme
+    /// la cause et ne part pas en appel.
+    #[tokio::test]
+    async fn mika2956_le_garde_en_profondeur_de_la_sixieme_lecture_tient() {
+        let (calls, mut runner) = build_recorder();
+        runner.plan_text = Some(PLAN_DE_500.into());
+        let bodies = HashMap::from([(
+            1700u64,
+            "> - **Plan:** `docs/plans/2026-10-01-001-feat-1700-x-plan.md`".to_string(),
+        )]);
+
+        let lu = read_one_plan_size(&runner, "senara-solutions/mika", 1700, &bodies).await;
+
+        assert_eq!(
+            lu,
+            PlanSizeReading::Unread(UnreadCause::NoCallout),
+            "sans ref à lire, la cause se nomme"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "et aucun appel ne part : {:?}",
+            calls.lock().unwrap()
+        );
+    }
+
+    /// Cas 17 — sur un numéro présent dans les deux lectures, le milestone
+    /// gagne.
+    ///
+    /// Même précédence qu'à l'admission, où un tel ticket est jugé `Milestone` :
+    /// deux réponses divergentes à « d'où vient #42 » feraient lire le plan d'un
+    /// ticket au ref annoncé par l'autre. Le corps hors milestone est ici
+    /// délibérément **mieux formé** que celui du milestone — si la précédence
+    /// s'inversait, le test verrait un callout là où il en attend zéro.
+    #[test]
+    fn mika2699_sur_un_numero_commun_le_corps_du_milestone_gagne() {
+        let milestone = r#"[{"number": 42, "body": "du milestone"}]"#;
+        let dehors = format!(r#"[{{"number": 42, "body": "{CORPS_GROOME}"}}]"#);
+
+        let bodies = compose_candidate_bodies(milestone, &dehors).expect("deux JSON valides");
+        assert_eq!(
+            bodies.get(&42).map(String::as_str),
+            Some("du milestone"),
+            "le milestone écrase le dehors"
+        );
+    }
+
+    /// Cas 18 — un corps absent de la sortie `gh` est un `NoCallout`, pas un
+    /// panic ni un zéro.
+    ///
+    /// `compose_candidate_bodies` ne promet rien sur un numéro : `gh` peut
+    /// rendre une issue sans champ `body`. Le vide résultant n'a ni callout ni
+    /// branche, donc la même cause que le cas 16 — et surtout aucune taille, ce
+    /// qu'un `0` par défaut aurait rendu comme « tient largement la borne »
+    /// (motif mika#2331).
+    #[test]
+    fn mika2699_une_issue_sans_champ_body_rend_une_chaine_vide() {
+        let bodies = compose_candidate_bodies(r#"[{"number": 42}]"#, "[]")
+            .expect("un body absent reste du JSON valide");
+        assert_eq!(bodies.get(&42).map(String::as_str), Some(""));
+    }
+
+    // -- mika#2969 : un milestone de plus de cent tickets, de bout en bout ----
+
+    /// Une énumération de `n` tickets fermés, numéros **décroissants** depuis
+    /// `depart` — l'ordre que `gh issue list` rend, le plus récent d'abord.
+    ///
+    /// Décroissant parce que c'est ce qui donne son sens au test : sous une
+    /// borne, ce sont les **plus petits** numéros qui tombent, donc les plus
+    /// anciens tickets du milestone. Le défaut de mika#2969 s'est vu là — #1721
+    /// et #1727, ouverts, lus « hors milestone ».
+    fn tickets_decroissants(depart: u64, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let number = depart - i as u64;
+                format!(
+                    r#"{{"number": {number}, "title": "t{number}", "state": "CLOSED", "body": "", "labels": [], "updatedAt": "2026-10-01T00:00:00Z"}}"#
+                )
+            })
+            .collect()
+    }
+
+    /// **T2 (AC2)** — un ticket ouvert au-delà du centième est une sous-issue du
+    /// milestone, et non un candidat « hors milestone ».
+    ///
+    /// Le fixture sert 117 tickets et **tronque à la borne demandée**
+    /// (`servir_borne`), comme `gh issue list` le fait : c'est ce qui rend ce
+    /// test sensible. Avec le `--limit "100"` d'avant ce vol, #1727 — 117ᵉ de
+    /// l'énumération — tombe hors de `sub_issues`, et comme `outside_json` le
+    /// porte aussi, il entre dans `outside_candidates` avec le motif faux que le
+    /// ticket décrit. Vérifié par mutation avant de poser le vol : borne à 100,
+    /// ce test rougit sur les deux assertions.
+    ///
+    /// #1700 est là pour la contre-épreuve : la lecture hors milestone garde son
+    /// office, et un ticket réellement hors du milestone y reste. Sans lui, un
+    /// `outside_candidates` vide pour n'importe quelle raison ferait passer
+    /// l'assertion négative.
+    #[tokio::test]
+    async fn mika2969_un_ticket_au_dela_du_centieme_est_une_sous_issue_pas_un_candidat_du_dehors() {
+        let mut items = tickets_decroissants(2150, 116);
+        // Le 117ᵉ : ouvert, et le plus petit numéro du milestone.
+        items.push(
+            r#"{"number": 1727, "title": "p1", "state": "OPEN", "body": "", "labels": [], "updatedAt": "2026-10-20T00:00:00Z"}"#
+                .to_string(),
+        );
+        let (_calls, mut runner) = build_recorder();
+        runner.issues_json = format!("[{}]", items.join(","));
+        runner.milestone_json = r#"{"title": "Substrat de boucle", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null, "open_issues": 14, "closed_issues": 178}"#.into();
+        // La lecture hors milestone voit #1727 — c'est le cœur du défaut — et
+        // #1700, qui lui est réellement dehors.
+        runner.outside_json = r#"[{"number": 1727, "body": "", "labels": [], "state": "OPEN"}, {"number": 1700, "body": "", "labels": [], "state": "OPEN"}]"#.into();
+
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        assert_eq!(
+            state.sub_issues.len(),
+            117,
+            "les 117 tickets du milestone sont lus, pas 100"
+        );
+        assert!(
+            state.sub_issues.iter().any(|s| s.number == 1727),
+            "#1727, 117ᵉ de l'énumération, est une sous-issue du milestone"
+        );
+        assert!(
+            !state.outside_candidates.iter().any(|c| c.number == 1727),
+            "un ticket du milestone n'est pas un candidat « hors milestone » : {:?}",
+            state.outside_candidates
+        );
+        assert!(
+            state.outside_candidates.iter().any(|c| c.number == 1700),
+            "la lecture hors milestone garde son office : {:?}",
+            state.outside_candidates
+        );
+
+        let audit = state
+            .milestone_read_audit
+            .as_ref()
+            .expect("un cycle qui a lu le milestone porte son audit");
+        assert_eq!(audit.returned, 117);
+        assert_eq!(audit.limit, MILESTONE_READ_LIMIT);
+        assert_eq!(
+            audit.api_item_total, 192,
+            "14 ouverts + 178 fermés, PR comprises"
+        );
+        assert!(
+            !audit.truncated(),
+            "117 pour une borne de 1000 : la lecture est complète, et l'écart avec \
+             les 192 items de l'API vaut les PR du milestone (classe mika#2205)"
+        );
+    }
+
+    /// **T3 (AC2, contrôle négatif)** — un milestone sous la borne se lit comme
+    /// avant, et son rapport ne signale aucune troncature.
+    ///
+    /// Le rapport est produit par la chaîne de production — `Assessor::assess`
+    /// puis `Reporter::report`, comme la cadence le fait — et non par un
+    /// littéral : un fixture écrit à la main resterait vert le jour où le
+    /// rapporteur change de phrase.
+    #[tokio::test]
+    async fn mika2969_un_milestone_sous_la_borne_se_lit_comme_avant_et_ne_signale_rien() {
+        let (_calls, mut runner) = build_recorder();
+        runner.issues_json = format!("[{}]", tickets_decroissants(2150, 7).join(","));
+        runner.milestone_json = r#"{"title": "Petit", "description": "", "state": "open", "created_at": "2026-08-01T00:00:00Z", "due_on": null, "open_issues": 0, "closed_issues": 7}"#.into();
+
+        let mref = MilestoneRef {
+            repo: "senara-solutions/mika".into(),
+            number: 33,
+        };
+        let state = Reader::new(None)
+            .read_with_runner(&mref, &runner)
+            .await
+            .expect("read_with_runner doit réussir sur du JSON canné");
+
+        assert_eq!(state.sub_issues.len(), 7);
+        assert_eq!(state.progress.total, 7);
+        let audit = state
+            .milestone_read_audit
+            .as_ref()
+            .expect("un cycle qui a lu le milestone porte son audit");
+        assert_eq!(audit.returned, 7);
+        assert!(!audit.truncated());
+
+        let assessment = super::super::assessor::Assessor::new(Default::default()).assess(&state);
+        let rapport = super::super::reporter::Reporter::new().report(&state, &assessment);
+        assert!(
+            !rapport.contains("TRONQUÉE"),
+            "sept tickets sous une borne de mille ne tronquent rien :\n{rapport}"
+        );
+        assert!(
+            rapport.contains("- Lecture du milestone : 7 tickets lus, borne 1000 — complète"),
+            "le rapport dit le compte lu, la borne, et le mot « complète » :\n{rapport}"
+        );
+    }
+}
+
+/// Les tests de [`read_flight_prs`] — la lecture des PR des vols **par numéro**
+/// (mika#2968, vol 2a).
+///
+/// Module à part, et non une extension de `gh_arg_capture_tests`, pour une
+/// raison qui est le cœur de ce qu'ils attestent : l'enregistreur de ce dernier
+/// porte un arm `Some("pr")` **nu**, qui aurait servi la fixture des PR du
+/// milestone aux deux nouveaux appels. Les quatre cas seraient verts sans
+/// qu'aucun n'ait lu ce qu'il croit lire — exactement l'échec contre lequel la
+/// docstring de cet enregistreur met en garde.
+#[cfg(test)]
+mod flight_pr_read_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    const DEPOT: &str = "senara-solutions/mika";
+    const AUTRE_DEPOT: &str = "senara-solutions/mika-cloud";
+
+    /// Un enregistreur **dédié** aux deux appels de [`read_flight_prs`].
+    ///
+    /// Il discrimine sur la valeur de `--state` — `all` pour l'appel 1, `open`
+    /// pour l'appel 2 — c'est-à-dire sur le jeton que chaque appel possède
+    /// seul, et jamais sur le premier argument, que les deux partagent. Un
+    /// dépôt absent de `par_depot` et toute autre forme d'appel tombent sur
+    /// l'arm d'erreur : un test ne peut pas lire un dépôt qu'il n'a pas gréé, et
+    /// un troisième appel `gh` devra étendre ce `match` plutôt qu'hériter d'une
+    /// réponse qui n'est pas la sienne.
+    struct RecordingFlightPrRunner {
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
+        /// Par dépôt : la réponse de l'appel 1, puis celle de l'appel 2.
+        /// `None` simule l'échec de l'appel correspondant.
+        par_depot: BTreeMap<String, (Option<String>, Option<String>)>,
+    }
+
+    impl RecordingFlightPrRunner {
+        fn new(par_depot: BTreeMap<String, (Option<String>, Option<String>)>) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                par_depot,
+            }
+        }
+
+        fn appels(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GhRunner for RecordingFlightPrRunner {
+        async fn run(&self, args: &[&str]) -> Result<String> {
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            self.calls.lock().unwrap().push(owned.clone());
+            let valeur = |drapeau: &str| {
+                owned
+                    .windows(2)
+                    .find(|w| w[0] == drapeau)
+                    .map(|w| w[1].clone())
+                    .unwrap_or_default()
+            };
+            let depot = valeur("--repo");
+            let etat = valeur("--state");
+            let Some((etats, rollups)) = self.par_depot.get(&depot) else {
+                return Err(anyhow!(
+                    "RecordingFlightPrRunner : dépôt non gréé {depot:?} dans {owned:?}"
+                ));
+            };
+            match (owned.first().map(String::as_str), etat.as_str()) {
+                (Some("pr"), "all") => etats
+                    .clone()
+                    .ok_or_else(|| anyhow!("échec simulé de l'appel 1 sur {depot}")),
+                (Some("pr"), "open") => rollups
+                    .clone()
+                    .ok_or_else(|| anyhow!("échec simulé de l'appel 2 sur {depot}")),
+                _ => Err(anyhow!(
+                    "RecordingFlightPrRunner : forme d'appel inattendue {owned:?}"
+                )),
+            }
+        }
+    }
+
+    /// Le `statusCheckRollup` **mesuré** de mika#2966 le 2026-10-29 : le job
+    /// `Egress Manifest Lint`, un check requis, terminé en `FAILURE` à
+    /// 17:44:16Z, à côté d'un `Check` vert.
+    fn rollup_2966_mesure() -> serde_json::Value {
+        serde_json::json!([
+            { "name": "Egress Manifest Lint", "status": "COMPLETED", "conclusion": "FAILURE" },
+            { "name": "Check", "status": "COMPLETED", "conclusion": "SUCCESS" }
+        ])
+    }
+
+    fn etats_mesures() -> String {
+        serde_json::json!([
+            { "number": 2966, "state": "OPEN" },
+            { "number": 2962, "state": "MERGED" },
+            { "number": 2960, "state": "CLOSED" }
+        ])
+        .to_string()
+    }
+
+    /// La revue **mesurée** de mika#2972 le 2026-10-29 à 22:42:22Z : la seule
+    /// revue de la PR, en état `COMMENTED` sur la tête `be265527`, portant le
+    /// texte moteur `VERDICT: hold[review]` — le tour de callback de mika-qa
+    /// avait atteint 30 steps d'outil sans poster de verdict
+    /// (`cut_off_max_steps`, trace `1ecce0852bb84f42b7ca8471bf7ac20c`).
+    ///
+    /// **Ne pas relire mika#2972 pour reconstituer cette fixture.** Une seconde
+    /// revue, `APPROVED`, a été posée le 2026-10-30 à 07:14:30Z sur le même
+    /// commit ; la PR ne montre donc plus l'état mesuré. Les octets ci-dessous
+    /// sont le relevé, et ils sont figés à ce titre.
+    const TETE_2972: &str = "be2655270f30db9a59b7110cad08034faeca48a8";
+
+    fn revue_2972_mesuree() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "author": { "login": "mika-platform-qa" },
+                "state": "COMMENTED",
+                "submittedAt": "2026-10-29T22:42:22Z",
+                "commit": { "oid": TETE_2972 },
+                "body": "Le tour de revue n'a pas conclu.\n\nVERDICT: hold[review]\n"
+            }
+        ])
+    }
+
+    fn rollups_mesures() -> String {
+        serde_json::json!([
+            {
+                "number": 2966,
+                "statusCheckRollup": rollup_2966_mesure(),
+                "headRefOid": "b972dd2e",
+                "reviewDecision": "REVIEW_REQUIRED",
+                "reviews": []
+            }
+        ])
+        .to_string()
+    }
+
+    /// L'appel 2 d'une seule PR ouverte, dont la tête et les revues sont
+    /// passées telles quelles.
+    fn tete(numero: u64, head_oid: &str, decision: &str, reviews: serde_json::Value) -> String {
+        serde_json::json!([
+            {
+                "number": numero,
+                "statusCheckRollup": [
+                    { "name": "Check", "status": "COMPLETED", "conclusion": "SUCCESS" }
+                ],
+                "headRefOid": head_oid,
+                "reviewDecision": decision,
+                "reviews": reviews
+            }
+        ])
+        .to_string()
+    }
+
+    fn etat_ouvert(numero: u64) -> String {
+        serde_json::json!([{ "number": numero, "state": "OPEN" }]).to_string()
+    }
+
+    /// La revue lue d'une PR ouverte unique, grée par [`tete`].
+    async fn revue_lue(numero: u64, head_oid: &str, reviews: serde_json::Value) -> FlightPrRead {
+        let runner = un_depot(
+            Some(etat_ouvert(numero)),
+            Some(tete(numero, head_oid, "REVIEW_REQUIRED", reviews)),
+        );
+        let reads = read_flight_prs(&runner, &cibles()).await;
+        lu(&reads, DEPOT)
+            .get(&numero)
+            .cloned()
+            .expect("la PR ouverte est lue")
+    }
+
+    fn un_depot(etats: Option<String>, rollups: Option<String>) -> RecordingFlightPrRunner {
+        RecordingFlightPrRunner::new(BTreeMap::from([(DEPOT.to_string(), (etats, rollups))]))
+    }
+
+    fn cibles() -> BTreeSet<String> {
+        BTreeSet::from([DEPOT.to_string()])
+    }
+
+    fn lu(reads: &HashMap<String, RepoPrRead>, depot: &str) -> HashMap<u64, FlightPrRead> {
+        match reads.get(depot) {
+            Some(RepoPrRead::Read(map)) => map.clone(),
+            autre => panic!("{depot} devait être lu, et rend {autre:?}"),
+        }
+    }
+
+    /// Cas nominal — et c'est ici que les arguments `gh` sont épinglés.
+    ///
+    /// Les deux vecteurs sont comparés **en entier**, parce que c'est la seule
+    /// forme d'assertion qui attrape la dérive qui compte : un `--state open`
+    /// devenu `all` sur l'appel 2 demanderait le rollup de toutes les PR du
+    /// dépôt — un test vert pour un coût que la borne nommée prétend contenir —
+    /// et un `--json` qui perd `statusCheckRollup` rendrait toutes les CI non
+    /// lues sans qu'aucune assertion d'état ne bouge.
+    #[tokio::test]
+    async fn mika2968_le_lecteur_par_numero_joint_le_rollup_a_letat() {
+        let runner = un_depot(Some(etats_mesures()), Some(rollups_mesures()));
+        let reads = read_flight_prs(&runner, &cibles()).await;
+
+        let map = lu(&reads, DEPOT);
+        assert_eq!(map.len(), 3, "les trois PR de la page sont lues : {map:?}");
+
+        let pr2966 = map.get(&2966).expect("la PR ouverte du vol mesuré est lue");
+        assert_eq!(pr2966.state, "OPEN");
+        assert_eq!(
+            pr2966.ci,
+            Some(CiState::Failed),
+            "le rollup mesuré de mika#2966 traverse `classify_ci_state` et rend \
+             une CI rouge — si ce n'est plus le cas, le cas rouge ne teste plus rien"
+        );
+
+        let pr2962 = map.get(&2962).expect("la PR fusionnée est lue");
+        assert_eq!(pr2962.state, "MERGED");
+        assert_eq!(
+            pr2962.ci, None,
+            "une PR fusionnée n'a pas été lue sur l'axe CI : l'appel 2 ne \
+             demande que les `--state open`"
+        );
+        assert_eq!(map.get(&2960).map(|p| p.state.as_str()), Some("CLOSED"));
+        assert_eq!(map.get(&2960).and_then(|p| p.ci.clone()), None);
+
+        let appels = runner.appels();
+        assert_eq!(appels.len(), 2, "deux appels `gh` par dépôt : {appels:?}");
+        assert_eq!(
+            appels[0],
+            vec![
+                "pr",
+                "list",
+                "--repo",
+                DEPOT,
+                "--state",
+                "all",
+                "--json",
+                "number,state",
+                "--limit",
+                "100"
+            ],
+            "appel 1 : l'état de toutes les PR, sans le champ qui coûte"
+        );
+        assert_eq!(
+            appels[1],
+            vec![
+                "pr",
+                "list",
+                "--repo",
+                DEPOT,
+                "--state",
+                "open",
+                "--json",
+                "number,statusCheckRollup,headRefOid,reviewDecision,reviews",
+                "--limit",
+                "100"
+            ],
+            "appel 2 : la tête des **seules** PR ouvertes — rollup et revue dans \
+             le même appel, et c'est la propriété que ce vecteur épingle : un \
+             second appel `gh` pour les revues doublerait un coût que la borne \
+             nommée prétend contenir"
+        );
+    }
+
+    /// Une approbation du relecteur attendu **sur la tête** est lue comme
+    /// telle, et le commit revu traverse intact jusqu'au composeur.
+    #[tokio::test]
+    async fn mika2968_une_approbation_sur_la_tete_est_lue_avec_son_commit() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T07:14:30Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: pass\n"
+                }
+            ]),
+        )
+        .await;
+
+        assert_eq!(pr.head_oid.as_deref(), Some(TETE_2972));
+        let revue = pr.review.expect("la revue du relecteur attendu est lue");
+        assert_eq!(revue.state, "APPROVED");
+        assert_eq!(revue.commit.as_deref(), Some(TETE_2972));
+        assert_eq!(revue.submitted_at, "2026-10-30T07:14:30Z");
+        assert_eq!(
+            revue.hold_reason, None,
+            "un `pass` n'est pas un `hold` : le motif reste absent"
+        );
+        assert_eq!(pr.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
+    }
+
+    /// La revue mesurée de mika#2972 : `COMMENTED` + `VERDICT: hold[review]`.
+    ///
+    /// Les deux assertions portent la frontière décision / rapport : l'état
+    /// reste `COMMENTED` — donc la décision n'y verra jamais une approbation,
+    /// quel que soit le texte — et le motif est extrait pour le rapport seul.
+    #[tokio::test]
+    async fn mika2968_la_revue_coupee_de_2972_garde_son_etat_et_rend_son_motif() {
+        let pr = revue_lue(2972, TETE_2972, revue_2972_mesuree()).await;
+
+        let revue = pr.review.expect("la revue mesurée est lue");
+        assert_eq!(
+            revue.state, "COMMENTED",
+            "la revue mesurée n'approuve pas : si cela change, le cas « coupée » \
+             ne teste plus rien"
+        );
+        assert_eq!(revue.commit.as_deref(), Some(TETE_2972));
+        assert_eq!(
+            revue.hold_reason.as_deref(),
+            Some("review"),
+            "le motif du `VERDICT: hold[review]` est extrait pour le rapport"
+        );
+    }
+
+    /// Une revue d'un autre auteur n'entre dans **aucune** des deux
+    /// populations.
+    ///
+    /// Contrôle négatif du filtre : sans lui, l'approbation d'un tiers — un
+    /// humain de passage, un bot de la forge — passerait pour celle du
+    /// relecteur attendu. Ici l'approbation du tiers est la **plus récente**,
+    /// donc un tri sans filtre la retiendrait.
+    #[tokio::test]
+    async fn mika2968_une_revue_dun_autre_auteur_nest_pas_celle_du_relecteur() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-29T22:42:22Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: hold[review]\n"
+                },
+                {
+                    "author": { "login": "quelquun-dautre" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T09:00:00Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "LGTM\n"
+                }
+            ]),
+        )
+        .await;
+
+        let revue = pr.review.expect("la revue du relecteur attendu est lue");
+        assert_eq!(
+            revue.state, "COMMENTED",
+            "l'approbation du tiers, pourtant plus récente, n'est pas retenue"
+        );
+        assert_eq!(revue.submitted_at, "2026-10-29T22:42:22Z");
+    }
+
+    /// Le tri est sur `submittedAt`, pas sur l'ordre rendu.
+    ///
+    /// Le tableau est volontairement servi à l'envers : la plus récente en
+    /// premier n'est pas la première du tableau.
+    #[tokio::test]
+    async fn mika2968_la_derniere_revue_est_celle_du_dernier_submitted_at() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T07:14:30Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: pass\n"
+                },
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-10-29T22:42:22Z",
+                    "commit": { "oid": TETE_2972 },
+                    "body": "VERDICT: hold[review]\n"
+                }
+            ]),
+        )
+        .await;
+
+        let revue = pr.review.expect("une revue est retenue");
+        assert_eq!(
+            revue.state, "APPROVED",
+            "la plus récente par `submittedAt` gagne, quel que soit l'ordre rendu"
+        );
+    }
+
+    /// Un `commit.oid` vide n'est pas un commit.
+    ///
+    /// C'est l'octet mesuré de `latestReviews` le 2026-10-30 — `commit: ""` sur
+    /// cinq PR sur cinq. S'il arrivait quand même par `reviews`, le composeur
+    /// doit le voir absent : une chaîne vide comparée à une tête absente serait
+    /// une égalité, donc une approbation inventée.
+    #[tokio::test]
+    async fn mika2968_un_commit_vide_nest_pas_un_commit() {
+        let pr = revue_lue(
+            2972,
+            TETE_2972,
+            serde_json::json!([
+                {
+                    "author": { "login": "mika-platform-qa" },
+                    "state": "APPROVED",
+                    "submittedAt": "2026-10-30T07:14:30Z",
+                    "commit": { "oid": "" },
+                    "body": ""
+                }
+            ]),
+        )
+        .await;
+
+        assert_eq!(pr.review.expect("la revue est lue").commit, None);
+    }
+
+    /// Aucune revue du relecteur attendu : `None` sur un tableau **lu**.
+    ///
+    /// Le tableau vide est la réponse de la forge, pas une lecture manquée —
+    /// c'est la même distinction que celle de [`RepoPrRead`], un rang plus bas.
+    #[tokio::test]
+    async fn mika2968_un_tableau_de_revues_vide_est_lu_et_ne_rend_aucune_revue() {
+        let pr = revue_lue(2972, TETE_2972, serde_json::json!([])).await;
+        assert_eq!(pr.review, None);
+        assert_eq!(
+            pr.head_oid.as_deref(),
+            Some(TETE_2972),
+            "la tête reste lue : « aucune revue » n'est pas « rien n'est lu »"
+        );
+    }
+
+    /// L'appel 2 en échec laisse la revue et la tête non lues, comme la CI.
+    #[tokio::test]
+    async fn mika2968_un_second_appel_en_echec_laisse_la_revue_non_lue() {
+        let runner = un_depot(Some(etats_mesures()), None);
+        let reads = read_flight_prs(&runner, &cibles()).await;
+        let map = lu(&reads, DEPOT);
+        assert!(
+            map.values()
+                .all(|p| p.review.is_none() && p.head_oid.is_none()),
+            "les trois axes de la tête tombent ensemble : {map:?}"
+        );
+    }
+
+    /// Le `VERDICT:` n'est reconnu qu'en tête de ligne.
+    ///
+    /// Une revue qui *cite* la forme du verdict en prose n'en pose pas un —
+    /// c'est exactement le texte qu'un relecteur écrit en expliquant ce qu'il
+    /// aurait dû poser.
+    #[test]
+    fn mika2968_un_verdict_cite_en_prose_nest_pas_un_motif() {
+        assert_eq!(
+            hold_reason_from_body("VERDICT: hold[ci]\n"),
+            Some("ci".to_string())
+        );
+        assert_eq!(
+            hold_reason_from_body("  VERDICT: hold[review]  \n"),
+            Some("review".to_string()),
+            "l'indentation et la queue de ligne sont tolérées"
+        );
+        assert_eq!(
+            hold_reason_from_body("j'aurais dû poser VERDICT: hold[review] ici\n"),
+            None,
+            "cité au milieu d'une phrase : ce n'est pas une ligne de verdict"
+        );
+        assert_eq!(
+            hold_reason_from_body("VERDICT: pass\n"),
+            None,
+            "un `pass` n'est pas un motif de suspension"
+        );
+        assert_eq!(hold_reason_from_body("VERDICT: block[ac]\n"), None);
+        assert_eq!(hold_reason_from_body("VERDICT: hold[]\n"), None);
+    }
+
+    /// L'appel 1 en échec rend `Failed` pour ce dépôt — et **seulement** pour
+    /// lui.
+    ///
+    /// Le second dépôt, lu nominalement dans le même appel, est ce qui sépare
+    /// « l'échec est circonscrit » de « l'échec a emporté le cycle » : sans lui,
+    /// un `return` prématuré de `read_flight_prs` passerait le test.
+    #[tokio::test]
+    async fn mika2968_un_premier_appel_en_echec_ne_coute_que_son_depot() {
+        let runner = RecordingFlightPrRunner::new(BTreeMap::from([
+            (DEPOT.to_string(), (None, Some(rollups_mesures()))),
+            (
+                AUTRE_DEPOT.to_string(),
+                (Some(etats_mesures()), Some(rollups_mesures())),
+            ),
+        ]));
+        let reads = read_flight_prs(
+            &runner,
+            &BTreeSet::from([DEPOT.to_string(), AUTRE_DEPOT.to_string()]),
+        )
+        .await;
+
+        assert_eq!(
+            reads.get(DEPOT),
+            Some(&RepoPrRead::Failed),
+            "appel 1 en échec : rien n'est su de ce dépôt, et ce n'est pas une \
+             map vide — une map vide dirait « aucune PR » (classe mika#2205)"
+        );
+        assert_eq!(
+            lu(&reads, AUTRE_DEPOT).get(&2966).map(|p| p.ci.clone()),
+            Some(Some(CiState::Failed)),
+            "l'autre dépôt est lu quand même : un échec `gh` ne tue pas le cycle"
+        );
+    }
+
+    /// L'appel 2 seul en échec garde les états lus et laisse **toutes** les CI
+    /// non lues.
+    ///
+    /// C'est la cellule que le composeur traduira en `ReadFailed` sur une PR
+    /// ouverte : `ci: None` avec `state: "OPEN"` ne dit pas « CI absente », il
+    /// dit « CI non lue ».
+    #[tokio::test]
+    async fn mika2968_un_second_appel_en_echec_laisse_les_etats_lus_et_les_ci_non_lues() {
+        let runner = un_depot(Some(etats_mesures()), None);
+        let reads = read_flight_prs(&runner, &cibles()).await;
+
+        let map = lu(&reads, DEPOT);
+        assert_eq!(map.len(), 3, "les états restent lus : {map:?}");
+        assert_eq!(map.get(&2966).map(|p| p.state.as_str()), Some("OPEN"));
+        assert!(
+            map.values().all(|p| p.ci.is_none()),
+            "aucune CI lue quand l'appel 2 échoue : {map:?}"
+        );
+    }
+
+    /// Un numéro hors de la page lue n'est **pas** inventé, dans les deux sens.
+    ///
+    /// Côté appel 1, le numéro cherché est simplement absent de la map : le
+    /// composeur en tirera `NotFound`, « PR hors de la page lue », plutôt
+    /// qu'une CI verte. Côté appel 2, une PR ouverte que l'appel 1 n'a pas
+    /// rendue — ce que [`FLIGHT_PR_READ_LIMIT`] rend possible — n'entre pas dans
+    /// la map par la porte du rollup : la jointure est un `get_mut` et non un
+    /// `insert`, donc une PR n'arrive jamais avec une CI et sans état.
+    #[tokio::test]
+    async fn mika2968_un_numero_hors_de_la_page_nest_pas_invente() {
+        let rollups = serde_json::json!([
+            { "number": 2966, "statusCheckRollup": rollup_2966_mesure() },
+            { "number": 2999, "statusCheckRollup": rollup_2966_mesure() }
+        ])
+        .to_string();
+        let runner = un_depot(Some(etats_mesures()), Some(rollups));
+        let reads = read_flight_prs(&runner, &cibles()).await;
+
+        let map = lu(&reads, DEPOT);
+        assert!(
+            !map.contains_key(&2999),
+            "la jointure n'invente pas une PR que l'appel 1 n'a pas rendue : {map:?}"
+        );
+        assert!(
+            !map.contains_key(&2967),
+            "un numéro que personne n'a rendu reste absent : {map:?}"
+        );
+        assert_eq!(
+            map.len(),
+            3,
+            "la page lue reste celle de l'appel 1 : {map:?}"
+        );
+    }
+
+    /// Un dépôt sans aucune PR est **lu**, et son vide est une réponse.
+    ///
+    /// Contrôle négatif de la distinction de type : si [`RepoPrRead`] redevenait
+    /// un `Option<HashMap<…>>`, ce cas et celui de l'appel 1 en échec rendraient
+    /// les mêmes octets.
+    #[tokio::test]
+    async fn mika2968_un_depot_sans_pr_est_lu_et_nest_pas_en_echec() {
+        let runner = un_depot(Some("[]".to_string()), Some("[]".to_string()));
+        let reads = read_flight_prs(&runner, &cibles()).await;
+        assert_eq!(
+            reads.get(DEPOT),
+            Some(&RepoPrRead::Read(HashMap::new())),
+            "lu et vide, et non en échec"
+        );
     }
 }

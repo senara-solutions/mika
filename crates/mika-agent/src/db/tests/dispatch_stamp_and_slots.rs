@@ -1876,7 +1876,7 @@ fn test_fts_search_agent_isolation() {
 #[test]
 fn test_get_unembedded_content() {
     let db = db();
-    // Index two content rows — both start with embedding_json = NULL
+    // Index two content rows — both start with embedding_dims = NULL
     let id1 = db
         .index_content("mika", "person", Some(1), "Alice in Wonderland")
         .unwrap();

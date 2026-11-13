@@ -62,14 +62,28 @@ pub(crate) struct ToolDispatchCtx<'a> {
     /// where Phase-2 eviction is incomplete but the execute-time gate still
     /// fires.
     ///
-    /// **MCP note (aspirational, not enforced today):** dynamically-registered
-    /// MCP tools reach `execute_tool` via the third dispatch tier (`mcp.call_tool`)
-    /// and are NOT keyed in `skill_data_grades` because they are not
-    /// `skill_tools`. The map's shape is forward-compatible: when MCP manifests
-    /// gain a `data_grade` field and MCP tools are seeded into this map, the
-    /// L4 predicate will fire on them without any change to `execute_tool`.
-    /// Until then, MCP-registered testimony tools bypass L4 and must be gated
-    /// at MCP manifest ingestion — the vigilance-surface entry documented in
+    /// **MCP tools are in this map, and in force since mika#1959.**
+    /// They reach `execute_tool` via the third dispatch tier (`mcp.call_tool`)
+    /// and are not `skill_tools`, so `build_skill_data_grades` does not see
+    /// them — F5 of the mika#1798 adversarial review. The map is keyed by the
+    /// Claude-facing tool name, which an MCP tool has
+    /// (`mcp__<server>__<tool>`), so the fix was to **seed** it rather than to
+    /// add a second predicate: `McpServerConfig.data_grade` is joined onto each
+    /// namespaced tool by `mcp::mcp_tool_data_grades`, exposed as
+    /// `McpManager::tool_data_grades()`, and inserted here by
+    /// `agent_loop::seed_mcp_data_grades` at each of the two sites that publish
+    /// `mcp.tool_definitions()` to the model. **`execute_tool` was not modified**
+    /// — the forward-compatible shape this comment used to promise was real,
+    /// and the empty diff on that function is the proof.
+    ///
+    /// Silent/callback/heartbeat mode receives `None` in place of the manager
+    /// and is out of population by construction, not by omission; the pairing
+    /// is held by the structural guard
+    /// `mika1959_tout_site_publiant_des_outils_mcp_ensemence_la_map_l4`.
+    ///
+    /// **Residue, not closed:** a testimony MCP tool is still *published* in
+    /// `tool_definitions()`, so the model can still propose it — only the call
+    /// is refused. See § *Vigilance surface* of
     /// `crates/mika-agent/docs/non-transit-data-grade.md`.
     pub(crate) skill_data_grades: HashMap<String, crate::skills::manifest::DataGrade>,
 }
@@ -136,6 +150,28 @@ pub(crate) async fn process_tool_calls(
     // envelope after a dead send owes the same admission as one that concludes.
     // Never persisted, never serialized; it dies with the turn.
     delivery_log: &mut Vec<crate::evidence::guards::DeliveryRecord>,
+    // mika#2934 — ce que le tour a DÉJÀ exécuté avant ce pas, en ordre d'appel.
+    // Seul le site de refus de `record_reviewed_head` le lit : la preuve qu'il
+    // exige (« un `pr review` posté », « une lecture de CETTE tête ») peut avoir
+    // été produite à un pas antérieur du même tour, et `summaries` ci-dessous ne
+    // naît qu'avec ce pas-ci.
+    //
+    // En `&[…]` plutôt que dans `ToolContext` parce que cet historique **grandit
+    // pendant le tour** : `ToolContext` est construit une fois par tour et ne
+    // porte que des verdicts figés (voir `is_webhook_fallthrough_turn`).
+    // L'emprunt est immuable et se termine avec l'appel, donc les sites d'appel
+    // peuvent passer `&all_tool_summaries` puis l'`extend`er juste après.
+    prior_summaries: &[ToolCallSummary],
+    // mika#3003 — le registre de ce que les outils du tour ont RENDU, pour que la
+    // relance de la garde d'ancrage puisse nommer l'outil qui a produit une
+    // citation absente du brief. Rempli **vers l'avant**, ici, au site unique où
+    // un résultat d'outil est appendu au tour : la garde reçoit une valeur et ne
+    // remonte jamais `request.messages`. En `&mut` pour la même raison que
+    // `delivery_log` ci-dessus — la portée est le TOUR, pas le pas, et les sorties
+    // `MaxStepsExceeded` / `DeadlineExceeded` n'ont rien à resynchroniser.
+    // Normalisé et plafonné à la poussée (voir `ToolReadLedger`). Jamais
+    // persisté, jamais sérialisé ; il meurt avec le tour.
+    tool_read_ledger: &mut crate::agent_loop::review_anchor::ToolReadLedger,
 ) -> Vec<ToolCallSummary> {
     let mut tool_results: Vec<LlmContentBlock> = Vec::new();
     let mut summaries = Vec::new();
@@ -196,6 +232,113 @@ pub(crate) async fn process_tool_calls(
                     is_error: true,
                 });
                 continue;
+            }
+
+            // Garde de preuve du tour sur `record_reviewed_head` (mika#2934).
+            //
+            // Le registre `qa_reviewed_head` dit sur quelles têtes mika-qa a
+            // **statué**. Le 2026-10-27, trois têtes y ont été déclarées
+            // conclues 9 à 17 minutes avant le premier verdict sur chacune, et
+            // une quatrième ligne a attesté un verdict qu'un tour n'avait pas
+            // encore posté : dans les quatre cas le tour demandait une ligne que
+            // sa propre trace d'outils ne portait pas.
+            //
+            // Le refus est **en amont de l'exécution** : aucune ligne n'est
+            // écrite, et ce n'est pas un `field_error` de l'outil — un refus de
+            // validation nomme un champ fautif, celui-ci nomme une preuve
+            // absente. Même forme que le gate de frontière ci-dessus : un
+            // `ToolCallSummary` en échec, un `tool_result` `is_error` pour garder
+            // l'historique apparié, `continue` sans appeler l'outil.
+            //
+            // Pas une garde EndTurn : à la fin du tour la ligne serait déjà en
+            // base, et la garde nommerait le dégât au lieu de l'empêcher.
+            if name == crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_TOOL {
+                // Un argument absent ou mal typé rend `""`, que
+                // `preuve_du_tour_manquante` laisse passer : c'est l'outil qui
+                // nomme le champ fautif, et lui seul. Cette garde ne parle que
+                // de preuve.
+                let outcome = arguments
+                    .get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let head_sha = arguments
+                    .get("head_sha")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                // Les pas antérieurs du tour, puis ceux de ce bloc-ci, en ordre
+                // d'appel. La copie est bornée par construction : au plus un
+                // appel de cet outil par tour, et chaque résumé est déjà tronqué
+                // à `INPUT_SUMMARY_MAX`.
+                let deja_execute: Vec<ToolCallSummary> = prior_summaries
+                    .iter()
+                    .chain(summaries.iter())
+                    .cloned()
+                    .collect();
+                if let Some(variante) = crate::qa_reviewed_head::preuve_du_tour_manquante(
+                    outcome,
+                    head_sha,
+                    &deja_execute,
+                ) {
+                    let (variante_label, ce_qui_manque) = match variante {
+                        crate::qa_reviewed_head::PreuveManquante::VerdictSansPost => (
+                            "verdict_sans_post",
+                            "`verdict_posted` attests a verdict this turn posted. No successful \
+                             `run_gh(\"pr review …\")` appears in this turn's tool history. If you \
+                             dispatched a build and are awaiting its callback, record nothing — \
+                             the callback turn records the head after its own post (qa-review \
+                             invariant 7)."
+                                .to_string(),
+                        ),
+                        crate::qa_reviewed_head::PreuveManquante::StopSansLectureDeTete => (
+                            "stop_sans_lecture_de_tete",
+                            format!(
+                                "a `stop_*` outcome attests a head you ruled out on the evidence \
+                                 of THAT head's reviews. No successful `qa_head_reviews` call for \
+                                 `{head_sha}` appears in this turn's tool history. Call it first \
+                                 (step 3), then conclude."
+                            ),
+                        ),
+                    };
+                    let suppressed_msg = format!(
+                        "[mika-engine] Tool call suppressed: record_reviewed_head needs this \
+                         turn's own evidence (mika#2934). {ce_qui_manque}"
+                    );
+                    // La sonde de la garde. Son **zéro** est l'assertion que le
+                    // prompt tient tout seul ; chaque ligne est un tour qui a
+                    // demandé une attestation qu'il n'avait pas produite.
+                    warn!(
+                        trace_id = %tool_ctx.trace_id,
+                        step,
+                        outcome = %outcome,
+                        variante = variante_label,
+                        "reviewed_head_write_without_evidence: suppressed record_reviewed_head"
+                    );
+                    let input_summary_for_suppressed = truncate_summary(
+                        &arguments.to_string(),
+                        crate::planning::policy::INPUT_SUMMARY_MAX,
+                    );
+                    summaries.push(ToolCallSummary {
+                        step,
+                        name: name.clone(),
+                        input_summary: scrub_secrets(&input_summary_for_suppressed).into_owned(),
+                        output_summary: truncate_summary(
+                            &suppressed_msg,
+                            crate::planning::policy::OUTPUT_SUMMARY_MAX,
+                        ),
+                        success: false,
+                        non_zero_exit: false,
+                    });
+                    // Délibérément **pas** dans `suppressed_write_tools` : ce
+                    // vecteur alimente le gate inter-pas de `send_message`, qui
+                    // force un EndTurn. Ici le tour doit pouvoir continuer — et
+                    // produire la preuve qui manque.
+                    tool_results.push(LlmContentBlock::ToolResult {
+                        tool_call_id: id.clone(),
+                        content: LlmToolResultContent::Text(suppressed_msg),
+                        is_error: true,
+                    });
+                    continue;
+                }
             }
 
             let dedup_key = (
@@ -403,6 +546,18 @@ pub(crate) async fn process_tool_calls(
                 });
             }
 
+            // mika#3003 — LE site unique qui alimente le registre de lecture du
+            // tour, tenu par `mika3003_le_registre_de_lecture_a_un_seul_ecrivain`.
+            // Ici et pas plus haut : les deux autres `tool_results.push` de cette
+            // fonction portent un texte écrit par le moteur (suppression de
+            // frontière #771, refus de preuve mika#2934), pas un document qu'un
+            // outil a rendu — attribuer une ancre à l'un d'eux nommerait un outil
+            // qui n'a rien lu. Juste avant que `output.content` ne soit déplacé
+            // dans `content`. Une sortie en erreur est enregistrée comme les
+            // autres : c'est bien ce que le modèle a lu à ce pas, et le refus
+            // d'attribution se joue sur la recherche verbatim, pas sur `is_error`.
+            tool_read_ledger.record_tool_read(name, &output.content);
+
             let image_count = output.images.len();
             let content = if output.images.is_empty() {
                 LlmToolResultContent::Text(output.content)
@@ -487,8 +642,14 @@ const TOOL_TESTIMONY_GRADE_FORBIDDEN: &str = r#"{"error":"testimony_grade_forbid
 /// dispatch fires, `dispatch.skill_data_grades` is consulted. If the tool's
 /// owning skill declared `data_grade = "testimony"`, the call is rejected
 /// with `TOOL_TESTIMONY_GRADE_FORBIDDEN` before reaching the handler. This
-/// closes the hot-reload race window, dynamic MCP registration (forward-
-/// compatible), and DB-override paths that Phase-2 eviction cannot cover.
+/// closes the hot-reload race window, dynamic MCP registration (in force
+/// since mika#1959 — see `skill_data_grades`), and DB-override paths that
+/// Phase-2 eviction cannot cover.
+///
+/// **This function's body is unchanged by mika#1959.** The MCP tier was brought
+/// under L4 by seeding `skill_data_grades`, not by a second predicate here;
+/// only this parenthetical moved, because it asserted the opposite of what now
+/// happens.
 async fn execute_tool(
     dispatch: &ToolDispatchCtx<'_>,
     name: &str,
@@ -671,6 +832,375 @@ mod tests {
         assert!(
             !matches!(grades.get("web_search"), Some(&DataGrade::Testimony)),
             "Layer 4 predicate must not classify web_search as Testimony"
+        );
+    }
+
+    // -- mika#1959 : la troisième tier MCP sous la garde L4 --
+
+    /// Outil MCP de référence des deux tests ci-dessous, et son serveur.
+    const OUTIL_MCP: &str = "mcp__journal-perso__read_entry";
+    const SERVEUR_MCP: &str = "journal-perso";
+
+    /// Manager MCP sans connexion qui route `OUTIL_MCP`, au grade demandé.
+    fn manager_mcp(grade: DataGrade) -> McpManager {
+        let mut routage = HashMap::new();
+        routage.insert(
+            OUTIL_MCP.to_string(),
+            (SERVEUR_MCP.to_string(), "read_entry".to_string()),
+        );
+        let mut grades = HashMap::new();
+        grades.insert(OUTIL_MCP.to_string(), grade);
+        McpManager::sans_connexion_pour_tests(routage, grades)
+    }
+
+    /// La phrase que rend `McpManager::call_tool` quand il est atteint sur un
+    /// serveur non connecté. C'est le témoin d'atteinte du troisième étage.
+    fn temoin_call_tool_atteint() -> String {
+        format!("MCP server '{SERVEUR_MCP}' is not connected.")
+    }
+
+    #[tokio::test]
+    async fn mika1959_un_outil_mcp_testimony_est_refuse_avant_call_tool() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+        let ctx = harness.ctx();
+        let tools = ToolRegistry::new();
+        let skill_tools: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let timeouts: HashMap<String, u64> = HashMap::new();
+        let mcp = manager_mcp(DataGrade::Testimony);
+
+        // La map L4 telle que `agent_loop::seed_mcp_data_grades` la produit.
+        let dispatch = ToolDispatchCtx {
+            tools: &tools,
+            skill_tools: &skill_tools,
+            ctx: &ctx,
+            skill_timeout: 30,
+            skill_tool_timeouts: &timeouts,
+            mcp_manager: Some(&mcp),
+            long_running_ctx: None,
+            skill_data_grades: mcp.tool_data_grades().clone(),
+        };
+
+        let sortie = execute_tool(&dispatch, OUTIL_MCP, serde_json::json!({})).await;
+
+        assert!(sortie.is_error, "un outil testimony doit être refusé");
+        assert_eq!(
+            sortie.content, TOOL_TESTIMONY_GRADE_FORBIDDEN,
+            "le corps de refus doit être celui de la garde L4"
+        );
+        // Le témoin d'atteinte : son absence est la preuve qu'aucun appel
+        // distant n'a été tenté. Le contrôle positif ci-dessous montre que
+        // cette phrase sort bel et bien quand `call_tool` est atteint.
+        assert!(
+            !sortie.content.contains(&temoin_call_tool_atteint()),
+            "la garde doit refuser AVANT le troisième étage, pas après"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1959_le_meme_outil_en_operational_nest_pas_refuse_par_l4() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+        let ctx = harness.ctx();
+        let tools = ToolRegistry::new();
+        let skill_tools: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let timeouts: HashMap<String, u64> = HashMap::new();
+        let mcp = manager_mcp(DataGrade::Operational);
+
+        let dispatch = ToolDispatchCtx {
+            tools: &tools,
+            skill_tools: &skill_tools,
+            ctx: &ctx,
+            skill_timeout: 30,
+            skill_tool_timeouts: &timeouts,
+            mcp_manager: Some(&mcp),
+            long_running_ctx: None,
+            skill_data_grades: mcp.tool_data_grades().clone(),
+        };
+
+        let sortie = execute_tool(&dispatch, OUTIL_MCP, serde_json::json!({})).await;
+
+        assert_ne!(
+            sortie.content, TOOL_TESTIMONY_GRADE_FORBIDDEN,
+            "L4 ne doit pas refuser un outil MCP operational"
+        );
+        // Contrôle positif de la paire : le dispatch a poursuivi jusqu'au
+        // troisième étage et `call_tool` a répondu. Sans cette assertion, le
+        // test ci-dessus pourrait être vert sur un chemin qui n'atteint jamais
+        // `call_tool` pour une raison étrangère au grade.
+        assert_eq!(
+            sortie.content,
+            temoin_call_tool_atteint(),
+            "le dispatch doit atteindre McpManager::call_tool"
+        );
+    }
+
+    // ---- mika#2934 : le site de refus de `record_reviewed_head` -------------
+
+    /// La tête poussée le 2026-10-27 sur #2931, et celle que son approbation du
+    /// 26/10 portait. Les deux mêmes valeurs qu'`qa_reviewed_head.rs`, parce que
+    /// les deux moitiés d'AC2 rejouent le même force-push.
+    const TETE_NOUVELLE: &str = "1f649bf10e2d4c6a8b1d3f5e7a9c0b2d4e6f8a1c";
+    const TETE_ANCIENNE: &str = "3b44b0359c7e5a3f1d0b8a6c4e2f0d9b7a5c3e1f";
+
+    /// Requête minimale : `process_tool_calls` n'y pousse que des messages.
+    fn requete_vide() -> LlmRequest {
+        LlmRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            max_tokens: 1024,
+            thinking: None,
+        }
+    }
+
+    /// Les arguments que le prompt du webhook fait émettre à l'étape 4.
+    fn appel_de_letape_4(tete: &str) -> serde_json::Value {
+        serde_json::json!({
+            "repo": "senara-solutions/mika",
+            "pr": 2931,
+            "head_sha": tete,
+            "outcome": "stop_verdict_recorded",
+        })
+    }
+
+    /// Le résumé qu'un `qa_head_reviews` réussi laisse derrière lui, sous la
+    /// borne réelle du moteur — c'est la forme que la garde doit reconnaître.
+    fn lecture_de_tete_reussie(tete: &str) -> ToolCallSummary {
+        let arguments = serde_json::json!({
+            "repo": "senara-solutions/mika",
+            "pr": 2931,
+            "head_sha": tete,
+        });
+        ToolCallSummary {
+            step: 3,
+            name: crate::qa_reviewed_head::QA_HEAD_REVIEWS_TOOL.to_string(),
+            input_summary: truncate_summary(
+                &arguments.to_string(),
+                crate::planning::policy::INPUT_SUMMARY_MAX,
+            ),
+            output_summary: "[]".to_string(),
+            success: true,
+            non_zero_exit: false,
+        }
+    }
+
+    /// Le dernier message d'une requête : celui que `process_tool_calls` remplit
+    /// avec les `tool_result` du pas.
+    fn resultats_doutils(request: &LlmRequest) -> Vec<LlmContentBlock> {
+        match &request.messages.last().expect("un message Tool").content {
+            LlmContent::Blocks(blocks) => blocks.clone(),
+            other => panic!("le dernier message doit porter des blocs, pas {other:?}"),
+        }
+    }
+
+    /// Lance un pas dont le seul bloc est l'appel d'écriture de l'étape 4, avec
+    /// `prior_summaries` pour tout historique. Rend les résumés et la requête.
+    async fn un_pas_decriture(
+        harness: &crate::test_utils::test_helpers::TestHarness,
+        tete: &str,
+        prior_summaries: &[ToolCallSummary],
+    ) -> (Vec<ToolCallSummary>, LlmRequest) {
+        let ctx = harness.ctx();
+        // Le registre **réel**, pas un bouchon : si la garde ne tirait pas,
+        // `record_reviewed_head` s'exécuterait et écrirait sa ligne. C'est ce
+        // qui rend l'assertion « l'outil n'a pas été appelé » falsifiable.
+        let tools = crate::tools::default_tools();
+        let skill_tools: HashMap<String, &ResolvedSkillTool> = HashMap::new();
+        let grades: HashMap<String, DataGrade> = HashMap::new();
+        let timeouts: HashMap<String, u64> = HashMap::new();
+        let mut request = requete_vide();
+        let mut boundary = false;
+        let mut supprimes: Vec<String> = Vec::new();
+        let mut capture = String::new();
+        let mut livraisons: Vec<crate::evidence::guards::DeliveryRecord> = Vec::new();
+        let mut registre = crate::agent_loop::review_anchor::ToolReadLedger::default();
+
+        let summaries = process_tool_calls(
+            vec![LlmResponseContent::ToolCall {
+                id: "toolu_2934".to_string(),
+                name: crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_TOOL.to_string(),
+                arguments: appel_de_letape_4(tete),
+            }],
+            &tools,
+            &skill_tools,
+            &grades,
+            30,
+            &timeouts,
+            &ctx,
+            &mut request,
+            4,
+            None,
+            None,
+            &harness.db,
+            "test-session",
+            false,
+            None,
+            &mut boundary,
+            &mut supprimes,
+            &mut capture,
+            false,
+            None,
+            &mut livraisons,
+            prior_summaries,
+            &mut registre,
+        )
+        .await;
+
+        (summaries, request)
+    }
+
+    /// AC2/AC3, moitié moteur : le site **supprime** l'appel au lieu de le
+    /// laisser écrire.
+    ///
+    /// Trois assertions, et la troisième est celle qui compte : un résumé en
+    /// échec et un `tool_result` `is_error` diraient la même chose d'un outil
+    /// qui a tourné et refusé son entrée. Ce qui sépare les deux, c'est
+    /// **l'absence de ligne en base** — le registre réel est enregistré, donc
+    /// sans la garde l'appel aboutirait.
+    ///
+    /// Le contrôle positif est dans le même test : avec la lecture de tête du
+    /// pas 3 dans l'historique, le même appel passe et la ligne existe. Sans
+    /// lui, un site qui refuserait `record_reviewed_head` **toujours** serait
+    /// vert ici, et aurait désarmé le registre entier.
+    #[tokio::test]
+    async fn mika2934_le_site_supprime_lappel_sans_lexecuter() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+
+        let (summaries, request) = un_pas_decriture(&harness, TETE_NOUVELLE, &[]).await;
+
+        assert_eq!(summaries.len(), 1, "un bloc, un résumé");
+        let resume = &summaries[0];
+        assert_eq!(
+            resume.name,
+            crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_TOOL,
+            "le résumé doit nommer l'outil supprimé"
+        );
+        assert!(!resume.success, "le résumé du refus est en échec");
+        assert!(
+            !resume.non_zero_exit,
+            "une suppression n'est pas un code de sortie non nul"
+        );
+        assert!(
+            resume.output_summary.contains("mika#2934"),
+            "le refus doit se nommer ; lu : {}",
+            resume.output_summary
+        );
+
+        let resultats = resultats_doutils(&request);
+        assert_eq!(resultats.len(), 1, "un `tool_result` pour garder la paire");
+        match &resultats[0] {
+            LlmContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_call_id, "toolu_2934", "la paire doit être appariée");
+                assert!(
+                    *is_error,
+                    "le `tool_result` d'une suppression est `is_error`"
+                );
+                match content {
+                    LlmToolResultContent::Text(texte) => assert!(
+                        texte.contains("qa_head_reviews") && texte.contains(TETE_NOUVELLE),
+                        "le message doit nommer la lecture manquante ET la tête ; lu : {texte}"
+                    ),
+                    autre => panic!("le refus doit être du texte, pas {autre:?}"),
+                }
+            }
+            autre => panic!("le bloc doit être un `tool_result`, pas {autre:?}"),
+        }
+
+        // L'assertion centrale : l'outil n'a pas tourné.
+        let lignes = harness
+            .db
+            .count_audit_events_by_tool_name(crate::qa_reviewed_head::QA_REVIEWED_HEAD_TOOL)
+            .await
+            .expect("lecture du registre");
+        assert_eq!(
+            lignes, 0,
+            "un appel supprimé n'écrit RIEN — l'écrivain unique n'a pas été atteint"
+        );
+
+        // ---- Contrôle positif : la preuve présente, l'appel passe ----------
+        let (summaries, request) = un_pas_decriture(
+            &harness,
+            TETE_NOUVELLE,
+            &[lecture_de_tete_reussie(TETE_NOUVELLE)],
+        )
+        .await;
+
+        assert!(
+            summaries[0].success,
+            "avec la lecture de CETTE tête, l'appel doit aboutir ; sortie : {}",
+            summaries[0].output_summary
+        );
+        match &resultats_doutils(&request)[0] {
+            LlmContentBlock::ToolResult { is_error, .. } => {
+                assert!(!*is_error, "un appel satisfait n'est pas une erreur")
+            }
+            autre => panic!("le bloc doit être un `tool_result`, pas {autre:?}"),
+        }
+        let lignes = harness
+            .db
+            .count_audit_events_by_tool_name(crate::qa_reviewed_head::QA_REVIEWED_HEAD_TOOL)
+            .await
+            .expect("lecture du registre");
+        assert_eq!(lignes, 1, "l'appel satisfait écrit sa ligne, et une seule");
+
+        // ---- Et la lecture de l'ANCIENNE tête ne la satisfait pas ----------
+        // La propriété que `reviewDecision` n'avait pas, vue depuis le site.
+        let (summaries, _) = un_pas_decriture(
+            &harness,
+            TETE_NOUVELLE,
+            &[lecture_de_tete_reussie(TETE_ANCIENNE)],
+        )
+        .await;
+        assert!(
+            !summaries[0].success,
+            "une lecture de l'ancienne tête ne prouve rien sur la nouvelle"
+        );
+        let lignes = harness
+            .db
+            .count_audit_events_by_tool_name(crate::qa_reviewed_head::QA_REVIEWED_HEAD_TOOL)
+            .await
+            .expect("lecture du registre");
+        assert_eq!(lignes, 1, "aucune seconde ligne : le force-push est refusé");
+    }
+
+    /// La garde correspond sur `input_summary`, qui est **tronqué** à
+    /// [`crate::planning::policy::INPUT_SUMMARY_MAX`]. Si cette borne descendait
+    /// sous la position du `head_sha` dans les arguments de `qa_head_reviews`,
+    /// la garde cesserait de reconnaître une lecture pourtant faite — et
+    /// refuserait **tous** les `stop_*`, en silence.
+    ///
+    /// Ce test épingle la borne par le besoin plutôt que par sa valeur : il
+    /// rougit si la troncature mange le SHA, quelle que soit la raison.
+    #[test]
+    fn mika2934_la_borne_de_resume_dentree_laisse_passer_un_sha() {
+        let resume = lecture_de_tete_reussie(TETE_NOUVELLE);
+
+        // Anti-vacuité : la troncature a bien été appliquée à la forme réelle.
+        assert!(
+            resume.input_summary.len() <= crate::planning::policy::INPUT_SUMMARY_MAX,
+            "le résumé doit être borné comme le moteur le borne"
+        );
+        assert!(
+            resume.input_summary.contains(TETE_NOUVELLE),
+            "le SHA doit survivre à la borne de {} octets ; lu : {}",
+            crate::planning::policy::INPUT_SUMMARY_MAX,
+            resume.input_summary
+        );
+
+        // Et la garde en tire bien son `None` : la borne sert la décision, pas
+        // seulement la lisibilité du journal.
+        assert_eq!(
+            crate::qa_reviewed_head::preuve_du_tour_manquante(
+                "stop_verdict_recorded",
+                TETE_NOUVELLE,
+                std::slice::from_ref(&resume),
+            ),
+            None,
+            "sous la borne réelle, une lecture faite doit satisfaire la preuve"
         );
     }
 }

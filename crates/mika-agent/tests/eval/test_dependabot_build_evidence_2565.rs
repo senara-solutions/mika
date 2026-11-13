@@ -203,7 +203,7 @@ fn run_gh_definition() -> ToolDefinition {
 ///
 /// Everything below the network is production: the same
 /// `validate_dependabot_verdict_coherence_with_reader`, the same JSON parse, the
-/// same `find_recent_build_invocation` against the same real database.
+/// same `find_recent_tool_invocation` against the same real database.
 struct DependabotGatedRunGhTool {
     pr: Result<String, String>,
 }

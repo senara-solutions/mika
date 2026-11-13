@@ -139,7 +139,7 @@ async fn budget(name: &str, format: &OutputFormat, out: &mut impl Write) -> Resu
 
     match format {
         OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&record)?)?,
-        OutputFormat::Yaml => writeln!(out, "{}", serde_yaml::to_string(&record)?)?,
+        OutputFormat::Yaml => writeln!(out, "{}", yaml_serde::to_string(&record)?)?,
         OutputFormat::Text => render_budget_text(&record, out)?,
     }
     Ok(())
@@ -501,7 +501,7 @@ fn render_unattested(
     }
     match format {
         OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&payload)?)?,
-        OutputFormat::Yaml => writeln!(out, "{}", serde_yaml::to_string(&payload)?)?,
+        OutputFormat::Yaml => writeln!(out, "{}", yaml_serde::to_string(&payload)?)?,
         OutputFormat::Text => {
             writeln!(out, "{name}")?;
             writeln!(out, "  (non attesté — ce serveur n'a rien attesté)")?;
@@ -543,7 +543,7 @@ fn list(global_home: &std::path::Path, format: &OutputFormat) -> Result<()> {
                     })
                 })
                 .collect();
-            print!("{}", serde_yaml::to_string(&entries)?);
+            print!("{}", yaml_serde::to_string(&entries)?);
         }
         OutputFormat::Text => {
             if agents.is_empty() {
@@ -745,7 +745,7 @@ fn validate_agents(
                     OutputFormat::Json => println!("[]"),
                     OutputFormat::Yaml => print!(
                         "{}",
-                        serde_yaml::to_string(&Vec::<serde_json::Value>::new())?
+                        yaml_serde::to_string(&Vec::<serde_json::Value>::new())?
                     ),
                     OutputFormat::Text => println!("\n  Agent '{n}' not found.\n"),
                 }
@@ -760,7 +760,7 @@ fn validate_agents(
                     OutputFormat::Json => println!("[]"),
                     OutputFormat::Yaml => print!(
                         "{}",
-                        serde_yaml::to_string(&Vec::<serde_json::Value>::new())?
+                        yaml_serde::to_string(&Vec::<serde_json::Value>::new())?
                     ),
                     OutputFormat::Text => println!("\n  No agents found.\n"),
                 }
@@ -814,7 +814,7 @@ fn validate_agents(
             println!("{}", serde_json::to_string_pretty(&all_diags)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&all_diags)?);
+            print!("{}", yaml_serde::to_string(&all_diags)?);
         }
         OutputFormat::Text => {
             println!();
@@ -1728,7 +1728,7 @@ mod budget_tests {
             let mut out: Vec<u8> = Vec::new();
             budget(agent, &OutputFormat::Yaml, &mut out).await.unwrap();
             let yaml: serde_json::Value =
-                serde_yaml::from_slice(&out).expect("the YAML render must parse");
+                yaml_serde::from_slice(&out).expect("the YAML render must parse");
             assert_eq!(yaml["reason"], reason, "{agent} (yaml) : {yaml}");
             assert_eq!(yaml["attested"], false, "{agent} (yaml) : {yaml}");
         }
@@ -2123,8 +2123,8 @@ mod budget_tests {
             json["model_drift"]["model_config_key"], "openrouter_model",
             "et ressortir en JSON : {json}"
         );
-        let yaml = serde_yaml::to_string(&record).unwrap();
-        let back: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = yaml_serde::to_string(&record).unwrap();
+        let back: serde_json::Value = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(
             back["model_drift"]["model_config_key"], "openrouter_model",
             "et en YAML — deux sérialiseurs sur une valeur : {yaml}"
@@ -2176,8 +2176,8 @@ mod budget_tests {
         assert_eq!(json["model_drift"]["runtime_model"], "moonshotai/kimi-k3");
         assert_eq!(json["model_drift"]["runtime_model_source"], "process_env");
 
-        let yaml = serde_yaml::to_string(&record).unwrap();
-        let back: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = yaml_serde::to_string(&record).unwrap();
+        let back: serde_json::Value = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(back["model_drift"]["status"], "drift", "{yaml}");
     }
 

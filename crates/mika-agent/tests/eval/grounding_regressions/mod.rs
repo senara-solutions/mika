@@ -68,5 +68,6 @@ pub mod required_suffix_line_caught;
 pub mod required_suffix_line_unconstrained;
 pub mod required_tools_retry_thin_final_turn;
 pub mod review_anchor;
+pub mod review_anchor_unparsed_retry_2996;
 pub mod summary_conversational_recall;
 pub mod webhook_zero_tools_no_correlation;

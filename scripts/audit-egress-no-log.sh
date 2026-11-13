@@ -95,6 +95,81 @@ readonly ATTESTATION_TTL_DEFAULT_DAYS=30
 # shell variable.
 readonly ATTESTATION_MAX_BYTES=65536
 
+# ------------------------------------------------------------------
+# The declared `search_*` event names (mika#2788)
+# ------------------------------------------------------------------
+#
+# THIS LIST IS CLOSED AND IT DERIVES FROM ITS PRODUCER. Declaring a name here is
+# half the gesture; the other half is the emission site in
+# `crates/mika-gateway/src/`, and `scripts/test-audit-egress-no-log.sh` (CI job
+# `egress-no-log-lint`) refuses to let the two diverge — in BOTH directions: a
+# name emitted and not declared is red, and a name declared that no site emits
+# any more is red too. A closed list carrying dead names is exactly what teaches
+# an operator to stop reading it.
+#
+# This is the defect mika#2788 was filed for: mika#2407 added three legitimate
+# `search_*` events in `main.rs` and `settings.rs`, this list stayed at two, and
+# the audit cried LEAK on a sanctioned startup event for a month. An audit that
+# cries leak on a sanctioned event can no longer serve as proof.
+#
+# The two classes are not two policies. The class decides what gets PRINTED (the
+# operator sees each class counted separately) and what the leak diagnostic says
+# (which array to declare a new name in). The forbidden-field check applies to
+# BOTH, identically — a configuration event carrying `url` or `api_key` is a leak
+# at exactly the same title as a flow event carrying one.
+
+# FLOW events — one per request, field-shape held by the Q4 CapturingLayer test
+# (`crates/mika-gateway/src/egress_search/mod.rs`). The build-time lint
+# `scripts/verify-egress-no-log.sh` keeps its own `ALLOWED_EVENT_NAMES` at these
+# two names and MUST NOT be widened: its scope is the flow module, where the Q4
+# discipline is right.
+readonly AUDIT_FLOW_EVENTS=(
+    search_requested   # egress_search/mod.rs — mika#1810 E4
+    search_egress      # egress_search/mod.rs — mika#1810 E4
+)
+
+# CONFIGURATION events — one per gateway startup, operator surface
+# (`crates/mika-gateway/CLAUDE.md` § Search Substrate → Operator surfaces).
+# Accepted as names, and submitted to the SAME forbidden-field check as the flow
+# events above.
+readonly AUDIT_CONFIG_EVENTS=(
+    search_upstream_resolved              # main.rs     — mika#2407
+    search_upstream_key_without_selector  # main.rs     — mika#2407
+    search_required_unrecognized_value    # settings.rs — mika#2407
+)
+
+# The union, and the ONE regex alternation built from it. Both Layer 1b
+# predicates (the unexpected-name check and the forbidden-field check, in its
+# `jq` branch AND in its `grep` fallback) read this single variable. Two
+# independently-written selections drift — lesson V13 of
+# `scripts/test-verify-egress-no-log.sh`, where "both parsers call sanitize()"
+# was true globally and false per function. Pinned structurally by assertion A8
+# of `scripts/test-audit-egress-no-log.sh`.
+readonly AUDIT_KNOWN_EVENTS=("${AUDIT_FLOW_EVENTS[@]}" "${AUDIT_CONFIG_EVENTS[@]}")
+
+_join_alternation() {
+    local out="" name
+    for name in "$@"; do
+        out+="${out:+|}$name"
+    done
+    printf '%s' "$out"
+}
+
+readonly KNOWN_EVENT_ALTERNATION="$(_join_alternation "${AUDIT_KNOWN_EVENTS[@]}")"
+
+# `grep -c` writes `0` on stdout and THEN exits 1 when it matched nothing, so
+# the `|| echo 0` this replaced appended a second `0`: the variable held `0\n0`
+# and the line read `search_requested events: 0 0`. `|| n=0` on the ASSIGNMENT
+# overwrites instead of appending. The `||` cannot simply be dropped — under
+# `set -euo pipefail` a failing substitution would kill the script. A `grep`
+# exiting 2 (unreadable file) writes nothing at all, which `${n:-0}` covers, so
+# this never returns the empty string. mika#2788.
+count_event_lines() {
+    local name="$1" file="$2" n
+    n=$(grep -cF -- "\"$name\"" "$file" 2>/dev/null) || n=0
+    printf '%s' "${n:-0}"
+}
+
 leak_found=0
 warnings=0
 
@@ -105,11 +180,17 @@ warnings=0
 usage() {
     cat <<'USAGE'
 usage: audit-egress-no-log.sh [--attest --target <deployment> --by <author>]
+       audit-egress-no-log.sh --known-events
 
   (no arguments)   run the three-layer audit and read the Layer 2 attestation
   --attest         record a Layer 2 attestation instead of auditing
   --target <t>     the deployment the attestation covers (required with --attest)
   --by <who>       who is attesting (required with --attest)
+  --known-events   print the declared search_* event names as
+                   "<name><TAB>flow|config", sorted, and exit 0 without
+                   running any layer. This is the machine interface the CI
+                   guard (scripts/test-audit-egress-no-log.sh) compares
+                   against the emission sites in crates/mika-gateway/src/.
 
 exit 0 = every layer clean, Layer 2 attested
 exit 1 = leak detected
@@ -137,6 +218,22 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { echo "audit-egress-no-log.sh: --by needs a value." >&2; usage >&2; exit "$EXIT_USAGE"; }
             ATTEST_BY="$2"
             shift 2
+            ;;
+        --known-events)
+            # A MODE OF INVOCATION, not a `sed` of this script's arrays. Sourcing
+            # is excluded (the script is `set -euo pipefail` and runs on read);
+            # re-parsing the array literals would be a second reader that drifts
+            # from the first — the very defect class this closes. One reader.
+            # Sorted, so the output is deterministic and `diff`-able. mika#2788.
+            {
+                for known_event in ${AUDIT_FLOW_EVENTS[@]+"${AUDIT_FLOW_EVENTS[@]}"}; do
+                    printf '%s\tflow\n' "$known_event"
+                done
+                for known_event in ${AUDIT_CONFIG_EVENTS[@]+"${AUDIT_CONFIG_EVENTS[@]}"}; do
+                    printf '%s\tconfig\n' "$known_event"
+                done
+            } | sort
+            exit "$EXIT_OK"
             ;;
         -h|--help)
             usage
@@ -411,31 +508,49 @@ if [[ ! -f "$LOG_FILE" ]]; then
 else
     echo "  Log file: $LOG_FILE"
 
-    # Count each event name — if the substrate emitted anything else, list it.
-    total_requested=$(grep -c '"search_requested"' "$LOG_FILE" 2>/dev/null || echo 0)
-    total_egress=$(grep -c '"search_egress"' "$LOG_FILE" 2>/dev/null || echo 0)
-    echo "  search_requested events: $total_requested"
-    echo "  search_egress events:    $total_egress"
+    # Count each declared event name, by class — the operator reads the flow
+    # counts and the startup counts as two different things. The loop, rather
+    # than five named literals, is also what keeps every `search_*` literal out
+    # of this layer's predicates (assertion A8).
+    echo "  flow events"
+    for known_event in ${AUDIT_FLOW_EVENTS[@]+"${AUDIT_FLOW_EVENTS[@]}"}; do
+        printf '    %s events: %s\n' "$known_event" "$(count_event_lines "$known_event" "$LOG_FILE")"
+    done
+    echo "  config events"
+    for known_event in ${AUDIT_CONFIG_EVENTS[@]+"${AUDIT_CONFIG_EVENTS[@]}"}; do
+        printf '    %s events: %s\n' "$known_event" "$(count_event_lines "$known_event" "$LOG_FILE")"
+    done
 
-    # Any other event name with 'search' in it that isn't one of the two
-    # allowlisted events is a discipline break.
+    # Any event name with 'search' in it that is not in the declared union is a
+    # discipline break.
     unexpected=$(grep -oE '"event":"search[^"]*"' "$LOG_FILE" 2>/dev/null \
         | sort -u \
-        | grep -Ev '"event":"search_(requested|egress)"' \
+        | grep -Ev "\"event\":\"($KNOWN_EVENT_ALTERNATION)\"" \
         || true)
     if [[ -n "$unexpected" ]]; then
         echo "  LEAK (Layer 1): unexpected search_* event names in log:"
         printf "%s\n" "$unexpected" | sed 's/^/    /'
+        # The remedy, named here rather than left to be guessed. A rc=1 an
+        # operator cannot act on is a rc=1 they learn to ignore — which is the
+        # second half of the mika#2788 defect.
+        echo "  If one of these is a legitimate event, declare it in"
+        echo "  AUDIT_FLOW_EVENTS or AUDIT_CONFIG_EVENTS of this script. CI"
+        echo "  (job egress-no-log-lint) already refuses an undeclared name on"
+        echo "  the PRODUCER side, so seeing one HERE means the deployed binary"
+        echo "  is newer than this audit script — establish the deployment"
+        echo "  first (class mika#2340), then declare the name."
         leak_found=1
     else
-        echo "  OK: only allowlisted event names appear on search_* lines."
+        echo "  OK: only declared event names appear on search_* lines."
     fi
 
-    # Field-shape check on the two allowlisted events. If jq is available, use
-    # it — otherwise fall back to a coarser grep-based rejection list.
+    # Field-shape check on EVERY declared event, flow and config alike. A
+    # configuration event carrying `url` or `api_key` is a leak at the same
+    # title. If jq is available, use it — otherwise fall back to a coarser
+    # grep-based rejection list.
     if command -v jq >/dev/null 2>&1; then
         forbidden_field_hits=$(
-            grep '"search_requested"\|"search_egress"' "$LOG_FILE" 2>/dev/null \
+            grep -E "\"($KNOWN_EVENT_ALTERNATION)\"" "$LOG_FILE" 2>/dev/null \
             | jq -c 'select(
                 has("query") or has("tenant_id") or has("tenant_hash") or
                 has("user_id") or has("chat_id") or has("customer_id") or
@@ -457,7 +572,7 @@ else
         for forbidden_field in '"query":' '"tenant_id":' '"tenant_hash":' \
                                 '"user_id":' '"chat_id":' '"customer_id":' \
                                 '"api_key":' '"retry_after":' '"url":'; do
-            hits=$(grep '"search_requested"\|"search_egress"' "$LOG_FILE" 2>/dev/null \
+            hits=$(grep -E "\"($KNOWN_EVENT_ALTERNATION)\"" "$LOG_FILE" 2>/dev/null \
                 | grep -F "$forbidden_field" \
                 | head -3 \
                 || true)

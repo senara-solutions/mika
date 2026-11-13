@@ -525,14 +525,19 @@ impl Database {
     }
 
     /// Cancel a recurring task by label (e.g. when reflection is disabled in identity.toml).
-    pub fn cancel_recurring_task_by_label(&self, agent_id: &str, label: &str) -> Result<()> {
-        self.conn.execute(
+    ///
+    /// Returns how many rows were actually cancelled (mika#2456). The caller's
+    /// log says *what the gate did*, not just *that it ran*: zero means the row
+    /// was already dead (or never existed), and that reads differently from a
+    /// gate that just retired two live schedules.
+    pub fn cancel_recurring_task_by_label(&self, agent_id: &str, label: &str) -> Result<usize> {
+        let cancelled = self.conn.execute(
             "UPDATE tasks SET status = 'cancelled', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE agent_id = ?1 AND label = ?2 AND trigger_type = 'recurring'
                AND status NOT IN ('completed','failed','cancelled','expired')",
             params![agent_id, label],
         )?;
-        Ok(())
+        Ok(cancelled)
     }
 
     /// Cancel active recurring tasks for agents no longer on disk (mika#1436).
@@ -843,6 +848,39 @@ impl Database {
              WHERE id = ?2 AND agent_id = ?3
              AND status = 'failed'",
             params![reason, id, agent_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Réhabilite une parente `self_dev` de `failed` → `in_progress`
+    /// (mika#3044). Rend `true` si la transition a eu lieu.
+    ///
+    /// Sœur de [`Self::promote_task_completed`] : même patron de *compare-and-swap*,
+    /// l'état attendu dans le `WHERE`, et `rows > 0` rendu au lecteur plutôt
+    /// qu'un succès supposé.
+    ///
+    /// # Le `WHERE` n'est pas une redite du prédicat
+    ///
+    /// [`crate::parent_rehabilitation::decide`] a déjà vérifié ces trois colonnes
+    /// — mais entre cette lecture et cette écriture, `validate_dispatch_readiness`
+    /// a fait plusieurs allers-retours GitHub de 10 s. La garde est ce qui rend la
+    /// course perdable : `Ok(false)` veut dire *quelqu'un d'autre a bougé la
+    /// parente*, et l'appelant refuse le dispatch au lieu de l'écrire.
+    ///
+    /// # Ce qui n'est délibérément pas touché
+    ///
+    /// - `completed_at` parle d'une fin ; cette transition en est l'inverse.
+    /// - `fired_at` (mika#2335) a été estampillé au dispatch d'origine, et c'est
+    ///   bien de celui-là que la parente est issue.
+    pub fn promote_task_in_progress(&self, id: &str, agent_id: &str) -> Result<bool> {
+        let rows = self.conn.execute(
+            "UPDATE tasks SET status = 'in_progress',
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1 AND agent_id = ?2
+               AND status = 'failed'
+               AND trigger_type = 'manual'
+               AND source = 'self_dev'",
+            params![id, agent_id],
         )?;
         Ok(rows > 0)
     }
@@ -1981,67 +2019,204 @@ impl Database {
         Ok(row)
     }
 
-    /// Find implement-class parent self_dev tasks left `in_progress` whose
-    /// callback subtask delivered without producing a PR (#871).
+    /// Find parent self_dev tasks of the given `dispatch_class` left
+    /// `in_progress` whose callback subtask delivered without producing a PR
+    /// (#871, parameterised by class in mika#2750).
     ///
     /// A parent is "orphaned" when:
     /// - `status = 'in_progress'`, `source = 'self_dev'`, `trigger_type = 'manual'`
     /// - Its latest callback subtask is `status = 'delivered'`
-    /// - **The callback's** `dispatch_class = 'implement'` (or NULL — pre-v34 via COALESCE).
-    ///   The class is keyed off the child (per-dispatch) rather than the parent
-    ///   because reused parents (mika#920 pattern) carry stale class data from
-    ///   their original dispatch.
-    /// - The callback's `updated_at` is older than `grace_seconds` ago
+    /// - **The callback's** `dispatch_class` equals `dispatch_class` (NULL reads
+    ///   as `'implement'` — pre-v34 via COALESCE). The class is keyed off the
+    ///   child (per-dispatch) rather than the parent because reused parents
+    ///   (mika#920 pattern) carry stale class data from their original dispatch.
+    /// - The callback is **not** a deferred launcher (`label NOT LIKE
+    ///   '%:deferred'`, mika#2762)
+    /// - **The most recent** retained callback's `updated_at` is older than
+    ///   `grace_seconds` ago (`HAVING MAX(...)`, mika#2762)
     /// - Parent metadata does NOT contain `$.claude_pilot.pr_url`
-    /// - No other active callback child exists (defers to #870's retry loop)
+    /// - No other **live** sibling exists — `pending` / `in_progress`, or
+    ///   `completed` within the grace window (mika#2980). Defers to #870's
+    ///   retry loop.
     ///
-    /// Groom-class callbacks (mika#1001) are NOT reaped here — their expected
-    /// artifact is a plan commit pushed to the branch, not a PR url. Groom-class
-    /// leak detection is a separate follow-up (mika#1118 Option B).
+    /// # Why a `completed` sibling counts as live (mika#2980)
+    ///
+    /// A groom child that reached `completed` without being `delivered` yet is
+    /// a child **in flight**: its callback is on its way, and it is
+    /// `deliver_callback` that — in delivering it — runs
+    /// `try_dispatch_pilot_after_groom_success`. Until mika#2980 neither
+    /// predicate knew that state: the anchor reads only `child.status =
+    /// 'delivered'`, the sibling guard only `('pending','in_progress')`. So a
+    /// parent that also carried an **older delivered** groom child was reaped
+    /// *inside* the `completed → delivered` window of the groom that had just
+    /// succeeded. Measured on 2026-10-30 (mika#2968 vol 2b): parent
+    /// `be9eca02`, first groom child delivered at 14:38:05Z with
+    /// `STATUS=REBASE_CONFLICT`, second one `completed` at 15:20:31Z with
+    /// `Outcome: PLAN_GROOMED` and its plan pushed, parent failed at 15:21:05Z,
+    /// callback delivered 40 s later to a terminal parent. The plan was on the
+    /// branch and the flight was lost, silently. Reachable case: a groom in two
+    /// attempts on the same parent — exactly what a `REBASE_CONFLICT`
+    /// (mika#2976) followed by a regroom produces.
+    ///
+    /// **The guard, not the anchor**, and the three reasons are distinct:
+    ///
+    /// 1. The two predicates do not answer the same question. The anchor
+    ///    answers *"how far back is the last movement the grace is measured
+    ///    against?"*; the guard answers *"does anybody still represent this
+    ///    parent?"*. Liveness is a property of **representation**, not of age.
+    /// 2. Widening the anchor would give one value two causes.
+    ///    `last_callback_at` is the instant of the last **delivery** (see the
+    ///    `callback_task_id` note below); if it also read `completed` rows, the
+    ///    field the engine logs would mean "last delivery" or "last completion"
+    ///    depending on the row, and the operator reading it could no longer
+    ///    tell which (class mika#2205).
+    /// 3. Widening the anchor would move the scythe on the healthy population
+    ///    too — it pushes the 600 s threshold out for **every** parent carrying
+    ///    a `completed` groom child, corpses included. The guard acts only
+    ///    inside the liveness window and hands back at the same instant as
+    ///    today's behaviour once the window has passed.
+    ///
+    /// Same shape, same house precedent:
+    /// [`Self::find_live_deferred_wrapper_child`] (mika#2181) closed this very
+    /// blind spot for the `stuck_pending` reaper. The groom reaper had not
+    /// inherited it.
+    ///
+    /// **Why the clause is bounded, and bounded on `completed_at`.** An
+    /// unbounded `sibling.status = 'completed'` would make the parent immortal:
+    /// the silent-turn error path leaves a child `completed` **for ever**, and
+    /// that corpse would become a permanent shield — trading a flight lost to
+    /// orphaning for a parent wedged for life, which is worse and mute.
+    /// `completed_at IS NOT NULL` is part of the bound, not decoration:
+    /// `update_task_completed` writes `status` and `completed_at` in the same
+    /// `UPDATE`, so on the nominal path the column is always set; a NULL marks
+    /// a row written otherwise, whose completion cannot be dated — and an
+    /// unknown date cannot prove freshness.
+    ///
+    /// **The window is `grace_seconds` itself** (`?2`, already bound — no new
+    /// parameter, no new constant, no new `MIKA_*`). A dedicated dial would
+    /// want its own clamp, and `strftime(…, 'now', '-N seconds')` returns NULL
+    /// on an out-of-range modifier, where `x > NULL` is NULL — an absurd
+    /// override would bring the defect back with **no signal at all**, the
+    /// guard simply never retaining anybody again. 600 s is also the right
+    /// order of magnitude: 2 × `AGENT_TOTAL_TIMEOUT`, and 8 × the measured
+    /// 74 s window. **Cost, named:** this number now does two jobs — it bounds
+    /// the grace *and* a `completed` sibling's liveness. Recalibrating
+    /// `REAPER_GRACE_SECONDS` moves both. The day the two must diverge is the
+    /// day a dedicated constant, with its clamp, is justified.
+    ///
+    /// **Why `sibling.id != child.id` does not filter the very child we want
+    /// to count.** The main `WHERE` requires `child.status = 'delivered'`, so a
+    /// `completed` child never enters the `child` population at all — it is
+    /// never the `child` of a joined row, and the inequality never applies
+    /// to it.
+    ///
+    /// Three properties of the mika#2762 grace the SQL does not state:
+    ///
+    /// - **`MAX` covers only the children the `WHERE` retained** — class-scoped
+    ///   and non-deferred. The two clauses are not redundant: the `WHERE`
+    ///   decides *which deliveries can anchor*, the `HAVING` decides *which one
+    ///   does*. Writing the grace as a per-row `WHERE child.updated_at < …`
+    ///   **alongside** the `HAVING` reproduces the measured defect exactly: the
+    ///   `WHERE` would discard the recent delivery before aggregation and `MAX`
+    ///   would only ever see the old ones. The grace is a property of the
+    ///   population, never of a line. Shape modelled on
+    ///   [`Self::find_settleable_dispatch_parents`].
+    /// - **`NOT LIKE '%:deferred'` excludes an anchor both too *old* and too
+    ///   *recent*.** The measured case was the old side: the launcher
+    ///   `long_running:run_claude_pilot:deferred` (class `groom`,
+    ///   `trigger_type='callback'`, `action_type='resume_agent'`), delivered
+    ///   11 min before the groom it launched, satisfied the grace on its own
+    ///   and the parent of a *successful* groom was failed one second after its
+    ///   callback landed (mika#2752 at 07:37:20Z, mika#2751 at 07:55:20Z, on
+    ///   2026-10-17). The symmetric case is just as wrong: a launcher delivered
+    ///   *within* the grace would hold back a parent whose real callback has
+    ///   long since delivered. The clause is more **just** in both directions,
+    ///   not merely more permissive.
+    /// - **`callback_task_id` is NOT the anchor.** It stays `MIN(child.id)` —
+    ///   the identity the caller resolves the `NO_PR:` motif from — while
+    ///   `last_callback_at` carries `MAX(child.updated_at)`, the instant the
+    ///   grace was measured against. Two different children in the general
+    ///   case; reading the first as the second is how the engine's log would
+    ///   lie about what the reaper saw.
+    ///
+    /// Three properties the SQL does not state (mika#2750 § 3 D1):
+    ///
+    /// - **The `COALESCE(..., 'implement')` is a property, not a residue.** A
+    ///   pre-v34 row carries a NULL `dispatch_class` and reads as `implement`,
+    ///   so a call with `'groom'` can **never** pick it up. Schema
+    ///   back-compatibility is preserved on the only side where it means
+    ///   something.
+    /// - **The `$.claude_pilot.pr_url IS NULL` predicate holds for both
+    ///   classes.** For `groom` it is not the artifact criterion (a groom's
+    ///   artifact is a plan commit, not a PR) — it is a belt. A reused parent
+    ///   (mika#920) already carrying a `pr_url` saw an `implement` dispatch
+    ///   succeed; the reaper has no business there.
+    /// - **No groom-specific artifact criterion is needed.** A successful groom
+    ///   re-dispatches the issue on the **same** parent (`create_task` is
+    ///   idempotent on `reference_url`), which creates a `pending` /
+    ///   `in_progress` sibling — and the `NOT EXISTS (active sibling)` clause
+    ///   already excludes it. Conversely, a groom that returns `GROOMED` with
+    ///   nobody picking the work back up is itself a leak: reaping it is
+    ///   correct, not accidental. "Callback delivered, no active sibling, grace
+    ///   elapsed" **is** the criterion, and it need not know the artifact's
+    ///   shape.
     ///
     /// **Coupled pair:** `find_completable_parent_tasks_on_pr_url` is the
     /// success-side sibling (mika#1162). Any filter change here (agent_id,
-    /// status, source, trigger_type, dispatch_class, sibling guard, grace
-    /// window) MUST be applied symmetrically there. The two queries differ
-    /// only on the `pr_url` predicate (`IS NULL` here vs `IS NOT NULL` there).
+    /// status, source, trigger_type, sibling guard, grace window) MUST be
+    /// applied symmetrically there. The two queries differ only on the
+    /// `pr_url` predicate (`IS NULL` here vs `IS NOT NULL` there) — and on the
+    /// class, which is **parameterised here, deliberately not there**: a groom
+    /// never produces a `pr_url`, so parameterising the success side would
+    /// create a `('groom')` call that can only ever return the empty set. See
+    /// mika#2750 § 3 D1.
     pub fn find_orphaned_parent_tasks(
         &self,
         agent_id: &str,
         grace_seconds: i64,
+        dispatch_class: &str,
     ) -> Result<Vec<OrphanedParentTask>> {
         let grace_modifier = format!("-{grace_seconds} seconds");
         let mut stmt = self.conn.prepare(
             "SELECT parent.id, parent.agent_id, parent.created_at,
-                    MIN(child.id) AS callback_task_id
+                    MIN(child.id) AS callback_task_id,
+                    MAX(child.updated_at) AS last_callback_at
              FROM tasks parent
              JOIN tasks child ON parent.id = child.parent_task_id
              WHERE parent.agent_id = ?1
                AND parent.status = 'in_progress'
                AND parent.source = 'self_dev'
                AND parent.trigger_type = 'manual'
-               AND COALESCE(child.dispatch_class, 'implement') = 'implement'
+               AND COALESCE(child.dispatch_class, 'implement') = ?3
                AND child.trigger_type = 'callback'
                AND child.action_type = 'resume_agent'
                AND child.status = 'delivered'
-               AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND child.label NOT LIKE '%:deferred'
                AND (parent.metadata IS NULL
                     OR json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NULL)
                AND NOT EXISTS (
                  SELECT 1 FROM tasks sibling
                  WHERE sibling.parent_task_id = parent.id
                    AND sibling.id != child.id
-                   AND sibling.status IN ('pending', 'in_progress')
+                   AND (
+                     sibling.status IN ('pending', 'in_progress')
+                     OR (sibling.status = 'completed'
+                         AND sibling.completed_at IS NOT NULL
+                         AND sibling.completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
+                   )
                )
              GROUP BY parent.id
+             HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
              ORDER BY parent.id",
         )?;
         let rows = stmt
-            .query_map(params![agent_id, grace_modifier], |row| {
+            .query_map(params![agent_id, grace_modifier, dispatch_class], |row| {
                 Ok(OrphanedParentTask {
                     id: row.get(0)?,
                     agent_id: row.get(1)?,
                     created_at: row.get(2)?,
                     callback_task_id: row.get(3)?,
+                    last_callback_at: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2205,7 +2380,14 @@ impl Database {
     /// `process_start_time` is extracted from `metadata` JSON, where the
     /// executor writes it as a *string* (see `skills/executor.rs`). Rows
     /// without it come back as `None` — the caller sweeps them (D-3).
-    pub fn find_dispatch_children_with_pid(
+    ///
+    /// **`pub(crate)` since mika#2670**: outside this crate the only door to
+    /// *which pilot does this task carry?* is `live_pilot::resolve_task_pilot`,
+    /// terminal filter included. A caller that walks here instead omits that
+    /// filter by construction — which is exactly what `mika-cli` did, and what
+    /// the compiler now refuses rather than a source scan reporting after the
+    /// fact.
+    pub(crate) fn find_dispatch_children_with_pid(
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<DispatchChild>> {
@@ -2394,12 +2576,44 @@ impl Database {
     /// - Parent is `status='in_progress'`, `source='self_dev'`, `trigger_type='manual'`
     /// - Its latest callback subtask is `status='delivered'`
     /// - **The callback's** `dispatch_class='implement'` (or NULL — pre-v34 via COALESCE)
-    /// - The callback's `updated_at` is older than `grace_seconds` ago
+    /// - The callback is **not** a deferred launcher (`label NOT LIKE
+    ///   '%:deferred'`, mika#2762)
+    /// - **The most recent** retained callback's `updated_at` is older than
+    ///   `grace_seconds` ago (`HAVING MAX(...)`, mika#2762)
     /// - Parent metadata HAS a non-empty `$.claude_pilot.pr_url`
-    /// - No other active callback child exists (mirrors the reaper's guard)
+    /// - No other **live** sibling exists — `pending` / `in_progress`, or
+    ///   `completed` within the grace window (mirrors the reaper's guard,
+    ///   mika#2980)
+    ///
+    /// mika#2980 adds the `completed`-within-grace arm **in the same terms**,
+    /// with the same already-bound `?2`. The full reasoning — why the guard and
+    /// not the anchor, why the clause is bounded on `completed_at`, and why
+    /// `grace_seconds` now does two jobs — lives on
+    /// [`Self::find_orphaned_parent_tasks`] and is not duplicated here.
+    ///
+    /// **Cost on this half, named because it is not nil:** a discarded row does
+    /// not fail a parent here — it leaves it `in_progress` for up to 600 s
+    /// longer instead of completing it, so it **holds the dispatch slot** that
+    /// much longer. Strictly less grave than the scythe on the failure side,
+    /// and above all: the question the guard asks — *is the parent still
+    /// represented?* — has exactly the same answer on both halves. Leaving the
+    /// pair divergent on the guard's shape would amount to claiming
+    /// representation counts for deciding a failure but not for deciding a
+    /// completion, which the Coupled-pair contract forbids.
     ///
     /// Groom-class callbacks (mika#1001) cannot trip this path because they
     /// never emit `PR:` lines — the `dispatch_class` filter is defense-in-depth.
+    ///
+    /// mika#2762 applies the **same** two-clause grace shape as the reaper, by
+    /// the Coupled-pair contract on [`Self::find_orphaned_parent_tasks`]: the
+    /// per-row `WHERE child.updated_at < …` is *replaced* by
+    /// `HAVING MAX(child.updated_at) < …`, and a deferred launcher no longer
+    /// anchors anything. Nothing measured bit here — the implement side always
+    /// ends with a sibling or a `pr_url` — but a grace whose shape differs
+    /// between the two halves is an asymmetry the next reader has to re-derive,
+    /// and that contract exists precisely to forbid it. `CompletableParentTask`
+    /// deliberately gains **no** `last_callback_at` field: no caller reads it
+    /// here, and a `SELECT` nobody consumes is a dead one.
     ///
     /// SOLE WRITER warning: this method is the only DB query that selects
     /// candidates for the `parent_completed_from_callback` audit transition.
@@ -2423,16 +2637,22 @@ impl Database {
                AND child.trigger_type = 'callback'
                AND child.action_type = 'resume_agent'
                AND child.status = 'delivered'
-               AND child.updated_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+               AND child.label NOT LIKE '%:deferred'
                AND json_extract(parent.metadata, '$.claude_pilot.pr_url') IS NOT NULL
                AND json_extract(parent.metadata, '$.claude_pilot.pr_url') != ''
                AND NOT EXISTS (
                  SELECT 1 FROM tasks sibling
                  WHERE sibling.parent_task_id = parent.id
                    AND sibling.id != child.id
-                   AND sibling.status IN ('pending', 'in_progress')
+                   AND (
+                     sibling.status IN ('pending', 'in_progress')
+                     OR (sibling.status = 'completed'
+                         AND sibling.completed_at IS NOT NULL
+                         AND sibling.completed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
+                   )
                )
              GROUP BY parent.id
+             HAVING MAX(child.updated_at) < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
              ORDER BY parent.id",
         )?;
         let rows = stmt
@@ -4299,14 +4519,52 @@ impl Database {
     /// R9 totale plutôt que partielle.
     ///
     /// Une ligne dont la colonne `result` est NULL ne porte rien, donc `Absent`.
+    ///
+    /// # mika#2981 — la preuve est liée à SON vol, et le SQL ne bouge pas
+    ///
+    /// `expected_plan` est le plan nommé par le callout `Plan:` du corps
+    /// **courant** du ticket ([`crate::plan_callout::PlanCallout::normalized`]),
+    /// ou `None` quand le corps n'en porte aucun. La décision est
+    /// [`crate::task_state::tasks::groom_proof_convergence`] : une preuve dont
+    /// la ligne ancrée nomme un **autre** plan est celle d'un vol antérieur et
+    /// rend `PlanMismatch`. Sans ce terme, la porte acceptait n'importe quelle
+    /// preuve de groom du ticket — mesuré le 2026-10-30 sur mika#2968, trois
+    /// preuves simultanément valides, une par vol.
+    ///
+    /// **Aucun terme n'est ajouté au `SELECT`, et c'est délibéré.** Filtrer le
+    /// plan en SQL exigerait de relire le marqueur par `instr`, très exactement
+    /// la régression que mika#2590 a retirée d'ici (voir ci-dessus) ; et une
+    /// ligne écartée par SQL serait invisible au verdict, donc la preuve d'un
+    /// autre vol remonterait `Absent` au lieu de `PlanMismatch` et la sonde
+    /// d'AC4 mesurerait zéro sur sa propre population.
+    ///
+    /// # La grâce d'une preuve nue s'arrête à la PR ouverte après elle
+    ///
+    /// Décision de Vincent du 2026-10-31 (option C). La seconde requête lit
+    /// l'instant de la dernière PR ouverte par un vol `dev-pilot` pour ce
+    /// ticket : un callback d'implémentation terminal, sous une parente qui
+    /// porte l'URL du ticket, dont le `result` porte la ligne ancrée `PR: <url>`.
+    /// Cette ligne est lue par
+    /// [`crate::task_engine::dispatcher::extract_callback_fields`], le lecteur
+    /// du parent-completer (mika#1162), et non par un second motif. L'instant est
+    /// le `COALESCE(completed_at, updated_at)` du callback, à quelques secondes
+    /// de l'ouverture réelle (mesuré le 2026-10-30 : #2971 ouverte à 22:23:59Z,
+    /// callback terminé à 22:24:20Z). La décision est
+    /// [`crate::task_state::tasks::bound_unbound_grace`].
+    ///
+    /// Locale et sans réseau : un merge fait à la main ne laisse rien en base,
+    /// une ouverture de PR par la boucle laisse cette ligne.
     pub fn has_completed_groom_for_issue(
         &self,
         agent_id: &str,
         issue_url: &str,
+        expected_plan: Option<&str>,
     ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
+        let last_pr_opened_at = self.last_pr_opened_for_issue(agent_id, issue_url)?;
         let mut stmt = self.conn.prepare(
-            "SELECT child.result FROM tasks child
+            "SELECT child.result, COALESCE(child.completed_at, child.updated_at)
+             FROM tasks child
              JOIN tasks parent ON child.parent_task_id = parent.id
              WHERE child.agent_id = ?1
                AND child.trigger_type = 'callback'
@@ -4316,12 +4574,16 @@ impl Database {
         )?;
         let verdicts = stmt
             .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
-                row.get::<_, Option<String>>(0)
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|result| match result {
-                Some(text) => crate::task_state::tasks::groom_result_convergence(&text),
+            .map(|(result, proof_at)| match result {
+                Some(text) => crate::task_state::tasks::bound_unbound_grace(
+                    crate::task_state::tasks::groom_proof_convergence(&text, expected_plan),
+                    &proof_at,
+                    last_pr_opened_at.as_deref(),
+                ),
                 None => crate::task_state::tasks::GroomConvergence::Absent,
             });
         Ok(crate::task_state::tasks::aggregate_groom_convergence(
@@ -4329,9 +4591,47 @@ impl Database {
         ))
     }
 
-    /// The `result` of the **most recent** terminal groom callback for a GitHub
-    /// issue (mika#2545). Sister of [`Self::has_completed_groom_for_issue`]: same
-    /// join, same agent scoping, same tolerance for the legacy
+    /// L'instant de la dernière PR ouverte par un vol `dev-pilot` pour ce
+    /// ticket, ou `None` si aucun callback d'implémentation n'en porte
+    /// (mika#2981). Lecteur de la borne de
+    /// [`Self::has_completed_groom_for_issue`], qui documente la source.
+    ///
+    /// `COALESCE(dispatch_class, 'implement')` comme le parent-completer : une
+    /// ligne d'avant v34 est un vol d'implémentation.
+    fn last_pr_opened_for_issue(&self, agent_id: &str, issue_url: &str) -> Result<Option<String>> {
+        let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
+        let mut stmt = self.conn.prepare(
+            "SELECT child.result, COALESCE(child.completed_at, child.updated_at)
+             FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND COALESCE(child.dispatch_class, 'implement') = 'implement'
+               AND child.status IN ('completed', 'delivered')
+               AND child.result IS NOT NULL
+               AND parent.reference_url IN (?2, ?3)",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(result, _)| {
+                crate::task_engine::dispatcher::extract_callback_fields(result)
+                    .pointer("/claude_pilot/pr_url")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|url| !url.is_empty())
+            })
+            .map(|(_, at)| at)
+            .max())
+    }
+
+    /// The `result` of **every** terminal groom callback for a GitHub issue,
+    /// **newest first** (mika#2545, reshaped by mika#2795). Sister of
+    /// [`Self::has_completed_groom_for_issue`]: same join, same agent scoping,
+    /// same tolerance for the legacy
     /// [`crate::task_state::tasks::GROOM_PHASE_SUFFIX`] on the parent's URL.
     ///
     /// # Why the LAST groom, never "does an ESCALATE exist"
@@ -4340,7 +4640,31 @@ impl Database {
     /// a question about the current state, not about history. A ticket escalated
     /// and then re-groomed successfully must become dispatchable again; an
     /// `EXISTS`-shaped predicate would block it for ever and turn a brake into a
-    /// wall. Hence `ORDER BY … LIMIT 1` rather than a `COUNT`.
+    /// wall. Hence an **ordered** list the caller walks until it finds the first
+    /// row that actually carries a verdict, rather than a `COUNT`.
+    ///
+    /// # Why the list is returned whole, and not pre-filtered (mika#2795)
+    ///
+    /// Until mika#2795 this method carried `LIMIT 1` and returned that single
+    /// row. The row it returned was not always a groom *verdict*: the deferred
+    /// launcher promoted by `promote_next_deferred_callback_for_class` is a
+    /// terminal `dispatch_class='groom'` callback too, and its `result` is
+    /// `deferred dispatch slot freed` — no `Outcome:` line at all. On mika#2762
+    /// (2026-10-18) one such row, written at 18:20:02, masked an `ESCALATE` from
+    /// 18:13; the gate let the re-dispatch through and it cost a groom pilot
+    /// plus an architect pass. Seven minutes later, the same gate refused.
+    ///
+    /// So the row selection moved to the caller —
+    /// `skills::executor::groom_verdict_from_rows` — and the **whole** ordered
+    /// list comes back. The skip is deliberately **not** an SQL `WHERE` on the
+    /// marker: doctrine mika#2590 on the sister above, *a line discarded by SQL
+    /// is invisible to the verdict*, and here it would also be uncountable —
+    /// the `skipped_neutral` field of the `groom_verdict_selected` probe exists
+    /// precisely to say how many neutral rows were walked over, and a pre-filter
+    /// would make it read zero on the exact population it was added to see.
+    /// Cardinality does not argue for one either: the join already bounds the
+    /// result to a handful of rows per issue (`dispatch_class='groom'` +
+    /// terminal status + the parent's URL).
     ///
     /// # Why `created_at DESC, id DESC`
     ///
@@ -4353,52 +4677,170 @@ impl Database {
     /// inside the same second — which the ISO-8601 second-resolution timestamps
     /// make representable — and deliberately not more than that: `tasks.id` is a
     /// UUID v4, so the tiebreak is reproducible, **never chronological**. Named
-    /// rather than implied, because the difference matters if the population
-    /// ever stops being empty: two terminal groom callbacks under one parent
-    /// inside one second is unreachable today (a groom dispatch runs for
-    /// minutes, and its class cap is 1 — `max_concurrent_for_class`), so the
-    /// tiebreak only ever has to stop the answer depending on SQLite's scan
-    /// order. Should that change, the fix is a monotonic discriminator, not a
-    /// second sort key.
+    /// rather than implied, because the difference matters now that the
+    /// population is no longer capped at one row: the deferred launcher and the
+    /// verdict it hid can be born inside the same second, and the walk's answer
+    /// must not depend on SQLite's scan order. Should the order ever need to
+    /// mean more than *reproducible*, the fix is a monotonic discriminator, not
+    /// a second sort key.
     ///
-    /// # Two levels of `Option`, and they say different things
+    /// # The `Option` inside the `Vec`
     ///
-    /// - `Ok(None)` — **no** terminal groom callback for this issue. The nominal
-    ///   shape of a ticket about to be groomed for the first time; the caller
-    ///   reads it as "never escalated".
-    /// - `Ok(Some(None))` — a callback exists and its `result` column is NULL.
-    ///   Anomalous (the completion write path always carries a result), and the
-    ///   caller reads it as *unreadable* rather than guessing a verdict.
-    /// - `Ok(Some(Some(text)))` — the callback's `result`, verbatim. The verdict
-    ///   is derived from it by the pure function
-    ///   `skills::executor::groom_escalate_verdict`, never here: this method
-    ///   returns a fact, the marker's grammar is the caller's business.
+    /// One element per terminal groom callback, in `created_at DESC, id DESC`
+    /// order. `Some(text)` is that callback's `result` verbatim; `None` is a
+    /// `result` column that is NULL — anomalous (the completion write path
+    /// always carries a result), and the caller reads it as *unreadable* rather
+    /// than guessing a verdict or skipping it. An **empty** `Vec` means no
+    /// terminal groom callback for this issue at all: the nominal shape of a
+    /// ticket about to be groomed for the first time, which the caller reads as
+    /// "never escalated".
+    ///
+    /// The marker's grammar stays the caller's business — this method returns
+    /// facts, and `skills::executor::groom_escalate_verdict` turns the one
+    /// selected row into a verdict.
+    ///
+    /// # Why the sister did not move
+    ///
+    /// [`Self::has_completed_groom_for_issue`] already returns no row at all:
+    /// it collects the same join with `query_map` and decides in Rust, and its
+    /// `GroomConvergence` aggregation reads *every* row by construction — a
+    /// neutral launcher row contributes `Absent` and is outvoted by any real
+    /// marker. It answers *"has a groom converged here?"*, which no single row
+    /// can mask, so mika#2795 leaves it byte for byte intact. Its shape is this
+    /// method's model, not its co-defendant.
     ///
     /// Read-only. An `Err` is a DB failure and the caller refuses (fail-closed,
     /// like `has_completed_groom_for_issue` on the same gate).
-    pub fn latest_groom_verdict_for_issue(
+    pub fn groom_callback_results_newest_first(
         &self,
         agent_id: &str,
         issue_url: &str,
-    ) -> Result<Option<Option<String>>> {
+    ) -> Result<Vec<Option<String>>> {
         let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
-        let row: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT child.result FROM tasks child
-                 JOIN tasks parent ON child.parent_task_id = parent.id
-                 WHERE child.agent_id = ?1
-                   AND child.trigger_type = 'callback'
-                   AND child.dispatch_class = 'groom'
-                   AND child.status IN ('completed', 'delivered')
-                   AND parent.reference_url IN (?2, ?3)
-                 ORDER BY child.created_at DESC, child.id DESC
-                 LIMIT 1",
-                params![agent_id, exact_url, legacy_groom_url],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        Ok(row)
+        let mut stmt = self.conn.prepare(
+            "SELECT child.result FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND parent.reference_url IN (?2, ?3)
+             ORDER BY child.created_at DESC, child.id DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, exact_url, legacy_groom_url], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `(created_at, result)` of the `limit` most recent terminal groom callbacks
+    /// for an issue, newest first (mika#2786).
+    ///
+    /// Same join and same order as [`Self::latest_groom_verdict_for_issue`], so
+    /// the anchor brake and the mika#2545 gate agree on what "the groom
+    /// callbacks of this ticket" are, with **one deliberate difference**: deferred
+    /// launchers (`long_running:run_claude_pilot:deferred`, result "deferred
+    /// dispatch slot freed") are left out at the source. They are groom callbacks
+    /// that carry no verdict, and a parent can pile up ten of them
+    /// (`dispatcher.rs`, mika#861/#1124): read in a fixed window of rows, they
+    /// would push the withholdings the brake counts out of the window. One of
+    /// them sat on top of an ESCALATE on mika#2762, 2026-10-18 18:20:02Z. The
+    /// grammar of each `result` is the caller's business; it comes back verbatim.
+    pub fn recent_groom_results_for_issue(
+        &self,
+        agent_id: &str,
+        issue_url: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let [exact_url, legacy_groom_url] = crate::task_state::tasks::issue_url_variants(issue_url);
+        let mut stmt = self.conn.prepare(
+            "SELECT child.created_at, child.result FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE child.agent_id = ?1
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND child.label NOT LIKE '%:deferred%'
+               AND parent.reference_url IN (?2, ?3)
+             ORDER BY child.created_at DESC, child.id DESC
+             LIMIT ?4",
+        )?;
+        // A negative LIMIT is "no limit" to SQLite; never let a huge `usize`
+        // wrap into one.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(
+                params![agent_id, exact_url, legacy_groom_url, limit],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `(id, result)` des enfants de groom **de cette parente** livrés
+    /// strictement après l'instant `since`, du plus récent au plus ancien
+    /// (mika#3044, condition (c)). Le `result` revient **brut**.
+    ///
+    /// L'`id` est projeté parce que la ligne d'audit de la réhabilitation le
+    /// nomme (`groom_child: …`) : sans lui, un opérateur lirait *« un groom a
+    /// convergé »* sans pouvoir remonter auquel.
+    ///
+    /// # Pourquoi une lecture neuve plutôt qu'une des quatre voisines
+    ///
+    /// Les trois lecteurs de preuve de groom
+    /// ([`Self::has_completed_groom_for_issue`],
+    /// [`Self::groom_callback_results_newest_first`],
+    /// [`Self::recent_groom_results_for_issue`]) sont tous clés sur
+    /// `parent.reference_url` et ne portent **aucune borne d'instant**. Réutiliser
+    /// l'un d'eux élargirait (c) en silence : un groom convergé d'un *autre* vol
+    /// sur le même ticket, ou convergé *avant* le reap, suffirait à réhabiliter.
+    /// La clé est donc `parent_task_id` et la borne est explicite.
+    ///
+    /// # Quatre décisions, chacune empruntée à une voisine
+    ///
+    /// - **Le marqueur n'est JAMAIS filtré en SQL.** Le `result` revient brut et
+    ///   le verdict se prend dans [`crate::task_state::tasks::groom_result_convergence`],
+    ///   seul lecteur de `PLAN_GROOMED`. Un `LIKE '%PLAN_GROOMED%'` accepterait un
+    ///   marqueur cité en prose et masquerait un `MarkerOutOfPosition` — doctrine
+    ///   mika#2590, écrite sur [`Self::has_completed_groom_for_issue`] : *une ligne
+    ///   écartée par SQL est invisible au verdict*.
+    /// - **`status IN ('completed','delivered')` et `label NOT LIKE '%:deferred%'`**
+    ///   sont ceux de [`Self::recent_groom_results_for_issue`] : un lanceur différé
+    ///   est un callback de groom qui ne porte aucun verdict.
+    /// - **`COALESCE(completed_at, updated_at)`** est l'instant terminal que les
+    ///   deux voisines utilisent ; la comparaison lexicographique est correcte
+    ///   parce que [`crate::timestamp`] écrit de l'UTC à largeur fixe.
+    /// - **`>` strict.** Un groom livré dans la même seconde que le reap ne le
+    ///   dément pas — même stricture, et même raison, que `bound_unbound_grace`.
+    ///
+    /// La clé de jointure est couverte par `idx_tasks_parent(parent_task_id,
+    /// agent_id)`.
+    pub fn groom_children_delivered_since(
+        &self,
+        agent_id: &str,
+        parent_task_id: &str,
+        since: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT child.id, child.result FROM tasks child
+             WHERE child.agent_id = ?1
+               AND child.parent_task_id = ?2
+               AND child.trigger_type = 'callback'
+               AND child.dispatch_class = 'groom'
+               AND child.status IN ('completed', 'delivered')
+               AND COALESCE(child.completed_at, child.updated_at) > ?3
+               AND child.label NOT LIKE '%:deferred%'
+             ORDER BY child.created_at DESC, child.id DESC
+             LIMIT 10",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, parent_task_id, since], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Count pending callback tasks for a given team run with depth > 1.
@@ -4743,4 +5185,476 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
+
+    /// Les vols d'implémentation **terminés** sur un ensemble de **dépôts**, pour
+    /// le manager de milestone (mika#2698 vol 1, élargi par mika#2921). Lecture
+    /// seule, zéro DDL, aucune dépendance réseau : tout est déjà dans `tasks`.
+    ///
+    /// **Le périmètre est le dépôt, plus le ticket** (mika#2921). `repos` porte
+    /// des `owner/repo` et chacun devient un `reference_url LIKE
+    /// 'https://github.com/<owner>/<repo>/issues/%' ESCAPE '\'` ; les motifs sont
+    /// joints par `OR`. Un `repos` vide rend `vec![]` — « aucun dépôt sous
+    /// contrôle » ⇒ « aucun vol », jamais « tous les vols ». **Aucun nom de dépôt
+    /// n'est écrit dans ce fichier** : la liste arrive par paramètre, et son
+    /// lecteur unique est [`crate::flight_source`].
+    ///
+    /// Trois propriétés du prédicat, chacune acquise plutôt que choisie :
+    ///
+    /// - l'ancien `IN (<variantes closes>)` couvrait `?phase=groom` par
+    ///   énumération ([`crate::task_state::tasks::issue_url_variants`]) ; le `%`
+    ///   terminal le couvre par construction, et le voisin numérique que
+    ///   l'énumération écartait n'est plus une question — on ne vise plus un
+    ///   numéro ;
+    /// - `senara-solutions/mika` ne capture pas `senara-solutions/mika-cloud` :
+    ///   le motif exige `/issues/` juste après le nom du dépôt ;
+    /// - `%`, `_` et `\` d'un nom de dépôt sont échappés
+    ///   ([`escape_like_literal`]), sans quoi un `_` ferait du motif un
+    ///   joker d'un caractère. Le `LIKE` de SQLite est insensible à la casse sur
+    ///   l'ASCII, ce qui coïncide avec la casse des dépôts GitHub.
+    ///
+    /// **La borne temporelle est `COALESCE(completed_at, updated_at)`**, et le
+    /// `COALESCE` est portant plutôt que défensif : `update_task_completed`
+    /// estampille `completed_at`, mais un vol mort par `failed`/`cancelled` peut
+    /// n'avoir que son `updated_at`, et un vol mort est exactement celui que le
+    /// ticket demande de voir. Comparer une colonne nulle aurait rendu `NULL`,
+    /// c'est-à-dire un silence sur la moitié des issues. `since = None` ⇒ `""`,
+    /// qui est strictement inférieur à tout horodatage ISO 8601 : « depuis
+    /// toujours », au premier cycle, et non « rien ».
+    ///
+    /// **Elle porte sur la fin du VOL, pas sur celle de la parente** — une
+    /// parente passe la borne quand sa propre terminalité est postérieure à
+    /// `since` **ou** quand l'un de ses enfants l'est. Sans cette disjonction,
+    /// l'ajournement de mika#2951 serait un oubli définitif, et c'était la
+    /// moitié manquante du correctif : le `completed_at` d'une parente de groom
+    /// est l'heure de fin du *groom* et ne bouge plus jamais, alors que le
+    /// cycle qui vient de l'ajourner avance `last_observed_at` au-delà. Mesuré
+    /// sur les trois vols du 2026-10-28 : groom fini à 12:28:08Z, cycle à
+    /// 12:31:59Z, pilote d'implémentation fini à 13:20:48Z — le cycle suivant
+    /// aurait cherché au-delà de 12:31 et n'aurait plus jamais rendu cette
+    /// parente. AC1 aurait été tenu (aucun verdict prématuré) et AC4 jamais
+    /// (aucun verdict du tout) : un silence sans fin, qui est précisément la
+    /// classe que D5 du plan refuse.
+    ///
+    /// **La sous-requête surapproxime délibérément : aucun filtre de label.**
+    /// Un enfant quelconque suffit à faire relire la parente. C'est voulu à
+    /// deux titres. D'abord parce que les filtres fins vivent en Rust
+    /// ([`crate::task_engine::engine::is_pilot_dispatch_label`] en est le
+    /// lecteur unique) et qu'une clause `IN` ici en ferait une seconde source
+    /// de vérité — le refus que le commentaire de l'agrégation ci-dessous
+    /// écrit en propre. Ensuite parce que les deux erreurs ne coûtent pas le
+    /// même prix : **surapprocher ne produit aucune fausseté** (la parente est
+    /// relue, les filtres Rust concluent juste, et `write_and_swallow` est
+    /// idempotent, donc au pire une ligne de rapport), tandis que
+    /// sous-approcher perd le vol pour toujours.
+    ///
+    /// **Le statut terminal se filtre en Rust**, par
+    /// [`crate::task_state::tasks::is_terminal_task_status`], et pas dans le SQL.
+    /// Ce serait une troisième copie de la liste, dans un dialecte où sa règle
+    /// « un statut inconnu n'est pas terminal » ne se lit pas (même raison,
+    /// nommée au même endroit, que `find_dispatch_children_for_issue_url`).
+    ///
+    /// **Le scope est le conteneur, pas un agent** (mika#2792) — et c'est ce que
+    /// le nom de la méthode dit. Il n'y a pas d'`agent_id` dans la requête,
+    /// parce que **le manager n'a pas d'agent** : la cadence est une tâche de
+    /// processus. La version mika#2698 filtrait sur l'`agent_id` du handle qu'on
+    /// lui avait emprunté pour obtenir une connexion — sur gentux l'agent par
+    /// défaut, alors que les vols d'implement sont des tâches de `mika-dev`. La
+    /// requête interrogeait donc un agent sans aucun vol et rendait zéro ligne,
+    /// indiscernable de « aucun vol terminé » : 43 vols en quatre jours, aucun
+    /// verdict.
+    ///
+    /// Lever le filtre ne traverse aucune frontière : `init_agent` ouvre une
+    /// base **unique** par conteneur (`home::container_db_path`), donc le scope
+    /// par `agent_id` y est purement logique, et un conteneur est un client
+    /// (topologie « one container per customer »). Le filtre porteur est
+    /// désormais le dépôt : mika#2698 bornait la lecture aux sous-issues du
+    /// milestone surveillé, mika#2921 la borne au périmètre des dépôts sous
+    /// contrôle — « la boucle, jamais au-delà ». Le **rapport** reste, lui, par
+    /// milestone.
+    ///
+    /// **Deux requêtes, et la seconde est la raison de mika#2886.** La ligne
+    /// que l'URL du ticket trouve est la **parente** `ready-label: …#N` : elle
+    /// porte le ticket et les tours, son `result` est vide. L'issue du pilote —
+    /// `Outcome: PR_OPENED — <url>` — vit sur l'**enfant**
+    /// `long_running:run_claude_pilot`, dont le `reference_url` est NULL. La
+    /// seconde requête va la chercher, pour toutes les parentes à la fois (une
+    /// requête par vol serait un N+1 sur le chemin du cycle), et le résultat
+    /// est rendu dans [`FinishedFlightRow`] — deux champs parce que les deux
+    /// données viennent de deux lignes.
+    ///
+    /// **Une parente terminale n'est pas un vol terminé** (mika#2951). Depuis
+    /// mika#1614 le moteur relance le pilote d'implémentation **sur la row de la
+    /// parente de groom**, qui est passée `completed` à la fin du groom : la
+    /// terminalité de la parente est donc l'heure de fin du *groom*, pas celle
+    /// du vol. La requête 2 rapporte les deux faits que cette ambiguïté
+    /// demande — l'issue de l'enfant d'implémentation quand il y en a une
+    /// (`pilot_result`, la **classe** primant la récence), et le fait qu'un tel
+    /// enfant vole encore (`pending_implement`).
+    ///
+    /// Cette lecture repose sur **une propriété d'ordonnancement** qui lui est
+    /// extérieure : l'enfant d'implémentation est créé *avant* que la parente
+    /// devienne terminale. Elle tient parce que `deliver_callback` appelle
+    /// `try_complete_parent_on_callback_success` **avant**
+    /// `try_dispatch_pilot_after_groom_success`, et qu'un callback de groom ne
+    /// porte pas de `pr_url` — donc la première est un no-op sur cette parente,
+    /// qui reste `in_progress` jusqu'à ce que l'enfant existe. Si l'ordre
+    /// s'inversait, il y aurait une fenêtre où la parente est terminale sans
+    /// enfant d'implémentation : elle serait jugée sur son groom, exactement le
+    /// défaut d'aujourd'hui. L'ordre est épinglé par
+    /// `task_engine::engine::tests::mika2951_la_parente_devient_terminale_apres_la_naissance_de_lenfant_dimplementation`.
+    pub fn list_finished_implement_flights_in_container(
+        &self,
+        since: Option<&str>,
+        repos: &[String],
+    ) -> Result<Vec<FinishedFlightRow>> {
+        if repos.is_empty() {
+            return Ok(vec![]);
+        }
+        let motifs: Vec<String> = repos.iter().map(|r| issue_url_like_pattern(r)).collect();
+        // Le prédicat de dépôt, écrit **une fois** et porté sur la colonne que
+        // chaque requête nomme — `reference_url` pour la 1, `parent.reference_url`
+        // pour la 2. Les numéros de liaison sont les mêmes des deux côtés, donc la
+        // seconde requête ne consomme **aucun paramètre de plus**.
+        let predicat_depot = |colonne: &str| -> String {
+            (0..motifs.len())
+                .map(|i| format!("{colonne} LIKE ?{} ESCAPE '\\'", i + 2))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
+        // La borne temporelle, écrite **une fois** et portée sur le préfixe de
+        // table que chaque requête nomme — `tasks.` pour la 1, `parent.` pour la
+        // 2. Les deux doivent border à l'identique : la 1 décide quelle parente
+        // est lue, la 2 va chercher ses enfants, et une parente rendue sans ses
+        // enfants serait jugée sur un `pilot_result` vide.
+        //
+        // La qualification n'est pas cosmétique : non qualifié, `id` dans le
+        // `EXISTS` se résoudrait sur `enfant.id` — la sous-requête corrélée
+        // deviendrait une tautologie et la borne ne bornerait plus rien.
+        let predicat_borne = |prefixe: &str| -> String {
+            format!(
+                "(COALESCE({prefixe}completed_at, {prefixe}updated_at) > ?1
+                   OR EXISTS (SELECT 1 FROM tasks enfant
+                               WHERE enfant.parent_task_id = {prefixe}id
+                                 AND COALESCE(enfant.completed_at, \
+                                              enfant.updated_at) > ?1))"
+            )
+        };
+        let clause = predicat_depot("reference_url");
+        let sql = format!(
+            "SELECT {} FROM tasks
+             WHERE COALESCE(dispatch_class, 'implement') = 'implement'
+               AND ({clause})
+               AND {}
+             ORDER BY COALESCE(completed_at, updated_at) ASC",
+            Self::TASK_COLUMNS,
+            predicat_borne("tasks."),
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(since.unwrap_or("").to_string())];
+        for m in &motifs {
+            bind.push(Box::new(m.clone()));
+        }
+        let refs: Vec<&dyn rusqlite::types::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+        let rows: Vec<Task> = stmt
+            .query_map(refs.as_slice(), Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+        let flights: Vec<Task> = rows
+            .into_iter()
+            .filter(|t| crate::task_state::tasks::is_terminal_task_status(&t.status))
+            .collect();
+        if flights.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Requête 2 — les enfants de ces mêmes parentes. La jointure et les
+        // liaisons sont celles de `find_dispatch_children_for_issue_url` ; le
+        // `WHERE` est celui de la requête 1, déplacé sur `parent`, donc **zéro
+        // paramètre de plus** : les mêmes `refs` servent les deux.
+        //
+        // `TASK_COLUMNS` est une liste **sans préfixe de table** — la requête 1
+        // n'en a pas besoin. Ici, `child.` est obligatoire : `parent` porte les
+        // mêmes trente-deux colonnes, et `row_to_task` les lit par **position**.
+        //
+        // Pas de garde `json_valid` : contrairement à
+        // `find_dispatch_children_for_issue_url`, cette requête n'évalue aucun
+        // `json_extract` — elle ne lit pas de JSON en SQL, donc elle n'a rien à
+        // protéger d'un `metadata` non-JSON.
+        let child_columns: String = Self::TASK_COLUMNS
+            .split(',')
+            .map(|c| format!("child.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let clause_parente = predicat_depot("parent.reference_url");
+        let sql_enfants = format!(
+            "SELECT {child_columns}
+             FROM tasks child
+             JOIN tasks parent ON child.parent_task_id = parent.id
+             WHERE COALESCE(parent.dispatch_class, 'implement') = 'implement'
+               AND ({clause_parente})
+               AND {}",
+            predicat_borne("parent."),
+        );
+        let mut stmt = self.conn.prepare(&sql_enfants)?;
+        let enfants: Vec<Task> = stmt
+            .query_map(refs.as_slice(), Self::row_to_task)?
+            .collect::<rusqlite::Result<_>>()?;
+
+        /// La clé de récence d'un enfant : le même `COALESCE` que la borne
+        /// temporelle, et l'`id` pour trancher une égalité à la seconde (les
+        /// horodatages sont au format `%Y-%m-%dT%H:%M:%SZ`).
+        fn recence(t: &Task) -> (&str, &str) {
+            (
+                t.completed_at.as_deref().unwrap_or(t.updated_at.as_str()),
+                t.id.as_str(),
+            )
+        }
+
+        /// Ce qu'on retient des enfants d'**une** parente : la dernière issue de
+        /// chaque classe, et le fait qu'une implémentation vole encore.
+        #[derive(Default)]
+        struct Enfants {
+            dernier_implement: Option<Task>,
+            dernier_groom: Option<Task>,
+            implement_en_vol: bool,
+        }
+
+        // Les filtres vivent en **Rust**, jamais en SQL.
+        //
+        // - **population** : `is_pilot_dispatch_label` est le lecteur unique de
+        //   la liste des labels de pilote. La recopier dans une clause `IN`
+        //   serait une seconde source de vérité, et `long_running:build_mika`
+        //   s'y glisserait au premier élargissement.
+        // - **classe** : `is_implement_pilot_label` sépare le pilote
+        //   d'implémentation du pilote de groom. Son doc-comment porte le
+        //   pourquoi de ce discriminant-là (mika#2951).
+        // - **vivacité** : `is_terminal_task_status`, même raison que la
+        //   requête 1 ci-dessus — sa règle « un statut inconnu n'est pas
+        //   terminal » ne se lit pas dans un `IN` SQL.
+        // - **contenu** : un `result` présent **et** non vide. Un enfant
+        //   terminé sans texte ne dit rien, et le dire quand même écraserait un
+        //   enfant antérieur qui, lui, parlait.
+        let mut par_parente: std::collections::HashMap<String, Enfants> =
+            std::collections::HashMap::new();
+        for enfant in enfants {
+            if !crate::task_engine::engine::is_pilot_dispatch_label(&enfant.label) {
+                continue;
+            }
+            let Some(parente_id) = enfant.parent_task_id.clone() else {
+                continue;
+            };
+            let implement = crate::task_engine::engine::is_implement_pilot_label(&enfant.label);
+            let etat = par_parente.entry(parente_id).or_default();
+
+            if !crate::task_state::tasks::is_terminal_task_status(&enfant.status) {
+                // Un **groom** encore en vol n'ajourne rien : la parente n'est
+                // alors pas terminale non plus, donc la requête 1 ne l'a pas
+                // retenue. C'est l'implémentation qui survit à la terminalité
+                // de sa parente (mika#1614), et elle seule.
+                etat.implement_en_vol |= implement;
+                continue;
+            }
+            if enfant.result.as_deref().unwrap_or("").is_empty() {
+                continue;
+            }
+            let tenant = if implement {
+                &mut etat.dernier_implement
+            } else {
+                &mut etat.dernier_groom
+            };
+            match tenant {
+                Some(t) if recence(t) >= recence(&enfant) => {}
+                _ => *tenant = Some(enfant),
+            }
+        }
+
+        // L'ordre rendu reste celui de la requête 1 — `COALESCE(…) ASC` sur les
+        // parentes. La seconde requête enrichit, elle ne réordonne pas.
+        Ok(flights
+            .into_iter()
+            .map(|flight| {
+                let etat = par_parente.remove(&flight.id).unwrap_or_default();
+                FinishedFlightRow {
+                    // **La classe prime, jamais la récence** (mika#2951). Un
+                    // re-groom postérieur à l'implémentation ne reprend pas la
+                    // main : « le plus récent » est exactement la moitié du
+                    // défaut que ce ticket corrige.
+                    pilot_result: etat
+                        .dernier_implement
+                        .or(etat.dernier_groom)
+                        .and_then(|e| e.result),
+                    pending_implement: etat.implement_en_vol,
+                    flight,
+                }
+            })
+            .collect())
+    }
+
+    /// Les dispatches de **groom** vivants ou morts portant une de ces URLs
+    /// d'issue, sur tout le conteneur (mika#2958, vol 2c).
+    ///
+    /// La question est *« une tâche de classe `groom` existe-t-elle sur ce
+    /// ticket ? »*, et elle est posée **sans `agent_id`** — comme son précédent
+    /// [`Self::list_finished_implement_flights_in_container`] et pour le même
+    /// motif (mika#2792) : le manager est une tâche de processus *sans agent*,
+    /// donc tout filtre sur l'`agent_id` du handle emprunté pour la connexion
+    /// rend une lecture constamment vide. L'invariant est porté par le **nom**
+    /// de la méthode — `…_in_container` — pas par un commentaire qu'un refactor
+    /// déplace.
+    ///
+    /// L'appariement se fait sur l'**ensemble fermé** de variantes de
+    /// [`crate::task_state::tasks::issue_url_variants`], en `IN (?, ?, …)`.
+    /// **Jamais** un `LIKE 'url%'` : le préfixe faisait apparier `/issues/216`
+    /// avec `/issues/2161`, et c'est le bug que mika#2638 a corrigé.
+    ///
+    /// **Deux formes de ligne, en `UNION ALL`**, parce que la topologie d'un
+    /// dispatch en a deux (mika#2279) : la parente porte l'URL et jamais le
+    /// `process_id`, l'enfant porte le pgid et jamais l'URL. Sans la branche
+    /// (b), un enfant de groom encore en vol sous une parente **annulée** lit
+    /// comme « aucun groom » — exactement la collision que ce vol existe pour
+    /// éviter.
+    ///
+    /// Le statut sort **brut** : le filtre terminal est en Rust, chez l'appelant
+    /// ([`crate::groom_in_flight`]), parce que la règle « un statut inconnu
+    /// n'est pas terminal » de `is_terminal_task_status` n'a pas d'expression
+    /// dans ce dialecte, et qu'une seconde copie de la liste des statuts
+    /// divergerait.
+    ///
+    /// `issue_urls` vide ⇒ `Ok(vec![])` **sans requête** : un `IN ()` est une
+    /// syntaxe refusée, et un aller-retour qui ne peut rien rendre est un
+    /// aller-retour de trop. **Aucun plafond nommé ici** — le bornage vient de
+    /// l'unique appelant, dont la relève vaut au plus `RELIEF_SIZE` tickets ;
+    /// une constante locale serait un second lecteur du même chiffre
+    /// (doctrine mika#2201).
+    pub fn list_groom_dispatches_in_container(
+        &self,
+        issue_urls: &[String],
+    ) -> Result<Vec<GroomDispatchRow>> {
+        if issue_urls.is_empty() {
+            return Ok(vec![]);
+        }
+        let variantes: Vec<String> = issue_urls
+            .iter()
+            .flat_map(|url| crate::task_state::tasks::issue_url_variants(url))
+            .collect();
+        let places = (0..variantes.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Les deux branches lisent les **mêmes** numéros de liaison, donc la
+        // seconde ne consomme aucun paramètre de plus — même économie que les
+        // deux requêtes du précédent.
+        //
+        // Le lien parente/enfant de la branche (b) est **qualifié** des deux
+        // côtés (`enfant.parent_task_id = parent.id`), et la qualification n'est
+        // pas cosmétique : dans un prédicat qui nomme deux fois `tasks`, un `id`
+        // nu se résout sur l'alias le plus proche et le lien devient une
+        // tautologie — l'avertissement est déjà écrit au précédent, à la borne
+        // temporelle de sa requête 1. Il est tenu ici par une **jointure** et non
+        // par un `EXISTS` corrélé, pour une raison de projection : la branche (b)
+        // doit rendre l'URL de la *parente* **et** le statut de l'*enfant*, et un
+        // `EXISTS` ne projette rien — il faudrait une seconde sous-requête
+        // corrélée sur le même lien pour aller chercher l'URL.
+        let sql = format!(
+            "SELECT reference_url, status FROM tasks
+              WHERE COALESCE(dispatch_class, 'implement') = 'groom'
+                AND reference_url IN ({places})
+             UNION ALL
+             SELECT parent.reference_url, enfant.status
+               FROM tasks enfant
+               JOIN tasks parent ON enfant.parent_task_id = parent.id
+              WHERE COALESCE(enfant.dispatch_class, 'implement') = 'groom'
+                AND parent.reference_url IN ({places})"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> = variantes
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(refs.as_slice(), |row| {
+                Ok(GroomDispatchRow {
+                    issue_url: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// Une ligne de dispatch de groom : l'URL qui l'a appariée, et le statut de la
+/// tâche qui la porte (mika#2958, vol 2c).
+///
+/// Le **statut sort brut**. Cette couche rapporte, elle ne filtre pas : un
+/// `SELECT` qui aurait écarté les statuts terminaux rendrait « un groom est
+/// mort ici » et « aucun groom n'a jamais eu lieu ici » en octets identiques
+/// (classe mika#2205), et le filtre vivrait alors à deux endroits — en SQL et
+/// chez le lecteur unique du type, [`crate::groom_in_flight`].
+///
+/// L'URL rendue est celle qui a **apparié**, variante comprise : c'est elle, et
+/// jamais un numéro reconstruit depuis sa forme, que le lecteur retraduit en
+/// numéro de ticket par sa propre table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroomDispatchRow {
+    pub issue_url: String,
+    pub status: String,
+}
+
+/// Un vol terminé, et l'issue que son pilote a écrite (mika#2886).
+///
+/// Les deux champs viennent de **deux lignes différentes** : `flight` est la
+/// tâche qui porte l'URL du ticket (la parente `ready-label:`), `pilot_result`
+/// est le `result` du dernier enfant pilote terminé. C'est la topologie que
+/// `build_callback_task` produit, et la raison d'être de ce type : un `Task`
+/// dont le `result` aurait été écrasé ne dirait pas d'où il vient.
+#[derive(Debug, Clone)]
+pub struct FinishedFlightRow {
+    pub flight: crate::task_state::tasks::Task,
+    /// `None` quand le vol n'a aucun enfant pilote terminé portant un
+    /// `result` — jamais une chaîne vide (motif mika#2331 : absent ≠ vide).
+    ///
+    /// Quand les deux classes d'enfant ont parlé, c'est **l'implémentation**
+    /// qui est portée, quelle que soit la date du groom (mika#2951).
+    pub pilot_result: Option<String>,
+    /// mika#2951 — un enfant d'implémentation est encore en vol sous cette
+    /// parente : elle est terminale (mika#1614 la réutilise), le vol ne l'est
+    /// pas.
+    ///
+    /// **Cette couche rapporte, elle ne filtre pas.** Un `SELECT` qui aurait
+    /// écarté la ligne ici rendrait « vol ajourné » et « aucun vol » en octets
+    /// identiques (classe mika#2205), et l'ajournement ne serait mesurable par
+    /// personne. La décision de ne pas juger, et la sonde qui la dit, vivent
+    /// chez le lecteur unique de ce type — [`crate::flight_source`].
+    pub pending_implement: bool,
+}
+
+/// Le motif `LIKE` qui reconnaît **toute** URL d'issue d'un dépôt (mika#2921).
+///
+/// `senara-solutions/mika` ⇒ `https://github.com/senara-solutions/mika/issues/%`.
+/// Le `/issues/` littéral avant le joker est ce qui empêche `mika` de capturer
+/// `mika-cloud`, et le `%` terminal est ce qui couvre le suffixe `?phase=groom`
+/// sans énumérer de variante.
+fn issue_url_like_pattern(repo: &str) -> String {
+    format!(
+        "https://github.com/{}/issues/%",
+        escape_like_literal(repo.trim_matches('/'))
+    )
+}
+
+/// Échappe les métacaractères `LIKE` d'un littéral, pour un `ESCAPE '\'`.
+///
+/// Sans cela un `_` dans un nom de dépôt serait un joker d'un caractère, et
+/// `mika_cloud` reconnaîtrait `mika-cloud` : un élargissement silencieux du
+/// périmètre, exactement ce que « jamais au-delà » interdit. Le `\` est échappé
+/// en premier au sein du même parcours, donc jamais deux fois.
+fn escape_like_literal(litteral: &str) -> String {
+    let mut sortie = String::with_capacity(litteral.len());
+    for c in litteral.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            sortie.push('\\');
+        }
+        sortie.push(c);
+    }
+    sortie
 }

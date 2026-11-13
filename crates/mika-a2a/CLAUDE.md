@@ -23,14 +23,60 @@ enforces, so an error can name the interval it really spent.
 
 **The policy is guarded, not merely written down (mika#2309).** CI job
 `a2a-timeout-literal-lint` runs `scripts/check-a2a-timeout-literals.sh` over a
-declared perimeter (this crate's `src/`, the two `A2aClient` call sites, and
-`mika-common/src/llm/`): a budget at a bounding site may not be a *literal*
+declared perimeter (this crate's `src/`, the two `A2aClient` call sites,
+`mika-cli/src/budget_floor.rs` — the send-floor attestation, added by mika#2759 —
+and `mika-common/src/llm/`): a budget at a bounding site may not be a *literal*
 (`from_secs(600)` and `from_secs(10 * 60)` alike), and a `const … : Duration`
 ≥ 60 s must be a `DEFAULT_*` backed by a declared `MIKA_*` env var. The predicate
 is on the **site that bounds**, never on the value — a TTL or a JWT lifetime is
 not a call budget. `crates/mika-agent/tests/a2a_budget_transitivity_2309.rs`
 asserts the full chain `client ≥ total > http` by calling the production
 resolvers; `>` is strict because the code refuses `total == http`.
+
+**The floor covers the PER-AGENT envelope, and it is held at send time
+(mika#2759).** `resolve_timeout_secs` reads the process environment; the
+envelopes of mika#2189 live in the agent's **`config.toml`** (mika-arch:
+`agent_total_timeout_secs = 900`). The two never met, so a call to mika-arch
+resolved **600 s** against a **900 s** envelope and abandoned a generation the
+engine still had the right to finish — the 2026-09-11 incident that motivated
+300 → 600, reproduced one caller away.
+
+`resolve_send_timeout_with_floor(agent_envelope_secs: Option<u64>)` takes the
+envelope as a **third candidate to the same `max`**. Four properties, and each
+undoes itself if guessed:
+
+- **At send time, not at construction, because the agent is only knowable from
+  the URL.** `A2aClient::new` builds its `reqwest::Client` before the URL is
+  decomposed, so no constructor signature could carry the answer. The single
+  call site is `mika-cli/src/remote_ask.rs`, held by a source scan whose
+  allowlist ships **empty** (`mika2759_le_plancher_a_un_seul_site`): a second
+  site would be a second place deriving an agent from a URL, and one of the two
+  would drift back into `A2aClient::new`.
+- **The envelope comes from spirit's attestation, never resolved locally**
+  (`GET /api/v1/agents/{id}/budget`, field `budget.agent_total_timeout_secs`).
+  Doctrine mika#2457: *spirit attests, the CLI renders; never the reverse* — a
+  CLI reading an agent's `config.toml` itself would print a setting that is not
+  the one in force, which is mika#2304's defect one field over.
+- **Loopback only**, and that predicate is the inversion of `a2a_call`'s: that
+  one *refuses* loopback (SSRF), this one accepts **nothing else**. The target's
+  own spirit is the only authority on that target's envelope, and a remote URL's
+  attestation is neither reachable nor ours to trust.
+- **Absent is not zero** (motif mika#2331). `None` — not a local target,
+  unreachable, a non-2xx, a body this version cannot read — makes
+  `resolve_send_timeout_with_floor(None)` return, byte for byte, the budget
+  `A2aClient::new` would have resolved. The degradation tree is **named** rather
+  than discovered: `a2a_floor_not_local` (DEBUG), `a2a_floor_unattested` (WARN,
+  with `cause` ∈ `unreachable` | `status_<code>` | `malformed`),
+  `a2a_floor_resolved` (DEBUG). Details in `crates/mika-cli/CLAUDE.md`.
+
+`crates/mika-agent/tests/a2a_budget_transitivity_2309.rs` **keeps its declared
+perimeter and its three assertions byte for byte** — defaults plus the process
+env is still exactly what it covers. Only its `//!` prose moved, because it named
+the positive control mika#2759 removed (`mika2309_client_default_is_below_the_arch_envelope`,
+retired with its cause per mika#1574) and asserted a divergence that no longer
+exists. Its successor on the same site is
+`mika2759_le_plancher_couvre_lenveloppe_de_mika_arch`, which pins the `max`
+property rather than the number: no envelope value can redden it alone.
 
 `TransportFailure` (in `error`) classifies a `reqwest` failure into unreachable /
 timed out / HTTP status / unreadable / interrupted. Its load-bearing question is

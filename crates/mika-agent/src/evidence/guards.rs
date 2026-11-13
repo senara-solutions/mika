@@ -1004,6 +1004,128 @@ fn sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// mika#2872 — le créneau de la classe `fabrication-detected`, typé
+// ---------------------------------------------------------------------------
+
+/// La notification P0 de la classe `fabrication-detected`, différée jusqu'à
+/// l'acceptation de l'`EndTurn`, **et le site qui l'a posée**.
+///
+/// mika#2867 a livré le créneau en `Option<String>` pour un site unique. Dès le
+/// second, le texte seul ne suffit plus : la revérification à l'acceptation doit
+/// rejouer *le prédicat du site qui a déposé*, pas un prédicat câblé en dur. Un
+/// message posé par 5d que l'on revérifierait avec le prédicat d'`assert_grounded`
+/// serait supprimé sur un texte portant pourtant toujours la fausse revendication
+/// de localité, ou émis sur un texte qui ne la porte plus — dans les deux sens,
+/// le silence est faux.
+pub(crate) struct PendingFabricationP0 {
+    /// Le texte de la notification, formaté au site de dépôt — il nomme la faute,
+    /// le `trace_id` et le geste.
+    pub(crate) message: String,
+    /// Le site qui a déposé, donc le prédicat avec lequel on revérifie.
+    pub(crate) site: PendingFabricationP0Site,
+}
+
+/// Les sites de la classe `fabrication-detected` qui déposent une P0.
+///
+/// **Le critère d'appartenance à la classe** (mika#2872 D1, du bearing de Prime
+/// du 2026-10-22) : *la phrase fautive affirme-t-elle un état du système
+/// qu'aucun résultat d'outil de ce tour ne porte ?* Oui ⇒ la classe ; personne
+/// dans le système ne sait si c'est vrai, seul un humain peut l'établir, et le
+/// réveil de l'opérateur a donc un geste. Non ⇒ hors classe : la faute est une
+/// divergence de forme, de registre ou de conduite mesurée contre un fait que le
+/// garde tient déjà (`tenant_language`, l'horloge, un `DeliveryRecord`), ou un
+/// engagement sur l'avenir, ou une omission — aucun état n'est posé, donc il n'y
+/// a rien à aller vérifier.
+///
+/// Un garde qui *réfute* la phrase (5d voit `deployment` et sait qu'elle est
+/// fausse) reste dans la classe : « un état attesté » décrit une réponse que le
+/// garde peut **confirmer**, pas une réponse qu'il peut réfuter.
+///
+/// Les quatre sites `_uncorrected` restants — `response_language_drift`,
+/// `time_of_day_greeting_mismatch`, `testimony_access_proposal`,
+/// `unacknowledged_send_failure` — sont **hors classe** par ce critère et n'ont
+/// délibérément pas de variante ici. `unactioned_frequency_promise` y est entré
+/// avec mika#2879 (vol 3) **par sa seule branche « état accompli »** : sa
+/// moitié « engagement sur l'avenir » reste hors classe, et la frontière est
+/// tenue par la nature relue — au dépôt comme à la revérification.
+///
+/// **Un seul créneau, donc une seule P0 par tour pour toute la classe.** Le
+/// verrou du ticket (« un verrou d'une notification par tour ») se lit à
+/// l'échelle de la **classe**, pas du site : chaque branche n'écrit que si le
+/// créneau est `None`, et le premier écrivain gagne dans l'ordre de la chaîne.
+/// *Coût nommé* : un tour qui viole 5d **et** `assert_grounded` ne réveille
+/// l'opérateur qu'une fois, pour 5d. Rien n'est perdu — la notification porte le
+/// `trace_id` et tous les `_uncorrected` du tour sont sur cette trace dans
+/// `/var/log/mika/server.log`. L'alternative, un créneau par site, rendrait
+/// possible trois réveils pour un seul tour, qui est le mode d'extinction d'une
+/// surface jamais muette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFabricationP0Site {
+    /// La récidive de la garde `assert_grounded` (#1331, site de mika#2867) :
+    /// un état affirmé sur une ressource qu'aucun outil d'ancrage n'a touchée
+    /// ce tour.
+    AssertGrounded,
+    /// La récidive de la garde `false_local_hosting_claim` (5d, mika#2290,
+    /// rattachée par mika#2872) : « je tourne en local sur ta machine » est un
+    /// état du déploiement qu'aucun résultat d'outil ne porte — et que
+    /// `tool_ctx.deployment` contredit.
+    FalseLocalHosting,
+    /// 5e sur sa seule branche « état accompli » (mika#2879, vol 3). La
+    /// moitié « engagement sur l'avenir » reste HORS de la classe : une
+    /// promesse non tenue n'affirme aucun état du système, et aucun geste
+    /// d'opérateur ne la rendrait vraie (critère mika#2872 D1).
+    ///
+    /// Le nom porte la moitié délibérément : une variante
+    /// `UnactionedFrequencyPromise` tout court inviterait le prochain lecteur à
+    /// y rattacher le détecteur entier, c'est-à-dire le verdict en bloc que
+    /// mika#2878 a refusé dans les deux sens.
+    UnactionedFrequencyPromiseAccomplished,
+}
+
+impl PendingFabricationP0Site {
+    /// Le texte **accepté** porte-t-il encore la violation que ce site a posée ?
+    ///
+    /// Six gardes en aval de la chaîne peuvent encore refuser la clôture et
+    /// obtenir un texte qui ne porte plus la faute : la réponse qui a récidivé
+    /// ne sortirait alors jamais, et la notification dirait le contraire
+    /// (« The answer went out »). La revérification est donc obligatoire, et
+    /// elle est **une propriété du type** plutôt qu'un prédicat recopié dans la
+    /// boucle : un troisième site ne compile pas sans nommer son bras, donc
+    /// « j'ai oublié de revérifier » n'est plus un état atteignable — la forme
+    /// que mika#1381 a imposée à `send_notification` pour l'étage.
+    pub(crate) fn still_violated(
+        self,
+        text: &str,
+        summaries: &[ToolCallSummary],
+        deployment: mika_common::home::Deployment,
+    ) -> bool {
+        match self {
+            // Recopié à l'identique du site d'acceptation de mika#2867 plutôt
+            // que reformulé : le risque de ce refactor n'est pas que les tests
+            // de #2870 rougissent, c'est qu'ils restent verts sur un prédicat
+            // devenu plus permissif.
+            Self::AssertGrounded => detect_affirmative_state_claim(text)
+                .is_some_and(|claim| !assert_grounded_satisfied(&claim, summaries)),
+            // Pas de terme de satisfaction : 5d n'a pas d'outil d'ancrage, la
+            // vérité de terrain est `deployment` et le détecteur la prend déjà.
+            Self::FalseLocalHosting => detect_false_local_hosting_claim(text, deployment).is_some(),
+            // La nature est **relue**, jamais transportée dans le créneau :
+            // transporter `promise.nature` ferait d'un champ la source de
+            // vérité sur un texte qui a changé entre-temps — la forme que
+            // mika#2158 condamne. Ici les deux lectures appellent la même
+            // fonction, à deux instants, sur deux textes. Et le terme (C) du
+            // détecteur lit les `summaries` du tour d'**acceptation** : un tour
+            // qui a fini par appeler `set_config` ne réveille personne.
+            Self::UnactionedFrequencyPromiseAccomplished => {
+                detect_unactioned_frequency_promise(text, summaries).is_some_and(|promise| {
+                    promise.nature == FrequencyAssertionNature::AccomplishedState
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mika#2358 — Unactioned frequency-promise guard
 // ---------------------------------------------------------------------------
 
@@ -1018,12 +1140,43 @@ fn sentence_is_suppressed(text: &str, start: usize, end: usize) -> bool {
 /// about.
 pub(crate) const UNACTIONED_FREQUENCY_PROMISE_LABEL: &str = "unactioned_frequency_promise";
 
+/// The nature of the Layer-B alternative that matched (mika#2879).
+///
+/// Not a logging convenience: this is the discriminant that decides membership
+/// of the P0 class `fabrication-detected` (see `PendingFabricationP0Site`), and
+/// mika#2879's next flight makes it a term of a guard. It is `Copy` and has
+/// exactly two arms so that term reads `== AccomplishedState` and so a third
+/// arm cannot appear without breaking the `match`es.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrequencyAssertionNature {
+    /// « c'est corrigé », « i've stopped » — a state of the system is posed,
+    /// and term (C) has proven that no `set_config` carries it.
+    AccomplishedState,
+    /// « je vais réduire », « i'll stop » — a commitment about the future. No
+    /// state posed, so nothing to go and verify, so outside the class.
+    FutureCommitment,
+}
+
+impl FrequencyAssertionNature {
+    /// The value that goes on the wire — into the two `warn!`s of 5e, which
+    /// are this discriminant's production consumer (mika#2879 D2).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AccomplishedState => "accomplished_state",
+            Self::FutureCommitment => "future_commitment",
+        }
+    }
+}
+
 /// Structured result from unactioned-frequency-promise detection.
 pub(crate) struct FrequencyPromiseMatch {
     /// The frequency / proactive-message predicate captured by Layer A.
     pub(crate) subject: String,
     /// The performative assertion captured by Layer B.
     pub(crate) assertion: String,
+    /// Which of the two natures Layer B matched (mika#2879). Read from the
+    /// branch the regex engine took, never re-computed from `assertion`.
+    pub(crate) nature: FrequencyAssertionNature,
 }
 
 /// **Layer A — subject:** the frequency of, or the suspension of, Mika's own
@@ -1067,25 +1220,90 @@ const FREQUENCY_SUBJECT_ALTERNATION: &str = r"(?:
 /// decoration: French routinely pronominalises the object it has just named, so
 /// « la fréquence de mes veilles, je **la** réduis » is the *normal* way to
 /// write the subject-first order that this guard also has to catch.
-const FREQUENCY_ASSERTION_ALTERNATION: &str = r"(?:
-      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
-    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
-    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
-    | je\s+ne?\s*t'?enverrai\s+plus
-    | je\s+n'?enverrai\s+plus
-    | c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
-    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
-    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
-    | i\s+(?:won'?t|will\s+not)\s+send
+///
+/// # Two natures, since mika#2879
+///
+/// The twelve alternatives are **not** of one kind, and the difference decides
+/// membership of the P0 class `fabrication-detected` (mika#2878's verdict on
+/// this site). They are therefore split into
+/// [`FREQUENCY_ASSERTION_ACCOMPLISHED_STATE`] and
+/// [`FREQUENCY_ASSERTION_FUTURE_COMMITMENT`], whose **union** —
+/// [`FREQUENCY_ASSERTION_ALTERNATION`] — is what detection reads. Detection
+/// behaviour is unchanged by construction: there is one alternation, one pass,
+/// one evaluation order.
+///
+/// **Nature « accomplished state ».** The sentence asserts a state *of the
+/// system* — and term (C) of the detector ([`frequency_actor_called`]) has
+/// already proven that no `set_config` carries it. The membership criterion is
+/// `PendingFabricationP0Site`'s (mika#2872 D1): *does the offending sentence
+/// assert a system state that no tool result of this turn carries?* For
+/// « c'est corrigé », yes. This is the half that belongs to the class — the
+/// attachment itself is mika#2879's next flight, not this one.
+const FREQUENCY_ASSERTION_ACCOMPLISHED_STATE: &str = r"(?:
+      c'?est\s+(?:corrig[ée]|r[ée]gl[ée]|fait|bon|r[ée]par[ée])
     | i'?ve\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
     | i\s+have\s+(?:fixed|stopped|reduced|changed|adjusted|limited|cut)
     | (?:it'?s|that'?s|it\s+is)\s+(?:fixed|done|sorted)
 )";
 
+/// **Nature « future commitment ».** A commitment about behaviour, not a state.
+/// Outside the `fabrication-detected` class: nothing is posed that a human
+/// would have to go and verify. The guard still fires on it — an unbacked
+/// promise is what 5e exists to re-prompt — but it is not a fabrication.
+///
+/// The two **present-tense** forms (`je corrige`, `je ne t'envoie plus`) are
+/// here and not above, and the choice is deliberate: that is a present of
+/// decision, not a report. Nobody writes « je ne t'envoie plus » to state an
+/// already-reached state — the sentence announces the conduct to come. Filing
+/// it as accomplished would wake the operator on a commitment, exactly the
+/// false positive mika#2879 exists to make unreachable.
+const FREQUENCY_ASSERTION_FUTURE_COMMITMENT: &str = r"(?:
+      je\s+vais\s+(?:l[ae]\s+|les\s+|l'|t'|te\s+|y\s+|en\s+)?(?:corriger|r[ée]gler|arr[êe]ter|r[ée]duire|changer|ajuster|limiter|baisser|espacer|couper)
+    | je\s+(?:l[ae]\s+|les\s+|l'|y\s+|en\s+)?(?:corrige|r[ée]gle|arr[êe]te|r[ée]duis|change|ajuste|limite|espace|coupe)\b
+    | je\s+n(?:e\s+t'?|'?)envoie\s+plus
+    | je\s+ne?\s*t'?enverrai\s+plus
+    | je\s+n'?enverrai\s+plus
+    | i'?ll\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+will\s+(?:fix|stop|reduce|change|adjust|limit|lower|cut|send)
+    | i\s+(?:won'?t|will\s+not)\s+send
+)";
+
+/// The union of the two natures, and **the only site that assembles them**.
+///
+/// Three properties, all three load-bearing:
+///
+/// 1. **Detection reads the union, and the union IS the concatenation of the
+///    two halves.** An alternative therefore cannot fall on the floor: if it
+///    disappears from a half it disappears from detection, and the ten
+///    existing 5e tests redden. That is what makes "detection is unchanged" a
+///    property of the construction rather than of a sample.
+/// 2. **The nature is never re-computed.** The nested named groups let
+///    `caps.name("accompli")` read *the branch the engine took*. Re-matching
+///    the captured fragment against an anchored regex would introduce a third
+///    predicate, a word boundary to guess, and an "unclassifiable" case with a
+///    default to name. None of that exists here.
+/// 3. **The evaluation order of detection does not move.** Two passes
+///    (accomplished first, commitment second) would change *which* violation is
+///    returned on a text carrying both — hence `matched_assertion`, hence
+///    observable behaviour. One pass over the union, then a read of the branch.
+///
+/// A second site building a regex out of one half alone would undo all three,
+/// silently and with every behavioural test still green. That is the class the
+/// repo's single-reader scans exist to refuse (mika#1833, mika#2425), and
+/// `mika2879_les_deux_moities_nont_quun_seul_site_dunion` refuses it here.
+static FREQUENCY_ASSERTION_ALTERNATION: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        format!(
+            r"(?P<assert>(?P<accompli>{FREQUENCY_ASSERTION_ACCOMPLISHED_STATE})|(?P<engagement>{FREQUENCY_ASSERTION_FUTURE_COMMITMENT}))"
+        )
+    },
+);
+
 static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
+        let assertion = &*FREQUENCY_ASSERTION_ALTERNATION;
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
+            r"(?ix)\b{assertion}(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})"
         ))
         .expect("frequency-promise assert-then-subject regex must compile")
     },
@@ -1093,8 +1311,9 @@ static FREQ_ASSERT_THEN_SUBJECT_RE: std::sync::LazyLock<regex::Regex> = std::syn
 
 static FREQ_SUBJECT_THEN_ASSERT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
     || {
+        let assertion = &*FREQUENCY_ASSERTION_ALTERNATION;
         regex::Regex::new(&format!(
-            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?)(?P<assert>{FREQUENCY_ASSERTION_ALTERNATION})"
+            r"(?ix)\b(?P<subj>{FREQUENCY_SUBJECT_ALTERNATION})(?P<gap>[^.!?\n]{{0,{CLAIM_GAP_MAX}}}?){assertion}"
         ))
         .expect("frequency-promise subject-then-assert regex must compile")
     },
@@ -1248,6 +1467,13 @@ fn first_surviving_frequency_promise(
         return Some(FrequencyPromiseMatch {
             subject: caps.name("subj")?.as_str().to_string(),
             assertion: caps.name("assert")?.as_str().to_string(),
+            // The branch the engine took, not a re-classification of the
+            // captured fragment (mika#2879 D1, property 2).
+            nature: if caps.name("accompli").is_some() {
+                FrequencyAssertionNature::AccomplishedState
+            } else {
+                FrequencyAssertionNature::FutureCommitment
+            },
         });
     }
     None
@@ -1453,6 +1679,137 @@ pub(crate) fn detect_response_language_drift(
         detected: detected.as_str(),
         detected_hits,
         expected_hits,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// mika#1680 — CJK-script response guard
+// ---------------------------------------------------------------------------
+
+/// Label used for `intent_guard_retries` tracking of the CJK-script guard
+/// (mika#1680). Inline guard at position 5i, appended at the tail of the chain.
+pub(crate) const RESPONSE_CJK_SCRIPT_LABEL: &str = "response_cjk_script";
+
+/// Ideograph floor. Below it, a text is naming a CJK string, not written in one.
+const CJK_MIN_IDEOGRAPHS: usize = 5;
+
+/// Share floor, in percent of script characters. The two bounds apply together
+/// and the tighter one bites, depending on the length of the text: the floor
+/// alone would fire on an English sentence quoting five ideographs, the share
+/// alone would fire on a three-ideograph text and nothing else.
+const CJK_MIN_SHARE_PCT: usize = 30;
+
+/// Width of the excerpt carried into the correction message, in **characters**.
+const CJK_EXCERPT_CHARS: usize = 80;
+
+/// Structured result of a response written in CJK ideographs.
+pub(crate) struct CjkScriptMatch {
+    /// Characters in U+4E00–U+9FFF.
+    pub(crate) ideographs: usize,
+    /// `char::is_alphabetic()` characters **outside** that range.
+    pub(crate) latin: usize,
+    /// `ideographs` as a percentage of `ideographs + latin`.
+    pub(crate) share_pct: usize,
+    /// Window of `CJK_EXCERPT_CHARS` characters opening on the first ideograph.
+    pub(crate) excerpt: String,
+}
+
+/// CJK Unified Ideographs, **exactly** U+4E00–U+9FFF, no more and no less.
+///
+/// The range is the one the mika#1680 AC4 probe measures
+/// (`content GLOB '*[一-鿿]*'`), and the parity is deliberate: **the guard and
+/// the probe must count the same population**, or the probe's target of 0 says
+/// nothing about the guard. The historical GLOB of the ticket body, `[一-龥]`,
+/// stops at U+9FA5 and leaks 90 codepoints — that difference is exactly the one
+/// between a probe that measures this guard and a probe that measures something
+/// else.
+///
+/// CJK punctuation (U+3000–U+303F: `。`, `（`, `、`) is **out** of the
+/// predicate, despite being present in the measured fixture. The defect
+/// measured on 2026-10-29 is a response **in Chinese**, not an English response
+/// with CJK decoration — that is the correction the 2026-06-30 14:53Z comment
+/// already made to this ticket's original framing, and reopening it would
+/// reopen the "punctuation police" class that reframing closed. Hiragana,
+/// katakana and Hangul are outside the range for the same reason: nothing has
+/// measured them, and a predicate that refuses a population with no known
+/// occurrence is a predicate whose false positives nobody can count.
+fn is_cjk_ideograph(c: char) -> bool {
+    ('\u{4E00}'..='\u{9FFF}').contains(&c)
+}
+
+/// Does this response read as written in Chinese ideographs rather than in the
+/// Latin script?
+///
+/// Fires **iff** `ideographs >= CJK_MIN_IDEOGRAPHS` **and**
+/// `ideographs * 100 >= CJK_MIN_SHARE_PCT * (ideographs + latin)`. The share is
+/// written as a cross-product rather than a division: no division means no
+/// division-by-zero to reason about, and the order of the two conjuncts
+/// guarantees a non-zero denominator anyway.
+///
+/// # Why mika#2247's guard is not reused, which is not guessable
+///
+/// `detect_response_language_drift` is the thematic neighbour and it cannot
+/// cover this. Each of the three reasons is sufficient on its own, and none is
+/// repaired by a setting:
+///
+/// 1. **It requires a *declared* language, and nothing declares one for
+///    mika-dev.** Its body opens on `let expected = expected?;`, and the value
+///    comes from the `customer_config` key `language`, which nothing in this
+///    repository emits — setting `MIKA_TENANT_LANGUAGE` is a `mika-cloud`
+///    gesture.
+/// 2. **Its verdict domain does not know Chinese, and its threshold makes it
+///    fail at the opening.** `LanguageVerdict` is `French | English |
+///    Undetermined`, measured by counting function words from two closed Latin
+///    lists with `LANGUAGE_MIN_HITS = 3`; a fully Chinese text produces tokens
+///    (ideographs are `char::is_alphabetic()`) but **zero** hits in either
+///    list, hence `Undetermined`, hence `None`.
+/// 3. **Its correction names a value that does not exist.** The re-prompt
+///    points at `set_config language = <detected>` and `TenantLanguage::parse`
+///    accepts only `fr` and `en`. There is no `zh` to name, and a guard whose
+///    correction prescribes an impossible gesture corrects nothing.
+///
+/// The consequence decides the axis: the right quantity is not the **language**
+/// but the **script**. mika#2247's declarable domain — `{fr, en}` — is entirely
+/// Latin, so "write in the Latin script" is true for **every** declarable
+/// tenant **and** for an agent that declared nothing. A script guard needs no
+/// declaration to arm itself.
+pub(crate) fn detect_cjk_script_response(text: &str) -> Option<CjkScriptMatch> {
+    let mut ideographs = 0usize;
+    let mut latin = 0usize;
+    let mut first: Option<usize> = None;
+
+    for (idx, c) in text.chars().enumerate() {
+        if is_cjk_ideograph(c) {
+            ideographs += 1;
+            if first.is_none() {
+                first = Some(idx);
+            }
+        } else if c.is_alphabetic() {
+            latin += 1;
+        }
+    }
+
+    if ideographs < CJK_MIN_IDEOGRAPHS {
+        return None;
+    }
+    let script = ideographs + latin;
+    if ideographs * 100 < CJK_MIN_SHARE_PCT * script {
+        return None;
+    }
+
+    // Built character-wise, never by byte offset: `scripts/check-byte-slices.sh`
+    // (mika#764) refuses the three byte-slicing shapes it knows, and on an
+    // ideographic text they would panic on the first multi-byte character
+    // anyway. No `// safe-byte-slice:` derogation is needed here, and the plan
+    // forbids adding one: the site is written right instead of excepted.
+    let first = first.unwrap_or(0);
+    let excerpt: String = text.chars().skip(first).take(CJK_EXCERPT_CHARS).collect();
+
+    Some(CjkScriptMatch {
+        ideographs,
+        latin,
+        share_pct: ideographs * 100 / script,
+        excerpt,
     })
 }
 
@@ -2507,7 +2864,12 @@ impl WorkCreationAction {
 /// d'`issue create`. Les deux sont listés parce que le scan des étiquettes sert
 /// aussi à la ligne de journal du verbe `create`, mais `IssueCreate` est refusé
 /// **entier** : le verbe suffit, indépendamment de ses étiquettes.
-const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
+///
+/// `pub(crate)` depuis mika#2995 : le scan de prose de `canonical_tokens.rs`
+/// cherche les mêmes trois drapeaux dans les prompts bundlés. Deux listes
+/// séparées dérivent — un quatrième drapeau ajouté ici laisserait le scan de
+/// prose aveugle sur sa forme, en silence (classe mika#2158).
+pub(crate) const ADD_LABEL_FLAGS: &[&str] = &["--add-label", "--label", "-l"];
 
 /// Reconnaît, dans un argv `gh`, un verbe qui crée du travail (mika#2573 U2).
 ///
@@ -2545,6 +2907,47 @@ pub fn detect_fallthrough_work_creation(args: &[String]) -> Option<WorkCreationA
         Some("edit") => added_dispatch_trigger_label(&args[2..])
             .map(|label| WorkCreationAction::ReadyLabelAdd { label }),
         _ => None,
+    }
+}
+
+/// Sur quelle **population** chaque motif est refusé (mika#2995 AC1).
+///
+/// # L'asymétrie est la décision, pas un oubli
+///
+/// `IssueCreate` garde sa borne de mika#2573 : il est refusé sur les tours
+/// Webhook Fallthrough, où la prémisse est qu'un événement informationnel n'est
+/// pas un ordre de créer du travail (mika#2517). Hors de ces tours, créer une
+/// issue est un geste légitime qu'aucune doctrine ne refuse.
+///
+/// `ReadyLabelAdd` est refusé sur **toute** la population, quel que soit le
+/// tour. `ready` est le consentement positif de l'opérateur au dispatch
+/// autonome (mika#841), et la garde de mika#2772 n'en lit que la PRÉSENCE : un
+/// moteur qui peut le poser se donne à lui-même le consentement qu'une garde
+/// exige d'un humain. Le 2026-10-31, c'est exactement ce qui est arrivé sur
+/// mika#2958, sur un tour qui n'était **pas** un Fallthrough — donc une borne
+/// « Fallthrough seulement » n'aurait rien refusé ce jour-là. Retirer la
+/// capacité est ce qui rend le self-consent impossible plutôt
+/// qu'improbable ; en dévaluer le geste côté lecteur est l'autre voie, et elle
+/// est suivie par le vol 2.
+///
+/// # Pourquoi un `match` et pas un `||`
+///
+/// Les deux arms énumérés rendent l'asymétrie lisible à l'endroit où elle est
+/// décidée, et un troisième motif ne compilera pas sans que son auteur dise sur
+/// quelle population il tombe. Un `matches!(action, ReadyLabelAdd{..}) || turn`
+/// enterrerait la même information dans une précédence d'opérateurs.
+///
+/// # Le booléen reste un PARAMÈTRE
+///
+/// Ce module ne lit que de l'argv et le reste (mika#2201 : un seul lecteur pour
+/// `ctx`). Le tour est fourni par l'appelant, qui est le seul à le connaître.
+pub fn work_creation_is_refused(
+    action: &WorkCreationAction,
+    is_webhook_fallthrough_turn: bool,
+) -> bool {
+    match action {
+        WorkCreationAction::ReadyLabelAdd { .. } => true,
+        WorkCreationAction::IssueCreate => is_webhook_fallthrough_turn,
     }
 }
 
@@ -3845,6 +4248,731 @@ pub fn detect_review_verdict_act(argv: &[String]) -> Option<ReviewVerdictAct> {
         return Some(ReviewVerdictAct::UnreadableBody);
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// mika#2687 — un `block[pipeline]` qui ne cite aucune garde en échec n'est pas
+// un verdict, c'est une paraphrase
+// ---------------------------------------------------------------------------
+//
+// Sur mika#2685, mika-qa a rendu deux fois `VERDICT: block[pipeline]` sur la
+// même tête `0a53b5f0` alors que `scripts/verify-pipeline.sh` (check *Pipeline
+// Artifacts*) était **verte les deux fois**. Aucune des deux revues ne portait
+// la section `PIPELINE:`, et les deux raisons énonçaient une règle qu'aucune
+// garde ne porte : *« Missing plan document in docs/plans/ »* — or
+// `verify-pipeline.sh` compte `docs/solutions/` comme doc, et passait.
+//
+// **Le prompt l'interdisait déjà.** Le prompt déployé (md5 `447f1af4…`) porte
+// à Step 2 *« Do NOT re-evaluate, second-guess, or supplement any rule a guard
+// already carries »*, et à Step 2E l'obligation de citer chaque garde avec son
+// code de sortie. Le défaut est sorti du **modèle**, pas du prompt : c'est la
+// signature exacte de mika#2172 et de mika#2237, et une troisième passe de
+// prompt serait la troisième copie d'une règle qui a déjà dérivé deux fois.
+//
+// **Pourquoi B1 (mika#2519) n'a rien vu.** B1 refuse un `block[pipeline]` sur
+// le seul auteur automatisé ; l'auteur de mika#2685 est humain. B1 s'est
+// abstenue correctement — sa population n'est pas celle-ci.
+//
+// **Pourquoi ici et pas dans `verdict_handler`.** Une rétrogradation côté
+// handler agirait **après** publication : la PR porterait déjà son
+// `changes_requested`. Le critère d'acceptation du ticket dit *« n'est pas
+// publié comme bloquant »*, donc le refus vit dans la chaîne pré-subprocess de
+// `run_gh`, là où la revue n'existe pas encore sur GitHub — la raison même que
+// mika#2237 avait écrite : *« the defect is the call, not a sentence »*.
+//
+// Ce module ne porte que le prédicat pur ; l'application (lecture de l'argv,
+// audit, refus) vit dans `skills::builtin_handlers`, parce que c'est elle qui
+// tient le `ToolContext`. Dernière de la famille à ne lire **ni le réseau ni la
+// base** : sa place dans la chaîne est juste après mika#2237 et avant mika#2455.
+
+/// Le préfixe de la ligne par laquelle une revue ouvre sa section de preuve
+/// pipeline.
+///
+/// **Jeton de fil** : prescrit par Step 2E de `qa-review/system_prompt.md`, lu
+/// ici par [`pipeline_section_present`]. Il porte sa ligne dans
+/// `scripts/canonical-tokens.tsv` avec sa tolérance et son site de match ;
+/// sans cette déclaration, `canonical-tokens-lint` ne le voit pas et la classe
+/// mika#2201 se rouvre.
+pub const PIPELINE_SECTION_LINE_PREFIX: &str = "PIPELINE:";
+
+/// Le préfixe que `scripts/verify-pipeline.sh` écrit sur stderr quand il
+/// refuse.
+///
+/// Verbatim du script, qui l'émet préfixé de `[pipeline-exempt: none] ` :
+/// `REJECT: code-only PR: …` et `REJECT: docs-only PR: …`. **Jeton de fil**,
+/// déclaré dans `scripts/canonical-tokens.tsv`.
+pub const PIPELINE_GUARD_REJECT_TOKEN: &str = "REJECT:";
+
+/// La ligne de conclusion que `scripts/verify-pipeline.sh` écrit avant son
+/// `exit 1` : `Verification FAILED: $ERRORS missing artifact(s).`
+///
+/// **Jeton de fil**, déclaré dans `scripts/canonical-tokens.tsv`. Le motif
+/// s'arrête avant le `:` : le nombre d'artefacts manquants varie, la phrase
+/// non.
+pub const PIPELINE_GUARD_FAILED_TOKEN: &str = "Verification FAILED";
+
+/// Audit-event `tool_name` de **chaque** décision du gate, refus comme
+/// autorisation.
+///
+/// Même convention que [`DEPENDABOT_VERDICT_AUDIT_TOOL`] et
+/// [`QA_CI_COHERENCE_AUDIT_TOOL`] : `audit_events` n'a pas de colonne
+/// `event_type`, `tool_name` est du TEXT libre, aucune migration. **SOLE
+/// WRITER** : `skills::builtin_handlers`.
+///
+/// La ligne est écrite aussi sur [`PipelineGroundingOutcome::Allowed`], et
+/// c'est le contrôle positif de mika#2205 : une table vide dit que le maillon
+/// n'est pas atteint, jamais qu'il ne refuse rien.
+pub const PIPELINE_GROUNDING_AUDIT_TOOL: &str = "pipeline_grounding_guard";
+
+/// Variable de désarmement du gate — le STOP opérateur, nommé et greppable.
+pub const PIPELINE_GROUNDING_GATE_ENV: &str = "MIKA_PIPELINE_GROUNDING_GATE";
+
+/// Motif des codes de sortie cités dans une section `PIPELINE:`.
+///
+/// Les **deux** formes que `qa-review` émet réellement sont couvertes : Step 2E
+/// écrit `- scripts/verify-pipeline.sh → exit 1`, et la boucle de Step 2B écrit
+/// `GUARD: $g exit=$rc`. D'où le séparateur optionnel (`=`, `:`, blancs) entre
+/// le mot et le nombre. Casse repliée : un corps de revue est de la prose.
+static PIPELINE_EXIT_CODE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bexit\b[\s:=]*([0-9]+)").expect("valid pipeline exit-code regex")
+});
+
+/// Ce que le gate conclut d'un verdict de sa population et du corps qui le
+/// porte.
+///
+/// La population a **deux membres** depuis mika#2961 : `block[pipeline]`
+/// (vol mika#2687, les trois premiers variants) et `pass` — dont le vol 2/2
+/// porte **deux** classes de refus,
+/// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`] (la section
+/// `PIPELINE:`) et [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`]
+/// (la ligne `NEGATIVE-TEST:`), évaluées dans cet ordre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineGroundingOutcome {
+    /// Le corps ne porte **aucune** ligne `PIPELINE:` — les deux revues
+    /// mesurées sur mika#2685 sont exactement dans ce cas.
+    RefusedSectionAbsent,
+    /// Le corps porte une ligne `PIPELINE:` mais rien qui cite une garde en
+    /// échec : ni code de sortie non-zéro, ni `REJECT:`, ni
+    /// `Verification FAILED`. Couvre aussi `PIPELINE: not-applicable (…)` de
+    /// Step 2D, délibérément — une garde qu'on n'a pas trouvée n'est pas une
+    /// garde qui a refusé.
+    RefusedNoFailingGuardCited,
+    /// Le corps dit tout ce qu'il faut — section présente, échec cité — mais
+    /// **aucun appel `run_shell` de cette session n'a exécuté de garde**
+    /// (mika#2687, vol 2). C'est la classe que les deux volets précédents ne
+    /// peuvent pas voir : un corps bien formé se rédige, une invocation ne se
+    /// rédige pas. Évaluée **en dernier**, parce qu'elle coûte une lecture en
+    /// base et que les deux premières sont gratuites.
+    RefusedNoGuardExecuted,
+    /// **mika#2961** — un `pass` dont le corps ne porte **aucune** ligne
+    /// `PIPELINE:`. Les trois corps mesurés du § 2 du plan (control-monitor#217,
+    /// mika#2960, mika#2691) sont exactement dans ce cas, et avec eux les 261
+    /// `pass` de la population relevée le 2026-10-29.
+    ///
+    /// **C'est la première des deux classes du membre `pass`** — la seconde est
+    /// [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`], ajoutée par
+    /// le vol 2/2 et évaluée **après** celle-ci. Les deux autres refus ne
+    /// s'appliquent délibérément pas au membre `pass` :
+    ///
+    /// - [`PipelineGroundingOutcome::RefusedNoFailingGuardCited`] serait un
+    ///   contresens. Un `pass` ne cite **aucun** échec par construction : Step 2E
+    ///   prescrit `PIPELINE: pass (<repo>)` avec un `exit 0`, et Step 2D
+    ///   `PIPELINE: not-applicable (…)` quand le dépôt n'a aucune garde. La
+    ///   polarité du second terme de mika#2687 est donc **inversée** entre les
+    ///   deux membres : `PIPELINE: not-applicable (…)` est refusé sous
+    ///   `block[pipeline]` et autorisé sous `pass` ;
+    /// - [`PipelineGroundingOutcome::RefusedNoGuardExecuted`] resterait juste,
+    ///   mais sa lecture en base reste **réservée au membre `block[pipeline]`** :
+    ///   la payer ici serait une requête sur la population la plus fréquente de
+    ///   la flotte, pour une classe que la seule présence de la section ferme
+    ///   déjà.
+    RefusedPassSectionAbsent,
+    /// **mika#2961, vol 2/2** — un `pass` qui porte bien sa section `PIPELINE:`
+    /// et **aucune** ligne `NEGATIVE-TEST:`.
+    ///
+    /// Seconde classe du membre `pass`, sur la seconde exigence que le même
+    /// paragraphe du prompt déclare obligatoire *« whichever verdict you
+    /// emit »* (`qa-review/system_prompt.md:406-415`, mika#2264). Relevé du
+    /// 2026-10-30, 60 dernières PR par dépôt : **0 ligne ancrée sur 260
+    /// `pass`** — le même régime que la section au vol 1.
+    ///
+    /// # L'ordre des deux termes, et ce qu'il préserve
+    ///
+    /// La section est évaluée **d'abord**, et ce n'est pas cosmétique : les
+    /// trois corps mesurés que le vol 1 a mis au dépôt (`MEASURED_CM217`,
+    /// `MEASURED_2960`, `MEASURED_2691` dans le module de test) ne portent
+    /// **ni l'une ni l'autre**. Avec cet ordre ils restent classés
+    /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`], et leurs trois
+    /// tests restent verts sans une ligne d'édition. L'ordre inverse les ferait
+    /// tous basculer sur ce variant-ci, pour un résultat identique en
+    /// production au prix de trois éditions de fixtures **mesurées** — ce qu'on
+    /// ne banalise pas. `mika2961_la_table_des_deux_termes_epingle_lordre`
+    /// l'épingle.
+    ///
+    /// # Ce que ce variant n'exige pas, et l'incitation perverse que ça crée
+    ///
+    /// **La présence de la ligne, rien de plus.** Le prédicat est sans ancre de
+    /// fin (voir [`negative_test_line_present`]) : aucune des quatre
+    /// dispositions du prompt — `satisfied`, `mechanical`, `missing`, `n/a` —
+    /// n'est validée, et la contradiction `pass` + `missing` que le prompt
+    /// déclare explicitement (l. 415) n'est **pas** refusée ici.
+    ///
+    /// C'est délibéré et ça se paie : la forme la moins chère à produire pour
+    /// satisfaire ce garde est `NEGATIVE-TEST: missing — … — no negative
+    /// assertion in diff`, c'est-à-dire exactement la seule que le prompt
+    /// déclare incohérente avec un `pass`. Le garde accepterait alors un corps
+    /// que son propre prompt interdit ; le remedy, lui, ne la propose pas.
+    ///
+    /// La raison de s'arrêter là est celle du vol 1 : **on ferme la classe
+    /// mesurée**, et la classe mesurée est 260 sur 260 *sans aucune ligne*. La
+    /// population de `pass` + `missing` est **vide** au relevé, et celle d'une
+    /// ligne mal formée l'est aussi par construction. Un garde dimensionné sur
+    /// une population vide est un garde dont on ne sait pas s'il mord, et dont
+    /// le premier vrai contact serait post-armement. Le bras de contradiction
+    /// et la validation des quatre dispositions attendent le chiffre de la
+    /// sonde AC5, et sont portés par le ticket de suivi de la PR de ce vol.
+    RefusedPassNegativeTestAbsent,
+    /// Rien à refuser : hors population, ou section présente **et** citant au
+    /// moins une garde en échec **et** exécution observée (ou abstention) — ou,
+    /// pour le membre `pass`, section présente **et** ligne `NEGATIVE-TEST:`
+    /// présente.
+    Allowed,
+}
+
+/// Le corps ouvre-t-il une section `PIPELINE:` ?
+///
+/// Lecture **permissive**, celle de [`body_asserts_api_surface`] et de la
+/// doctrine `guard-parser-must-be-as-permissive-as-downstream-consumer` :
+/// préfixe ancré en début de ligne (blancs de tête tolérés), casse repliée,
+/// **aucune ancre de fin**. Une course d'emphase markdown de tête est franchie
+/// (`**PIPELINE: block (mika)**`) — précédent mika#1828, que `VERDICT_RE` tient
+/// déjà sur la ligne voisine, et un modèle qui met sa section en gras n'a pas
+/// commis le défaut que ce gate ferme.
+///
+/// **Aucune exigence de reste non vide, à la différence de son voisin
+/// mika#2519** : une ligne `PIPELINE:` nue est bien une section *présente*, et
+/// elle sera refusée un cran plus loin par
+/// [`PipelineGroundingOutcome::RefusedNoFailingGuardCited`] — qui nomme la
+/// vraie cause. La faire tomber ici dirait « section absente » d'une section
+/// qui est là, et enverrait le modèle réécrire ce qu'il a déjà écrit.
+///
+/// Le prédicat lui-même vit dans [`line_prefix_present`] depuis mika#2961
+/// vol 2/2, partagé avec [`negative_test_line_present`] : signature et
+/// visibilité inchangées ici, aucun appelant ne bouge.
+pub fn pipeline_section_present(body: &str) -> bool {
+    line_prefix_present(body, PIPELINE_SECTION_LINE_PREFIX)
+}
+
+/// Le corps porte-t-il une ligne **ouvrant** sur `prefix` ?
+///
+/// Le prédicat ancré de cette famille, extrait de
+/// [`pipeline_section_present`] par mika#2961 vol 2/2 et traversé par **les
+/// deux** motifs du membre `pass` — la section `PIPELINE:` et la ligne
+/// `NEGATIVE-TEST:` ([`negative_test_line_present`]). Une seule
+/// implémentation, pour trois raisons mesurées :
+///
+/// - c'est **la** doctrine du vol : un `contains` compterait la prose d'une
+///   revue comme sa preuve. Le cas le plus net que le relevé ait produit est
+///   l'unique corps sur 260 que `contains("NEGATIVE-TEST:")` attrape — la revue
+///   de la PR du vol 1, dont la ligne de case à cocher dit que le test négatif
+///   est *reporté* ;
+/// - un futur passage du prédicat en `contains` casserait donc les tests des
+///   **deux** motifs d'un coup, au lieu d'un seul ;
+/// - le trait d'union de `NEGATIVE-TEST:` ne demande aucune règle : c'est un
+///   caractère du préfixe comme un autre, et `eq_ignore_ascii_case` le traite.
+///
+/// Les trois tolérances de la famille sont celles que
+/// `scripts/canonical-tokens.tsv` déclare en `ci+emphasis:line-anchored` pour
+/// les deux jetons : blancs de tête tolérés, course d'emphase markdown franchie
+/// (`**PIPELINE: block (mika)**`, précédent mika#1828), casse repliée, et
+/// **aucune ancre de fin**.
+///
+/// La comparaison marche caractère par caractère plutôt que par tranche
+/// d'octets : un corps de revue porte de l'UTF-8 multi-octets et
+/// `scripts/check-byte-slices.sh` refuse un offset calculé (mika#764,
+/// mika#2103).
+pub fn line_prefix_present(body: &str, prefix: &str) -> bool {
+    body.lines().any(|line| {
+        let mut chars = line
+            .trim_start()
+            .chars()
+            .skip_while(|c| *c == '*' || *c == '_');
+        for expected in prefix.chars() {
+            match chars.next() {
+                Some(got) if got.eq_ignore_ascii_case(&expected) => {}
+                _ => return false,
+            }
+        }
+        true
+    })
+}
+
+/// Le corps cite-t-il une garde réellement sortie en échec ?
+///
+/// Disjonction de trois motifs, parce que `qa-review` et
+/// `scripts/verify-pipeline.sh` donnent trois manières d'écrire le même fait :
+///
+/// 1. un code de sortie **non nul** ([`PIPELINE_EXIT_CODE_RE`]) — couvre
+///    `→ exit 1` de Step 2E et `exit=1` de la boucle de Step 2B ;
+/// 2. [`PIPELINE_GUARD_REJECT_TOKEN`] — le refus verbatim du script ;
+/// 3. [`PIPELINE_GUARD_FAILED_TOKEN`] — sa ligne de conclusion avant `exit 1`.
+///
+/// Le code de sortie est lu **chiffre par chiffre** plutôt que par `parse` :
+/// `exit 999999999999` ne doit pas dépendre d'un débordement d'entier pour
+/// être compté comme un échec, et `exit 00` doit se lire comme zéro.
+///
+/// # Dans quel sens ça se trompe
+///
+/// **Fail-open, délibérément, et la borne est nommée.** La disjonction est
+/// large : un corps dont la seule mention d'échec est un `exit 1` dans la prose
+/// d'une garde par ailleurs verte **passera**. C'est l'arithmétique de
+/// mika#2455 et de mika#2519 — un faux positif du refus rend une revue
+/// légitime impossible à poster et fait traverser la porte de merge à une PR
+/// réellement cassée ; un faux négatif laisse subsister le coût déjà payé
+/// aujourd'hui. Ce prédicat ferme la classe **mesurée** (aucune section du
+/// tout, ou une section qui ne cite aucun échec), pas toutes les manières
+/// imaginables de citer de travers.
+pub fn body_cites_failing_guard(body: &str) -> bool {
+    let cites_nonzero_exit = PIPELINE_EXIT_CODE_RE
+        .captures_iter(body)
+        .any(|caps| caps[1].chars().any(|c| c != '0'));
+    if cites_nonzero_exit {
+        return true;
+    }
+
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains(&PIPELINE_GUARD_REJECT_TOKEN.to_ascii_lowercase())
+        || lowered.contains(&PIPELINE_GUARD_FAILED_TOKEN.to_ascii_lowercase())
+}
+
+/// La classification, en une fonction pure, sur les seuls faits lus.
+///
+/// `verdict_is_pipeline_block` est passé plutôt que le `Verdict` lui-même :
+/// ce module ne dépend pas de `server::verdict`, et le point de décision doit
+/// rester testable sans construire un verdict — même convention que
+/// [`classify_dependabot_verdict`]. C'est l'appelant qui plie la casse de la
+/// classe du verdict, exactement comme `verdict_handler` la lit.
+///
+/// **La population a deux membres, et c'est le cœur de la décision** :
+/// `block[pipeline]` (mika#2687) et `pass` (mika#2961). `hold[review]`,
+/// `block[ac]`, `block[ci]`, `block[security]`, `block[dependency]` et un corps
+/// sans ligne `VERDICT:` traversent intacts. Élargir aux autres classes de
+/// `block` demanderait, pour chacune, la mesure de ce qui la fonde — les deux
+/// tickets n'en ont mesuré que deux.
+///
+/// # `verdict_is_pass` — le second membre, et sa branche en tête
+///
+/// Quatrième paramètre depuis mika#2961, sur le patron de
+/// [`classify_dependabot_verdict`] qui porte déjà ce même couple de booléens
+/// dans ce même ordre. **Les deux sont mutuellement exclusifs chez l'appelant**
+/// — un corps ne porte qu'une classe de verdict — et le `pass` est évalué **en
+/// tête** parce que son terme est le moins coûteux du lot : une seule lecture de
+/// prédicat de corps, et aucune lecture en base.
+///
+/// Ses termes sont [`pipeline_section_present`] puis
+/// [`negative_test_line_present`], en **conjonction ordonnée** (mika#2961
+/// vol 2/2), jamais [`body_cites_failing_guard`] : voir
+/// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`] pour la polarité
+/// inversée du second terme de mika#2687 entre les deux membres, et
+/// [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`] pour ce que
+/// l'ordre des deux termes du `pass` préserve.
+///
+/// # `guard_execution_observed` — le fait que le corps ne peut pas porter
+///
+/// Troisième paramètre depuis le vol 2. Il vaut *« un appel `run_shell` de
+/// **cette session** a invoqué une garde de [`PIPELINE_GUARD_SCRIPT_PATHS`] »*,
+/// lu en base par l'appelant sur le patron de B3 (mika#2565). Les deux
+/// prédicats de corps lisent de la **prose** : un modèle qui paraphrase une
+/// règle sait aussi écrire `exit 1` sous une ligne `PIPELINE:`. Seul le
+/// ledger d'outils distingue la revue qui a exécuté la garde de celle qui l'a
+/// racontée.
+///
+/// **Il est passé, jamais lu ici** — même convention que le gate : ce module
+/// reste pur et testable sans base. Et il est **fail-open par construction**,
+/// parce que l'appelant lui passe `true` sur ses trois causes d'abstention
+/// (voir [`PipelineGroundingAbstention`]) : une lecture qui n'a pas répondu
+/// n'est pas un `false`.
+pub fn classify_pipeline_block_grounding(
+    verdict_is_pipeline_block: bool,
+    verdict_is_pass: bool,
+    body: &str,
+    guard_execution_observed: bool,
+) -> PipelineGroundingOutcome {
+    if verdict_is_pass {
+        // La conjonction ordonnée du membre `pass` : la section d'abord, la
+        // ligne ensuite. L'ordre est load-bearing — il garde les trois corps
+        // mesurés du vol 1 dans leur classe d'origine (cf. la doc de
+        // `RefusedPassNegativeTestAbsent`).
+        if !pipeline_section_present(body) {
+            return PipelineGroundingOutcome::RefusedPassSectionAbsent;
+        }
+        if !negative_test_line_present(body) {
+            return PipelineGroundingOutcome::RefusedPassNegativeTestAbsent;
+        }
+        return PipelineGroundingOutcome::Allowed;
+    }
+    if !verdict_is_pipeline_block {
+        return PipelineGroundingOutcome::Allowed;
+    }
+    if !pipeline_section_present(body) {
+        return PipelineGroundingOutcome::RefusedSectionAbsent;
+    }
+    if !body_cites_failing_guard(body) {
+        return PipelineGroundingOutcome::RefusedNoFailingGuardCited;
+    }
+    if !guard_execution_observed {
+        return PipelineGroundingOutcome::RefusedNoGuardExecuted;
+    }
+    PipelineGroundingOutcome::Allowed
+}
+
+/// Les gardes que Step 2B de `qa-review/system_prompt.md` prescrit d'exécuter.
+///
+/// **Jetons de fil**, au sens strict : la liste doit rester celle de la boucle
+/// `for g in …` du prompt. Un chemin ajouté là et pas ici rend l'exécution de
+/// cette garde invisible au gate ; un chemin retiré là et gardé ici ne casse
+/// rien (la disjonction est un `any`). Aucune ligne de
+/// `scripts/canonical-tokens.tsv` ne les porte : le relevé ne rapporte que les
+/// courses de capitales, et ces chemins n'en ont aucune.
+///
+/// Le match est un `contains` sur l'`input` JSON de l'appel outil, pas un
+/// parse : l'argv exact de Step 2B est une boucle shell multi-lignes, et le
+/// seul fait recherché est *« ce nom de script est passé par là »*.
+pub const PIPELINE_GUARD_SCRIPT_PATHS: &[&str] =
+    &["scripts/verify-pipeline.sh", "scripts/plan-doc-check.sh"];
+
+/// Le `tool_name` sous lequel le ledger enregistre un appel shell.
+///
+/// Paramètre de la lecture, jamais littéral au site d'appel — convention de
+/// `find_recent_tool_invocation` (mika#2565) : deux orthographes d'un même
+/// nom d'outil feraient deux vérités.
+pub const PIPELINE_GROUNDING_SHELL_TOOL: &str = "run_shell";
+
+/// Fenêtre de la lecture du ledger d'outils, en secondes.
+///
+/// Constante et **non réglable**, à la différence de
+/// [`QA_BUILD_EVIDENCE_WINDOW_DEFAULT_SECS`] : la requête est déjà bornée par
+/// `session_id`, donc la fenêtre n'est pas le discriminant — c'est un garde-fou
+/// contre une session-singleton qui vivrait des jours. Un réglage de plus
+/// serait une variable d'environnement qu'aucune décision ne consulte.
+pub const PIPELINE_GROUNDING_WINDOW_SECS: i64 = 7200;
+
+/// Les causes pour lesquelles la preuve d'exécution **s'abstient**.
+///
+/// Même doctrine que [`DependabotAbstention`] : **format de fil**. Ces chaînes
+/// partent dans la colonne `after_value` d'`audit_events` et dans le champ
+/// `reason` d'un WARN `pipeline_grounding_abstained` ; deux orthographes d'une
+/// même cause scindent une population sans le dire (doctrine mika#2131).
+///
+/// Il n'y en a que deux, et la frontière entre elles est **la seule chose que
+/// le ledger sait dire** :
+///
+/// - une erreur de lecture est un non-réponse explicite ;
+/// - **zéro ligne `run_shell` dans la session** a deux causes qu'aucune requête
+///   ne sépare — `MIKA_STORE_TOOL_CALLS` désarmé (le ledger n'écrit rien), ou
+///   une revue reprise sur un callback de build, qui tourne sous un
+///   `session_id` tout neuf (`dispatcher.rs`, `format!("{session_prefix}-{}")`)
+///   et ne voit donc pas le `run_shell` de la session d'origine. Dans les deux
+///   cas le ledger est muet, pas accusateur.
+///
+/// Ce qui **n'est pas** une abstention : des lignes `run_shell` existent mais
+/// aucune ne nomme une garde. Là le ledger a parlé, il est vivant, et il dit
+/// que cette session n'a exécuté aucune garde. C'est le refus.
+pub struct PipelineGroundingAbstention;
+
+impl PipelineGroundingAbstention {
+    /// La base n'a pas répondu — l'échec de lecture n'est pas un `false`.
+    pub const TOOL_LEDGER_UNREADABLE: &'static str = "tool_ledger_unreadable";
+    /// Aucune ligne `run_shell` du tout : ledger désarmé, ou session reprise.
+    pub const NO_SHELL_CALL_RECORDED: &'static str = "no_shell_call_recorded";
+}
+
+/// Cet `input` d'appel outil invoque-t-il une garde de pipeline ?
+///
+/// # Ce que ce prédicat observe, et ce qu'il n'observe pas
+///
+/// Il observe qu'une garde a été **invoquée**, pas qu'elle est allée au bout.
+/// Resserrer en exigeant aussi un `GUARD: ` dans la sortie a été envisagé et
+/// **écarté** : cela ajoute un chemin de faux négatif (sortie tronquée, outil
+/// qui a timeouté avec la garde réellement lancée) du mauvais côté de
+/// l'arithmétique fail-open de mika#2455 — un faux refus rend une revue
+/// légitime impossible à poster *et* fait passer la porte de merge à une PR
+/// cassée. La classe mesurée est *« la revue n'a lancé aucune garde »*, et une
+/// invocation suffit à la fermer.
+pub fn shell_invocation_runs_pipeline_guard(input: &str) -> bool {
+    PIPELINE_GUARD_SCRIPT_PATHS
+        .iter()
+        .any(|path| input.contains(path))
+}
+
+/// Le gate est-il armé ?
+///
+/// Polarité et vocabulaire de ses deux voisins
+/// ([`qa_ci_coherence_gate_is_enabled`], [`dependabot_verdict_gate_is_enabled`]),
+/// délibérément à l'identique : armé par défaut, désarmé par le seul
+/// `0`/`false`/`off`/`no` explicite, et **toute valeur non reconnue laisse
+/// ARMÉ** avec un WARN qui nomme la valeur **entre guillemets** — sans les
+/// guillemets un espace parasite est invisible (mika#2220).
+pub fn pipeline_grounding_gate_is_enabled(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            tracing::warn!(
+                event = "pipeline_grounding_gate_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2687: MIKA_PIPELINE_GROUNDING_GATE porte une valeur non reconnue — le gate \
+                 reste ARMÉ (le défaut). Utiliser 0/false/off/no pour le désarmer."
+            );
+            true
+        }
+    }
+}
+
+/// Résolution unique par process, mise en cache.
+///
+/// Lue une fois : poser ou retirer la variable sur un process déjà démarré n'a
+/// aucun effet, par construction — même contrat que ses deux voisins. C'est
+/// pourquoi le STOP opérateur est *« poser la variable **et redémarrer** »*.
+pub fn pipeline_grounding_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        pipeline_grounding_gate_is_enabled(
+            std::env::var(PIPELINE_GROUNDING_GATE_ENV).ok().as_deref(),
+        )
+    })
+}
+
+/// Dit au démarrage que le gate est désarmé — et ne dit rien s'il est armé.
+///
+/// Même raison d'être, mot pour mot, que [`log_qa_ci_coherence_gate_state`] :
+/// le silence d'un gate désarmé se lit exactement comme le silence d'un gate
+/// sain (mika#2205).
+pub fn log_pipeline_grounding_gate_state() {
+    if !pipeline_grounding_gate_enabled() {
+        tracing::info!(
+            event = "pipeline_grounding_gate_disabled",
+            env = PIPELINE_GROUNDING_GATE_ENV,
+            "mika#2687: le gate d'ancrage du `block[pipeline]` est DÉSARMÉ — un `block[pipeline]` \
+             sans section `PIPELINE:` citant une garde en échec peut être posté"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mika#2961 — un `pass` sans section `PIPELINE:` approuve sans dire si la garde
+// du dépôt a tourné
+// ---------------------------------------------------------------------------
+//
+// Step 2E de `qa-review/system_prompt.md` exige une section `PIPELINE:` dans
+// **chaque** verdict, et plafonne à `hold[review]` celui qui en manque. Relevé
+// du 2026-10-29, 60 dernières PR par dépôt, sur les revues `mika-platform-qa`
+// dont le corps commence par `VERDICT: pass` :
+//
+// | dépôt           | `pass` | ligne `PIPELINE:` **ancrée** |
+// |-----------------|--------|------------------------------|
+// | mika            |     79 |                            0 |
+// | claude-pilot    |     96 |                            0 |
+// | mika-platform   |     70 |                            0 |
+// | control-monitor |     16 |                            0 |
+// | **total**       | **261**|                        **0** |
+//
+// **L'écart entre une mesure en `contains` et un prédicat ancré est ce qui
+// rendait la classe illisible.** Le ticket comptait 4 verdicts porteurs sur
+// mika#2691 en filtrant `body.contains("PIPELINE:")` ; les quatre portent le mot
+// **dans leur prose** — cette PR implémentait mika#2687 et parle de *« a
+// `PIPELINE:` section citing a failing guard »*. Aucune de leurs lignes n'ouvre
+// une section. Le régime réel est donc 426 sur 426 et non 422 sur 426, et le
+// prédicat de ce gate doit rester **ancré** : un `contains` compterait la prose
+// d'une revue comme sa preuve, ce qui est le fail-open que le ticket condamne.
+// C'est le test `mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`
+// qui tient cette doctrine, en assérant les deux faits sur le même corps.
+//
+// **Pourquoi élargir le garde mika#2687 plutôt qu'en écrire un second.** Le
+// défaut est le même, une classe de verdict plus loin : une exigence de prompt
+// que le modèle ne tient pas, et qu'aucun garde moteur ne refuse. La population
+// de [`classify_pipeline_block_grounding`] passe donc d'un membre à deux, et le
+// chemin `block[pipeline]` est inchangé — ses tests sont le contrôle de
+// non-régression. La place dans la chaîne pré-subprocess de `run_gh` est celle
+// de mika#2687, et sa justification tient mot pour mot : le refus vit là où la
+// revue n'existe pas encore sur GitHub.
+//
+// **Ce que ce vol ne ferme pas.** La ligne `NEGATIVE-TEST:` de mika#2264 reste
+// hors population — c'est le **vol 2/2**, et il a atterri : voir le bandeau
+// ci-dessous, qui porte sa mesure, son jeton canonique et sa classe de refus.
+// L'abstention CI de mika#2455 reste fail-open et intacte : ce vol ne change pas
+// la porte de merge, il change le **signal** — une approbation sans aucune
+// preuve pipeline n'est plus postable.
+
+/// Variable d'**armement** du gate du membre `pass` — le switch opérateur,
+/// nommé et greppable.
+///
+/// Contrat de lecture identique à [`PIPELINE_GROUNDING_GATE_ENV`] ; seule la
+/// **polarité** diverge, et c'est une décision : ce gate est **désarmé par
+/// défaut**, parce que le régime mesuré est 261 sur 261 et que l'ouverture
+/// revient à l'opérateur (AC4 du ticket).
+pub const PASS_EVIDENCE_GATE_ENV: &str = "MIKA_QA_PASS_EVIDENCE_GATE";
+
+/// Le gate du membre `pass` est-il **armé** ?
+///
+/// Vocabulaire de ses trois voisins, mot pour mot — `0`/`false`/`off`/`no`
+/// contre `1`/`true`/`on`/`yes`, casse repliée, blancs de bord tolérés — et
+/// **toute valeur non reconnue laisse au défaut** avec un WARN qui nomme la
+/// valeur **entre guillemets** : sans les guillemets un espace parasite est
+/// invisible (mika#2220).
+///
+/// La **polarité est inversée** : ici le défaut est DÉSARMÉ. Une valeur non
+/// reconnue laisse donc désarmé, ce qui est le côté sûr de l'arithmétique
+/// fail-open de mika#2455 pour un gate dont la population est la plus fréquente
+/// de la flotte.
+pub fn pass_evidence_gate_is_armed(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => true,
+        "0" | "false" | "off" | "no" => false,
+        _ => {
+            tracing::warn!(
+                event = "pass_evidence_gate_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#2961: MIKA_QA_PASS_EVIDENCE_GATE porte une valeur non reconnue — le gate \
+                 reste DÉSARMÉ (le défaut). Utiliser 1/true/on/yes pour l'armer."
+            );
+            false
+        }
+    }
+}
+
+/// Résolution unique par process, mise en cache.
+///
+/// Même contrat que [`pipeline_grounding_gate_enabled`] : lue une fois, donc
+/// poser la variable sur un process déjà démarré n'a aucun effet. Le geste
+/// d'ouverture est *« poser la variable **et redémarrer** »*.
+pub fn pass_evidence_gate_armed() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        pass_evidence_gate_is_armed(std::env::var(PASS_EVIDENCE_GATE_ENV).ok().as_deref())
+    })
+}
+
+/// Dit au démarrage que le gate du `pass` est désarmé — donc **parle par
+/// défaut**.
+///
+/// L'inversion de polarité retourne le contrôle positif de mika#2205, et c'est
+/// nommé plutôt que subi : chez [`log_pipeline_grounding_gate_state`] le silence
+/// est le cas nominal et la ligne signale le désarmement ; ici **la ligne est le
+/// cas nominal** et son absence veut dire que le garde mord. L'instrument qui
+/// distingue les deux régimes n'est donc pas cette ligne mais `audit_events`
+/// sous [`PIPELINE_GROUNDING_AUDIT_TOOL`], écrit sur `allowed` comme sur
+/// `refused`.
+pub fn log_pass_evidence_gate_state() {
+    if !pass_evidence_gate_armed() {
+        tracing::info!(
+            event = "pass_evidence_gate_disarmed",
+            env = PASS_EVIDENCE_GATE_ENV,
+            "mika#2961: le gate de preuve pipeline du `pass` est DÉSARMÉ (le défaut) — un `pass` \
+             sans section `PIPELINE:` ni ligne `NEGATIVE-TEST:` peut être posté. L'armer : poser \
+             la variable à 1 et redémarrer"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mika#2961, vol 2/2 — la ligne `NEGATIVE-TEST:` : un `pass` qui ne nomme aucun
+// invariant testé négativement
+// ---------------------------------------------------------------------------
+//
+// Le même paragraphe de prompt qui exige la section exige **exactement une**
+// ligne `NEGATIVE-TEST:` par corps de verdict, en ligne de premier niveau,
+// *« whichever verdict you emit »* (`qa-review/system_prompt.md:406-415`,
+// mika#2264 / #2268 du 2026-09-09). Relevé du 2026-10-30, 60 dernières PR par
+// dépôt, tous états, sur les revues `mika-platform-qa` dont le corps commence
+// par `VERDICT: pass`, prédicat **ancré** appliqué ligne à ligne :
+//
+// | dépôt           | `pass` | ligne ancrée | `contains("NEGATIVE-TEST:")` |
+// |-----------------|--------|--------------|------------------------------|
+// | mika            |     78 |            0 |                            1 |
+// | claude-pilot    |     96 |            0 |                            0 |
+// | mika-platform   |     70 |            0 |                            0 |
+// | control-monitor |     16 |            0 |                            0 |
+// | **total**       | **260**|        **0** |                        **1** |
+//
+// **Le régime est 260 sur 260, et l'unique `contains` est le meilleur argument
+// pour l'ancrage que la mesure ait produit.** Ce corps-là est **la revue de la
+// PR du vol 1 elle-même** (#2967), et l'occurrence vit dans une ligne de case à
+// cocher d'AC : *« satisfied: AC1 — … `NEGATIVE-TEST:` explicitly deferred to
+// vol 2 »*. Une mesure en `contains` compterait donc comme **preuve de test
+// négatif** une revue qui dit que le test négatif est reporté. Le fail-open du
+// `contains` n'est pas théorique : il a un numéro de PR, et c'est le test
+// `mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne` qui le tient.
+//
+// **Ce que ce vol ajoute, et ce qu'il réutilise tel quel.** Il ajoute un
+// préfixe, un prédicat (partagé, cf. [`line_prefix_present`]), une classe de
+// refus et un bras de `match` chez l'appelant. Il ne crée **aucun** nom
+// d'événement (`pass_evidence_refused` couvre les deux classes, discriminées par
+// `reason` — mika#2131 interdit deux populations sous un nom, pas deux motifs
+// sous une population), **aucune** variable d'environnement, **aucun**
+// `OnceLock` et **aucune** ligne de démarrage : l'interrupteur ci-dessus est
+// celui des deux classes, et l'ouvrir les arme ensemble — deux exigences que le
+// même paragraphe du prompt déclare obligatoires ne se fractionnent pas en deux
+// sous-populations armables séparément.
+//
+// **Ce que ce vol ne ferme toujours pas.** Le membre `block[pipeline]` n'est
+// **pas** étendu : son gate est armé par défaut, donc lui ajouter un terme
+// changerait le comportement au merge sans interrupteur pour le refermer. Coût
+// assumé et dans le bon sens : un `block` sans sa ligne retient un merge qui
+// l'aurait été de toute façon, un `pass` sans la sienne en ouvre un. Et la
+// **forme** de la ligne n'est pas validée (cf. la doc de
+// [`PipelineGroundingOutcome::RefusedPassNegativeTestAbsent`] pour l'incitation
+// perverse que ça laisse ouverte, et le ticket qui la suit).
+
+/// Le préfixe de la ligne par laquelle une revue nomme l'invariant qu'un test
+/// négatif assère.
+///
+/// **Jeton de fil** : prescrit par le paragraphe *« Mandatory `NEGATIVE-TEST:`
+/// line (consumed downstream) »* de `qa-review/system_prompt.md` (l. 406-415),
+/// lu ici par [`negative_test_line_present`], consommé en aval par
+/// `self-dev-webhook-qa` (mika#2264). Il porte sa ligne dans
+/// `scripts/canonical-tokens.tsv` avec sa tolérance et son site de match ;
+/// sans cette déclaration, `canonical-tokens-lint` ne le voit pas et la classe
+/// mika#2201 se rouvre. Une seule ligne y suffit : le relevé capture
+/// `/[A-Z][A-Z_]{4,}([ -][A-Z][A-Z_]+)*/`, dont l'alternative `[ -]` fait de
+/// `NEGATIVE-TEST` **un** jeton et non deux.
+///
+/// Les quatre formes que le prompt déclare, verbatim :
+///
+/// ```text
+/// NEGATIVE-TEST: satisfied — <invariant named> — <test file:symbol asserting it>
+/// NEGATIVE-TEST: mechanical — <invariant named> — no behavior change in perimeter
+/// NEGATIVE-TEST: missing — <invariant named> — no negative assertion in diff
+/// NEGATIVE-TEST: n/a — PR out of perimeter
+/// ```
+///
+/// Le prédicat est **sans ancre de fin**, donc aucune de ces quatre
+/// dispositions n'est distinguée : la seule présence du préfixe satisfait le
+/// garde. C'est la sémantique voulue, et son coût est nommé à la classe de
+/// refus.
+pub const NEGATIVE_TEST_LINE_PREFIX: &str = "NEGATIVE-TEST:";
+
+/// Le corps porte-t-il une ligne `NEGATIVE-TEST:` ?
+///
+/// Second motif du membre `pass`, sur le prédicat ancré **partagé** avec la
+/// section ([`line_prefix_present`], mika#2961 § 4.6) : blancs de tête tolérés,
+/// emphase markdown franchie, casse repliée, aucune ancre de fin. Lu en
+/// conjonction du premier terme par
+/// [`classify_pipeline_block_grounding`], jamais seul.
+pub fn negative_test_line_present(body: &str) -> bool {
+    line_prefix_present(body, NEGATIVE_TEST_LINE_PREFIX)
 }
 
 #[cfg(test)]
@@ -5348,6 +6476,428 @@ mod tests {
         );
     }
 
+    // -- mika#2879 — les deux natures de l'assertion de fréquence --
+    //
+    // ## Rouge-avant, terme par terme (AC4)
+    //
+    // Un test qui n'a jamais été rouge n'atteste rien. Chaque recette est une
+    // injection jouée sur l'arbre vert, le test lancé, l'injection retirée.
+    // Ce qui suit est ce qui a été **observé** le 2026-10-23, pas ce qui
+    // était prévu.
+    //
+    // | # | injection | observé |
+    // |---|---|---|
+    // | i | `c'est corrigé` déplacée dans la moitié engagement | **rouge** sur la table (« classée FutureCommitment, attendu AccomplishedState ») et sur le compte (3 au lieu de 4) |
+    // | ii | `i won't send` dupliquée dans la moitié accomplie | **rouge** sur la table : la première branche de l'union gagne, donc l'alternative dupliquée rend `AccomplishedState` — et sur le compte (5 au lieu de 4) |
+    // | iii | `je vais …` supprimée sans être replacée | **rouge** sur trois des dix tests de mika#2358. C'est le contrôle d'AC2 : retirer une alternative d'une moitié la retire **de la détection**, donc la détection n'a pas d'autre source que l'union |
+    // | iv | `caps.name("accompli")` → `caps.name("engagement")` | **rouge** sur la table, dès sa première ligne — les douze natures s'inversent en bloc, le test s'arrête à la première |
+    // | v | `assertion_nature` retiré du `warn!` du résidu | **rouge** sur `mika2879_les_deux_sites_5e_emettent_la_nature`, qui nomme lequel des deux sites est nu. Voir ci-dessous : ce n'est pas la forme que le plan prévoyait |
+    // | vi | un second `Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)` hors union | **rouge** sur le scan d'union, avec le chemin et la ligne. Livré aussi comme test sur source injectée, pas seulement joué |
+    //
+    // ## La recette (v) : ce qui a été livré, et pourquoi pas ce qui était prévu
+    //
+    // Le plan (R3) donnait deux issues au champ `assertion_nature`, et
+    // interdisait de livrer sans dire laquelle avait eu lieu. **Aucune des
+    // deux n'a eu lieu telle quelle**, et la raison n'est pas celle que le
+    // plan avait anticipée.
+    //
+    // L'issue (1) — un `tracing-test` sur la branche 5e — a été refusée non
+    // pour son coût en lignes mais parce qu'elle est **hors périmètre** :
+    // `tracing-test` n'est pas une dépendance de ce crate, donc l'ajouter
+    // mettrait `Cargo.toml` et `Cargo.lock` dans le diff, ce qu'AC-f refuse en
+    // toutes lettres. Une impossibilité de périmètre, pas une marge trop
+    // étroite.
+    //
+    // L'issue (2) — déclarer la recette verte — aurait donc été la suite
+    // littérale du plan. Elle a été écartée parce que le refus de (1) venait
+    // d'une raison **nouvelle**, et qu'une contre-mesure restait disponible
+    // dans le périmètre : une garde structurelle sur `agent_loop/mod.rs`,
+    // `mika2879_les_deux_sites_5e_emettent_la_nature`, qui refuse qu'un site
+    // d'émission 5e n'émette pas la nature. ~30 lignes, aucun fichier nouveau,
+    // aucune dépendance.
+    //
+    // Ce qu'elle atteste et ce qu'elle n'atteste pas, parce que la différence
+    // décide de ce que le vol 3 devra encore couvrir : elle atteste que le
+    // champ est **émis** par les deux sites ; elle n'atteste pas que la valeur
+    // émise est la bonne — c'est
+    // `mika2879_chaque_alternative_porte_la_nature_attendue` ci-dessous qui le
+    // fait, sur les douze alternatives. Ni l'une ni l'autre ne traverse la
+    // branche sous un vrai tour : le vol 3 le fera.
+
+    /// Le nombre d'alternatives d'une des deux moitiés.
+    ///
+    /// Compte les séparateurs de l'alternation plutôt que les lignes : une
+    /// alternative qui serait recollée sur la ligne d'une autre ne gonflerait
+    /// pas le compte, et c'est voulu — ce que la table pinne, c'est le nombre
+    /// d'alternatives, pas la mise en page.
+    fn alternative_count(alternation: &str) -> usize {
+        alternation.matches("\n    | ").count() + 1
+    }
+
+    /// **AC-a, première moitié : quatre et huit.**
+    ///
+    /// Le compte seul ne dit pas que la répartition est juste — c'est la table
+    /// ci-dessous qui le dit. Il dit qu'aucune alternative n'a été perdue ni
+    /// ajoutée en silence pendant la scission : douze avant, douze après.
+    #[test]
+    fn mika2879_les_douze_alternatives_sont_reparties_quatre_et_huit() {
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE),
+            4,
+            "la moitié « état accompli » porte quatre alternatives"
+        );
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_FUTURE_COMMITMENT),
+            8,
+            "la moitié « engagement sur l'avenir » porte huit alternatives"
+        );
+        assert_eq!(
+            alternative_count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE)
+                + alternative_count(FREQUENCY_ASSERTION_FUTURE_COMMITMENT),
+            12,
+            "les douze de mika#2358 sont toutes là, et une seule fois"
+        );
+    }
+
+    /// **AC-a, seconde moitié : la table de classification des douze.**
+    ///
+    /// Une ligne par alternative de la couche B, avec un texte qui fait tirer
+    /// le détecteur et la nature que le moteur doit rendre. C'est la seule
+    /// attestation qui distingue « les deux constantes existent » de « chaque
+    /// alternative est du bon côté ».
+    ///
+    /// Elle rougit sur une alternative **dupliquée** dans les deux moitiés :
+    /// la branche accomplie est la première de l'union, donc elle gagne, donc
+    /// un texte d'engagement dupliqué rend `AccomplishedState` là où la table
+    /// attend `FutureCommitment`.
+    #[test]
+    fn mika2879_chaque_alternative_porte_la_nature_attendue() {
+        use FrequencyAssertionNature::{AccomplishedState, FutureCommitment};
+
+        // (alternative, texte représentatif, nature attendue)
+        let table: &[(&str, &str, FrequencyAssertionNature)] = &[
+            // --- les quatre d'état accompli ---
+            (
+                "c'est corrigé",
+                "C'est corrigé : plus aucun message de veille technique.",
+                AccomplishedState,
+            ),
+            (
+                "i've stopped",
+                "I've stopped the daily digests.",
+                AccomplishedState,
+            ),
+            (
+                "i have reduced",
+                "I have reduced the daily digests.",
+                AccomplishedState,
+            ),
+            (
+                "it's fixed",
+                "It's fixed, the daily digest stops today.",
+                AccomplishedState,
+            ),
+            // --- les huit d'engagement sur l'avenir ---
+            (
+                "je vais corriger",
+                "Je vais corriger ça : plus aucun message de veille technique.",
+                FutureCommitment,
+            ),
+            (
+                "je réduis",
+                "Je réduis la fréquence de mes veilles techniques.",
+                FutureCommitment,
+            ),
+            (
+                "je ne t'envoie plus",
+                "Je ne t'envoie plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "je ne t'enverrai plus",
+                "Je ne t'enverrai plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "je n'enverrai plus",
+                "Je n'enverrai plus de rapport technique.",
+                FutureCommitment,
+            ),
+            (
+                "i'll reduce",
+                "I'll reduce the daily digests.",
+                FutureCommitment,
+            ),
+            (
+                "i will stop",
+                "I will stop the daily digests.",
+                FutureCommitment,
+            ),
+            (
+                "i won't send",
+                "I won't send you daily digests anymore.",
+                FutureCommitment,
+            ),
+        ];
+
+        assert_eq!(
+            table.len(),
+            12,
+            "la table couvre les douze alternatives, pas un échantillon"
+        );
+
+        for (alternative, text, expected) in table {
+            let m = detect_unactioned_frequency_promise(text, &no_tools()).unwrap_or_else(|| {
+                panic!(
+                    "l'alternative {alternative:?} doit faire tirer le détecteur : {text:?} — \
+                     si ce panic apparaît, la scission a perdu une alternative, et AC2 est faux"
+                )
+            });
+            assert_eq!(
+                m.nature, *expected,
+                "l'alternative {alternative:?} ({text:?}) est classée {:?}, attendu {expected:?}",
+                m.nature
+            );
+        }
+    }
+
+    /// **AC2, dit une fois de plus et autrement.** Les textes de la table sont
+    /// exactement ceux qui faisaient tirer le détecteur avant la scission ; le
+    /// contrôle qui compte est que les dix tests de mika#2358 ci-dessus sont
+    /// verts **sans modification**. Celui-ci ajoute la contrainte inverse : une
+    /// phrase honnête ne gagne pas une nature, elle ne fait rien tirer du tout.
+    #[test]
+    fn mika2879_une_phrase_honnete_na_pas_de_nature() {
+        for text in [
+            "Je ne peux pas régler la fréquence de mes veilles moi-même.",
+            "Tu veux que je réduise la fréquence de mes veilles techniques ?",
+            "En ce moment je t'envoie jusqu'à trois veilles techniques par jour.",
+        ] {
+            assert!(
+                detect_unactioned_frequency_promise(text, &no_tools()).is_none(),
+                "aucune violation, donc aucune nature à rendre : {text:?}"
+            );
+        }
+    }
+
+    // -- mika#2879 — le scan structurel : un seul site d'union (D3) --
+
+    const ACCOMPLISHED_CONST_NAME: &str = "FREQUENCY_ASSERTION_ACCOMPLISHED_STATE";
+    const COMMITMENT_CONST_NAME: &str = "FREQUENCY_ASSERTION_FUTURE_COMMITMENT";
+
+    /// **Livrée vide, et [`mika2879_lallowlist_dunion_est_vide`] l'y maintient.**
+    ///
+    /// La population a été recensée avant d'écrire le scan : les deux constantes
+    /// naissent avec ce vol, donc leurs usages hors union sont vides par
+    /// construction. Il n'y a rien à exempter, et il ne doit jamais y avoir rien
+    /// à exempter — une allowlist née vide est un tiroir où déposer la prochaine
+    /// infraction (mika#2323).
+    const UNION_SITE_EXCEPTIONS: &[&str] = &[];
+
+    /// Classe les lignes **non commentaires** de la moitié de production d'une
+    /// source, et rend `(nombre de sites d'union, infractions)`.
+    ///
+    /// Trois classes, et la troisième est celle qui compte :
+    /// - une ligne portant **les deux** noms est le site d'union — la seule forme
+    ///   où les deux moitiés se rencontrent légitimement ;
+    /// - une ligne portant `const <NOM>` est une déclaration ;
+    /// - toute autre ligne portant l'un des deux noms est une infraction : un
+    ///   second assembleur, ou une regex bâtie « juste pour une moitié ».
+    ///
+    /// Les commentaires sont retirés par [`crate::source_scan::strip_comment_lines`]
+    /// — la prose *à propos* des deux constantes n'est pas un usage, et il y en a
+    /// plusieurs paragraphes juste au-dessus de leur déclaration (motif mika#2050).
+    /// La moitié de production est découpée par
+    /// [`crate::source_scan::production_half`], parce que ce module même porte
+    /// les deux noms dans ses propres tests.
+    fn scan_union_sites(src: &str) -> (usize, Vec<String>) {
+        let production = crate::source_scan::production_half(src);
+        let mut union_sites = 0usize;
+        let mut offenders = Vec::new();
+
+        for line in crate::source_scan::strip_comment_lines(production).lines() {
+            let accomplished = line.contains(ACCOMPLISHED_CONST_NAME);
+            let commitment = line.contains(COMMITMENT_CONST_NAME);
+            if !accomplished && !commitment {
+                continue;
+            }
+            if accomplished && commitment {
+                union_sites += 1;
+                continue;
+            }
+            let name = if accomplished {
+                ACCOMPLISHED_CONST_NAME
+            } else {
+                COMMITMENT_CONST_NAME
+            };
+            if line.contains(&format!("const {name}")) {
+                continue;
+            }
+            offenders.push(line.trim().to_string());
+        }
+
+        (union_sites, offenders)
+    }
+
+    /// **AC-e — les deux moitiés n'ont qu'un seul site d'union (D3).**
+    ///
+    /// Le mode de régression que ce vol crée : deux constantes dans le module
+    /// invitent un futur éditeur à bâtir une regex « juste pour la moitié
+    /// accomplie », par souci de performance ou pour un troisième consommateur.
+    /// Ce jour-là la détection se dédouble — deux passes, deux ordres
+    /// d'évaluation, un `matched_assertion` qui change — et **aucun test de
+    /// comportement ne le voit** : c'est la classe `grooming_marker` (mika#2158),
+    /// et c'est pourquoi les scans « ce prédicat a un seul lecteur » existent
+    /// (mika#1833, mika#2425).
+    ///
+    /// **Quand ce scan tire, on route le site par l'union ; on n'ajoute pas de
+    /// ligne** (doctrine mika#2201).
+    #[test]
+    fn mika2879_les_deux_moities_nont_quun_seul_site_dunion() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        let mut offenders = Vec::new();
+        let mut union_sites = 0usize;
+        let mut scanned = 0usize;
+        let mut stack = vec![src_root.clone()];
+
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("la garde doit pouvoir lire {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs")
+                    || crate::source_scan::is_test_source_path(&path)
+                {
+                    continue;
+                }
+                let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("la garde doit pouvoir lire {}: {e}", path.display())
+                });
+                scanned += 1;
+
+                let shown = path
+                    .strip_prefix(&src_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string();
+                if UNION_SITE_EXCEPTIONS.contains(&shown.as_str()) {
+                    continue;
+                }
+
+                let (sites, found) = scan_union_sites(&content);
+                union_sites += sites;
+                offenders.extend(found.into_iter().map(|l| format!("{shown}: {l}")));
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "la garde n'a scanné aucun fichier — chemin cassé"
+        );
+
+        // Anti-vacuité : un scan qui garde un motif que personne n'écrit ne
+        // vérifie rien, et se lit exactement comme un arbre propre. Si l'union
+        // cesse d'être une ligne unique — un rustfmt qui la scinde, par exemple
+        // — ce compte tombe à zéro et le scan doit le dire, pas passer.
+        assert_eq!(
+            union_sites, 1,
+            "mika#2879 — exactement un site d'union attendu (la ligne du \
+             `format!` qui porte les deux noms), {union_sites} trouvé(s). \
+             Zéro signifie que l'union a été scindée sur plusieurs lignes : ce \
+             scan ne garde plus rien. Plus d'un signifie un second assembleur."
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2879 — une moitié de l'assertion de fréquence est lue hors du \
+             site d'union :\n{}\n\n\
+             RÉSOLUTION : lire `FREQUENCY_ASSERTION_ALTERNATION`. Ne PAS ajouter \
+             le site à UNION_SITE_EXCEPTIONS — une seconde regex répondrait un \
+             jour différemment à la même question, en silence (classe mika#2158), \
+             et c'est AC2 qui tomberait.",
+            offenders.join("\n")
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus (R1, recette vi).
+    ///
+    /// Sans lui, « le scan voit un second site » est indistinguable de « le scan
+    /// ne voit jamais rien ». Il injecte la source plutôt que de l'écrire dans
+    /// l'arbre : un scan qui doit salir le dépôt pour être attesté n'est joué
+    /// qu'une fois.
+    #[test]
+    fn mika2879_le_scan_dunion_rougit_sur_un_second_site() {
+        // Le vrai arbre, tel que livré : une union, aucune infraction.
+        let canonical = concat!(
+            "const FREQUENCY_ASSERTION_ACCOMPLISHED_STATE: &str = r\"(?: c'est )\";\n",
+            "const FREQUENCY_ASSERTION_FUTURE_COMMITMENT: &str = r\"(?: je vais )\";\n",
+            "static U: LazyLock<String> = LazyLock::new(|| format!(\n",
+            "    r\"(?P<assert>(?P<accompli>{FREQUENCY_ASSERTION_ACCOMPLISHED_STATE})\
+             |(?P<engagement>{FREQUENCY_ASSERTION_FUTURE_COMMITMENT}))\"\n",
+            "));\n",
+        );
+        assert_eq!(
+            scan_union_sites(canonical),
+            (1, Vec::new()),
+            "la forme livrée doit se lire comme un site d'union et rien d'autre"
+        );
+
+        // L'infraction que le scan existe pour refuser : une seconde regex
+        // bâtie sur une seule moitié.
+        let (sites, offenders) = scan_union_sites(&format!(
+            "{canonical}\nstatic ACCOMPLI_ONLY: LazyLock<Regex> = LazyLock::new(|| {{\n    \
+             Regex::new(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE).unwrap()\n}});\n"
+        ));
+        assert_eq!(sites, 1, "le site légitime reste reconnu comme tel");
+        assert_eq!(
+            offenders.len(),
+            1,
+            "le second lecteur d'une moitié doit être vu : {offenders:?}"
+        );
+        assert!(
+            offenders[0].contains(ACCOMPLISHED_CONST_NAME),
+            "l'infraction doit nommer la constante lue : {offenders:?}"
+        );
+
+        // Bonne foi dans l'autre sens, les deux formes hors population.
+        let (_, prose_only) = scan_union_sites(
+            "/// `FREQUENCY_ASSERTION_ACCOMPLISHED_STATE` porte les quatre formes.\n\
+             // On n'utilise plus FREQUENCY_ASSERTION_FUTURE_COMMITMENT ailleurs.\n",
+        );
+        assert!(
+            prose_only.is_empty(),
+            "une mention en commentaire n'est pas un usage (classe mika#2050) : \
+             {prose_only:?}"
+        );
+
+        let (_, test_only) = scan_union_sites(concat!(
+            "const X: u8 = 0;\n",
+            "\n#[cfg(test)]\nmod tests {\n",
+            "    let n = count(FREQUENCY_ASSERTION_ACCOMPLISHED_STATE);\n}\n"
+        ));
+        assert!(
+            test_only.is_empty(),
+            "le code de test lit légitimement les deux moitiés — c'est ce que \
+             fait la table de classification ci-dessus : {test_only:?}"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist.
+    #[test]
+    fn mika2879_lallowlist_dunion_est_vide() {
+        assert!(
+            UNION_SITE_EXCEPTIONS.is_empty(),
+            "UNION_SITE_EXCEPTIONS est livrée vide et doit le rester : une \
+             allowlist née vide est un tiroir où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     // -- mika#2247 response language-drift tests --
 
     use crate::config_keys::TenantLanguage;
@@ -5452,6 +7002,78 @@ mod tests {
         assert!(
             detect_response_language_drift(text, None).is_none(),
             "no declaration, no ground truth, nothing to drift from"
+        );
+    }
+
+    // -- mika#1680 CJK-script response tests --
+
+    /// **AC2 of mika#1680, in one test, on measured text.**
+    ///
+    /// Three cases, and the third is the one that carries the regression value.
+    ///
+    /// 1. The Chinese response measured 2026-10-29 at 14:09:58Z in the
+    ///    `messages` table of `~/.mika/data/mika.db` (`agent_id='mika-dev'`,
+    ///    `role='assistant'`), answering `mika ask --agent mika-dev "groom
+    ///    mika#2959"`. Transcribed verbatim in the ticket body. The test asserts
+    ///    `share_pct >= CJK_MIN_SHARE_PCT` on top of the `Some`, because a `Some`
+    ///    alone does not say *which* bound carried the decision.
+    /// 2. The English control, from the same table and the same agent.
+    /// 3. An English sentence naming a CJK filename inside backticks. It is the
+    ///    only case that reddens if someone lowers the ideograph floor or drops
+    ///    the share bound, and it is the property the prompt line of
+    ///    `write_latin_script_line` promises in its last sentence.
+    ///
+    /// # Provenance of the English fixture (the plan requires this declaration)
+    ///
+    /// The plan offers two paths and asks which one was used. **Path 2 was
+    /// used.** Path 1 — reading the live table from the dispatch sandbox — was
+    /// tried first and refused: `sqlite3 ~/.mika/data/mika.db "SELECT content
+    /// FROM messages WHERE agent_id='mika-dev' AND role='assistant' AND content
+    /// NOT GLOB '*[一-鿿]*' ORDER BY created_at DESC LIMIT 1;"` exits 1 with
+    /// `Parse error: no such table: messages` — only `pilot-transcripts` is
+    /// mounted under `~/.mika/data/`, so the file resolved there is not the
+    /// agent database. Path 2 is therefore the English acknowledgement measured
+    /// 2026-06-30 at 14:48:48Z, transcribed verbatim by operator-CC into this
+    /// ticket's `UPDATE — Hard evidence captured (2026-06-30 14:53Z)` block. A
+    /// fixture whose provenance is not written down becomes, in six months, a
+    /// fixture that was invented.
+    #[test]
+    fn mika1680_le_detecteur_rougit_sur_la_reponse_chinoise_mesuree_et_pas_sur_langlaise() {
+        // Case 1 — the measured defect, 2026-10-29 14:09:58Z, verbatim.
+        let chinese = "已分派 mika#2959 的梳理任务。正在等待通过回调获取架构师评审结果（任务：3c94d788-6e36-4a7c-8fe1-59369c8c92c8）。";
+        let m = detect_cjk_script_response(chinese)
+            .expect("the response measured on 2026-10-29 at 14:09:58Z is the founding defect");
+        assert!(
+            m.ideographs >= CJK_MIN_IDEOGRAPHS,
+            "{} ideographs must clear the floor of {CJK_MIN_IDEOGRAPHS}",
+            m.ideographs
+        );
+        assert!(
+            m.share_pct >= CJK_MIN_SHARE_PCT,
+            "the measured response is majority-ideographic: {}% must clear {CJK_MIN_SHARE_PCT}%",
+            m.share_pct
+        );
+        assert!(
+            m.excerpt.starts_with('已'),
+            "the excerpt opens on the first ideograph, got {:?}",
+            m.excerpt
+        );
+
+        // Case 2 — the English control, same table, same agent (see provenance).
+        let english = "Engine confirmed: `issue_comment.created` webhook is not authorized \
+                       for dispatch (mika#933). mika#1665 grooming completed - plan located \
+                       in the `fix/1665/calibration-refusal-regression-max-tokens` branch, \
+                       `ready` label applied. Task `f76f594e` created and in `in_progress`.";
+        assert!(
+            detect_cjk_script_response(english).is_none(),
+            "a measured English acknowledgement must never be re-prompted"
+        );
+
+        // Case 3 — the legitimate citation, and the bound that makes it pass.
+        let citation = "the fixture lives in `任务.md`, see above";
+        assert!(
+            detect_cjk_script_response(citation).is_none(),
+            "naming a CJK string that is itself data is the contract the prompt line grants"
         );
     }
 
@@ -5965,6 +7587,74 @@ mod tests {
                 produced.len(),
                 "the registry has an entry no variant produces — a dead value in a wire \
                  format reads exactly like a live one"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2995 — `work_creation_is_refused` : la population par motif
+    // -----------------------------------------------------------------------
+
+    /// Les quatre cases de la table (motif × tour). Chacune est un test, parce
+    /// que chacune est une **population** distincte et qu'un seul test
+    /// paramétré rendrait l'asymétrie illisible dans le nom de ce qui rougit.
+    mod mika2995 {
+        use super::super::*;
+
+        fn ready_label_add() -> WorkCreationAction {
+            WorkCreationAction::ReadyLabelAdd {
+                label: "ready".to_string(),
+            }
+        }
+
+        /// Sur un tour Fallthrough, `ready_label_add` était déjà refusé par
+        /// mika#2573. Ce vol ne l'affaiblit pas.
+        #[test]
+        fn ready_label_add_est_refuse_sur_un_tour_fallthrough() {
+            assert!(work_creation_is_refused(&ready_label_add(), true));
+        }
+
+        /// **La case que ce vol ajoute, et l'incident fondateur.**
+        ///
+        /// Le 2026-10-31 à 16:51:37Z, `run_gh` a été appelé avec
+        /// `["issue", "edit", "2958", "--add-label", "ready"]` sur un tour
+        /// ordinaire — pas un Fallthrough. La borne de mika#2573 n'avait donc
+        /// rien à refuser, et la garde de consentement de mika#2772 a lu la
+        /// présence du label une minute plus tard comme un consentement
+        /// d'opérateur.
+        #[test]
+        fn ready_label_add_est_refuse_hors_dun_tour_fallthrough() {
+            assert!(
+                work_creation_is_refused(&ready_label_add(), false),
+                "mika#2995 — la pose de `ready` est refusée sur TOUTE la population. Si ce \
+                 test rougit, l'asymétrie a été perdue et le moteur peut à nouveau se \
+                 donner le consentement que mika#2772 exige d'un opérateur (mika#841)."
+            );
+        }
+
+        /// `issue create` garde sa borne mika#2573.
+        #[test]
+        fn issue_create_est_refuse_sur_un_tour_fallthrough() {
+            assert!(work_creation_is_refused(
+                &WorkCreationAction::IssueCreate,
+                true
+            ));
+        }
+
+        /// **Le contrôle négatif de l'asymétrie.**
+        ///
+        /// Hors d'un tour Fallthrough, créer une issue est un geste légitime —
+        /// c'est la moitié de la table que mika#2573 a délibérément laissée
+        /// passer, et un refus qui l'emporterait ferait de ce vol un
+        /// élargissement silencieux. Si ce test rougit, la décision à prendre
+        /// est de restaurer, pas de mettre l'attente à jour.
+        #[test]
+        fn issue_create_passe_hors_dun_tour_fallthrough() {
+            assert!(
+                !work_creation_is_refused(&WorkCreationAction::IssueCreate, false),
+                "mika#2573 — hors d'un tour Webhook Fallthrough, `gh issue create` n'est \
+                 pas refusé. mika#2995 retire une capacité au moteur, il n'en retire pas \
+                 deux."
             );
         }
     }
@@ -8072,6 +9762,1087 @@ mod tests {
             "two channels share one wire value: their populations would merge \
              silently"
         );
+    }
+
+    // -- mika#2687 — un `block[pipeline]` qui ne cite aucune garde en échec --
+    mod mika2687 {
+        use super::super::*;
+
+        /// Le troisième paramètre, nommé plutôt qu'écrit `true` : un booléen
+        /// positionnel au bout d'un appel ne dit pas lequel des trois faits il
+        /// porte. Les cas du vol 1 passent `GUARD_RAN` parce qu'ils mesurent
+        /// les prédicats de corps, pas la preuve d'exécution.
+        const GUARD_RAN: bool = true;
+        /// Son contraire : aucun `run_shell` de la session n'a nommé de garde.
+        const GUARD_NOT_RAN: bool = false;
+        /// Le second membre de la population (mika#2961), hors sujet pour tous
+        /// les cas de ce module. Nommé plutôt qu'écrit `false` pour la même
+        /// raison que les deux ci-dessus : c'est le **seul** changement que
+        /// l'arrivée du membre `pass` fait subir à ces tests — aucune de leurs
+        /// attentes ne bouge, ce qui est exactement le contrôle de
+        /// non-régression du chemin `block[pipeline]`.
+        const NOT_A_PASS: bool = false;
+
+        /// Revue 1 sur mika#2685, tête `0a53b5f0`, 2026-10-13 11:54Z. Aucune
+        /// section `PIPELINE:`, et la raison énonce une règle que la garde ne
+        /// porte pas : `verify-pipeline.sh` compte `docs/solutions/` comme doc,
+        /// et passait sur cette tête.
+        const MEASURED_2685_FIRST: &str = "\
+## Review
+
+VERDICT: block[pipeline]
+
+Missing plan document in docs/plans/ — pipeline compliance Check 1 fails.
+The PR changes Cargo.lock and deny.toml with a doc under docs/solutions/,
+but no plan document is present.
+";
+
+        /// Revue 2 sur mika#2685, **même tête**, 2026-10-13 17:03Z. Toujours
+        /// aucune section `PIPELINE:`.
+        const MEASURED_2685_SECOND: &str = "\
+## Review
+
+VERDICT: block[pipeline]
+
+pipeline-exempt label present but PR contains non-docs files (Cargo.lock,
+deny.toml), so label bypass does not apply.
+";
+
+        /// L'exemple bloquant de Step 2E, verbatim du prompt déployé.
+        const STEP_2E_BLOCKING: &str = "\
+VERDICT: block[pipeline]
+
+PIPELINE: block (mika)
+- scripts/verify-pipeline.sh → exit 1
+  [pipeline-exempt: none] REJECT: code-only PR: source changes present but no plan/solution doc
+          Add 'Pipeline-Exempt: code-only — <reason>' trailer to a commit
+          if this code-only ship is intentional.
+  Verification FAILED: 1 missing artifact(s).
+";
+
+        /// L'exemple vert de Step 2E — section présente, garde à `exit 0`.
+        ///
+        /// `pub(super)` depuis mika#2961 : c'est le contrôle positif T4 du
+        /// module voisin, et deux frères ne voient pas leurs items privés. La
+        /// partager plutôt que la recopier est ce qui garantit que les deux
+        /// membres de la population sont jugés sur le **même** verbatim du
+        /// prompt déployé.
+        pub(super) const STEP_2E_GREEN: &str = "\
+VERDICT: block[pipeline]
+
+PIPELINE: pass (mika)
+- scripts/verify-pipeline.sh → exit 0
+  Pipeline verification passed. Plan: <none> Compound: docs/solutions/bug-fixes/x.md
+";
+
+        // -- les deux corps mesurés : le défaut que ce gate ferme --
+
+        #[test]
+        fn mika2687_les_deux_revues_mesurees_sur_2685_sont_refusees() {
+            for (label, body) in [
+                ("2026-10-13 11:54Z", MEASURED_2685_FIRST),
+                ("2026-10-13 17:03Z", MEASURED_2685_SECOND),
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(true, NOT_A_PASS, body, GUARD_RAN),
+                    PipelineGroundingOutcome::RefusedSectionAbsent,
+                    "la revue du {label} ne porte aucune section `PIPELINE:` — \
+                     c'est exactement la classe mesurée"
+                );
+            }
+        }
+
+        // -- contrôle positif : un `block[pipeline]` fondé passe intact --
+
+        #[test]
+        fn mika2687_lexemple_bloquant_de_step_2e_passe_intact() {
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, STEP_2E_BLOCKING, GUARD_RAN),
+                PipelineGroundingOutcome::Allowed,
+                "le corps que le prompt prescrit lui-même doit traverser : un \
+                 gate qui refuse la forme canonique rend le verdict impossible \
+                 à poster"
+            );
+        }
+
+        #[test]
+        fn mika2687_la_forme_exit_egal_de_la_boucle_de_step_2b_passe_aussi() {
+            // Step 2B émet `GUARD: $g exit=$rc` ; Step 2E émet `→ exit 1`. Les
+            // deux formes sortent du même prompt et la seconde seule ne suffit
+            // pas.
+            let body = "VERDICT: block[pipeline]\n\nPIPELINE: block (mika)\nGUARD: scripts/verify-pipeline.sh exit=1\n";
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, body, GUARD_RAN),
+                PipelineGroundingOutcome::Allowed
+            );
+        }
+
+        #[test]
+        fn mika2687_lemphase_markdown_de_la_ligne_de_section_est_franchie() {
+            // Précédent mika#1828 : `VERDICT_RE` tolère déjà `**…**` sur la
+            // ligne voisine. Un modèle qui met sa section en gras n'a pas
+            // commis le défaut que ce gate ferme.
+            for line in [
+                "**PIPELINE: block (mika)**",
+                "__PIPELINE: block (mika)__",
+                "***PIPELINE: block (mika)***",
+            ] {
+                let body = format!("VERDICT: block[pipeline]\n\n{line}\n- guard → exit 1\n");
+                assert_eq!(
+                    classify_pipeline_block_grounding(true, NOT_A_PASS, &body, GUARD_RAN),
+                    PipelineGroundingOutcome::Allowed,
+                    "{line}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2687_la_casse_et_les_blancs_de_tete_sont_tolerees_sur_la_section() {
+            let body = "VERDICT: block[pipeline]\n\n   pipeline: BLOCK (mika)\n   - guard EXIT 1\n";
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, body, GUARD_RAN),
+                PipelineGroundingOutcome::Allowed
+            );
+        }
+
+        // -- section présente, mais rien d'échoué de cité --
+
+        #[test]
+        fn mika2687_une_section_verte_est_refusee_sur_labsence_de_citation() {
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, STEP_2E_GREEN, GUARD_RAN),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited,
+                "la section est là, la garde est à `exit 0` : le verdict n'est \
+                 pas fondé, et le refus doit nommer CETTE cause plutôt que \
+                 l'absence de section"
+            );
+        }
+
+        #[test]
+        fn mika2687_la_section_not_applicable_de_step_2d_est_refusee_deliberement() {
+            // Une garde qu'on n'a pas trouvée n'est pas une garde qui a refusé.
+            let body = "VERDICT: block[pipeline]\n\nPIPELINE: not-applicable (no executable guard found in mika: scripts/verify-pipeline.sh absent)\n";
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, body, GUARD_RAN),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited
+            );
+        }
+
+        #[test]
+        fn mika2687_une_ligne_de_section_nue_est_presente_puis_refusee_sur_la_vraie_cause() {
+            // À la différence de `body_asserts_api_surface` (mika#2519), la
+            // présence n'exige pas un reste non vide : la faire tomber ici
+            // dirait « section absente » d'une section qui est là.
+            let body = "VERDICT: block[pipeline]\n\nPIPELINE:\n";
+            assert!(pipeline_section_present(body));
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, body, GUARD_RAN),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited
+            );
+        }
+
+        // -- hors population : tout le reste traverse intact --
+
+        #[test]
+        fn mika2687_les_autres_verdicts_traversent_sans_section() {
+            for body in [
+                "VERDICT: pass\n\nAll acceptance criteria met.\n",
+                "VERDICT: hold[review]\n\nWaiting on CI.\n",
+                "VERDICT: block[ac]\n\nAC3 is not covered by any test.\n",
+                "VERDICT: block[ci]\n\nThe required Check job is red.\n",
+                "VERDICT: block[security]\n\nA secret is committed.\n",
+                "VERDICT: block[dependency]\n\nBreaking changelog entry.\n",
+                "LGTM, thanks — no verdict line at all here.\n",
+                "",
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(false, NOT_A_PASS, body, GUARD_NOT_RAN),
+                    PipelineGroundingOutcome::Allowed,
+                    "{body:?}"
+                );
+            }
+        }
+
+        // -- le lecteur de code de sortie, chiffre par chiffre --
+
+        #[test]
+        fn mika2687_un_code_de_sortie_non_nul_est_une_citation_decheck() {
+            for body in [
+                "- guard → exit 1",
+                "GUARD: g exit=1",
+                "guard exit: 2",
+                "guard EXIT 10",
+                "guard exit 127",
+                // Lu chiffre par chiffre : aucun `parse` à déborder.
+                "guard exit 999999999999999999999999",
+            ] {
+                assert!(body_cites_failing_guard(body), "{body:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_un_code_de_sortie_nul_nest_pas_une_citation_decheck() {
+            for body in [
+                "- guard → exit 0",
+                "GUARD: g exit=0",
+                "guard exit 00",
+                "guard exit: 000",
+                "the guard exited cleanly",
+            ] {
+                assert!(!body_cites_failing_guard(body), "{body:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_les_deux_jetons_verbatim_du_script_sont_des_citations() {
+            // Verbatim de `scripts/verify-pipeline.sh`, qui les émet sur
+            // stderr juste avant son `exit 1`.
+            for body in [
+                "[pipeline-exempt: none] REJECT: code-only PR: source changes present but no plan/solution doc",
+                "[pipeline-exempt: none] REJECT: docs-only PR: plan/solution present but no source changes",
+                "Verification FAILED: 1 missing artifact(s).",
+                "verification failed: 2 missing artifact(s).",
+            ] {
+                assert!(body_cites_failing_guard(body), "{body:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_la_ligne_de_succes_du_script_nest_pas_une_citation_decheck() {
+            assert!(!body_cites_failing_guard(
+                "Pipeline verification passed. Plan: <none> Compound: docs/solutions/x.md"
+            ));
+        }
+
+        // -- le gate, sur ses six entrées --
+
+        #[test]
+        fn mika2687_le_gate_est_arme_par_defaut_et_desarme_par_quatre_formes() {
+            // Armé : absent, vide, toute valeur d'armement, et **toute valeur
+            // non reconnue** — un désarmement par coquille sur un gate de
+            // sûreté serait la panne silencieuse que ce travail ferme
+            // (mika#2220).
+            for raw in [
+                None,
+                Some(""),
+                Some("   "),
+                Some("1"),
+                Some("true"),
+                Some("ON"),
+                Some("yes"),
+            ] {
+                assert!(pipeline_grounding_gate_is_enabled(raw), "{raw:?}");
+            }
+            assert!(
+                pipeline_grounding_gate_is_enabled(Some("frobnicate")),
+                "une valeur non reconnue laisse ARMÉ, avec un WARN qui la nomme"
+            );
+
+            for raw in [
+                Some("0"),
+                Some("false"),
+                Some("off"),
+                Some("NO"),
+                Some(" off "),
+            ] {
+                assert!(!pipeline_grounding_gate_is_enabled(raw), "{raw:?}");
+            }
+        }
+
+        #[test]
+        fn mika2687_les_jetons_sont_un_format_de_fil() {
+            // Ces trois chaînes sont déclarées dans
+            // `scripts/canonical-tokens.tsv` avec leur site de match. Les
+            // épingler ici fait rougir le test avant que le lint ne devienne
+            // muet sur un renommage.
+            assert_eq!(PIPELINE_SECTION_LINE_PREFIX, "PIPELINE:");
+            assert_eq!(PIPELINE_GUARD_REJECT_TOKEN, "REJECT:");
+            assert_eq!(PIPELINE_GUARD_FAILED_TOKEN, "Verification FAILED");
+            assert_eq!(PIPELINE_GROUNDING_AUDIT_TOOL, "pipeline_grounding_guard");
+            assert_eq!(PIPELINE_GROUNDING_GATE_ENV, "MIKA_PIPELINE_GROUNDING_GATE");
+        }
+
+        // -- vol 2 : la preuve d'exécution --
+
+        #[test]
+        fn mika2687_un_corps_irreprochable_sans_garde_executee_est_refuse() {
+            // Le cœur du vol 2, et la seule classe que les deux prédicats de
+            // corps ne peuvent pas voir : `STEP_2E_BLOCKING` est la forme que
+            // le prompt prescrit lui-même, section comprise et `exit 1`
+            // compris. Un modèle qui paraphrase une règle sait écrire ça.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    true,
+                    NOT_A_PASS,
+                    STEP_2E_BLOCKING,
+                    GUARD_NOT_RAN
+                ),
+                PipelineGroundingOutcome::RefusedNoGuardExecuted,
+                "un corps qui dit tout mais qu'aucune garde n'a fondé est \
+                 rédigé, pas observé"
+            );
+        }
+
+        #[test]
+        fn mika2687_la_preuve_dexecution_est_evaluee_en_dernier() {
+            // L'ordre est une décision, pas un hasard : les deux prédicats de
+            // corps sont gratuits, la preuve d'exécution coûte une lecture en
+            // base. Un corps sans section doit donc rendre `SectionAbsent`
+            // même quand l'exécution manque aussi — sinon l'appelant paierait
+            // la requête pour un refus déjà acquis, et le motif du WARN
+            // désignerait la mauvaise cause.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    true,
+                    NOT_A_PASS,
+                    MEASURED_2685_FIRST,
+                    GUARD_NOT_RAN
+                ),
+                PipelineGroundingOutcome::RefusedSectionAbsent
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(true, NOT_A_PASS, STEP_2E_GREEN, GUARD_NOT_RAN),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited
+            );
+        }
+
+        #[test]
+        fn mika2687_hors_population_la_preuve_dexecution_ne_mord_pas() {
+            // Contrôle négatif : un `pass` dont la session n'a lancé aucune
+            // garde traverse. Ce gate ferme `block[pipeline]`, il n'impose pas
+            // d'exécuter une garde pour rendre un verdict.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    false,
+                    NOT_A_PASS,
+                    STEP_2E_BLOCKING,
+                    GUARD_NOT_RAN
+                ),
+                PipelineGroundingOutcome::Allowed
+            );
+        }
+
+        #[test]
+        fn mika2687_un_appel_shell_qui_nomme_une_garde_est_reconnu() {
+            // Verbatim de la boucle de Step 2B, telle qu'elle arrive dans
+            // l'`input` JSON de l'appel outil.
+            let step_2b = r#"{"command":"for g in scripts/verify-pipeline.sh scripts/plan-doc-check.sh; do out=$(cd \"$W\" && bash \"$W/$g\" origin/main 2>&1); rc=$?; echo \"GUARD: $g exit=$rc\"; done"}"#;
+            assert!(shell_invocation_runs_pipeline_guard(step_2b));
+
+            for path in PIPELINE_GUARD_SCRIPT_PATHS {
+                assert!(
+                    shell_invocation_runs_pipeline_guard(&format!("bash {path} origin/main")),
+                    "{path} est prescrit par Step 2B et doit être reconnu seul"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2687_les_appels_shell_de_fond_ne_sont_pas_une_garde() {
+            // Contrôle négatif du prédicat : ce sont les appels qu'une revue
+            // fait de toute façon. Si l'un d'eux comptait, la preuve
+            // d'exécution serait satisfaite par le trafic de fond — le défaut
+            // que mika#2565 avait nommé sur la fenêtre de B3.
+            for input in [
+                r#"{"command":"git diff --stat origin/main"}"#,
+                r#"{"command":"cargo test -p mika-agent"}"#,
+                r#"{"command":"ls scripts/"}"#,
+                r#"{"command":"cat docs/plans/x.md"}"#,
+            ] {
+                assert!(
+                    !shell_invocation_runs_pipeline_guard(input),
+                    "{input} n'exécute aucune garde de pipeline"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2687_les_causes_dabstention_sont_un_format_de_fil() {
+            // Même doctrine que `DependabotAbstention` (mika#2519/#2565) :
+            // ces chaînes partent en base et dans les logs, un `GROUP BY` les
+            // compte. Deux orthographes d'une cause scindent une population
+            // sans le dire.
+            assert_eq!(
+                PipelineGroundingAbstention::TOOL_LEDGER_UNREADABLE,
+                "tool_ledger_unreadable"
+            );
+            assert_eq!(
+                PipelineGroundingAbstention::NO_SHELL_CALL_RECORDED,
+                "no_shell_call_recorded"
+            );
+            assert_eq!(PIPELINE_GROUNDING_SHELL_TOOL, "run_shell");
+            assert_eq!(
+                PIPELINE_GUARD_SCRIPT_PATHS,
+                ["scripts/verify-pipeline.sh", "scripts/plan-doc-check.sh"],
+                "la liste doit rester celle de la boucle `for g in …` de Step 2B"
+            );
+        }
+
+        // -- vol 2 : le scan à lecteur unique (doctrine mika#2201/#2205) --
+
+        /// Les sites d'appel de `classify_pipeline_block_grounding` dans un
+        /// contenu de production.
+        ///
+        /// Le besoin, en un mot : un **second** lecteur appliquerait la
+        /// classification sans l'audit, sans le WARN et sans le `remedy` — un
+        /// refus muet, ou pire, une branche qui lit l'issue et n'en fait rien.
+        /// Aucune assertion de comportement ne devient fausse dans ce cas :
+        /// c'est la classe que cette maison ferme en scannant la source.
+        ///
+        /// Le prédicat anchore sur l'appel (`nom(`) et saute les lignes de
+        /// commentaire : trois paragraphes de prose *à propos* de la fonction
+        /// vivent au site de décision, et de la prose n'est pas une lecture
+        /// (motif mika#2050 Signal S). La définition est écartée par le `fn `.
+        fn classify_call_sites(content: &str) -> Vec<(usize, String)> {
+            content
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let t = line.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///") && !t.starts_with("* ")
+                })
+                .filter(|(_, line)| line.contains("classify_pipeline_block_grounding("))
+                .filter(|(_, line)| !line.contains("fn "))
+                .map(|(i, line)| (i + 1, line.trim().to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn mika2687_classify_pipeline_block_grounding_a_un_lecteur_unique() {
+            // Passe par `ProductionScanner` — et pas par une troncature à la
+            // main au premier `#[cfg(test)]`. `cargo test -p mika-common
+            // mika2398` refuse toute recomposition de la frontière
+            // production/test, sans exception possible.
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let src_root = scanner.src_root().to_path_buf();
+            let mut offenders: Vec<String> = Vec::new();
+            // `for_each` livre déjà la tranche de PRODUCTION, pas le fichier
+            // brut : la frontière est calculée par le scanner, jamais ici.
+            scanner.for_each(|path, production| {
+                for (line, text) in classify_call_sites(production) {
+                    let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+                    offenders.push(format!("{rel}:{line}: {text}"));
+                }
+            });
+
+            // L'allowlist est livrée VIDE et le reste. Une allowlist née vide
+            // n'est qu'un endroit où ranger la prochaine violation au lieu de
+            // la router : quand ce test rouge, **router le site par le lecteur
+            // unique**, ne pas ajouter de ligne (doctrine mika#2201).
+            assert_eq!(
+                offenders.len(),
+                1,
+                "mika#2687 : `classify_pipeline_block_grounding` doit avoir \
+                 exactement UN lecteur de production — \
+                 `skills::builtin_handlers::validate_pipeline_block_grounding_gated`, \
+                 le seul site qui écrit l'audit, le WARN et le `remedy`. \
+                 Trouvés : {offenders:#?}"
+            );
+            assert!(
+                offenders[0].starts_with("skills/builtin_handlers.rs:"),
+                "le lecteur unique doit rester dans `skills/builtin_handlers.rs` \
+                 (il y tient le `ToolContext`) — trouvé : {}",
+                offenders[0]
+            );
+        }
+
+        #[test]
+        fn mika2687_le_scan_de_lecteur_unique_voit_un_second_appel_fabrique() {
+            // Contrôle de bonne foi, écrit contre un extrait **fabriqué**
+            // plutôt qu'en éditant la vraie source : une garde vérifiée par
+            // son seul vert est une garde vérifiée par rien.
+            let second_reader = "\
+fn ailleurs(body: &str) -> bool {
+    // classify_pipeline_block_grounding(true, body, true) — en commentaire
+    matches!(
+        classify_pipeline_block_grounding(true, body, true),
+        PipelineGroundingOutcome::Allowed
+    )
+}
+";
+            let found = classify_call_sites(second_reader);
+            assert_eq!(
+                found.len(),
+                1,
+                "le scan doit voir l'appel réel et ignorer la ligne de \
+                 commentaire — trouvés : {found:#?}"
+            );
+
+            assert!(
+                classify_call_sites("pub fn classify_pipeline_block_grounding(\n").is_empty(),
+                "la définition n'est pas un lecteur"
+            );
+        }
+    }
+
+    /// mika#2961 — le second membre de la population : le `pass` dont le corps
+    /// ne porte aucune section `PIPELINE:`.
+    mod mika2961 {
+        use super::super::*;
+
+        /// Le membre `block[pipeline]` est hors sujet pour tout ce module :
+        /// chaque cas y arme le bit `pass` et laisse celui-ci à `false`. Nommé
+        /// plutôt qu'écrit `false`, pour la raison de `NOT_A_PASS` chez le
+        /// voisin — un booléen positionnel au bout d'un appel ne dit pas lequel
+        /// des quatre faits il porte.
+        const NOT_A_BLOCK: bool = false;
+        /// Le bit du membre de ce module.
+        const IS_A_PASS: bool = true;
+        /// Son contraire — pour les deux seuls cas de ce module qui sortent de
+        /// la population : le contraste du gate désarmé, et la moitié
+        /// `block[pipeline]` de l'assertion de polarité.
+        const NOT_A_PASS: bool = false;
+        /// Quatrième paramètre. Le membre `pass` ne lit **pas** le ledger
+        /// d'exécution (cf. la doc de
+        /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`]) : son
+        /// appelant passe donc `true` en dur, et la valeur n'a aucun effet sur
+        /// cette branche. `mika2961_la_preuve_dexecution_nest_pas_lue_par_le_pass`
+        /// en fait une propriété assérée plutôt qu'une convention d'écriture.
+        const GUARD_RAN: bool = true;
+
+        // -- les trois corps mesurés du § 2 du plan --
+        //
+        // Têtes verbatim, tronquées au gabarit des fixtures `MEASURED_2685_*`
+        // du module voisin. La troncature ne peut pas fabriquer le refus : la
+        // ligne `PIPELINE:` est **absente de la totalité** des trois corps, et
+        // chaque doc ci-dessous porte le compte mesuré qui l'établit.
+
+        /// control-monitor#217, revue APPROVED du 2026-10-29T14:26:24Z — le cas
+        /// d'origine du ticket : abstention CI (`qa_ci_coherence_abstained`,
+        /// `reason "gh_failed"`), dépôt sans aucune garde, merge manuel.
+        ///
+        /// Mesuré sur le corps **entier** : 30 lignes, **0** ligne `PIPELINE:`
+        /// ancrée, `contains("PIPELINE:")` **faux**, `NEGATIVE-TEST:` absent.
+        /// Step 2D exigeait pourtant un `PIPELINE: not-applicable (…)` — c'est
+        /// la ligne de [`STEP_2D_NOT_APPLICABLE`] ci-dessous.
+        const MEASURED_CM217: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Idempotent POST /messages on client_ref with detached delivery, reconcile command, and 5 ACs all verified against source.
+
+DIFF ANALYSIS:
+Files reviewed: 11
+Key changes:
+- messages.rs: client_ref field (optional, serde default), delivered_under() replay detection
+
+BUILD VERIFICATION: skipped (control-monitor PR — build_mika does not apply; cm CI gates are the build verification)
+
+FINDINGS: none
+";
+
+        /// mika#2960, revue du 2026-10-29T13:57:06Z — la même classe sur ce
+        /// dépôt-ci, la veille du ticket, sur une PR qui *a* une garde
+        /// exécutable.
+        ///
+        /// Mesuré sur le corps entier : 41 lignes, **0** ligne ancrée,
+        /// `contains("PIPELINE:")` **faux**, `NEGATIVE-TEST:` absent. Son
+        /// `BUILD VERIFICATION:` dit `Build: pass` — donc une garde *a* tourné,
+        /// et le corps n'en porte pas la trace au format exigé.
+        const MEASURED_2960: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Vol 1/2 of mika#2958 — le geste de groom de la relève existe, derrière un interrupteur OFF par défaut, avec son exception nommée au scan, sa table de vérité et son contrôle négatif. Build pass, tous les AC structurels vérifiés.
+
+DIFF ANALYSIS:
+Files reviewed: 7
+Key changes:
+- Nouveau fichier `groom_trigger.rs` (598 lignes) : déclare `ENV_GROOM_WRITE`, `groom_write_is_armed()` (lecteur unique)
+
+BUILD VERIFICATION:
+Build: pass
+ACs tested: 0 (cargo test refused by shell tool budget policy — 30s limit exceeded)
+";
+
+        /// mika#2691, revue du 2026-10-14T14:00:51Z — **le corps que le ticket
+        /// comptait comme porteur**, et le plus utile des trois.
+        ///
+        /// Mesuré sur le corps entier : 39 lignes, **0** ligne ancrée, et
+        /// `contains("PIPELINE:")` **vrai** — le mot est dans la ligne `REASON:`
+        /// ci-dessous, parce que cette PR implémentait mika#2687 et *parle* de
+        /// la section. Les trois autres revues `pass` de #2691
+        /// (15:05:35Z, 15:20:47Z, 16:25:27Z) sont dans le même cas.
+        const MEASURED_2691: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Pipeline grounding gate correctly refuses block[pipeline] verdicts without a PIPELINE: section citing a failing guard; all 3 ACs verified.
+
+PR: wip(mika#2687): trailing content after pilot end_turn (mika#1383)
+Size: +1815 -0, 8 files
+State: OPEN
+
+DIFF ANALYSIS:
+Files reviewed: 8
+";
+
+        /// La sortie de Step 2D, verbatim de `system_prompt.md:275` — la ligne
+        /// exacte que control-monitor#217 devait porter, et le contrôle positif
+        /// qui fixe la **polarité inversée** du second terme de mika#2687 :
+        /// `not-applicable` est refusé sous `block[pipeline]`
+        /// ([`PipelineGroundingOutcome::RefusedNoFailingGuardCited`]) et
+        /// autorisé sous `pass`.
+        const STEP_2D_NOT_APPLICABLE: &str = "\
+VERDICT: pass
+
+PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/verify-pipeline.sh, scripts/plan-doc-check.sh)
+";
+
+        /// La revue `pass` de **PR #2967** — le vol 1 de ce ticket — réduite à
+        /// ses lignes utiles, lue le 2026-10-30 par
+        /// `gh pr view 2967 --repo senara-solutions/mika --json reviews`.
+        ///
+        /// C'est le **seul** corps sur les 260 `pass` mesurés le 2026-10-30 qui
+        /// contient la chaîne `NEGATIVE-TEST:`, et il ne la porte pas en tête de
+        /// ligne : elle vit au milieu de la prose d'une case AC, où elle dit que
+        /// la ligne est *reportée au vol 2*. Un prédicat en `contains`
+        /// compterait donc cette phrase comme la preuve de test négatif de la
+        /// revue — et la seule occurrence de la population serait un faux
+        /// positif. C'est le motif du vol 1 sur `MEASURED_2691`, rejoué un vol
+        /// plus tard sur l'autre jeton, ce qui est la mesure la plus forte dont
+        /// dispose la doctrine du prédicat ancré : elle s'est reproduite.
+        ///
+        /// Le corps ne porte **pas non plus** de section `PIPELINE:` ancrée
+        /// (`PLAN-AC VERIFICATION:` et `Plan:` n'en sont pas une), donc la
+        /// conjonction ordonnée le classe en
+        /// [`PipelineGroundingOutcome::RefusedPassSectionAbsent`] — pas dans la
+        /// classe neuve. Le test qui le lit l'asserte explicitement : c'est
+        /// l'ordre des deux termes qui décide, et ce corps est la preuve que
+        /// l'ordre reste lisible même sur le corps qui a motivé le second terme.
+        const MEASURED_2967_PROSE: &str = "\
+VERDICT: pass
+DEPTH: code-level
+REASON: Pipeline evidence gate for `pass` verdicts — refusal path in same guard as mika#2687, env switch with inverted polarity (default OFF), build passes, all structural ACs verified.
+
+PLAN-AC VERIFICATION:
+Plan: docs/plans/2026-10-29-005-fix-2961-un-pass-sans-section-pipeline-plan.md
+ACs evaluated: 5
+- [✅] satisfied: AC1 — Refusal (not plafonnement) in same guard as mika#2687: `RefusedPassSectionAbsent` variant + `pass_evidence_gate_armed()` check in `validate_pipeline_block_grounding_gated` (guards.rs:4474). `NEGATIVE-TEST:` explicitly deferred to vol 2 (§ 4.6).
+
+BUILD VERIFICATION:
+Build: pass (cargo build --release --features telemetry)
+";
+
+        /// Un `pass` **conforme** au prompt : la section verbatim de Step 2E
+        /// *plus* la ligne de test négatif, dans la forme `satisfied` de
+        /// `system_prompt.md:409`.
+        ///
+        /// C'est le contrôle positif du membre `pass` depuis le vol 2/2 — celui
+        /// que [`super::mika2687::STEP_2E_GREEN`] tenait au vol 1, avant que la
+        /// conjonction lui retire le second terme. Il est **composite**, et le
+        /// dit : ses deux moitiés sont verbatim du prompt, leur assemblage ne
+        /// l'est pas, parce que la population mesurée n'offre aucun corps qui
+        /// porte les deux (0 sur 260 — c'est le défaut du ticket).
+        const PASS_CONFORME: &str = "\
+VERDICT: pass
+
+PIPELINE: pass (mika)
+- scripts/verify-pipeline.sh → exit 0
+  Pipeline verification passed. Plan: <none> Compound: docs/solutions/bug-fixes/x.md
+
+NEGATIVE-TEST: satisfied — mika2961_un_pass_qui_porte_la_section_mais_pas_la_ligne_est_refuse pins the refusal
+";
+
+        /// La même conformité pour un dépôt **sans garde** : la sortie Step 2D
+        /// verbatim, plus la ligne de test négatif dans sa forme `n/a` de
+        /// `system_prompt.md:412`.
+        ///
+        /// C'est la composition que control-monitor#217 devait porter, et donc
+        /// la réponse à la question qu'un lecteur du ticket posera : le garde
+        /// n'exige pas d'un dépôt sans garde qu'il invente un test négatif.
+        const PASS_CONFORME_NOT_APPLICABLE: &str = "\
+VERDICT: pass
+
+PIPELINE: not-applicable (no executable guard found in <repo>: checked scripts/verify-pipeline.sh, scripts/plan-doc-check.sh)
+
+NEGATIVE-TEST: n/a — PR out of perimeter for an executable invariant
+";
+
+        /// [`PASS_CONFORME`] **privé de ses deux lignes de section** — la
+        /// quatrième combinaison de la table des deux termes, celle que la
+        /// population mesurée n'offre pas : une ligne de test négatif sans
+        /// section.
+        ///
+        /// Dérivé, et non mesuré : c'est dit ici parce que la distinction porte
+        /// tout le poids des autres fixtures de ce module. Sa seule raison
+        /// d'être est d'épingler l'**ordre** des deux termes — sans elle, un
+        /// échange des deux `if` resterait vert.
+        const PASS_LIGNE_SANS_SECTION: &str = "\
+VERDICT: pass
+
+NEGATIVE-TEST: satisfied — mika2961_un_pass_qui_porte_la_section_mais_pas_la_ligne_est_refuse pins the refusal
+";
+
+        // -- T1, T2 : les deux corps que le ticket demande d'arrêter --
+
+        #[test]
+        fn mika2961_les_deux_corps_mesures_sont_arretes() {
+            for (label, body) in [
+                ("control-monitor#217 @ 2026-10-29T14:26:24Z", MEASURED_CM217),
+                ("mika#2960 @ 2026-10-29T13:57:06Z", MEASURED_2960),
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, body, GUARD_RAN),
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                    "{label} : un `pass` sans aucune ligne `PIPELINE:` — \
+                     c'est la classe mesurée, 261 sur 261"
+                );
+            }
+        }
+
+        // -- T3 : les deux faits sur le même corps --
+
+        #[test]
+        fn mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section() {
+            // Ce test porte à lui seul la doctrine du prédicat ancré, et il
+            // remplace le contrôle positif qu'AC2 demandait sans pouvoir
+            // l'obtenir : aucune revue `pass` de #2691 ne porte de ligne de
+            // section. Les deux assertions sont sur le MÊME corps, et c'est
+            // tout l'intérêt — séparées, chacune reste vraie après un passage
+            // du prédicat en `contains`.
+            assert!(
+                MEASURED_2691.contains(PIPELINE_SECTION_LINE_PREFIX),
+                "le corps contient bien la chaîne `PIPELINE:` — c'est ce que le \
+                 ticket a mesuré, et c'est pour ça qu'il comptait 4 verdicts \
+                 porteurs sur #2691"
+            );
+            assert!(
+                !pipeline_section_present(MEASURED_2691),
+                "et il n'ouvre aucune section : le mot est dans la prose de la \
+                 ligne `REASON:`. Un prédicat en `contains` compterait cette \
+                 prose comme la preuve pipeline de la revue — le fail-open même \
+                 que ce garde ferme"
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, MEASURED_2691, GUARD_RAN),
+                PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                "donc le garde l'arrête, et le régime réel est 426 sur 426 et \
+                 non 422 sur 426"
+            );
+        }
+
+        // -- T4′, T5′ : les deux contrôles positifs du vol 1, que la
+        // conjonction du vol 2 fait basculer — et c'est l'assertion que le
+        // second terme existe --
+
+        #[test]
+        fn mika2961_un_pass_qui_porte_la_section_mais_pas_la_ligne_est_refuse() {
+            // T4′ — `STEP_2E_GREEN` est la fixture déjà au dépôt, verbatim de
+            // l'exemple vert de Step 2E. Elle déclare `block[pipeline]` dans
+            // son texte, ce qui n'a aucun effet ici : la classification lit des
+            // booléens passés par son appelant, pas la ligne du corps.
+            //
+            // Au vol 1 ce corps était le contrôle positif du membre `pass`
+            // (`…_un_pass_qui_porte_la_section_passe`, attendu `Allowed`). Le
+            // vol 2/2 le fait basculer, et la fixture n'est PAS mutée pour le
+            // ramener au vert : elle est `pub(super)` et partagée avec le
+            // module mika2687, où elle sert le membre `block`. Le contrôle
+            // positif du membre `pass` est désormais `PASS_CONFORME` (T7), qui
+            // porte les deux lignes.
+            assert!(
+                pipeline_section_present(super::mika2687::STEP_2E_GREEN),
+                "la section est bien là — c'est le premier terme, et il est \
+                 satisfait"
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    super::mika2687::STEP_2E_GREEN,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::RefusedPassNegativeTestAbsent,
+                "section présente, aucune ligne `NEGATIVE-TEST:` : c'est le \
+                 second terme qui mord, et le basculement de ce test est ce qui \
+                 l'atteste"
+            );
+        }
+
+        #[test]
+        fn mika2961_le_not_applicable_de_step_2d_porte_la_section_mais_pas_la_ligne_est_refuse() {
+            // T5′ — même basculement que T4′ sous `pass`. La fixture reste
+            // verbatim de `system_prompt.md:275` : c'est tout son intérêt, et
+            // la muter pour lui ajouter une ligne de test négatif ferait perdre
+            // la propriété qu'elle porte.
+            //
+            // **La seconde assertion est inchangée** — c'est la polarité
+            // inversée du second terme de mika#2687, assérée sur le MÊME corps :
+            // ce verbatim est refusé sous `block[pipeline]` (une garde qu'on
+            // n'a pas trouvée n'est pas une garde qui a refusé) et, sous
+            // `pass`, sa section est acceptée (c'est exactement ce que Step 2D
+            // prescrit à un dépôt sans garde — le cas de control-monitor), seule
+            // la ligne de test négatif lui manque.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    STEP_2D_NOT_APPLICABLE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::RefusedPassNegativeTestAbsent,
+                "sous `pass`, `not-applicable` est la section prescrite — et la \
+                 ligne `NEGATIVE-TEST:` manque encore"
+            );
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    true,
+                    NOT_A_PASS,
+                    STEP_2D_NOT_APPLICABLE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::RefusedNoFailingGuardCited,
+                "sous `block[pipeline]`, le même corps est refusé — c'est la \
+                 polarité qui interdit de réutiliser le second terme de \
+                 mika#2687 pour le membre `pass`"
+            );
+        }
+
+        // -- T6 : le `contains` de la population, une seconde fois --
+
+        #[test]
+        fn mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne() {
+            // Le pendant exact de `…_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`
+            // sur l'autre jeton, et sur le corps de la PR du vol 1. Les deux
+            // assertions sont sur le MÊME corps : séparées, chacune reste vraie
+            // après un passage du prédicat en `contains`.
+            assert!(
+                MEASURED_2967_PROSE.contains(NEGATIVE_TEST_LINE_PREFIX),
+                "le corps contient bien la chaîne — c'est l'unique occurrence \
+                 des 260 `pass` mesurés le 2026-10-30"
+            );
+            assert!(
+                !negative_test_line_present(MEASURED_2967_PROSE),
+                "et il n'ouvre aucune ligne : le jeton vit au milieu de la prose \
+                 d'une case AC, où il dit que la ligne est REPORTÉE. Un prédicat \
+                 en `contains` tiendrait cette phrase pour la preuve de test \
+                 négatif de la revue"
+            );
+            // Et la classification, qui n'est pas la classe neuve : ce corps ne
+            // porte pas non plus de section, donc le PREMIER terme mord. C'est
+            // l'ordre qui décide, et c'est pourquoi ce corps est resté dans la
+            // classe du vol 1 sans qu'aucun de ses tests ne bouge.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    MEASURED_2967_PROSE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                "les deux termes manquent : c'est le premier qui nomme le refus"
+            );
+        }
+
+        // -- T7, T8 : les contrôles positifs du membre `pass` après le vol 2 --
+
+        #[test]
+        fn mika2961_un_pass_conforme_passe() {
+            assert_eq!(
+                classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, PASS_CONFORME, GUARD_RAN),
+                PipelineGroundingOutcome::Allowed,
+                "section ET ligne : il ne reste rien à refuser — sans ce test, \
+                 un garde qui refuse TOUT `pass` resterait vert"
+            );
+        }
+
+        #[test]
+        fn mika2961_un_pass_conforme_sans_garde_au_depot_passe() {
+            // La composition que control-monitor#217 devait porter : le garde
+            // n'exige pas d'un dépôt sans garde qu'il invente un test négatif,
+            // il exige qu'il le DISE. Les deux formes `not-applicable` et `n/a`
+            // sont celles du prompt.
+            assert_eq!(
+                classify_pipeline_block_grounding(
+                    NOT_A_BLOCK,
+                    IS_A_PASS,
+                    PASS_CONFORME_NOT_APPLICABLE,
+                    GUARD_RAN
+                ),
+                PipelineGroundingOutcome::Allowed,
+                "`not-applicable` + `n/a` : la sortie prescrite d'un dépôt sans \
+                 garde traverse"
+            );
+        }
+
+        // -- T9 : la table des deux termes, qui épingle l'ORDRE --
+
+        #[test]
+        fn mika2961_la_table_des_deux_termes_epingle_lordre() {
+            // Les quatre combinaisons, dont la troisième est la seule raison
+            // d'être de `PASS_LIGNE_SANS_SECTION` : avec les trois autres
+            // seules, un échange des deux `if` de la conjonction resterait vert.
+            // L'ordre est load-bearing — c'est lui qui garde les quatre corps
+            // mesurés (les trois du vol 1 plus celui du vol 2) dans la classe
+            // du vol 1, à zéro édition de leurs tests.
+            for (label, body, section, ligne, attendu) in [
+                (
+                    "section ✓ ligne ✓",
+                    PASS_CONFORME,
+                    true,
+                    true,
+                    PipelineGroundingOutcome::Allowed,
+                ),
+                (
+                    "section ✓ ligne ✗",
+                    STEP_2D_NOT_APPLICABLE,
+                    true,
+                    false,
+                    PipelineGroundingOutcome::RefusedPassNegativeTestAbsent,
+                ),
+                (
+                    "section ✗ ligne ✓",
+                    PASS_LIGNE_SANS_SECTION,
+                    false,
+                    true,
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                ),
+                (
+                    "section ✗ ligne ✗",
+                    MEASURED_CM217,
+                    false,
+                    false,
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                ),
+            ] {
+                assert_eq!(
+                    pipeline_section_present(body),
+                    section,
+                    "{label} : le premier terme du corps"
+                );
+                assert_eq!(
+                    negative_test_line_present(body),
+                    ligne,
+                    "{label} : le second terme du corps"
+                );
+                assert_eq!(
+                    classify_pipeline_block_grounding(NOT_A_BLOCK, IS_A_PASS, body, GUARD_RAN),
+                    attendu,
+                    "{label} : la sortie de la conjonction ordonnée"
+                );
+            }
+        }
+
+        // -- le contraste qui dit que le bit décide, et lui seul --
+
+        #[test]
+        fn mika2961_hors_population_le_meme_corps_traverse() {
+            // Le contrôle négatif du gate : les trois corps mesurés sont des
+            // `pass`, mais tant que le bit n'est pas armé — gate désarmé, ou
+            // verdict d'une autre classe — ils traversent. C'est ce qui sépare
+            // « le garde mord sur sa population » de « le garde mord sur tout
+            // corps sans section ».
+            //
+            // T10 du vol 2/2 : la liste porte aussi les corps du second terme —
+            // celui de #2967 (qui contient le mot sans la ligne) et les deux
+            // verbatim du prompt privés de leur ligne. Hors population, aucun
+            // des deux termes n'est évalué.
+            for (label, body) in [
+                ("control-monitor#217", MEASURED_CM217),
+                ("mika#2960", MEASURED_2960),
+                ("mika#2691", MEASURED_2691),
+                ("mika#2967", MEASURED_2967_PROSE),
+                ("Step 2E vert, sans ligne", super::mika2687::STEP_2E_GREEN),
+                ("Step 2D not-applicable, sans ligne", STEP_2D_NOT_APPLICABLE),
+                ("ligne sans section", PASS_LIGNE_SANS_SECTION),
+            ] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(NOT_A_BLOCK, NOT_A_PASS, body, GUARD_RAN),
+                    PipelineGroundingOutcome::Allowed,
+                    "{label} hors population : rien à refuser"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2961_la_preuve_dexecution_nest_pas_lue_par_le_pass() {
+            // Propriété, pas convention : la branche `pass` rend le même
+            // verdict quelle que soit la preuve d'exécution, parce qu'elle ne
+            // la lit pas. C'est ce qui autorise l'appelant à passer `true` en
+            // dur et à ne PAS payer la lecture en base sur la population la
+            // plus fréquente de la flotte.
+            for observed in [true, false] {
+                assert_eq!(
+                    classify_pipeline_block_grounding(
+                        NOT_A_BLOCK,
+                        IS_A_PASS,
+                        MEASURED_CM217,
+                        observed
+                    ),
+                    PipelineGroundingOutcome::RefusedPassSectionAbsent,
+                    "refus sans section, quelle que soit la preuve d'exécution \
+                     ({observed})"
+                );
+                assert_eq!(
+                    classify_pipeline_block_grounding(
+                        NOT_A_BLOCK,
+                        IS_A_PASS,
+                        PASS_CONFORME,
+                        observed
+                    ),
+                    PipelineGroundingOutcome::Allowed,
+                    "et passage avec les deux lignes, de même ({observed})"
+                );
+            }
+        }
+
+        // -- V6 : la polarité de l'interrupteur --
+
+        #[test]
+        fn mika2961_linterrupteur_est_desarme_par_defaut() {
+            // La décision D5, en assertion : absente, vide, ou blancs seuls, la
+            // variable laisse le gate DÉSARMÉ. C'est l'inverse de son voisin
+            // mika#2687, et c'est pourquoi l'ouverture revient à l'opérateur.
+            for raw in [None, Some(""), Some("   ")] {
+                assert!(
+                    !pass_evidence_gate_is_armed(raw),
+                    "désarmé par défaut : {raw:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2961_le_vocabulaire_darmement_est_celui_de_ses_voisins() {
+            for raw in [
+                Some("1"),
+                Some("true"),
+                Some("on"),
+                Some("YES"),
+                Some(" On "),
+            ] {
+                assert!(pass_evidence_gate_is_armed(raw), "armé : {raw:?}");
+            }
+            for raw in [
+                Some("0"),
+                Some("false"),
+                Some("off"),
+                Some("NO"),
+                Some(" off "),
+            ] {
+                assert!(!pass_evidence_gate_is_armed(raw), "désarmé : {raw:?}");
+            }
+        }
+
+        #[test]
+        fn mika2961_une_valeur_non_reconnue_laisse_desarme() {
+            // Le côté sûr de l'arithmétique fail-open de mika#2455 : sur la
+            // population la plus fréquente de la flotte, une faute de frappe ne
+            // doit pas armer un garde dont le faux refus tue le tour sans
+            // aucune revue postée. Le WARN qui nomme la valeur entre guillemets
+            // est ce qui rend la faute lisible (mika#2220).
+            for raw in [Some("oui"), Some("2"), Some("enabled"), Some("ON!")] {
+                assert!(
+                    !pass_evidence_gate_is_armed(raw),
+                    "valeur non reconnue ⇒ défaut, donc désarmé : {raw:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika2961_le_jeton_de_linterrupteur_est_un_format_de_fil() {
+            // Même raison que chez le voisin : un opérateur, un runbook et une
+            // sonde `grep` nomment cette chaîne. La renommer sans toucher les
+            // trois est un changement muet.
+            assert_eq!(PASS_EVIDENCE_GATE_ENV, "MIKA_QA_PASS_EVIDENCE_GATE");
+        }
     }
 }
 

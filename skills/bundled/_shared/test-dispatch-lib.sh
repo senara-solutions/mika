@@ -48,48 +48,22 @@ FAIL=0
 SKIPPED=0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Le binaire `mika`, résolu UNE fois et PARTAGÉ (mika#2608 R4)
+# Le binaire `mika`, résolu UNE fois et PARTAGÉ — désormais par une bibliothèque
+# commune aux DEUX suites (mika#2608 R4, déplacé par mika#2194 vol 5 R6).
 #
 # Depuis mika#2194 `_extract_plan_path` invoque `mika` par son nom, et depuis
 # mika#2608 les deux lecteurs bash du callout délèguent à cette fonction. Donc
 # les douze cas fonctionnels de la porte de grooming (`test_groom_gate_*`,
-# invoqués vers la ligne 4210) en dépendent AUSSI — et ils tournent bien avant
-# le bloc mika#2194, qui portait cette résolution en local.
+# invoqués vers la ligne 4210) en dépendent AUSSI.
 #
-# Trois portes, dans l'ordre : le PATH (le cas production), puis les deux cibles
-# cargo (le cas dev, et CI où `cargo test` précède `make test-dispatch-lib`).
-#
-# Le PATH est augmenté pour TOUT le fichier plutôt que par bloc : `mika` est
-# appelé par son nom au fond de dispatch-lib, donc un bloc qui oublierait de
-# l'augmenter skipperait sans le dire — l'inverse du contrat de la troisième
-# colonne. Aucune variable de production n'est introduite : c'est le PATH.
-MIKA_BIN=""
-if command -v mika >/dev/null 2>&1; then
-    MIKA_BIN="$(command -v mika)"
-else
-    for _mika_cand in "$SCRIPT_DIR/../../../target/debug/mika" "$SCRIPT_DIR/../../../target/release/mika"; do
-        if [ -x "$_mika_cand" ]; then MIKA_BIN="$_mika_cand"; break; fi
-    done
-fi
-if [ -n "$MIKA_BIN" ]; then
-    PATH="$(cd "$(dirname "$MIKA_BIN")" && pwd -P):$PATH"
-    export PATH
-fi
-
-# `mika_bin_or_skip <étiquette>` — rend 0 si le binaire est là, sinon compte un
-# SKIP BRUYANT et rend 1. Le SKIP est bruyant parce qu'un bloc de porte qui n'a
-# pas pu s'armer ne doit pas se lire comme un vert (mika#2149, troisième
-# colonne). CI construit avant (`cargo test` précède `make test-dispatch-lib`
-# dans `ci.yml`), donc le SKIP est le cas dev, pas le cas CI.
-mika_bin_or_skip() {
-    [ -n "$MIKA_BIN" ] && return 0
-    SKIPPED=$((SKIPPED + 1))
-    echo "  ⊘ SKIP $1 — binaire 'mika' introuvable (PATH, target/debug, target/release)."
-    echo "    Depuis mika#2608 les deux lecteurs bash du callout délèguent à"
-    echo "    'mika plan-callout' : sans le binaire ce bloc ne peut RIEN mesurer."
-    echo "    Remède : cargo build -p mika-cli --bin mika"
-    return 1
-}
+# Le vol 5 ajoute un second dépendant hors de ce fichier : depuis la bascule,
+# `_parse_disposition` et `_parse_verdict` appellent `mika arch-disposition`, et
+# `tests/test_parse_disposition.sh` les exerce sur 55 cas. La résolution est donc
+# sortie d'ici vers `tests/lib-mika-bin.sh`, SOURCÉE par les deux — pas recopiée.
+# Recopier reproduirait, dans le geste qui retire une seconde implémentation du
+# bash, le défaut que ce geste existe pour fermer.
+# shellcheck source=skills/bundled/_shared/tests/lib-mika-bin.sh
+source "$SCRIPT_DIR/tests/lib-mika-bin.sh"
 
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
@@ -719,6 +693,26 @@ echo "-----------------------------------------"
 # shellcheck disable=SC1090
 source "$DISPATCH_LIB" 2>/dev/null || true
 
+# Les trois entrées littérales des cas de tier 0 et 0b, définies AVANT la porte
+# ci-dessous : la garde de dérive de marqueur (plus bas dans ce fichier) les lit,
+# et elle tourne même quand ce bloc skippe. Les laisser à l'intérieur les rendrait
+# indéfinies sous `set -u` le jour où le binaire manque — un SKIP qui casse un
+# autre bloc n'est plus un SKIP.
+WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
+ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
+ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
+
+# mika#2194 (vol 5) : depuis la bascule, les ~30 cas ci-dessous appellent
+# `_parse_disposition` / `_parse_verdict`, qui délèguent à `mika arch-disposition`.
+# Sans le binaire, chaque enveloppe prend son chemin de refus et rend un jeton
+# vide : les cas « aucun match » resteraient verts et tous les autres rougiraient,
+# ce qui est exactement le genre de rouge qui ne dit pas sa cause. Le SKIP la dit.
+# Forme reprise de la porte de grooming mika#2012/#2608 plus bas — le corps n'est
+# pas réindenté, délibérément, pour que le diff de ce vol reste lisible.
+if ! mika_bin_or_skip "mika#2194 formes littérales des deux lecteurs (~30 cas)"; then
+    : # le SKIP est déjà compté et dit par le helper
+else
+
 # _parse_disposition — recognizes the three literal forms
 assert_eq "_parse_disposition READY" "READY" \
     "$(printf 'Some prose.\nDisposition: READY\nMore prose.\n' | _parse_disposition)"
@@ -763,9 +757,13 @@ assert_eq "_parse_verdict empty on no match" "" \
 # sixth assertions below are the ones that fail if tier 0 ever moves down.
 #
 # The literal must stay in sync with DISPOSITION_WITHHELD_MARKER in
-# crates/mika-agent/src/agent_loop/mod.rs.
+# crates/mika-agent/src/agent_loop/mod.rs. `$WITHHELD_MARKER` est défini en tête
+# de ce bloc, au-dessus de la porte du binaire.
+#
+# mika#2194 (vol 5) : le tier 0 vit désormais dans le moteur, et ces cas
+# l'exercent à travers les enveloppes. Ce qu'ils gardent est inchangé — la
+# POSITION du tier 0 dans l'ordre des cinq — et ils n'ont pas changé d'attente.
 # ---------------------------------------------------------------------------
-WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
 
 assert_eq "tier 0 beats tier 1a (literal Disposition present)" "" \
     "$(printf 'Some review prose.\n%s\nDisposition: READY\n' "$WITHHELD_MARKER" | _parse_disposition 2>/dev/null)"
@@ -818,9 +816,14 @@ assert_eq "no marker — verdict tier 1a still returns GROOMED" "GROOMED" \
 #
 # The literal must stay in sync with REVIEW_ANCHOR_ENGINE_FINDING_MARKER in
 # crates/mika-agent/src/agent_loop/mod.rs (drift guard below, next to the marker's).
+# `$ENGINE_FINDING_MARKER` et `$ENGINE_LINE` sont définis en tête de ce bloc, au-dessus
+# de la porte du binaire — la garde de dérive les lit même quand ce bloc skippe.
+#
+# mika#2194 (vol 5) : le tier 0b a basculé dans le moteur comme les quatre autres,
+# mais `_engine_escalation_line` RESTE dans le bash — elle a un second appelant de
+# production, `_escalate_groom` (mika#2338), qui n'est pas un lecteur de disposition.
+# C'est la seule des cinq fonctions du bloc d'origine que ce vol conserve.
 # ---------------------------------------------------------------------------
-ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
-ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
 
 assert_eq "tier 0b — engine line + Disposition: ESCALATE parses ESCALATE" "ESCALATE" \
     "$(printf 'A1: x\nA2: y\n\n%s\n\nDisposition: ESCALATE\n' "$ENGINE_LINE" | _parse_disposition 2>/dev/null)"
@@ -842,6 +845,8 @@ assert_eq "echo of the marker mid-line does not force ESCALATE on a genuine ITER
     "$(printf 'Were the anchors missing the engine would write %s here.\nDisposition: ITERATE\n' "$ENGINE_FINDING_MARKER" | _parse_disposition 2>/dev/null)"
 assert_eq "verdict parser — echo of [mika-engine] in prose keeps a genuine GROOMED" "GROOMED" \
     "$(printf 'I saw a [mika-engine] re-prompt earlier.\nA1: x\nVerdict: GROOMED\n' | _parse_verdict 2>/dev/null)"
+
+fi # fin de la porte du binaire pour les formes littérales (mika#2194, vol 5)
 
 # _trail_append + _trail_read — round-trip
 TRAIL_TMP=$(mktemp -d)
@@ -1887,6 +1892,207 @@ assert_contains "the already_groomed note names the gesture that works" \
     'remove the plan from the branch AND the grooming callouts from the issue body' \
     "$SETUP_WT_SRC"
 
+# ============================================================================
+# mika#2811 — quand le refus de la porte de dispatch EST la raison du groom
+# ============================================================================
+#
+# § 1.1 du ticket : deux portes jugeaient la même question — « ce ticket est-il
+# groomé ? » — sur deux sources différentes. La porte de dispatch lit la BASE
+# (preuve `Outcome: PLAN_GROOMED`, mika#1620/#2287) ; l'auto-skip assertionné
+# ci-dessus lit le CORPS (les trois callouts). Quand elles divergent, aucune des
+# deux ne fait le travail : cinq tâches `already_groomed` de deux minutes sur
+# #1381 et #1959 le 2026-10-19, jusqu'à épuiser le budget de re-drive de
+# mika#2020. Le correctif de mika#2484 avait déplacé la boucle sans la fermer.
+#
+# Le moteur transmet désormais la provenance du refus (`ready_label_handler`,
+# champ moteur-interne lu ici), et ce dispatch-là seulement désarme l'auto-skip.
+# La provenance est TRANSMISE, jamais recalculée (motif mika#2026) : le shell ne
+# doit pas devenir un troisième lecteur de l'état de grooming (mika#2158).
+#
+# LE CROISEMENT CONTRACTUEL DE LA LIGNE 1708 RESTE VRAI, et n'a pas à être
+# assoupli : « si la garde refuse pour `already_groomed`, alors le Rust doit
+# dire groomé. » Le désarmement ne rend la garde permissive dans AUCUN des cas
+# qu'elle refusait pour eux-mêmes ; il lui retire seulement ceux où le moteur a
+# déjà constaté l'absence de preuve — et dans ceux-là le Rust ne dit justement
+# PAS groomé (c'est `MarkersWithoutProof` ou `ProofUnreadable` qui a produit la
+# cause). L'implication tient donc avec un antécédent strictement plus petit.
+# C'est écrit ici, et assertionné plus bas par la position du RESULT dans la
+# chaîne, pour que le prochain lecteur n'aille pas « corriger » le test de la
+# ligne 1726.
+
+# --- (a) le lecteur d'entrée lit le champ PAR LA CONSTANTE -------------------
+#
+# `|| true` : sous `set -e`, `declare -f` sur une fonction renommée tue la suite
+# avant que l'anti-vacuité puisse dire quoi (même raison qu'à la ligne 1821).
+PARSE_SRC_2811=$(declare -f _parse_input_json || true)
+assert_contains "mika#2811 (anti-vacuité): le lecteur d'entrée existe toujours" \
+    '_parse_input_json (' "$PARSE_SRC_2811"
+assert_contains "mika#2811: la cause est lue par la constante, via --arg" \
+    '--arg f "$GROOM_FORCE_CAUSE_FIELD"' "$PARSE_SRC_2811"
+assert_not_contains "mika#2811: le nom du champ n'est pas retapé dans le lecteur" \
+    '__internal_groom_cause' "$PARSE_SRC_2811"
+
+# Le site de définition est UNIQUE et en colonne 0 — la forme exacte que le scan
+# de parité Rust lit (`canonical_tokens::tests::mika2811_le_nom_du_champ_de_cause_est_synchronise_shell_a_rust`).
+# COMPTÉ, pas seulement cherché : une seconde déclaration ailleurs laisserait le
+# scan vert tout en donnant deux vérités au même nom.
+assert_eq "mika#2811: le nom du champ a exactement un site de définition, en colonne 0" \
+    "1" "$(grep -c '^GROOM_FORCE_CAUSE_FIELD="__internal_groom_cause"$' "$DISPATCH_LIB" || true)"
+assert_eq "mika#2811: et le littéral n'apparaît nulle part ailleurs dans la lib" \
+    "1" "$(grep -oF -- '__internal_groom_cause' "$DISPATCH_LIB" | wc -l | tr -d '[:space:]')"
+
+# --- (b) comportemental, les deux sens : la lecture du champ -----------------
+_t2811_cause_probe() {
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _parse_input_json <<<"$1"
+        printf '%s' "${GROOM_FORCE_CAUSE:-}"
+    )
+}
+assert_eq "mika#2811: une cause posée par le moteur arrive dans GROOM_FORCE_CAUSE" \
+    "markers_without_proof" \
+    "$(_t2811_cause_probe '{"__mika_task_id":"t-2811","skill":"dev-groom","prompt":"mika#2811","__internal_groom_cause":"markers_without_proof"}' 2>/dev/null)"
+assert_eq "mika#2811: la panne de base arrive sous son propre nom" \
+    "proof_unreadable" \
+    "$(_t2811_cause_probe '{"__mika_task_id":"t-2811","skill":"dev-groom","prompt":"mika#2811","__internal_groom_cause":"proof_unreadable"}' 2>/dev/null)"
+# Contrôle négatif : sans la clé, la variable est VIDE — pas « absente lue comme
+# une cause ». C'est ce vide qui laisse la porte de mika#2012 armée sur tout
+# dispatch que le moteur n'a pas routé ici faute de preuve (flux opérateur
+# mika#1173 compris).
+assert_eq "mika#2811 (contrôle négatif): sans la clé, aucune cause n'est inventée" \
+    "" \
+    "$(_t2811_cause_probe '{"__mika_task_id":"t-2811","skill":"dev-groom","prompt":"mika#2811"}' 2>/dev/null)"
+
+# --- (c) la chaîne du gate : ordre, noms, et la note qui ne cite rien --------
+#
+# Aucun test comportemental ne peut atteindre la chaîne depuis `_set_up_worktree`
+# lui-même : elle vit après `gh issue view` et avant `worktree add`, donc hors
+# d'un dispatch complet. La région est extraite du fichier réel (même idiome que
+# mika#2590 U8f(c), vers la ligne 10474), et l'anti-vacuité passe D'ABORD — un
+# scan qui ne regarde rien rend les mêmes octets qu'un arbre propre (mika#2205).
+T2811_GATE_CHAIN=$(sed -n '/^        if \[ "\$SKILL" = "dev-groom" \] && \[ -n "\$GROOM_FORCE_CAUSE" \]/,/^        fi$/p' "$DISPATCH_LIB")
+assert_eq "mika#2811 (bonne foi): la chaîne du gate a été extraite" \
+    "yes" "$(if [ -n "$T2811_GATE_CHAIN" ]; then printf 'yes'; else printf 'no'; fi)"
+
+T2811_SHORTCIRCUIT_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- '-n "$GROOM_FORCE_CAUSE"' | head -1 | cut -d: -f1)
+T2811_PLANGATE_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- '_committed_plan_on_branch "$SUB_REPO_DIR"' | head -1 | cut -d: -f1)
+T2811_AUTOSKIP_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- '"reason":"already_groomed"' | head -1 | cut -d: -f1)
+T2811_ELIF_LN=$(printf '%s\n' "$T2811_GATE_CHAIN" | grep -n -F -- 'elif [ "$SKILL" = "dev-groom" ]; then' | head -1 | cut -d: -f1)
+# « Ce groom a-t-il été forcé ? » est à coût nul ; mesurer le plan coûte du git.
+assert_eq "mika#2811: le court-circuit de cause est AVANT la mesure git du plan" \
+    "yes" "$([ "${T2811_SHORTCIRCUIT_LN:-0}" -gt 0 ] && [ "${T2811_PLANGATE_LN:-0}" -gt 0 ] && [ "$T2811_SHORTCIRCUIT_LN" -lt "$T2811_PLANGATE_LN" ] && printf 'yes' || printf 'non (cause=%s plan=%s)' "${T2811_SHORTCIRCUIT_LN:-?}" "${T2811_PLANGATE_LN:-?}")"
+# L'implication de la ligne 1708, dite structurellement : le RESULT
+# `already_groomed` ne vit QUE dans le bras atteint sans cause.
+assert_eq "mika#2811: le RESULT already_groomed vit APRÈS le elif, donc hors du bras forcé" \
+    "yes" "$([ "${T2811_ELIF_LN:-0}" -gt 0 ] && [ "${T2811_AUTOSKIP_LN:-0}" -gt 0 ] && [ "$T2811_ELIF_LN" -lt "$T2811_AUTOSKIP_LN" ] && printf 'yes' || printf 'non (elif=%s skip=%s)' "${T2811_ELIF_LN:-?}" "${T2811_AUTOSKIP_LN:-?}")"
+
+# Le bras de forçage, isolé, pour juger la ligne qu'il émet et elle seule — le
+# commentaire voisin NOMME les deux autres signaux (à dessein), donc une
+# assertion sur la région entière serait vraie pour la mauvaise raison.
+T2811_FORCED_ECHO=$(printf '%s\n' "$T2811_GATE_CHAIN" | sed -n '1,/^        elif \[ "\$SKILL" = "dev-groom" \]; then$/p' | grep -F 'echo "dispatch_gate_' || true)
+assert_eq "mika#2811 (bonne foi): le bras forcé émet exactement une ligne de signal" \
+    "1" "$(printf '%s\n' "$T2811_FORCED_ECHO" | grep -c . || true)"
+# Un TROISIÈME nom : chaque population a le sien, et réutiliser un nom la rend
+# insoustractible (mika#2012 U4, qui a créé le second pour cette raison).
+assert_contains "mika#2811: le désarmement a son propre nom de signal" \
+    'dispatch_gate_groom_forced_no_proof:' "$T2811_FORCED_ECHO"
+assert_not_contains "mika#2811: ce n'est pas le signal de refus réutilisé" \
+    'dispatch_gate_groom_refused' "$T2811_FORCED_ECHO"
+assert_not_contains "mika#2811: ni celui du callout périmé" \
+    'dispatch_gate_groom_allowed_stale_callout' "$T2811_FORCED_ECHO"
+# `cause=` pour que le grep sépare la population nominale
+# (`markers_without_proof`) de la panne de base (`proof_unreadable`, régime
+# attendu VIDE) — deux populations sous un nom ne sont pas soustractibles
+# (mika#2205).
+assert_contains "mika#2811: le signal porte la cause, pas seulement le fait" \
+    'cause=${GROOM_FORCE_CAUSE}' "$T2811_FORCED_ECHO"
+# mika#2590 U5b : la porte prouvait le grooming par une sous-chaîne, donc le
+# texte qui disait « ceci n'est pas une preuve » EST devenu la preuve
+# (2026-09-29, offset 651). Le lecteur Rust est ancré depuis ; ceci est la
+# défense en profondeur, reportée sur le texte neuf.
+assert_not_contains "mika#2811 (mika#2590 U5b): la note de forçage ne cite pas le marqueur" \
+    'Outcome: PLAN_GROOMED' "$T2811_FORCED_ECHO"
+# Contrôle négatif de l'assertion elle-même : sur une fixture qui cite le jeton,
+# le prédicat DOIT accuser.
+T2811_MARKER_FIXTURE='            echo "dispatch_gate_groom_forced_no_proof: … no Outcome: PLAN_GROOMED exists in the database …" >&2'
+assert_eq "mika#2811 (contrôle négatif): le prédicat accuse une note qui cite le jeton" \
+    "1" "$(printf '%s\n' "$T2811_MARKER_FIXTURE" | grep -c -F 'Outcome: PLAN_GROOMED' || true)"
+
+# --- (d) comportemental, les deux sens : la disposition de la chaîne ---------
+#
+# La chaîne extraite est EXÉCUTÉE, pas paraphrasée : elle est enveloppée dans une
+# fonction et sourcée, les quatre appels qu'elle fait sont bouchonnés, et
+# `_deliver_callback` rend le RESULT au lieu de l'envoyer. Un futur éditeur du
+# gate change donc ce que ce test exécute, et non seulement ce qu'il lit.
+_t2811_gate_probe() {
+    local wrapper
+    wrapper=$(mktemp)
+    {
+        printf '_t2811_gate_arm() {\n'
+        printf '%s\n' "$T2811_GATE_CHAIN"
+        printf '}\n'
+    } > "$wrapper"
+    (
+        _committed_plan_on_branch() { printf '%s\n' "docs/plans/2026-08-14-001-ancien-plan.md"; }
+        _plan_provenance() { printf 'committed on the branch'; }
+        _extract_plan_path() { printf 'docs/plans/2026-08-14-001-ancien-plan.md'; }
+        _deliver_callback() { printf '%s' "$RESULT"; }
+        SKILL="dev-groom"
+        REPO="mika"
+        ISSUE_NUM="2811"
+        BRANCH="fix/2811/probe"
+        SUB_REPO_DIR="/nonexistent"
+        ISSUE_BODY='> - **Plan:** `docs/plans/2026-08-14-001-ancien-plan.md`'
+        RESULT=""
+        GROOM_FORCE_CAUSE="$1"
+        # shellcheck disable=SC1090
+        source "$wrapper"
+        _t2811_gate_arm
+    )
+    rm -f "$wrapper"
+}
+# Sens 1 — cause posée : la chaîne ne produit AUCUN `already_groomed`. C'est la
+# boucle du ticket, fermée : le dispatch continue vers une passe réelle qui
+# frappera la preuve, au lieu de rendre un skip de deux minutes.
+T2811_FORCED_OUT=$(_t2811_gate_probe "markers_without_proof" 2>/dev/null)
+T2811_FORCED_ERR=$(_t2811_gate_probe "markers_without_proof" 2>&1 >/dev/null)
+assert_eq "mika#2811 (comportemental): cause posée ⇒ aucun RESULT already_groomed" \
+    "0" "$(printf '%s\n' "$T2811_FORCED_OUT" | grep -c -F 'already_groomed' || true)"
+assert_contains "mika#2811 (comportemental): cause posée ⇒ le désarmement est DIT, sur stderr" \
+    'dispatch_gate_groom_forced_no_proof: repo=mika issue=2811' "$T2811_FORCED_ERR"
+assert_contains "mika#2811 (comportemental): et la ligne nomme la cause en vigueur" \
+    'cause=markers_without_proof' "$T2811_FORCED_ERR"
+# Sens 2 — cause absente : la porte de mika#2012 est INCHANGÉE. Si elle ne
+# refusait plus ici, le désarmement serait devenu une désactivation.
+T2811_PLAIN_OUT=$(_t2811_gate_probe "" 2>/dev/null)
+assert_eq "mika#2811 (contrôle négatif): cause absente ⇒ la porte de mika#2012 refuse comme avant" \
+    "auto_skipped|already_groomed" \
+    "$(printf '%s' "$T2811_PLAIN_OUT" | jq -r '[.status, .reason] | join("|")' 2>/dev/null || printf 'illisible')"
+assert_eq "mika#2811 (contrôle négatif): et le RESULT nomme toujours le plan mesuré" \
+    "docs/plans/2026-08-14-001-ancien-plan.md" \
+    "$(printf '%s' "$T2811_PLAIN_OUT" | jq -r '.plan' 2>/dev/null || printf 'illisible')"
+assert_contains "mika#2811 (contrôle négatif): et le geste de remède est intact" \
+    'remove the plan from the branch AND the grooming callouts from the issue body' \
+    "$T2811_PLAIN_OUT"
+
+# --- (e) le texte du remède : l'ORDRE des deux routes est le correctif -------
+#
+# Ce bras ne se lit plus que sans provenance de refus — donc sur un groom
+# demandé par un tour LLM (mika#1173). Pour tout ce qui passe par la boucle, le
+# retrait à la main du plan et des callouts est devenu du travail opérateur pour
+# rien : y repasser suffit. Le geste reste nommé, en SECOND, parce qu'il marche
+# toujours et qu'il est la seule issue hors boucle. C'est pourquoi l'assertion
+# porte sur l'ordre et pas seulement sur la présence.
+T2811_NOTE=$(printf '%s' "$T2811_PLAIN_OUT" | jq -r '.note' 2>/dev/null || printf 'illisible')
+assert_contains "mika#2811: la note nomme le retour par la boucle" \
+    'Cheapest route back: hand the ticket to the loop' "$T2811_NOTE"
+assert_contains "mika#2811: et dit que la passe forcée frappe la preuve, plan en place" \
+    'mints the proof with the plan left exactly where it is' "$T2811_NOTE"
+T2811_NOTE_HEAD="${T2811_NOTE%%remove the plan from the branch AND*}"
+assert_eq "mika#2811: la route de boucle est nommée AVANT le geste à la main" \
+    "1" "$(printf '%s' "$T2811_NOTE_HEAD" | grep -c -F 'Cheapest route back' || true)"
+
 # --- Test: Auto-rescue scaffold exclusion (mika#1288) ---
 
 echo ""
@@ -2152,6 +2358,150 @@ else
     echo "  ✗ Scaffold-only worktree: $RESULT_B"
 fi
 
+# Test F (mika#2760): les brouillons de corps de ticket à la racine du worktree.
+#
+# Deux fichiers sont entrés sur `main` par ces sites de récupération même, et
+# leurs messages de commit le disent : `b99c6219` (`wip(mika#2317)`) a commité
+# `followup-issue-body.md`, `50e98793` (`wip(mika#2309)`) a commité
+# `followup-issue.md`. Un corps de ticket écrit pour `gh issue create
+# --body-file` n'est pas du contenu de pilote : personne ne le lit, et chaque
+# worktree l'embarque depuis main une fois qu'il y est.
+#
+# CE CAS EXERCE LE TABLEAU RÉEL, jamais un littéral recopié. Les cas A, C et E
+# ci-dessus codent leur pathspec en dur : ils testent leur propre copie et
+# resteraient verts si `dispatch-lib.sh` perdait l'entrée. Ici la définition est
+# chargée depuis le fichier — une ligne unique, auto-contenue, extraite par
+# ancrage en colonne zéro (le même ancrage que `RESCUE_EXCLUDE_DEF` plus bas).
+# Le fichier entier n'est pas sourcé : cela exécuterait son setup top-level.
+_eval_real_rescue_pathspec() {
+    local def
+    def=$(grep -E '^RESCUE_EXCLUDE_PATHSPEC=\(' "$DISPATCH_LIB" | head -1)
+    if [ -z "$def" ]; then
+        echo "FAIL: no \`RESCUE_EXCLUDE_PATHSPEC=(\` line found in dispatch-lib.sh"
+        return 1
+    fi
+    eval "$def"
+}
+
+# Pose le dépôt fixture partagé par F et G : trois brouillons à la racine, et
+# trois chemins qui sont du contenu de pilote et doivent rester indexés.
+_mk_pilot_draft_fixture() {
+    local dir="$1"
+    git -C "$dir" init -q
+    git -C "$dir" commit --allow-empty -m "initial" -q
+
+    # Les trois formes de brouillon — ne doivent PAS être indexées.
+    echo "## Constat" > "$dir/followup-issue.md"
+    echo "## Constat" > "$dir/followup-issue-body.md"
+    echo "# brief seconde passe" > "$dir/groom-brief-mika-999-pass2.md"
+
+    # Du contenu de pilote — doit être indexé.
+    mkdir -p "$dir/src" "$dir/docs/plans" "$dir/sub"
+    echo "fn main() {}" > "$dir/src/new_feature.rs"
+    echo "# plan" > "$dir/docs/plans/2026-10-18-001-x-plan.md"
+    # L'exclusion est ancrée à la racine (d'où `:(exclude,glob)` et non `:!`) :
+    # un homonyme sous un répertoire est du contenu, et le reste.
+    echo "# nested" > "$dir/sub/followup-issue.md"
+}
+
+test_auto_rescue_excludes_pilot_draft_bodies() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    _mk_pilot_draft_fixture "$test_dir"
+    _eval_real_rescue_pathspec || return 1
+
+    git -C "$test_dir" add -A -- "${RESCUE_EXCLUDE_PATHSPEC[@]}" 2>/dev/null
+
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    local draft
+    for draft in followup-issue.md followup-issue-body.md groom-brief-mika-999-pass2.md; do
+        if grep -qxF -- "$draft" <<<"$staged"; then
+            echo "FAIL: $draft was staged (mika#2760)"
+            return 1
+        fi
+    done
+
+    local kept
+    for kept in src/new_feature.rs docs/plans/2026-10-18-001-x-plan.md sub/followup-issue.md; do
+        if ! grep -qxF -- "$kept" <<<"$staged"; then
+            echo "FAIL: pilot content $kept was not staged"
+            return 1
+        fi
+    done
+
+    echo "PASS"
+}
+
+# `|| true` : sans lui, `set -e` tue la suite sur l'assignation dès que la
+# fonction rend non-zéro, et la branche ✗ — avec son diagnostic — n'est jamais
+# atteinte. La branche FAIL compte, et la fin de suite sort 1.
+RESULT_F=$(test_auto_rescue_excludes_pilot_draft_bodies 2>/dev/null) || true
+if [ "$RESULT_F" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Root draft bodies excluded, nested namesake kept (mika#2760)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Root draft body exclusion: $RESULT_F"
+fi
+
+# Test G (mika#2760): le contrôle négatif, qui est ce qui donne sa valeur à F.
+# Le même fixture, re-stagé avec le tableau PRIVÉ des deux nouvelles entrées :
+# les trois brouillons doivent alors être indexés. Sans ce cas, F passerait
+# aussi si l'exclusion venait d'un `.gitignore`, d'un `core.excludesFile` de la
+# machine, ou de rien du tout — et la suite dirait vert sur un tableau vide.
+test_auto_rescue_draft_exclusion_is_not_accidental() {
+    local test_dir
+    test_dir=$(mktemp -d)
+    trap "rm -rf '$test_dir'" RETURN
+
+    _mk_pilot_draft_fixture "$test_dir"
+    _eval_real_rescue_pathspec || return 1
+
+    local filtered=() entry
+    for entry in "${RESCUE_EXCLUDE_PATHSPEC[@]}"; do
+        case "$entry" in
+            *followup-issue*|*groom-brief-*) continue ;;
+        esac
+        filtered+=("$entry")
+    done
+
+    # Le filtre doit avoir retiré exactement les deux entrées de mika#2760 :
+    # sinon ce cas passerait sur un tableau qui ne les a jamais portées.
+    local removed=$(( ${#RESCUE_EXCLUDE_PATHSPEC[@]} - ${#filtered[@]} ))
+    if [ "$removed" -ne 2 ]; then
+        echo "FAIL: expected 2 draft-body entries in RESCUE_EXCLUDE_PATHSPEC, removed $removed"
+        return 1
+    fi
+
+    git -C "$test_dir" add -A -- "${filtered[@]}" 2>/dev/null
+
+    local staged
+    staged=$(git -C "$test_dir" diff --cached --name-only)
+
+    local draft
+    for draft in followup-issue.md followup-issue-body.md groom-brief-mika-999-pass2.md; do
+        if ! grep -qxF -- "$draft" <<<"$staged"; then
+            echo "FAIL: $draft was NOT staged without its exclusion — F passes for another reason"
+            return 1
+        fi
+    done
+
+    echo "PASS"
+}
+
+RESULT_G=$(test_auto_rescue_draft_exclusion_is_not_accidental 2>/dev/null) || true
+if [ "$RESULT_G" = "PASS" ]; then
+    PASS=$((PASS + 1))
+    echo "  ✓ Without the two entries the drafts ARE staged (mika#2760 negative control)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ Draft exclusion negative control: $RESULT_G"
+fi
+
 # Test C: Structural — dispatch-lib uses pathspec exclusion (not bare git add -A)
 # mika#2031 moved the rescue body out of _post_flight_recovery into
 # _rescue_dirty_worktree(), so the extraction anchors on the function rather than
@@ -2169,6 +2519,15 @@ assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/commands/" \
     ":!.claude/commands/" "$RESCUE_EXCLUDE_DEF"
 assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :!.claude/claude-pilot.json" \
     ":!.claude/claude-pilot.json" "$RESCUE_EXCLUDE_DEF"
+# mika#2760 : la FORME, que les cas F/G seuls ne distinguent pas. `:!motif*.md`
+# et `:(exclude,glob)motif*.md` excluent tous deux le fichier racine ; seul
+# `sub/followup-issue.md` les sépare, parce que sans la magie `glob` git applique
+# `fnmatch` sans `FNM_PATHNAME` et le `*` traverse les `/`. C'est ce que F
+# mesure, et ce que ces deux lignes rendent lisible dans un nom de test.
+assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :(exclude,glob)followup-issue*.md (mika#2760)" \
+    ":(exclude,glob)followup-issue*.md" "$RESCUE_EXCLUDE_DEF"
+assert_contains "RESCUE_EXCLUDE_PATHSPEC excludes :(exclude,glob)groom-brief-*.md (mika#2760)" \
+    ":(exclude,glob)groom-brief-*.md" "$RESCUE_EXCLUDE_DEF"
 assert_contains "Rescue has empty-index guard (diff --cached --quiet)" "diff --cached --quiet" "$RESCUE_BLOCK"
 assert_contains "Rescue uses RESCUED_FILES for message" 'RESCUED_FILES' "$RESCUE_BLOCK"
 
@@ -3535,6 +3894,16 @@ echo "---------------------------------------------------"
 # Extract the _set_up_worktree function body for structural assertions
 SET_UP_WT_FUNC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
 
+# mika#2976 a EXTRAIT le geste « stash puis retire » en `_stash_and_remove_worktree`
+# (deux appelants : ce site-ci, et `_reset_spent_branch`). Les six assertions U1
+# ci-dessous se répartissent donc en deux moitiés, et aucune n'est perdue : la
+# DÉTECTION du relic reste dans `_set_up_worktree`, le GESTE est dans le helper,
+# et la DÉLÉGATION entre les deux est elle-même assertionnée. Un helper juste
+# qu'aucun site n'appelle ne nettoierait rien.
+STASH_REMOVE_FUNC=$(sed -n '/^_stash_and_remove_worktree()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "mika#2976 bonne foi: le corps de _stash_and_remove_worktree est non vide" "yes" \
+    "$([ -n "$STASH_REMOVE_FUNC" ] && echo yes || echo non)"
+
 # U1: Pre-flight block contains worktree list --porcelain detection
 assert_contains "Pre-flight uses worktree list --porcelain" \
     'worktree list --porcelain' "$SET_UP_WT_FUNC"
@@ -3543,25 +3912,32 @@ assert_contains "Pre-flight uses worktree list --porcelain" \
 assert_contains "Pre-flight awk matches refs/heads/\$BRANCH" \
     'refs/heads/$BRANCH' "$SET_UP_WT_FUNC"
 
-# U1: Pre-flight block contains the directory-exists guard
-assert_contains "Pre-flight has directory-exists guard for existing_wt" \
-    '[ -d "$existing_wt" ]' "$SET_UP_WT_FUNC"
+# U1: Pre-flight delegates the relic's stash-then-remove to the single-site helper,
+# passing the relic as the removal target and the CANONICAL worktree as the
+# recovery target (mika#2449, now an argument rather than a global read).
+assert_contains "Pre-flight délègue le geste au helper, relic retiré / canonique nommé" \
+    '_stash_and_remove_worktree "$SUB_REPO_DIR" "$existing_wt" "$WORKTREE_DIR" "$BRANCH" set_up_worktree_relic' \
+    "$SET_UP_WT_FUNC"
 
-# U1: Pre-flight block contains status --porcelain check
-assert_contains "Pre-flight checks dirty state via status --porcelain" \
-    'status --porcelain' "$SET_UP_WT_FUNC"
+# U1: the helper carries the directory-exists guard
+assert_contains "Helper has directory-exists guard for the removal target" \
+    '[ -d "$remove_dir" ]' "$STASH_REMOVE_FUNC"
 
-# U1: Pre-flight block contains stash push -u -m with descriptive name pattern
-assert_contains "Pre-flight stashes with descriptive name (stash push --include-untracked -m)" \
-    'stash push --include-untracked -m "$stash_name"' "$SET_UP_WT_FUNC"
+# U1: the helper checks dirty state via status --porcelain
+assert_contains "Helper checks dirty state via status --porcelain" \
+    'status --porcelain' "$STASH_REMOVE_FUNC"
 
-# U1: Pre-flight block contains the stale-worktree-cleanup naming convention
-assert_contains "Pre-flight stash name uses dispatch-lib-stale-worktree-cleanup prefix" \
-    'dispatch-lib-stale-worktree-cleanup' "$SET_UP_WT_FUNC"
+# U1: the helper stashes with a descriptive name
+assert_contains "Helper stashes with descriptive name (stash push --include-untracked -m)" \
+    'stash push --include-untracked -m "$stash_name"' "$STASH_REMOVE_FUNC"
 
-# U1: Pre-flight block contains worktree remove --force for the existing_wt
-assert_contains "Pre-flight removes non-canonical worktree with --force" \
-    'worktree remove --force "$existing_wt"' "$SET_UP_WT_FUNC"
+# U1: the helper keeps the stale-worktree-cleanup naming convention
+assert_contains "Helper stash name uses dispatch-lib-stale-worktree-cleanup prefix" \
+    'dispatch-lib-stale-worktree-cleanup' "$STASH_REMOVE_FUNC"
+
+# U1: the helper removes the worktree with --force
+assert_contains "Helper removes the worktree with --force" \
+    'worktree remove --force "$remove_dir"' "$STASH_REMOVE_FUNC"
 
 # U1: Call ordering — pre-flight cleanup runs BEFORE the existing dashed-path
 # collision check (the "Reuse existing worktree if valid" block).
@@ -3731,9 +4107,19 @@ echo "Test 13: Policy-deny disambiguation precedes drift detection (structural)"
 echo "-------------------------------------------------------------------------"
 
 DRIFT_BLOCK=$(sed -n '/Post-flight plan validation/,/Issue #138: Discover/p' "$DISPATCH_LIB")
+# mika#3040 (G2): la lecture du refus a quitté les deux sites pour une fonction
+# unique. Les trois claims qui portaient sur le CORPS de la lecture
+# (initialisation, strip ANSI, marqueur cherché) se mesurent donc là où la
+# lecture vit désormais ; les sites, eux, gardent leur claim propre — qu'ils
+# passent bien par cet appel-là. Les assertions n'ont pas été supprimées : une
+# assertion qui reste verte parce que son bloc contient encore le mot `sed` par
+# ailleurs ne mesure plus rien.
+POLICY_DENY_READ_BLOCK=$(sed -n '/^_policy_deny_read() {/,/^}/p' "$DISPATCH_LIB")
 
-assert_contains "POLICY_DENY variable initialized" \
-    'POLICY_DENY=""' "$DRIFT_BLOCK"
+assert_contains "POLICY_DENY variable initialized (dans le lecteur unique, mika#3040)" \
+    'POLICY_DENY=""' "$POLICY_DENY_READ_BLOCK"
+assert_contains "le site dev-groom passe par le lecteur unique (mika#3040 AC3)" \
+    '_policy_deny_read "$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
 # mika#2165 moved the directory behind the single resolver `_pilot_log_dir`;
 # the LOG_ID convention this assertion exists for is unchanged, only its
 # spelling is. The default literal now lives at exactly one site, pinned below.
@@ -3745,9 +4131,9 @@ assert_contains "PERSISTENT_STDERR_PATH uses LOG_ID convention" \
 assert_contains "Reads from persistent stderr (mika#1097 channel)" \
     '"$PERSISTENT_STDERR_PATH"' "$DRIFT_BLOCK"
 assert_contains "Strips ANSI before grep (UI ANSI shouldn't break match)" \
-    'sed' "$DRIFT_BLOCK"
+    "sed 's/\\x1b\\[[0-9;]*[mK]//g'" "$POLICY_DENY_READ_BLOCK"
 assert_contains "Searches for [policy:deny] marker" \
-    '[policy:deny]' "$DRIFT_BLOCK"
+    '_policy_deny_excerpt' "$POLICY_DENY_READ_BLOCK"
 assert_contains "Class C message identifies policy halt explicitly" \
     'halted by claude-pilot policy deny' "$DRIFT_BLOCK"
 assert_contains "Class C message explicitly NOT drift" \
@@ -3850,14 +4236,19 @@ POSTFLIGHT_BLOCK=$(sed -n '/Post-flight diff check: detect zero-commit/,/Unit 1 
 
 assert_contains "Class C check fires on HEAD-unchanged for ALL skills (not just dev-groom)" \
     'Policy-deny pre-check (Class C disambiguation, extended to dev-pilot' "$POSTFLIGHT_BLOCK"
-assert_contains "POLICY_DENY variable set in HEAD-unchanged path" \
-    'POLICY_DENY=""' "$POSTFLIGHT_BLOCK"
+# mika#3040 (G2) : même déplacement qu'au Test 13 ci-dessus, et c'est le fond
+# du geste — ce site et celui de dev-groom étaient des copies quasi-littérales,
+# et c'est cette duplication qui a laissé l'extrait et la létalité répondre sur
+# deux objets différents. Ce que ce site doit encore prouver, c'est qu'il passe
+# par le MÊME appel.
+assert_contains "POLICY_DENY set via the single reader in HEAD-unchanged path (mika#3040)" \
+    '_policy_deny_read "$PERSISTENT_STDERR_PATH"' "$POSTFLIGHT_BLOCK"
 assert_contains "Reads persistent stderr at LOG_ID path" \
     '_pilot_log_dir; PERSISTENT_STDERR_PATH="$_PILOT_LOG_DIR/${LOG_ID}.stderr"' "$POSTFLIGHT_BLOCK"
 assert_contains "Strips ANSI before grep" \
-    'sed' "$POSTFLIGHT_BLOCK"
+    "sed 's/\\x1b\\[[0-9;]*[mK]//g'" "$POLICY_DENY_READ_BLOCK"
 assert_contains "Searches for [policy:deny] marker" \
-    '[policy:deny]' "$POSTFLIGHT_BLOCK"
+    '_policy_deny_excerpt' "$POLICY_DENY_READ_BLOCK"
 assert_contains "Class C message — halted by policy deny, NOT generic exit" \
     'halted by policy deny — not generic exit' "$POSTFLIGHT_BLOCK"
 assert_contains "Links to investigation doc" \
@@ -4727,7 +5118,18 @@ assert_not_contains "U2: terminated classification carries no plan-lookup diagno
     "_find_issue_plan" "$CLASSIFY_WITH_GUARDRAIL"
 assert_not_contains "U2: terminated classification carries no convergence diagnosis" \
     "architect convergence" "$CLASSIFY_WITH_GUARDRAIL"
-assert_contains "U2: terminated classification points at the upstream stall lineage" \
+# mika#2029: this assertion TURNED, and that is the probe doing its job. Until
+# 2026-10-15 it required `mika#1901` — the auth lineage the delivered text named
+# as the cause. That lineage was refuted by measurement on 2026-08-29 (the very
+# sessions it described show `POST /v1/messages -> 200`, six candidate lineages
+# eliminated), and the cause was eventually traced upstream of this repo to
+# claude-pilot#177 (CLOSED 2026-09-11). A callback that names a dead lineage
+# costs more than a silent one: it sends the next reader into the wrong half of
+# the system. The pair below pins BOTH directions — the traced cause is named,
+# and the refuted one does not come back through an absent-minded restore.
+assert_contains "U2: terminated classification names the cause that was traced" \
+    "claude-pilot#177" "$CLASSIFY_WITH_GUARDRAIL"
+assert_not_contains "U2: and no longer points at the refuted auth lineage" \
     "mika#1901" "$CLASSIFY_WITH_GUARDRAIL"
 
 # R7: one Outcome line. The old path could stack two — _post_flight_recovery
@@ -5209,6 +5611,269 @@ assert_contains "T2-sink: the drift line reaches the persisted .stderr" \
 T2_SINK_KNOWN=$(_classify_sink_probe idle_timeout) || T2_SINK_KNOWN=""
 assert_not_contains "T2-sink (negative control): a known subtype writes nothing to either sink" \
     "halt_family.unknown" "$T2_SINK_KNOWN"
+
+# ============================================================================
+# mika#2029 — un pilote tué sans avoir produit se compte par son NOM
+#
+# Le trou mesuré : la branche `_terminated_empty` est la SEULE qui saute
+# `_post_flight_recovery`, donc la seule où aucun des deux sites de pose de la
+# ligne `PR:`/`NO_PR:` ne tourne. Le callback partait sans aucune des deux — 8/8
+# des kills depuis le 2026-09-04 — et le reaper (`engine.rs`
+# `reap_orphaned_parent_tasks`) retombait sur son défaut
+# `callback_delivered_without_pr_url`, motif qui confond « le pilote a été tué
+# avant de produire » avec « le callback est malformé ». Deux pannes, un seul
+# nom, aucune mesure possible.
+#
+# La justification est STRUCTURELLE et non statistique (D1) : le contrat total de
+# mika#2121 veut exactement une ligne par callback livré. Ce chemin en doit une
+# même si la classe s'éteignait demain — et elle n'est pas éteinte : zéro
+# `idle_timeout` en octobre sur 99 sessions, mais P(0)≈0,30 sous un taux
+# inchangé, donc l'extinction n'est pas établie.
+# ============================================================================
+
+echo ""
+echo "Test: le kill sans production porte un motif nommé (mika#2029)"
+echo "---------------------------------------------------------------"
+
+# V0 (anti-vacuité) — AVANT tout le reste. Une sonde qui regarde une fonction
+# disparue ou vide se lit exactement comme un arbre propre (classe mika#2205),
+# et tout ce qui suit serait vacuement vert sur une chaîne vide.
+T2029_REASON_FN=$(sed -n '/^_no_pr_reason_from_halt_subtype() {$/,/^}$/p' "$DISPATCH_LIB")
+assert_eq "V0 (anti-vacuité): _no_pr_reason_from_halt_subtype existe, corps non vide" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_REASON_FN" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# La branche `_terminated_empty` de `_run_claude_pilot`, extraite une fois. Elle
+# n'est pas appelable (il faut un vrai pilote et un vrai CLI), donc la sonde
+# comportementale ci-dessous REJOUE sa composition — et V3 épingle cette
+# composition au texte exact du site de production, pour que la réplication ne
+# puisse pas dériver en silence.
+#
+# L'extraction lit le FICHIER et non `declare -f` : le dé-parseur de bash rend
+# `fi;` avec un point-virgule, donc l'ancre de fin de plage ne matcherait pas et
+# la plage courrait jusqu'à la fin de la fonction — une sonde qui regarde trois
+# fois trop de texte sans le dire.
+T2029_BRANCH=$(sed -n '/^    if \[ "$_terminated_empty" = "1" \]; then$/,/^    fi$/p' "$DISPATCH_LIB")
+assert_eq "V0 (anti-vacuité): la branche _terminated_empty a bien été extraite" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_BRANCH" | grep -c .)" -gt 5 ]; then printf 'yes'; else printf 'no'; fi)"
+# La vue SANS commentaires, pour les scans de code. Les commentaires de la
+# branche citent `_resolve_halt_subtype` et `RESULT=$(_classify_terminated_session)`
+# par leur nom — un scan qui les compterait mesurerait sa propre prose.
+T2029_BRANCH_CODE=$(printf '%s\n' "$T2029_BRANCH" | grep -vE '^[[:space:]]*#')
+assert_eq "V0 (anti-vacuité): la vue sans commentaires garde le code des deux branches" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_BRANCH_CODE" | grep -c .)" -ge 8 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Le LECTEUR de la ligne, reproduit : `RE_NO_PR` dans dispatcher.rs est
+# `(?m)^NO_PR:\s+([a-z_]+)`. `[a-z_]+` est gourmand et NON ancré à droite,
+# exactement comme la regex Rust — donc une troncature ne se voit pas par un
+# échec, elle se voit par une capture plus COURTE que le motif posé. C'est
+# précisément ce que cette fonction rend observable.
+_t2029_re_no_pr_capture() {
+    printf '%s\n' "$1" | sed -n 's/^NO_PR:[[:space:]]\{1,\}\([a-z_]\{1,\}\).*/\1/p' | head -1
+}
+
+# La composition de la branche, rejouée sur un environnement injecté. Le
+# sous-type passe par `_resolve_halt_subtype` (D4) — les deux canaux, `.subtype`
+# structuré et scrape `[guardrail]`, sont donc couverts par la même sonde.
+_t2029_line_probe() {
+    local subtype="$1" guardrail_line="$2" seed="${3:-}"
+    local tmp log_id="probe-2029"
+    tmp=$(mktemp -d)
+    if [ -n "$guardrail_line" ]; then
+        printf '%s\n' "$guardrail_line" > "$tmp/${log_id}.stderr"
+    fi
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        STATUS="terminated"; TURNS=2; DURATION=1
+        SESSION_ID="0dab1700-5ca9-4145-87b0-6f618a047220"
+        LOG_ID="$log_id"; PILOT_LOG_DIR="$tmp"
+        STDERR_FILE=""; SUBTYPE="$subtype"
+        TERMINATION_REASON=""; API_ERROR_STATUS=""
+        RESULT="$seed"
+        _resolve_halt_subtype
+        _set_pr_status_line "NO_PR: $(_no_pr_reason_from_halt_subtype "${_HALT_SUBTYPE_RESOLVED:-}")"
+        printf '%s' "$RESULT"
+    )
+    rm -rf "$tmp"
+}
+
+# V1a — les quatre sous-types MESURÉS sur la fenêtre de 30 jours (578 sessions,
+# M2) : error_max_turns 30, stall_detected 6, idle_timeout 5, prompt_cache_dead 1.
+# Un par ligne, parce que le motif porte le sous-type et non la famille (D2) :
+# `budget_exhausted` confondrait error_max_turns avec error_max_budget_usd, et
+# `model_unproductive` confondrait stall_detected avec empty_response.
+for _t2029_st in error_max_turns stall_detected idle_timeout prompt_cache_dead; do
+    T2029_OUT=$(_t2029_line_probe "$_t2029_st" '') || T2029_OUT=""
+    assert_contains "V1a: $_t2029_st -> NO_PR: pilot_terminated_$_t2029_st" \
+        "NO_PR: pilot_terminated_$_t2029_st" "$T2029_OUT"
+    # V1b — le motif posé survit ENTIER à RE_NO_PR. Une capture plus courte
+    # serait un motif plausible, agrégeable, et faux.
+    assert_eq "V1b: RE_NO_PR consomme pilot_terminated_$_t2029_st en entier" \
+        "pilot_terminated_$_t2029_st" \
+        "$(_t2029_re_no_pr_capture "$(printf '%s\n' "$T2029_OUT" | grep '^NO_PR: ')")"
+done
+
+# V1a-bis — le second canal. Un résultat sans `.subtype` fait scraper la ligne
+# `[guardrail]` par `_resolve_halt_subtype` ; le motif doit suivre ce canal-là
+# aussi, sinon la population que mika#2149 (C-4) a rattrapée pour la bannière
+# repartirait en `unknown` pour le comptage.
+T2029_SCRAPED=$(_t2029_line_probe '' '[guardrail] idle_timeout: No meaningful progress for 300s') || T2029_SCRAPED=""
+assert_contains "V1a-bis: un halt arrivé par stderr est compté comme un halt structuré" \
+    "NO_PR: pilot_terminated_idle_timeout" "$T2029_SCRAPED"
+
+# V1c — la normalisation, et la troncature qu'elle empêche. Les sous-types
+# viennent d'un `Literal` Python amont que personne ici ne contrôle : la
+# correction est sur la FORME de ce qu'on pose, jamais sur une liste de valeurs.
+T2029_UPPER=$(_t2029_line_probe 'Error-Max-Turns' '') || T2029_UPPER=""
+assert_contains "V1c: Error-Max-Turns est normalisé, pas tronqué" \
+    "NO_PR: pilot_terminated_error_max_turns" "$T2029_UPPER"
+assert_eq "V1c: et RE_NO_PR en consomme la totalité" \
+    "pilot_terminated_error_max_turns" \
+    "$(_t2029_re_no_pr_capture "$(printf '%s\n' "$T2029_UPPER" | grep '^NO_PR: ')")"
+# La contre-mesure : SANS normalisation, le même sous-type arrive dans
+# `tasks.result` en `callback_no_pr_pilot_terminated_error`. Pas une erreur —
+# une mesure fausse. C'est ce que V1c achète.
+assert_eq "V1c (contre-mesure): le motif NON normalisé serait tronqué par RE_NO_PR" \
+    "pilot_terminated_error" \
+    "$(_t2029_re_no_pr_capture 'NO_PR: pilot_terminated_error-max-turns')"
+
+# V1d — aucune résolution est une résolution. La laisser produire
+# `pilot_terminated_` tendrait à RE_NO_PR une queue VIDE : le `+` ne matcherait
+# pas, la ligne serait ignorée, et le kill retomberait dans le générique que ce
+# livrable comble — un trou refermé par son propre correctif.
+T2029_NONE=$(_t2029_line_probe '' '') || T2029_NONE=""
+assert_contains "V1d: ni sous-type ni ligne [guardrail] -> pilot_terminated_unknown" \
+    "NO_PR: pilot_terminated_unknown" "$T2029_NONE"
+assert_eq "V1d: la queue n'est jamais vide (RE_NO_PR capture quelque chose)" \
+    "pilot_terminated_unknown" \
+    "$(_t2029_re_no_pr_capture "$(printf '%s\n' "$T2029_NONE" | grep '^NO_PR: ')")"
+
+# V1e — le contrat TOTAL de mika#2121 : exactement une ligne, et une seule des
+# deux formes. La graine porte une ligne `PR:` pour que le strip de
+# `_set_pr_status_line` soit mesuré et non supposé.
+T2029_SEEDED=$(_t2029_line_probe idle_timeout '' 'Outcome: PIPELINE_INCOMPLETE — x
+PR: https://github.com/senara-solutions/mika/pull/1') || T2029_SEEDED=""
+assert_eq "V1e: exactement une ligne NO_PR:" "1" \
+    "$(printf '%s\n' "$T2029_SEEDED" | grep -c '^NO_PR: ' || true)"
+assert_eq "V1e: et zéro ligne PR:" "0" \
+    "$(printf '%s\n' "$T2029_SEEDED" | grep -c '^PR: ' || true)"
+# Comptée seule, « exactement une ligne NO_PR: » est VERTE sur l'état d'avant le
+# correctif : une ligne `NO_PR: ` sans queue est toujours une ligne. C'est la
+# panne même que ce livrable ferme, et elle passerait ce comptage. Donc la ligne
+# est lue EN ENTIER, au texte.
+assert_eq "V1e (anti-vacuité): et cette ligne porte le motif en entier" \
+    "NO_PR: pilot_terminated_idle_timeout" \
+    "$(printf '%s\n' "$T2029_SEEDED" | grep '^NO_PR: ' || true)"
+assert_contains "V1e: le reste du RESULT est intact" \
+    "Outcome: PIPELINE_INCOMPLETE" "$T2029_SEEDED"
+
+# V1f (contre-vacuité) — la population qui a PRODUIT ne reçoit pas ce motif.
+# Elle passe par `_post_flight_recovery`, qui pose déjà sa propre ligne ; un
+# second motif ici la ferait compter deux fois, et le `banner` dirait d'une
+# branche porteuse de commits qu'aucune PR n'en est sortie faute de travail.
+# Sans cette assertion, V1a–V1e passeraient à l'identique sur un correctif qui
+# poserait la ligne pour TOUT le monde — le défaut que mika#1772 a fermé,
+# réintroduit par le correctif de mika#2029.
+assert_not_contains "V1f (contre-vacuité): le mode banner ne porte aucun pilot_terminated_*" \
+    "pilot_terminated_" "$CLASSIFY_BANNER"
+T2029_ELSE=$(printf '%s\n' "$T2029_BRANCH" | sed -n '/^    else$/,$p')
+assert_eq "V1f (contre-vacuité): la branche else a bien été extraite" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_ELSE" | grep -c .)" -gt 3 ]; then printf 'yes'; else printf 'no'; fi)"
+assert_contains "V1f (contre-vacuité): et c'est bien celle qui appelle la chaîne de reprise" \
+    "_post_flight_recovery" "$T2029_ELSE"
+assert_not_contains "V1f (contre-vacuité): la branche else ne compose aucun motif" \
+    "_no_pr_reason_from_halt_subtype" "$T2029_ELSE"
+# Un seul site de production compose ce motif. Le compte est fait hors
+# définition et hors commentaire — seuls les appels.
+assert_eq "V1f: _no_pr_reason_from_halt_subtype a exactement un appelant de production" "1" \
+    "$(grep -n '_no_pr_reason_from_halt_subtype' "$DISPATCH_LIB" \
+        | grep -v '_no_pr_reason_from_halt_subtype() {' \
+        | grep -vE ':[[:space:]]*#' | grep -c . || true)"
+
+# --- V2 : le diagnostic réfuté ne survit pas à sa réfutation ----------------
+#
+# La chaîne « rejet d'auth → stall SDK → idle_timeout 300s → mort au tour 1 »
+# était écrite à deux endroits : le commentaire au-dessus de
+# `_run_pilot_sandboxed` et le texte LIVRÉ à mika-dev en mode `full`. Elle a été
+# réfutée le 2026-08-29 (`POST /v1/messages -> 200` sur les sessions mêmes dont
+# elle parlait, six lignées éliminées), et la cause réelle vivait côté pilote
+# (claude-pilot#177, CLOSED 2026-09-11). Un diagnostic faux dans le texte livré
+# coûte plus qu'un silence : il oriente la lecture suivante vers la mauvaise
+# moitié du système.
+assert_eq "V2a: le diagnostic réfuté a disparu de dispatch-lib.sh" "0" \
+    "$(grep -c 'Anthropic 401' "$DISPATCH_LIB" || true)"
+# V2b (contre-vacuité, auto-nettoyante) — le détecteur de V2a est un `grep -c`
+# dont le succès est « rien trouvé » : il serait vert sur un fichier vide, sur un
+# chemin faux, et sur une suppression trop large. Le 401 GitHub de mika#2056
+# (`:1082`) est un 401 LÉGITIME et mesuré, sur un autre service ; il est la
+# frontière. S'il disparaît, V2a cesse de mesurer ce qu'il prétend et cette
+# ligne rougit le jour même.
+assert_contains "V2b (contre-vacuité): le 401 GitHub légitime de mika#2056 est intact" \
+    "401 on api.github.com" "$(cat "$DISPATCH_LIB")"
+# V2c — le texte livré nomme la cause réelle, il ne se contente pas de taire la
+# fausse (D7). Un opérateur qui lit ce callback doit pouvoir aller au bon ticket.
+T2029_FULL=$(_classify_probe '' 2 'idle_timeout' 'No meaningful progress for 300s' 'full') || T2029_FULL=""
+assert_contains "V2c: le mode full nomme la cause réelle (claude-pilot#177)" \
+    "claude-pilot#177" "$T2029_FULL"
+assert_contains "V2c: et renvoie l'opérateur à la ligne Halt class:" \
+    "The 'Halt class:' line above is what names it" "$T2029_FULL"
+assert_not_contains "V2c: le texte livré ne porte plus la chaîne réfutée" \
+    "SDK-stall chain" "$T2029_FULL"
+# V2c-bis — la phrase trouée. Le corps de `_classify_terminated_session` est un
+# `printf '%s' "…"` entre guillemets DOUBLES : un accent grave y est une
+# substitution de commande, pas une citation. Mesuré en écrivant ce correctif —
+# le premier jet livrait « The  line above is what names it », une phrase à trou,
+# et la commande inventée échouait sur un fd 2 déjà dirigé vers /dev/null
+# (mika#903), donc en silence. Un texte de diagnostic qui perd un mot est de la
+# même famille que le diagnostic faux que V2a retire : il oriente la lecture
+# suivante vers rien. Le scan est sur la FORME, au site, parce qu'une assertion
+# sur une phrase ne couvre que la phrase qu'elle cite.
+T2029_CLASSIFY_FN=$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")
+assert_eq "V2c-bis (anti-vacuité): _classify_terminated_session a bien été extraite" "yes" \
+    "$(if [ "$(printf '%s\n' "$T2029_CLASSIFY_FN" | grep -c .)" -gt 20 ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "V2c-bis: aucun accent grave dans le texte livré (ce serait une substitution)" "0" \
+    "$(printf '%s\n' "$T2029_CLASSIFY_FN" | grep -vE '^[[:space:]]*#' | grep -c '`' || true)"
+
+# --- V3 : le sous-type vient du résolveur, pas d'un $SUBTYPE brut -----------
+#
+# Même forme que le scan mika#2539 (S4) et pour la même raison : un troisième
+# lecteur de `$SUBTYPE` ferait diverger le motif de la bannière sur la population
+# que le scrape `[guardrail]` rattrape — `Halt class: session_silent` dans le
+# callback et `callback_no_pr_pilot_terminated_unknown` dans `tasks.result`, deux
+# énoncés contradictoires sur une seule session, dont un dans la base.
+assert_contains "V3: la branche résout le sous-type par le résolveur unique" \
+    "_resolve_halt_subtype" "$T2029_BRANCH_CODE"
+assert_not_contains "V3: la branche ne lit aucun \$SUBTYPE brut" \
+    'SUBTYPE:-}' "$(printf '%s\n' "$T2029_BRANCH_CODE" | grep -v '_HALT_SUBTYPE_RESOLVED')"
+assert_contains "V3: elle pose la ligne par _set_pr_status_line (D5)" \
+    "_set_pr_status_line" "$T2029_BRANCH_CODE"
+# La composition EXACTE, au texte. C'est ce qui empêche la sonde
+# `_t2029_line_probe` ci-dessus — qui rejoue la branche faute de pouvoir
+# l'appeler — de mesurer une composition que la production n'utilise plus.
+assert_contains "V3: la composition rejouée par les sondes est celle du site de production" \
+    '_set_pr_status_line "NO_PR: $(_no_pr_reason_from_halt_subtype "${_HALT_SUBTYPE_RESOLVED:-}")"' \
+    "$T2029_BRANCH"
+# L'ORDRE compte, et pas qu'un peu : `RESULT=$(_classify_terminated_session)` est
+# une substitution de commande, donc un SOUS-SHELL. Le résolveur appelé APRÈS
+# aurait à re-scraper stderr ; appelé DEDANS, son mémo mourrait avec le
+# sous-shell. Appelé AVANT, le mémo est hérité — bannière et motif décrivent la
+# même résolution par construction, et stderr n'est lu qu'une fois.
+T2029_ORDER=$(printf '%s\n' "$T2029_BRANCH_CODE" \
+    | grep -nE '_resolve_halt_subtype|RESULT=\$\(_classify_terminated_session\)|_set_pr_status_line' \
+    | sed 's/:.*//' | tr '\n' ' ' | sed 's/ *$//')
+assert_eq "V3: résolution AVANT la substitution, pose APRÈS l'affectation de RESULT" "yes" \
+    "$(set -- $T2029_ORDER; if [ "$#" -eq 3 ] && [ "$1" -lt "$2" ] && [ "$2" -lt "$3" ]; then printf 'yes'; else printf 'no'; fi)"
+
+# --- V4 : herméticité de cette section (patron mika#2178 T9 / mika#2493) ----
+T2029_SECTION=$(sed -n '/^# mika#2029 — un pilote tué sans avoir produit se compte par son NOM/,/^# The caller must route on the measurement/p' "${BASH_SOURCE[0]}")
+assert_eq "Herméticité: l'extraction de la section mika#2029 a trouvé la section" \
+    "yes" "$(if [ -n "$T2029_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "Herméticité: aucune invocation de forge en tête de commande" \
+    "0" "$(printf '%s\n' "$T2029_SECTION" | grep -cE '^[[:space:]]*gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune invocation de forge en substitution" \
+    "0" "$(printf '%s\n' "$T2029_SECTION" | grep -cE '\$\(gh[[:space:]]' || true)"
+assert_eq "Herméticité: aucune écriture hors mktemp (ni /var/log, ni le dépôt)" \
+    "0" "$(printf '%s\n' "$T2029_SECTION" | grep -cE '>[[:space:]]*"?(/var/log|\$SCRIPT_DIR|\$DISPATCH_LIB)' || true)"
 
 # The caller must route on the measurement, not on STATUS alone.
 assert_contains "the terminated branch is gated on _pilot_left_no_work" \
@@ -5782,26 +6447,51 @@ if [ -f "$RUST_SRC" ]; then
     assert_eq "shell allowlist matches Rust DISPATCHABLE_REPOS (no drift)" "$RUST_LIST" "$SHELL_LIST"
 fi
 
-# --- Drift guard: the withheld-disposition marker must equal the Rust constant ---
-# Same necessity as the list above: the engine side is a compile-time `&str`, not a
-# runtime-readable data file, so the literal exists in both languages. Here the stakes
-# are higher than drift-as-noise — if the two copies diverge, the engine still strips
-# the disposition but tier 0 stops recognizing the substitute, and every tier below it
-# resumes deriving a verdict from the body. The refusal would fail OPEN, silently
-# (mika#2037).
+# --- Garde de dérive du marqueur, INVERSÉE par la bascule (mika#2194, vol 5) ---
+#
+# CE QU'ELLE GARDAIT. Le littéral du marqueur de disposition retenue existait en
+# DEUX copies, une par langue, par nécessité (le côté moteur est un `&str` de
+# compilation, pas un fichier de données lisible à l'exécution). L'enjeu dépassait
+# le bruit de dérive : si les deux copies divergeaient, le moteur continuait de
+# retirer la disposition mais le tier 0 cessait de reconnaître le substitut, et
+# tous les tiers en dessous se remettaient à dériver un verdict du corps. Le refus
+# échouait OUVERT, en silence (mika#2037). La garde assérait donc que le bash
+# PORTAIT le littéral.
+#
+# CE QU'ELLE GARDE DEPUIS. Le vol 5 a retiré le tier 0 du bash : il n'y a plus
+# deux copies, il y en a une, et c'est la constante Rust. La garde est donc
+# retournée — elle assère que le littéral n'est PLUS dans le bash. Et les deux
+# moitiés tiennent ensemble :
+#   - la supprimer verdirait un arbre où le tier 0 aurait été RECOPIÉ ailleurs
+#     dans le bash (le retour que l'AC4 vise) ;
+#   - sa première moitié seule verdirait un arbre où le littéral aurait disparu
+#     DES DEUX CÔTÉS, c'est-à-dire où le tier 0 n'existerait plus du tout.
+# D'où la seconde moitié : la constante Rust a un lecteur, et c'est le moteur.
+#
+# L'extraction par `grep -oE 'const DISPOSITION_WITHHELD_MARKER: &str = "[^"]+"'`
+# est conservée telle quelle : non ancrée, elle survit au `pub(crate)` posé au
+# vol 4.
+#
+# Noter l'asymétrie avec le tier 0b, juste en dessous : `_engine_escalation_line`
+# est CONSERVÉE dans le bash (second appelant de production, `_escalate_groom`,
+# mika#2338), donc sa moitié « le bash porte le littéral » reste dans son sens
+# d'origine. Les deux tiers n'ont pas basculé ensemble, et le test le dit.
 ANCHOR_RUST_SRC="$REPO_ROOT/crates/mika-agent/src/agent_loop/mod.rs"
 if [ -f "$ANCHOR_RUST_SRC" ]; then
     RUST_MARKER=$(grep -oE 'const DISPOSITION_WITHHELD_MARKER: &str = "[^"]+"' "$ANCHOR_RUST_SRC" \
         | sed 's/.*= "//; s/"$//')
-    assert_eq "shell tier-0 marker matches Rust DISPOSITION_WITHHELD_MARKER (no drift)" \
-        "$RUST_MARKER" "$WITHHELD_MARKER"
-    # The shell parser must actually contain the literal, not merely compare equal to a
-    # variable this test defined.
-    if grep -qF "$RUST_MARKER" "$DISPATCH_LIB"; then
-        assert_eq "dispatch-lib carries the marker literal" "yes" "yes"
-    else
-        assert_eq "dispatch-lib carries the marker literal" "yes" "no"
-    fi
+    # Moitié 1 — le littéral a bien quitté le bash. `$WITHHELD_MARKER` reste
+    # défini par cette suite : c'est l'entrée des cas de tier 0 ci-dessus, qui
+    # exercent désormais le moteur à travers les enveloppes.
+    assert_eq "mika#2194: le littéral du tier 0 n'est plus dans dispatch-lib.sh" "no" \
+        "$(if grep -qF "$RUST_MARKER" "$DISPATCH_LIB"; then printf 'yes'; else printf 'no'; fi)"
+    # Moitié 2 — anti-vacuité de la précédente : le marqueur existe toujours, et
+    # il a un lecteur unique. Un arbre où la constante a disparu des deux côtés
+    # passerait la moitié 1 et rougit ici.
+    assert_eq "mika#2194: la constante Rust du tier 0 existe (lecteur unique)" "yes" \
+        "$(if [ -n "$RUST_MARKER" ]; then printf 'yes'; else printf 'no'; fi)"
+    assert_eq "mika#2194: le moteur est le lecteur du marqueur du tier 0" "yes" \
+        "$(if grep -rqF "DISPOSITION_WITHHELD_MARKER" "$REPO_ROOT/crates/mika-agent/src/arch_disposition.rs" 2>/dev/null; then printf 'yes'; else printf 'no'; fi)"
     # mika#2338 — same necessity, same shape, for the engine escalation line. If the two
     # copies diverge, tier 0b stops recognizing the engine's line and the escalation falls
     # through to the unanchored textual tiers.
@@ -7652,7 +8342,17 @@ _mika2542_unargumented_calls() {
 # le résolveur sur son propre site, en lui passant `"${LABELS:-}"` comme les
 # trois autres — un site qui l'oublierait résoudrait « aucun label », donc le
 # défaut, donc fail-safe vers 150 et jamais vers 200.
-assert_eq "mika#2542 (AC10): le scan voit exactement quatre appels du résolveur" "4" \
+# Puis de 4 à 5 le 2026-10-14 (mika#2693) : l'injection de la règle de taille
+# dans le prompt du groomeur a besoin du plafond pour en dériver la borne par
+# vol, et `_pilot_max_turns` reste le LECTEUR UNIQUE de la table des labels
+# (AC5) — le cinquième site est donc un appel du résolveur, jamais une seconde
+# lecture de `PILOT_LABEL_TURN_CEILINGS`. C'est précisément ce que ce
+# recensement existe pour rendre visible : il n'empêche pas d'ajouter un site,
+# il empêche d'en ajouter un en silence.
+# Puis de 5 à 6 (mika#2693, revue) : le finding synthétique du rattrapage rend
+# la même règle que le groom, donc il lui faut le même plafond, par le même
+# résolveur.
+assert_eq "mika#2542 (AC10): le scan voit exactement six appels du résolveur" "6" \
     "$(_mika2542_resolver_calls "$DISPATCH_LIB" | wc -l | tr -d ' ')"
 assert_eq "mika#2542 (AC10): chaque appel du résolveur passe \"\${LABELS:-}\"" "" \
     "$(_mika2542_unargumented_calls "$DISPATCH_LIB" | cut -c1-100)"
@@ -8294,8 +8994,16 @@ _mika1943_guard_calls_in() {
     awk -v fn="^$1\\\\(\\\\) \\\\{" '$0 ~ fn, /^\}/' "$DISPATCH_LIB" \
         | grep -c '_assert_removable_worktree_path' || true
 }
-assert_eq "mika#1943 U2: _set_up_worktree garde ses deux suppressions" \
-    "2" "$(_mika1943_guard_calls_in _set_up_worktree)"
+# mika#2976: `_set_up_worktree` avait DEUX appels directs. L'un des deux — le
+# relic non canonique — vit maintenant dans `_stash_and_remove_worktree`, qui
+# est le second appelant du helper avec `_reset_spent_branch`. Le total de sites
+# de suppression gardés est inchangé ; c'est leur répartition qui a bougé, et le
+# recensement suit, parce que l'invariant porte sur *tout* site de suppression
+# et non sur une liste figée.
+assert_eq "mika#1943 U2: _set_up_worktree garde sa suppression directe (registre périmé)" \
+    "1" "$(_mika1943_guard_calls_in _set_up_worktree)"
+assert_eq "mika#1943 U2 (mika#2976): _stash_and_remove_worktree garde la sienne" \
+    "1" "$(_mika1943_guard_calls_in _stash_and_remove_worktree)"
 assert_eq "mika#1943 U2: _handle_dry_run garde la sienne" \
     "1" "$(_mika1943_guard_calls_in _handle_dry_run)"
 assert_eq "mika#1943 U2: _clean_worktree_for_rebase garde son rm -rf" \
@@ -8969,14 +9677,21 @@ assert_eq "mika#2449 bonne foi: le scan trouve ≥ 2 sites « recover with … s
     "$([ "$T2449_SITE_COUNT" -ge 2 ] && echo yes || echo "non ($T2449_SITE_COUNT)")"
 assert_eq "mika#2449: aucun site « recover with » ne nomme SUB_REPO_DIR (allowlist vide)" "0" \
     "$(printf '%s\n' "$T2449_RECOVER_SITES" | grep -c 'SUB_REPO_DIR' || true)"
-# Le site B doit nommer le worktree CANONIQUE, pas le relic : celui-ci est
-# supprimé quelques lignes plus bas (`worktree remove --force "$existing_wt"`),
-# donc une consigne qui le nommerait échouerait au moment où l'opérateur la lit.
-T2449_SITE_B=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep 'stale-worktree-cleanup\|existing_wt' || true)
-assert_contains "mika#2449: le site B (relic) prescrit le worktree canonique \$WORKTREE_DIR" \
-    'git -C $WORKTREE_DIR stash apply' "$T2449_SITE_B"
-assert_not_contains "mika#2449: le site B ne prescrit pas le relic \$existing_wt (supprimé plus bas)" \
-    'git -C $existing_wt stash apply' "$T2449_SITE_B"
+# Le site B doit nommer le worktree CANONIQUE, pas celui qu'il retire : ce
+# dernier est supprimé quelques lignes plus bas (`worktree remove --force`), donc
+# une consigne qui le nommerait échouerait au moment où l'opérateur la lit.
+#
+# mika#2976 a EXTRAIT ce site en `_stash_and_remove_worktree`, donc il ne nomme
+# plus `$existing_wt` ni `$WORKTREE_DIR` : il porte deux paramètres, le worktree
+# retiré (`$remove_dir`) et celui que l'indice nomme (`$recover_in`). L'invariant
+# est inchangé — c'est son ancrage textuel qui a bougé, et les trois assertions
+# d'appel ci-dessous le referment par l'autre bout : chaque appelant doit passer
+# le worktree CANONIQUE en troisième argument.
+T2449_SITE_B=$(printf '%s\n' "$T2449_RECOVER_SITES" | grep 'remove_dir' || true)
+assert_contains "mika#2449: le site B (helper extrait) prescrit le worktree de récupération \$recover_in" \
+    'git -C $recover_in stash apply' "$T2449_SITE_B"
+assert_not_contains "mika#2449: le site B ne prescrit pas le worktree retiré \$remove_dir (supprimé plus bas)" \
+    'git -C $remove_dir stash apply' "$T2449_SITE_B"
 assert_contains "mika#2449: le site B dit explicitement de ne pas appliquer dans le checkout principal" \
     'NOT in the primary checkout' "$T2449_SITE_B"
 
@@ -9224,10 +9939,17 @@ assert_eq "U3c: la réécriture Outcome: PR_OPENED n'est appelée qu'au seul bra
     "1" "$(grep -c '_set_outcome_line "Outcome: PR_OPENED' "$DISPATCH_LIB" || true)"
 assert_eq "U3c (mika#2545): Outcome: ESCALATE n'est estampillé qu'à un site" \
     "1" "$(grep -c '_set_outcome_line "Outcome: ESCALATE' "$DISPATCH_LIB" || true)"
+# mika#2981 — PLAN_GROOMED est la seule des trois valeurs qui ne soit PAS passée
+# littéralement à `_set_outcome_line` : sa ligne porte depuis ce ticket un
+# suffixe ` — <plan>` nommant le plan que le groom a validé, composé dans
+# `_groomed_outcome` parce qu'il est conditionnel (repli nu sur le bras
+# `canonical_callout_failed`). La cardinalité de la VALEUR est donc comptée à son
+# site de composition, et elle reste de 1 : le geste juste est de suivre la
+# valeur là où elle est écrite, jamais de relâcher le compte.
 assert_eq "U3c (mika#2590): Outcome: PLAN_GROOMED n'est estampillé qu'à un site" \
-    "1" "$(grep -c '_set_outcome_line "Outcome: PLAN_GROOMED' "$DISPATCH_LIB" || true)"
+    "1" "$(grep -c '_groomed_outcome="Outcome: PLAN_GROOMED' "$DISPATCH_LIB" || true)"
 assert_eq "U3c: et _set_outcome_line n'a que ces trois valeurs déclarées" \
-    "3" "$(grep -c '_set_outcome_line "Outcome:' "$DISPATCH_LIB" || true)"
+    "3" "$(grep -cE '_set_outcome_line "Outcome:|_groomed_outcome="Outcome:' "$DISPATCH_LIB" || true)"
 
 # --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
 assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \
@@ -9424,6 +10146,104 @@ assert_not_contains "T14: ni la ligne de fin de session" \
 assert_eq "T14: sans marqueur ni autre événement, la capture est plafonnée" \
     "12" "$(_t2493_excerpt "$T2493_FIXTURE_DIR/deny_unbounded.stderr" | grep -c . || true)"
 
+# --- mika#3040 : l'extrait cite l'événement qui a TUÉ la session -------------
+#
+# Le site annonce « The deny's lethality marker says (terminal): it ended the
+# session », puis joint le PREMIER refus du flux. Les deux lectures portent sur
+# des objets différents — la létalité sur le fichier entier, l'extrait sur le
+# premier événement — et elles divergent dès qu'une session porte plusieurs
+# refus. Rejeu sur les 3162 `.stderr` du 2026-05-15 au 2026-11-03 : 118 sessions
+# portent un événement de refus terminal, et 98 d'entre elles citaient un
+# événement NON terminal sous le mot « Halt ».
+#
+# Le défaut vivait exactement dans la case que le produit cartésien des fixtures
+# ci-dessus laisse vide : T5 porte cinq refus dont un terminal, mais n'interroge
+# que la létalité ; T13 et T14 interrogent l'extrait, mais sur des refus
+# uniques. La paire « plusieurs refus ET extrait » est ci-dessous.
+
+# La forme exacte du cas d'origine, groom `e71ada95` (mika#3030) : un refus
+# `cause=default-deny` non terminal à 19:53:52Z, du bruit de journal, puis le
+# refus tier3 `[bash-grep]` terminal à 19:59:41Z qui a réellement fini la
+# session. Aucune ligne de continuation n'ouvre par `[` : la borne D6 s'applique
+# aux continuations comme au reste, et une fixture qui l'ignorerait mesurerait
+# une forme que le corpus ne porte pas.
+printf '%s\n' \
+    '[2026-11-03T19:53:52.000Z] [policy:deny] Bash: git -C /data/workspace/mika-platform/claude-pilot rev-parse --git-dir \' \
+    '  cause=default-deny (non-terminal)' \
+    '[debug] tool_use id=abc' \
+    '[2026-11-03T19:59:41.000Z] [policy:deny] Bash: grep -c "bash -c" ~/.mika/data/pilot-transcripts/*.jsonl \' \
+    '  | sort -rn \' \
+    '  cause=tier3 [bash-grep] (terminal)' \
+    '[done] Halted | 37 turns' \
+    > "$T2493_FIXTURE_DIR/two_denies.stderr"
+# Bonne foi AVANT les assertions : la fixture reproduit bien la forme mesurée.
+# Si sa létalité n'était pas `terminal`, le site n'annoncerait pas « it ended
+# the session » et tout ce qui suit ne mesurerait plus rien.
+assert_eq "AC1 (bonne foi): la fixture à deux refus a bien une létalité terminal" \
+    "terminal" "$(_t2493_lethality "$T2493_FIXTURE_DIR/two_denies.stderr")"
+T3040_EXCERPT_TWO=$(_t2493_excerpt "$T2493_FIXTURE_DIR/two_denies.stderr")
+assert_contains "AC1: l'extrait cite le [rule-id] du refus TERMINAL" \
+    "[bash-grep]" "$T3040_EXCERPT_TWO"
+assert_contains "AC1: et le marqueur cité concorde avec la létalité annoncée" \
+    "(terminal)" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: le premier refus, non terminal, n'est PAS celui qu'on cite" \
+    "rev-parse --git-dir" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: et son marqueur non terminal n'apparaît pas" \
+    "(non-terminal)" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: les bornes d'événement tiennent entre deux refus ([debug])" \
+    "[debug]" "$T3040_EXCERPT_TWO"
+assert_not_contains "AC1: ni la ligne de fin de session ([done])" \
+    "[done]" "$T3040_EXCERPT_TWO"
+# L'ÉVÉNEMENT TERMINAL EN ENTIER, à l'octet. Assertion d'égalité et non de
+# contenance, pour deux raisons : les continuations du terminal doivent être
+# emportées (sans quoi le [rule-id] et le marqueur se reperdent, le défaut même
+# de mika#2493), et elles doivent rester indentées de 4 espaces — D5 :
+# l'indentation neutralise les jetons de reclassification ancrés en début de
+# ligne. Les continuations de la fixture portent déjà 2 espaces, d'où 6 ici.
+#
+# `assert_contains` ne peut pas tenir cette moitié : son `grep -qF` traite une
+# aiguille multi-ligne comme PLUSIEURS motifs, et la ligne vide d'une aiguille
+# qui ouvre par un saut de ligne matche n'importe quoi — l'assertion passerait
+# au vert sur l'extrait d'aujourd'hui (mesuré).
+T3040_EXPECTED_TWO=$(printf '%s\n' \
+    '[2026-11-03T19:59:41.000Z] [policy:deny] Bash: grep -c "bash -c" ~/.mika/data/pilot-transcripts/*.jsonl \' \
+    '      | sort -rn \' \
+    '      cause=tier3 [bash-grep] (terminal)')
+assert_eq "AC1: l'extrait EST l'événement terminal entier, continuations indentées" \
+    "$T3040_EXPECTED_TWO" "$T3040_EXCERPT_TWO"
+
+# AC2, premier contrôle négatif — un refus unique NON terminal : l'extrait est
+# inchangé, parce que le candidat de repli a servi (aucun événement du flux ne
+# porte `(terminal)`). La valeur attendue est lue sur la FIXTURE et non réécrite
+# ici : sur un refus mono-ligne l'événement EST sa première ligne, donc
+# `grep -m1` en est la référence — propriété que T13 montre fausse dès que le
+# refus est multi-ligne.
+assert_eq "AC2: un refus unique non terminal ⇒ extrait inchangé (repli)" \
+    "$(sed 's/\x1b\[[0-9;]*[mK]//g' "$T2493_FIXTURE_DIR/nonterm.stderr" | grep -m1 '\[policy:deny\]' || true)" \
+    "$(_t2493_excerpt "$T2493_FIXTURE_DIR/nonterm.stderr")"
+
+# AC2, second contrôle négatif — un refus unique TERMINAL : extrait inchangé.
+assert_eq "AC2: un refus unique terminal ⇒ extrait inchangé" \
+    "$(grep -m1 '\[policy:deny\]' "$T2493_FIXTURE_DIR/term.stderr" || true)" \
+    "$(_t2493_excerpt "$T2493_FIXTURE_DIR/term.stderr")"
+
+# Et la même chose sur une forme MULTI-LIGNE. Sans cette fixture, le candidat
+# terminal n'est jamais exercé sur un événement à continuations : une
+# implémentation qui ne retiendrait que la première ligne du terminal — celle
+# qui perd le [rule-id] et le marqueur, le défaut de mika#2493 — passerait.
+printf '%s\n' \
+    '[policy:deny] Bash: grep -rn "token" /etc/shadow /etc/sudoers \' \
+    '  --include="*" \' \
+    '  cause=tier3 [bash-sensitive-read] (terminal)' \
+    > "$T2493_FIXTURE_DIR/term_multiline.stderr"
+T3040_EXCERPT_TERM_ML=$(_t2493_excerpt "$T2493_FIXTURE_DIR/term_multiline.stderr")
+T3040_EXPECTED_TERM_ML=$(printf '%s\n' \
+    '[policy:deny] Bash: grep -rn "token" /etc/shadow /etc/sudoers \' \
+    '      --include="*" \' \
+    '      cause=tier3 [bash-sensitive-read] (terminal)')
+assert_eq "AC2: terminal multi-ligne — l'événement entier, première ligne à fleur" \
+    "$T3040_EXPECTED_TERM_ML" "$T3040_EXCERPT_TERM_ML"
+
 # --- T8 : garde de préemption, formulée sur la POPULATION des sites ----------
 #
 # Formulé sur la population — toute branche qui déclare un halt sur un deny —
@@ -9468,6 +10288,51 @@ assert_eq "T8: tout site de halt sur deny est réservé à la létalité termina
 # résultat identique — et donnerait l'apparence d'un fix qui corrige ses tests.
 assert_eq "D1: les deux sites gardent POLICY_DENY en conjoint de tête" \
     "2" "$(grep -c 'if \[ -n "\$POLICY_DENY" \] && \[ -z "\$VALID_PLAN" \]' "$DISPATCH_LIB" || true)"
+
+# --- mika#3040 AC3 : un seul site construit le couple (extrait, létalité) ----
+#
+# Le défaut de mika#3040 n'était dans aucune des deux fonctions — chacune
+# répondait juste à sa propre question. Il était dans le fait que DEUX sites
+# posaient les deux questions séparément, en copies quasi-littérales l'un de
+# l'autre : c'est cette duplication qui était la condition matérielle de la
+# divergence. `_policy_deny_read` la supprime ; ce scan refuse qu'elle revienne.
+#
+# Même patron que T8 ci-dessus : une allowlist déclarée vide et tenue vide par
+# une assertion, un scan structurel, et un contrôle de bonne foi. « On déclare,
+# on n'allowliste pas » (mika#2201, mika#2323) : quand ce scan tire, la
+# résolution est de router le nouveau site par `_policy_deny_read`, JAMAIS
+# d'ajouter une entrée ici. Une exception ne peut d'ailleurs pas devenir stale,
+# parce qu'elle ne peut pas exister : toute entrée rougit l'assertion suivante
+# au premier run.
+POLICY_DENY_CONSTRUCTION_SITES_ALLOWED=""   # mika#3040 : LIVRÉE VIDE, et un test le tient
+assert_eq "AC3: allowlist des sites de construction — zero entries" \
+    "" "$POLICY_DENY_CONSTRUCTION_SITES_ALLOWED"
+
+# Les commentaires et les trois lignes de DÉFINITION sont exclus : on compte les
+# APPELS. Les trois premières mesures doivent toutes tomber dans
+# `_policy_deny_read`, la quatrième est ce qui empêche le scan de mesurer le
+# vide — un fichier où plus aucun site ne lirait le refus rendrait `0:0:0` et
+# passerait vert à vide, le mode de panne que mika#2578 et mika#2752 ont payé.
+T3040_READ_SCAN=$(awk '
+    /^[[:space:]]*#/ { next }
+    index($0, "_policy_deny_excerpt() {") > 0 { next }
+    index($0, "_policy_deny_lethality() {") > 0 { next }
+    index($0, "_policy_deny_read() {") > 0 { next }
+    index($0, "POLICY_DENY=$(") > 0 { ctor++ }
+    index($0, "_policy_deny_excerpt") > 0 { exc++ }
+    index($0, "_policy_deny_lethality") > 0 { leth++ }
+    index($0, "_policy_deny_read") > 0 { rd++ }
+    END { printf "%d:%d:%d:%d", ctor + 0, exc + 0, leth + 0, rd + 0 }
+' "$DISPATCH_LIB")
+# Bonne foi d'abord, comme T8 : le scan voit bien les deux sites d'appel.
+assert_eq "AC3 (bonne foi): le scan voit au moins deux appels de _policy_deny_read" \
+    "yes" "$([ "${T3040_READ_SCAN##*:}" -ge 2 ] && echo yes || echo "non ($T3040_READ_SCAN)")"
+assert_eq "AC3: une seule ligne construit POLICY_DENY par substitution" \
+    "1" "$(printf '%s' "$T3040_READ_SCAN" | cut -d: -f1)"
+assert_eq "AC3: _policy_deny_excerpt n'est appelé qu'une fois (jamais sans la létalité)" \
+    "1" "$(printf '%s' "$T3040_READ_SCAN" | cut -d: -f2)"
+assert_eq "AC3: _policy_deny_lethality n'est appelé qu'une fois (jamais dissocié)" \
+    "1" "$(printf '%s' "$T3040_READ_SCAN" | cut -d: -f3)"
 
 # --- T9, T10, T11, T15, T16 : comportement bout-en-bout ---------------------
 #
@@ -9728,22 +10593,57 @@ assert_eq "S2 (double sens): aucune entrée d'allowlist périmée" "" \
 # commit dirait `rescue no_halt_signal`, pour une même session, l'un des deux
 # gravé dans l'historique git pour toujours.
 #
+# Ce que ce scan compte est le nombre d'APPELANTS DU RÉSOLVEUR, pas un plafond de
+# consommateurs : un site de plus qui l'appelle est la conformité, un site de
+# plus qui lit `$SUBTYPE` à la main serait la panne. mika#2029 en a ajouté un
+# troisième — la branche `_terminated_empty` de `_run_claude_pilot`, qui compose
+# le motif `NO_PR: pilot_terminated_<sous-type>` — et il l'appelle AVANT la
+# substitution `RESULT=$(_classify_terminated_session)` : résolu ici, le mémo est
+# hérité par le sous-shell, donc le motif et la bannière décrivent la même
+# résolution par construction. La contrepartie `$SUBTYPE` de cette branche est
+# scannée par V3 dans le bloc mika#2029.
+#
+# mika#2077 en a ajouté un QUATRIÈME — `_classify_revise_halt`, qui classe la
+# halte de la session de REVISE. Il est l'exacte conformité que ce scan décrit :
+# il APPELLE le résolveur au lieu de relire `$SUBTYPE` à la main. Sa particularité
+# est inverse de celle de mika#2029 : il est appelé en SUBSTITUTION DE COMMANDE
+# et commence par `unset` le mémo, précisément pour ne PAS hériter de la
+# résolution du pilote principal — ici, une session, une réponse signifie deux
+# sessions, deux réponses. V5/V6 du bloc mika#2077 mesurent les deux sens.
+#
 # Le compte est fait hors définition et hors commentaire — seuls les appels.
 T2539_RESOLVER_CALLS=$(grep -n '_resolve_halt_subtype' "$DISPATCH_LIB" \
     | grep -v '_resolve_halt_subtype() {' \
     | grep -vE ':[[:space:]]*#' | grep -c . || true)
-assert_eq "S4: _resolve_halt_subtype a exactement deux appelants de production" "2" \
+assert_eq "S4: _resolve_halt_subtype a exactement quatre appelants de production" "4" \
     "$T2539_RESOLVER_CALLS"
-assert_contains "S4: l'un est la bannière du callback" \
+assert_contains "S4: le premier est la bannière du callback" \
     '_resolve_halt_subtype' "$(sed -n '/^_classify_terminated_session() {$/,/^}$/p' "$DISPATCH_LIB")"
-assert_contains "S4: l'autre est le compositeur du sujet de sauvetage" \
+assert_contains "S4: le deuxième est le compositeur du sujet de sauvetage" \
     '_resolve_halt_subtype' "$T2539_TOKEN_FN"
+assert_contains "S4: le troisième est la branche _terminated_empty (mika#2029)" \
+    '_resolve_halt_subtype' \
+    "$(sed -n '/^    if \[ "$_terminated_empty" = "1" \]; then$/,/^    fi$/p' "$DISPATCH_LIB" \
+        | grep -vE '^[[:space:]]*#')"
+assert_contains "S4: le quatrième est le classeur de la halte de revise (mika#2077)" \
+    '_resolve_halt_subtype' \
+    "$(sed -n '/^_classify_revise_halt() {$/,/^}$/p' "$DISPATCH_LIB")"
 
 # Le mémo est réinitialisé au site qui lit le sous-type d'une NOUVELLE session,
 # et pas chez l'un des deux appelants : « une session, une réponse » est ainsi
 # une propriété de la construction et non de la mémoire du prochain éditeur.
-assert_eq "S4: le mémo est réinitialisé exactement une fois, au site de SUBTYPE" "1" \
+#
+# mika#2077 — ils sont DEUX depuis que deux sessions distinctes sont classées
+# dans le même processus. Le compte reste exact et chaque site reste adossé à la
+# lecture d'un sous-type : `:5503` au `SUBTYPE=` du pilote principal, celui de
+# `_classify_revise_halt` au `SUBTYPE` local de la session de revise. Un
+# troisième site serait de nouveau une réinitialisation sans session neuve à
+# lire — c'est-à-dire la perte de la propriété, pas son renforcement.
+assert_eq "S4: le mémo est réinitialisé exactement deux fois, aux deux sites de SUBTYPE" "2" \
     "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$DISPATCH_LIB")"
+assert_contains "S4: la seconde réinitialisation est celle de la session de revise" \
+    'unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE' \
+    "$(sed -n '/^_classify_revise_halt() {$/,/^}$/p' "$DISPATCH_LIB")"
 
 # S5 — dispatch-lib parse toujours.
 T2539_RC=0
@@ -10026,11 +10926,30 @@ T2590_GROOMED_ARM=$(sed -n '/mika#1394: Architect converged on GROOMED/,/^      
 assert_eq "mika#2590 (bonne foi): le bras GROOMED a été extrait" \
     "yes" "$(if [ -n "$T2590_GROOMED_ARM" ]; then printf 'yes'; else printf 'no'; fi)"
 assert_contains "mika#2590 (U5a): le bras GROOMED pose sa ligne par _set_outcome_line" \
-    '_set_outcome_line "Outcome: PLAN_GROOMED"' "$T2590_GROOMED_ARM"
+    '_set_outcome_line "$_groomed_outcome"' "$T2590_GROOMED_ARM"
 assert_not_contains "mika#2590 (U5a): et le sed NON ANCRÉ a disparu (c'est lui, le faux négatif KTD3)" \
     's/Outcome: .*/Outcome: PLAN_GROOMED/' "$T2590_GROOMED_ARM"
 assert_contains "mika#2590 (U5a): le strip des PIPELINE FAILURE périmés est CONSERVÉ" \
     "sed '/^PIPELINE FAILURE:/d'" "$T2590_GROOMED_ARM"
+
+# --- mika#2981, Fire-Disposition : l'assertion auto-nettoyante de la grâce -----
+#
+# Le livrable de mika#2981 est une porte, et son chemin de succès est « aucune
+# violation trouvée ». La grâce D3 — une preuve dont la ligne ancrée ne porte
+# AUCUN suffixe de plan reste acceptée — a trois producteurs légitimes et doit se
+# vider d'elle-même (rétention de 30 jours de `prune_completed_tasks`). Le seul
+# chemin par lequel elle deviendrait la voie NOMINALE au lieu de se vider est un
+# retour du producteur à une frappe nue. Ces deux assertions rougissent ce
+# jour-là, et elles portent sur le FICHIER entier, pas sur le bras extrait : une
+# frappe nue ramenée ailleurs produirait la même population.
+#
+# Le compteur qui la fait expirer est `groom_proof_unbound_to_plan` dans
+# `audit_events` (écrivain unique, `executor.rs`) : c'est la sonde d'AC4, et à 0
+# le ticket de suivi retire la grâce et ces deux assertions avec elle.
+assert_not_contains "mika#2981 (Fire-Disposition): aucune frappe NUE de PLAN_GROOMED ne subsiste" \
+    '_set_outcome_line "Outcome: PLAN_GROOMED"' "$(cat "$DISPATCH_LIB")"
+assert_eq "mika#2981 (Fire-Disposition): la frappe SUFFIXÉE est présente une fois" \
+    "1" "$(grep -cF '_groomed_outcome="${_groomed_outcome} — ${GROOM_CALLOUT_PLAN}"' "$DISPATCH_LIB" || true)"
 
 # --- U7b (R8/D7) : aucune construction de RESULT auto_skipped ne cite le jeton -
 #
@@ -10428,9 +11347,14 @@ M2194_EXTRACT_SRC_EARLY=$(sed -n '/^_extract_plan_path()/,/^}/p' "$DISPATCH_LIB"
 M2194_NEEDLE='Plan:(\\)?\*(\\)?\*'
 M2194_READER='grep|sed|awk|=~|case[[:space:]]|expr[[:space:]]'
 
-m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE portant le motif
+# L'aiguille est un PARAMÈTRE depuis le vol 6 de mika#2194, et non une copie du
+# pipeline : le scan de tier 1 (plus bas, AC4) pose la même question sur une
+# autre aiguille. Le recopier créerait deux lecteurs de « quelles lignes de
+# commande LISENT ce motif » — précisément la classe que ce ticket migre. Le
+# corps, le discriminant et la sémantique de retour sont inchangés.
+m2194_read_sites() { # $1 = aiguille ERE ; lit sur stdin, rend le compte des lignes de LECTURE
     grep -v '^[[:space:]]*#' \
-        | grep -E -- "$M2194_NEEDLE" \
+        | grep -E -- "$1" \
         | grep -Ec -- "$M2194_READER" || true
 }
 
@@ -10448,7 +11372,7 @@ m2194_read_sites() { # lit sur stdin, rend le compte des lignes de LECTURE porta
 #    pas moins : ce sont eux qui distinguent « zéro lecteur » de « le prédicat ne
 #    regarde rien » (classe mika#2205), et sur un zéro il n'y a plus de
 #    population positive pour le faire à leur place.
-M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites)
+M2194_READ_COUNT=$(printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites "$M2194_NEEDLE")
 assert_eq "mika#2608 (R7): ZÉRO lecteur bash du callout — les deux de phase 2 ont migré" \
     "0" "$M2194_READ_COUNT"
 
@@ -10457,18 +11381,18 @@ assert_eq "mika#2608 (R7): ZÉRO lecteur bash du callout — les deux de phase 2
 # migré. Les deux assertions de la phase 1 s'INVERSENT plutôt que de disparaître.
 M2194_COMMITTED_SRC=$(sed -n '/^_committed_plan_on_branch()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "mika#2608 (R7): _committed_plan_on_branch ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_COMMITTED_SRC" | m2194_read_sites "$M2194_NEEDLE")"
 assert_contains "mika#2608 (R7): …et elle délègue au canal" \
     "_extract_plan_path" "$M2194_COMMITTED_SRC"
 M2194_WORKTREE_SRC=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
 assert_eq "mika#2608 (R7): _set_up_worktree ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_WORKTREE_SRC" | m2194_read_sites "$M2194_NEEDLE")"
 assert_contains "mika#2608 (R7): …et son \`elif\` délègue au canal" \
     "_extract_plan_path" "$M2194_WORKTREE_SRC"
 
 # Et le site que ce ticket bascule n'en est PLUS un : c'est le livrable de R3.
 assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
-    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_EXTRACT_SRC_EARLY" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°1 : sur une fixture portant le motif ÉCHAPPÉ en
 # position de lecture, le prédicat DOIT accuser. Sans lui, « aucun site » est
@@ -10477,13 +11401,13 @@ assert_eq "mika#2194 (R5): _extract_plan_path ne lit plus le motif" "0" \
 # livrable.
 M2194_FX_PCRE='    path=$(printf "%s\n" "$body" | grep -oP "^> - \*\*Plan:\*\* `\K[^`]+")'
 assert_eq "mika#2194 (R5, contrôle négatif a): le prédicat accuse un PCRE échappé" "1" \
-    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_PCRE" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°2 : la forme NON échappée aussi (un `case` sur le
 # littéral, la façon dont un futur lecteur bash le plus simple s'écrirait).
 M2194_FX_LITERAL='    case "$body" in *"> - **Plan:**"*) printf yes ;; esac'
 assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéral lu" "1" \
-    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_LITERAL" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Contrôle de bonne foi n°3 — celui qui borne la population : l'ÉCRIVAIN du
 # callout porte le motif et ne doit PAS être accusé. Sans ce contrôle, la
@@ -10491,7 +11415,7 @@ assert_eq "mika#2194 (R5, contrôle négatif b): le prédicat accuse un littéra
 # plus rien.
 M2194_FX_WRITER='> - **Plan:** \`${plan_relpath}\` (committed on branch @ \`${head_sha}\`)'
 assert_eq "mika#2194 (R5, contrôle négatif c): l'écrivain du callout est hors population" "0" \
-    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites)"
+    "$(printf '%s\n' "$M2194_FX_WRITER" | m2194_read_sites "$M2194_NEEDLE")"
 
 # Et l'anti-vacuité de la population elle-même : le motif DOIT encore apparaître
 # dans dispatch-lib. Le seuil passe de 3 à 1 avec la phase 2, et cette
@@ -10545,6 +11469,387 @@ assert_contains "mika#2194: le refus atteint le RESULT du callback" \
 M2194_DELIVER_SRC=$(sed -n '/^_deliver_callback()/,/^}/p' "$DISPATCH_LIB")
 assert_contains "mika#2194: _deliver_callback annexe le refus" \
     "_annex_plan_callout_refusal" "$M2194_DELIVER_SRC"
+
+# ============================================================================
+# mika#2194 vol 5 (AC4) — le scan anti-copie des TABLES DE TIER 2
+# ============================================================================
+#
+# Ce que le scan ci-dessus borne, c'est le motif du callout. Celui-ci borne
+# l'autre table que le vol 5 retire : les paraphrases du tier 2, qui vivaient
+# dans `_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` — déclarées
+# TEMPORAIRES au vol 3, donc explicitement en attente de ce retrait. Leur foyer
+# unique est désormais `arch_paraphrase::paraphrase`, avec son corpus doré.
+#
+# Pourquoi un scan et pas la seule disparition des deux fonctions : une fonction
+# retirée ne garantit rien sur ses littéraux. Le mode de rechute n'est pas « la
+# fonction revient » — personne ne la réécrira sous son nom — c'est « quelqu'un
+# recopie trois lignes de la table à l'endroit où il en a besoin », exactement ce
+# que le vol 3 a vu arriver une fois.
+#
+# La population : les lignes de COMMANDE de `dispatch-lib.sh`, commentaires
+# retirés d'abord. La doctrine de ce fichier cite abondamment les tiers et doit
+# pouvoir continuer — c'est le corps qu'on mesure, jamais la prose qui le décrit.
+#
+# ── CINQ DES QUINZE CHAÎNES DE LA TABLE SONT ÉCARTÉES PAR NOM, avec leur raison.
+#
+#    `escalate`, `fundamental`, `revise`, `proceed` et `dispatch` sont des mots
+#    courants de ce fichier (`dispatch` y est partout : c'est son nom). Une
+#    assertion qui les inclurait serait ROUGE À LA NAISSANCE, donc désarmée dans
+#    la semaine — et une garde désarmée est pire qu'une garde absente, parce
+#    qu'elle se lit comme une garde. Les dix qui restent sont les
+#    DISCRIMINANTES : des locutions de paraphrase d'architecte, qu'aucun autre
+#    besoin de ce fichier n'a de raison d'écrire.
+M2194_T2_NEEDLES=(
+    "human review"
+    "cannot proceed"
+    "out of scope for"
+    "needs revision"
+    "another pass"
+    "address the following"
+    "concerns that require"
+    "ship it"
+    "good to go"
+    "plan is clean"
+)
+
+# ── UNE exception PAR VALEUR, et elle s'auto-nettoie.
+#
+#    `human review` subsiste une fois sur une ligne de commande, dans le `RESULT`
+#    que `_halt_groom` compose : « Verdict: ESCALATE — human review required. »
+#    C'est une chaîne PRODUITE, pas un motif LU — l'inverse exact de ce que le
+#    scan refuse. L'exception est par valeur et non par fichier ni par fonction
+#    (doctrine mika#1804 / mika#2309), et l'assertion ci-dessous la rend
+#    AUTO-NETTOYANTE : le jour où `_halt_groom` cesse d'écrire cette ligne,
+#    l'exception rougit et on la retire. Le geste qui la rend inutile est celui
+#    qui la fait expirer.
+M2194_T2_EXCEPTION='Verdict: ESCALATE — human review required.'
+
+m2194_t2_offenders() { # rend le compte des lignes de commande portant une paraphrase
+    local needle count=0 n
+    for needle in "${M2194_T2_NEEDLES[@]}"; do
+        n=$(printf '%s\n' "$M2194_CMD_LINES" \
+            | grep -vF -- "$M2194_T2_EXCEPTION" \
+            | grep -ciF -- "$needle" || true)
+        count=$((count + n))
+    done
+    printf '%s' "$count"
+}
+
+assert_eq "mika#2194 (AC4): aucune paraphrase de tier 2 ne subsiste dans dispatch-lib.sh" \
+    "0" "$(m2194_t2_offenders)"
+
+assert_eq "mika#2194 (AC4): l'exception \`human review\` a encore son écrivain (auto-nettoyage)" \
+    "1" "$(printf '%s\n' "$M2194_CMD_LINES" | grep -cF -- "$M2194_T2_EXCEPTION" || true)"
+
+# Contrôle de bonne foi POSITIF : sur une fixture qui recopie trois lignes de la
+# table, le prédicat DOIT accuser. Sur un zéro il n'y a plus aucune population
+# pour le dire à sa place, et « zéro paraphrase » se lit exactement comme « le
+# prédicat ne regarde rien » (classe mika#2205).
+M2194_T2_FX='        *"ship it"*|*"good to go"*|*"plan is clean"*) printf READY ;;'
+M2194_T2_FX_HITS=0
+for m2194_needle in "${M2194_T2_NEEDLES[@]}"; do
+    M2194_T2_FX_HITS=$((M2194_T2_FX_HITS + $(printf '%s\n' "$M2194_T2_FX" | grep -ciF -- "$m2194_needle" || true)))
+done
+assert_eq "mika#2194 (AC4, contrôle positif): le prédicat accuse une table recopiée" \
+    "3" "$M2194_T2_FX_HITS"
+
+# ── LE TERME D'ANTI-VACUITÉ, mesuré sur une révision IMMUABLE.
+#
+#    Sans lui, un zéro et un prédicat aveugle se lisent pareil : si les dix
+#    chaînes n'étaient jamais des paraphrases de ce fichier, le zéro serait vrai
+#    sans rien mesurer. La population positive est donc prise dans l'arbre
+#    d'AVANT le retrait — `593a745c5`, le vol 4, un commit mergé : les dix
+#    chaînes y sont, sur des lignes de commande, dans les deux fonctions fuzzy.
+#    Le jour où elles n'y sont plus, c'est que l'assertion a cessé de mesurer son
+#    objet, et elle rougit.
+#
+#    La révision peut être INACCESSIBLE sans être fautive : `actions/checkout`
+#    clone à `fetch-depth: 1`, et l'objet n'est alors pas dans le dépôt. On
+#    distingue les deux cas — révision absente ⇒ SKIP qui se dit, révision
+#    présente mais vidée de ses chaînes ⇒ rouge. Confondre les deux donnerait soit
+#    une CI rouge sur rien, soit un vert acheté par un clone peu profond.
+M2194_T2_PRESWITCH_REV='593a745c5'
+if ! git cat-file -e "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" 2>/dev/null; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2194 (AC4, anti-vacuité) — la révision pre-switch ${M2194_T2_PRESWITCH_REV} n'est pas dans ce clone."
+    echo "    Un clone à 'fetch-depth: 1' n'a pas l'objet ; l'absence de la révision"
+    echo "    n'est pas l'absence des chaînes, et seule la seconde doit rougir."
+    echo "    Remède : git fetch --unshallow (ou fetch-depth: 0 dans le workflow)."
+else
+    M2194_T2_OLD=$(git show "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" \
+        | grep -v '^[[:space:]]*#' || true)
+    # La taille de la population est DITE : une anti-vacuité qui rougit sans
+    # nommer ce qu'elle a lu envoie chercher la cause dans la mauvaise moitié.
+    echo "    → mika#2194 (AC4): $(printf '%s\n' "$M2194_T2_OLD" | wc -l) lignes de commande lues dans ${M2194_T2_PRESWITCH_REV}"
+    # `grep -ciF` et non `grep -qiF` : sous `set -o pipefail`, un `-q` ferme le
+    # tube au premier match, `printf` meurt sur SIGPIPE, et le pipeline rend 141
+    # — donc le `if` lit FAUX sur les chaînes PRÉSENTES. Mesuré ici le
+    # 2026-11-02 : les dix comptaient zéro sur une population de 5 670 lignes.
+    # C'est la classe de panne que ce ticket existe pour sortir du bash, et elle
+    # mord jusque dans le test qui l'énonce.
+    M2194_T2_OLD_COVERED=0
+    for m2194_needle in "${M2194_T2_NEEDLES[@]}"; do
+        if [ "$(printf '%s\n' "$M2194_T2_OLD" | grep -ciF -- "$m2194_needle" || true)" -gt 0 ]; then
+            M2194_T2_OLD_COVERED=$((M2194_T2_OLD_COVERED + 1))
+        fi
+    done
+    # Les DIX, pas « au moins une » : un seuil bas laisserait neuf chaînes cesser
+    # d'être des paraphrases sans que personne ne l'apprenne.
+    assert_eq "mika#2194 (AC4, anti-vacuité): les dix chaînes étaient bien dans ${M2194_T2_PRESWITCH_REV}" \
+        "10" "$M2194_T2_OLD_COVERED"
+fi
+
+# Et les deux fonctions qui portaient la table ne sont plus définies du tout —
+# ce que la sentinelle de bascule ne dit pas : elle compte des délégations, pas
+# des absences.
+assert_eq "mika#2194 (AC4): _parse_disposition_fuzzy n'est plus définie" "no" \
+    "$(if declare -f _parse_disposition_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "mika#2194 (AC4): _parse_verdict_fuzzy n'est plus définie" "no" \
+    "$(if declare -f _parse_verdict_fuzzy >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+
+# ============================================================================
+# mika#2194 vol 6 (AC4) — le scan anti-copie des MOTIFS DE TIER 1
+# ============================================================================
+#
+# Le scan ci-dessus borne la table du tier 2. Celui-ci borne l'autre moitié
+# d'AC4 : les lecteurs de forme `Disposition:` / `Verdict:` que le vol 5 a
+# retirés de `_parse_disposition` et `_parse_verdict`. Leur foyer unique est
+# désormais `arch_disposition::decide` (`canonical-tokens.tsv:257-262`).
+#
+# RIEN d'autre dans l'arbre ne tient cette absence, et les trois choses qui en
+# ont l'air n'en sont pas : `scripts/check-canonical-tokens.sh:181` porte sur la
+# TYPOGRAPHIE (règle L4, espace insécable), l'assertion de `_detect_plan_on_branch`
+# plus haut est COMPORTEMENTALE sur `$RESULT`, et le scan de portée de module de
+# `plan_callout` lit une source RUST.
+#
+# ── L'AIGUILLE COUVRE LES DEUX ÉCRITURES DU MOTIF — piège 3 du § 5 de la
+#    doctrine (`dispatch-lib-migration.md:453-456`), déjà payé une fois sur le
+#    callout. Les deux écritures ne se recouvrent PAS : un littéral contigu
+#    (`Disposition:`) et une alternation en source (`(Verdict|Disposition)`).
+#    Mesuré le 2026-11-02, discriminant appliqué : sur `HEAD` le littéral compte
+#    0 et l'alternation 1 ; sur la révision pre-switch `593a745c5`, 4 et 1. Une
+#    aiguille au seul littéral vaudrait zéro aujourd'hui et resterait VERTE si un
+#    tier 1 revenait sous forme tolérante à l'emphase — exactement le défaut que
+#    le piège 3 documente comme déjà payé.
+#
+#    Le `:` est EXIGÉ, et c'est une mesure et non un confort : `Fire-Disposition`
+#    (`dispatch-lib.sh:10330`, `grep -qF`) est un vrai lecteur, portant le mot
+#    `Disposition`, sur une ligne de commande. Relâcher au mot nu le ferait
+#    rougir sur du code sain, donc désarmer le scan dans la semaine.
+#
+#    SENSIBLE À LA CASSE, et ce choix ne porte RIEN aujourd'hui : les deux jetons
+#    sont canoniquement capitalisés (`canonical-tokens.tsv:257-258`) et les deux
+#    variantes rendent le même verdict une fois le discriminant appliqué. Dit ici
+#    pour qu'un futur lecteur ne le croie pas mesuré sur un écart. Sans le
+#    discriminant, l'insensible ramasserait 4 artefacts d'affectation de variable
+#    (`${_BRANCH_REUSE_VERDICT:-}`, `${disposition:-UNPARSED}`, …) : élargir la
+#    population sans élargir la classe de défaut.
+M2194_T1_NEEDLE='Disposition:|Verdict:|\(Verdict\|Disposition\)'
+
+# ── UNE exception, PAR VALEUR, avec son ticket — et elle s'auto-nettoie.
+#
+#    `_second_pass_explicit_iterate` (`dispatch-lib.sh:11060`) est un lecteur de
+#    forme tier 1, en bash, CONSERVÉ PAR DÉCISION : AC1 de mika#2641 exclut
+#    nommément ITERATE du périmètre de relance, parce que `_parse_verdict` n'a
+#    aucun bras ITERATE et qu'une seconde passe qui écrit `Disposition: ITERATE`
+#    est une objection LISIBLE et non un illisible. Sa doctrine est au
+#    commentaire 11047-11057 de dispatch-lib, et il a deux appelants de
+#    production.
+#
+#    L'énoncé d'AC4 au corps du ticket (« aucun motif de tier 1 ou 2 ne subsiste
+#    dans dispatch-lib.sh ») est donc LITTÉRALEMENT FAUX sur ce lecteur, et
+#    l'écart est déclaré plutôt que résolu en silence. Rétrécir l'aiguille pour
+#    atteindre un zéro littéral serait choisir le NOMBRE plutôt que la
+#    CONSÉQUENCE — la faute que mika#2309 refuse sur les budgets d'appel et que
+#    mika#1804 a redite sur les couleurs du landing, et celle que le bearing de
+#    Prime du 2026-11-02 vient de corriger sur AC5. Le scan NOMME ce lecteur
+#    plutôt que de le rencontrer.
+#
+#    L'exception retire de la population le CORPS DE LA FONCTION NOMMÉE, et non
+#    une ligne littérale : c'est l'identité stable à travers un reformatage de la
+#    regex.
+M2194_T1_EXCEPTION='_second_pass_explicit_iterate'
+M2194_T1_EXC_LINES=$(sed -n "/^${M2194_T1_EXCEPTION}()/,/^}/p" "$DISPATCH_LIB" \
+    | grep -v '^[[:space:]]*#' | grep -E -- "$M2194_T1_NEEDLE" || true)
+
+m2194_t1_offenders() { # rend le compte des lecteurs de tier 1, exception nommée retirée
+    # `grep -vxF` sur une chaîne MULTILIGNE : chaque ligne du corps devient un
+    # motif à ligne entière. Le garde-fou sur le vide n'est pas décoratif — avec
+    # une exception vide, `grep -vxF -- ''` retirerait les lignes vides de la
+    # population, donc un compte juste pour une mauvaise raison.
+    if [ -n "$M2194_T1_EXC_LINES" ]; then
+        printf '%s\n' "$M2194_CMD_LINES" \
+            | grep -vxF -- "$M2194_T1_EXC_LINES" \
+            | m2194_read_sites "$M2194_T1_NEEDLE"
+    else
+        printf '%s\n' "$M2194_CMD_LINES" | m2194_read_sites "$M2194_T1_NEEDLE"
+    fi
+}
+
+assert_eq "mika#2194 (AC4): aucun lecteur de tier 1 hors l'exception nommée dans dispatch-lib.sh" \
+    "0" "$(m2194_t1_offenders)"
+
+# ── PÉREMPTION DE L'EXCEPTION. Le corps de la fonction doit exister et porter
+#    EXACTEMENT UN lecteur de l'aiguille. Trois façons de devenir stale, et les
+#    trois rougissent : mika#2641 migre vers le moteur (corps vide), la fonction
+#    est renommée (corps vide), un second lecteur est ajouté dans ce corps
+#    (compte à 2). Le geste qui rend l'exception inutile est celui qui la fait
+#    expirer — et ce jour-là on la retire, l'assertion zéro tenant seule.
+assert_eq "mika#2194 (AC4): l'exception mika#2641 porte exactement un lecteur (auto-nettoyage)" \
+    "1" "$(printf '%s\n' "$M2194_T1_EXC_LINES" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+# ── CONTRÔLE DE BONNE FOI POSITIF, sur fixture : les QUATRE formes de lecteur
+#    que le vol 5 a retirées (lignes 9965, 9974, 10047 et 10064 de la révision
+#    pre-switch). Le prédicat doit en compter 4. Sur un zéro il n'y a plus aucune
+#    population pour le dire à sa place, et « zéro lecteur » se lirait exactement
+#    comme « le prédicat ne regarde rien » (classe mika#2205).
+M2194_T1_FX=(
+    "    result=\$(printf '%s' \"\$text\" | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \\"
+    "    verdict_keyword=\$(printf '%s' \"\$text\" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \\"
+    "    result=\$(printf '%s' \"\$text\" | grep -oE 'Verdict:[[:space:]]*(GROOMED|ESCALATE)' \\"
+    "        | grep -oE 'Disposition:[[:space:]]*(READY|ITERATE|ESCALATE)' \\"
+)
+assert_eq "mika#2194 (AC4, contrôle positif): le prédicat accuse les quatre lecteurs retirés" \
+    "4" "$(printf '%s\n' "${M2194_T1_FX[@]}" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+# ── LES DEUX CONTRÔLES NÉGATIFS QUI ÉPINGLENT LE DESSIN DE L'AIGUILLE. Ce sont
+#    eux qui la rendent non substituable par un littéral nu, et ils rougissent si
+#    quelqu'un la rétrécit — ou la relâche au mot.
+#
+#    (a) un tier 1 revenu sous forme TOLÉRANTE À L'EMPHASE — donc SANS
+#        `Disposition:` contigu — EST compté. C'est la seconde écriture du § 2,
+#        celle qu'une aiguille au seul littéral laisserait passer en silence.
+M2194_T1_FX_EMPHASE='    grep -qE "^[[:space:]>*_]*(Verdict|Disposition)[*_]*:[[:space:]]*READY"'
+assert_eq "mika#2194 (AC4, contrôle négatif a): un lecteur tolérant à l'emphase est compté" \
+    "1" "$(printf '%s\n' "$M2194_T1_FX_EMPHASE" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+#    (b) `Fire-Disposition` n'est PAS compté : vrai lecteur, vrai outil de
+#        lecture, portant le mot `Disposition` — mais sans `:` contigu. C'est la
+#        mesure qui justifie que l'aiguille garde son `:`.
+M2194_T1_FX_FIREDISP="    grep -qF -- 'Fire-Disposition' \"\$first_pass_findings\" 2>/dev/null || return 0"
+assert_eq "mika#2194 (AC4, contrôle négatif b): Fire-Disposition est hors population" \
+    "0" "$(printf '%s\n' "$M2194_T1_FX_FIREDISP" | m2194_read_sites "$M2194_T1_NEEDLE")"
+
+# ── LE TERME D'ANTI-VACUITÉ, mesuré sur la même révision IMMUABLE que le scan de
+#    tier 2 ci-dessus. Les quatre lecteurs retirés par le vol 5 y sont, sur des
+#    lignes de commande, dans les deux fonctions fuzzy — plus le lecteur mika#2641
+#    qui existait déjà, d'où CINQ. Le jour où ils n'y sont plus, c'est que
+#    l'assertion a cessé de mesurer son objet, et elle rougit.
+#
+#    Même mécanique que le bloc de tier 2 : `git cat-file -e` d'abord, SKIP qui
+#    se dit si le clone est shallow (`actions/checkout` à `fetch-depth: 1` n'a
+#    pas l'objet), et jamais `grep -q` dans la mesure — sous `set -o pipefail` un
+#    `-q` ferme le tube au premier match, `printf`/`git show` meurt sur SIGPIPE
+#    et le pipeline rend 141, donc le `if` lit FAUX sur des chaînes PRÉSENTES.
+if ! git cat-file -e "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" 2>/dev/null; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2194 (AC4 tier 1, anti-vacuité) — la révision pre-switch ${M2194_T2_PRESWITCH_REV} n'est pas dans ce clone."
+    echo "    Un clone à 'fetch-depth: 1' n'a pas l'objet ; l'absence de la révision"
+    echo "    n'est pas l'absence des lecteurs, et seule la seconde doit rougir."
+    echo "    Remède : git fetch --unshallow (ou fetch-depth: 0 dans le workflow)."
+else
+    M2194_T1_OLD_COUNT=$(git show "${M2194_T2_PRESWITCH_REV}:skills/bundled/_shared/dispatch-lib.sh" \
+        | m2194_read_sites "$M2194_T1_NEEDLE")
+    # CINQ, et pas « au moins un » : un seuil bas laisserait quatre des cinq
+    # cesser d'être des lecteurs sans que personne ne l'apprenne.
+    assert_eq "mika#2194 (AC4 tier 1, anti-vacuité): les cinq lecteurs étaient bien dans ${M2194_T2_PRESWITCH_REV}" \
+        "5" "$M2194_T1_OLD_COUNT"
+fi
+
+# ── La forme des deux enveloppes, et le canal du refus (AC3).
+#
+# Même grille que `_extract_plan_path` ci-dessus, parce que c'est la même
+# doctrine : le corps par FICHIER (classe de portée de guillemets cpp#157), les
+# trois codes de sortie traités, et le refus qui ATTEINT le `RESULT` — un stderr
+# d'avant-pilote est perdu sur un dispatch qui réussit (classe mika#2050), et ce
+# refus laisse précisément le dispatch réussir.
+for m2194_fn in _parse_disposition _parse_verdict; do
+    M2194_W_SRC=$(declare -f "$m2194_fn")
+    assert_eq "mika#2194 (vol 5): $m2194_fn est définie" "yes" \
+        "$(if [ -n "$M2194_W_SRC" ]; then printf 'yes'; else printf 'no'; fi)"
+    assert_contains "mika#2194 (vol 5): $m2194_fn délègue à la sous-commande" \
+        "mika arch-disposition" "$M2194_W_SRC"
+    assert_contains "mika#2194 (vol 5): $m2194_fn passe la réponse par un fichier" \
+        "mktemp" "$M2194_W_SRC"
+    assert_contains "mika#2194 (vol 5, AC3): $m2194_fn nomme son refus sur le code ≥2" \
+        "_arch_disposition_refuse" "$M2194_W_SRC"
+    assert_contains "mika#2194 (vol 5): $m2194_fn écrit encore le canal fuzzy" \
+        "_DISPOSITION_FUZZY_FILE" "$M2194_W_SRC"
+done
+assert_contains "mika#2194 (vol 5, AC3): le refus porte le motif nommé" \
+    "REFUSED (arch-disposition, mika#2194)" "$(declare -f _arch_disposition_refuse)"
+assert_contains "mika#2194 (vol 5, AC3): _deliver_callback annexe le refus du lecteur" \
+    "_annex_arch_disposition_refusal" "$M2194_DELIVER_SRC"
+# Le fichier de refus est nettoyé par le trap, comme son jumeau fuzzy : deux
+# canaux `$`-suffixés, un seul endroit qui les retire.
+assert_contains "mika#2194 (vol 5): le trap de sortie nettoie le fichier de refus" \
+    "_ARCH_DISPOSITION_REFUSAL_FILE" "$(declare -f _dispatch_lib_exit_trap)"
+
+# ── AC3 par le COMPORTEMENT, aux deux polarités, dans le même bloc (revue du vol 5).
+#
+# Les assertions ci-dessus lisent le SOURCE : elles disent que les enveloppes
+# nomment le refus, pas qu'un refus traverse réellement le `$(...)` jusqu'au
+# `RESULT`. Ici `mika` est remplacé par une fonction du shell, ce qui exerce le
+# vrai chemin des enveloppes sans dépendre du binaire, donc sans porte de SKIP :
+#   - polarité positive : le moteur sort à 3. Jeton vide, enveloppe à 0 (le
+#     contrat de retour que les trois appelants lisent sous errexit), motif
+#     `subcommand_error` dans le fichier de refus ;
+#   - polarité négative : le moteur lit un jeton. Jeton rendu, fichier de refus
+#     ABSENT. Sans elle, « refuse quand il faut » et « refuse toujours » se
+#     liraient pareil.
+# Chaque cas tourne dans un sous-shell, pour que la fonction `mika` ne masque pas
+# le binaire dans la suite du fichier.
+for m2194_fn in _parse_disposition _parse_verdict; do
+    M2194_REFUSED=$(
+        mika() { return 3; }
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+        m2194_rc=0
+        m2194_tok=$(printf 'Disposition: READY\nVerdict: GROOMED\n' | "$m2194_fn" 2>/dev/null) || m2194_rc=$?
+        printf 'tok=[%s] rc=%s refus=[%s]' "$m2194_tok" "$m2194_rc" \
+            "$(cat "$_ARCH_DISPOSITION_REFUSAL_FILE" 2>/dev/null || true)"
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    )
+    assert_contains "mika#2194 (vol 5, AC3+): $m2194_fn sur moteur en échec rend un jeton vide" \
+        "tok=[] rc=0" "$M2194_REFUSED"
+    assert_contains "mika#2194 (vol 5, AC3+): $m2194_fn sur moteur en échec écrit le motif nommé" \
+        "refus=[subcommand_error: la sous-commande" "$M2194_REFUSED"
+
+    M2194_SAIN=$(
+        mika() { printf 'READY\n1a\n'; return 0; }
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+        m2194_rc=0
+        m2194_tok=$(printf 'Disposition: READY\n' | "$m2194_fn" 2>/dev/null) || m2194_rc=$?
+        printf 'tok=[%s] rc=%s refus=%s' "$m2194_tok" "$m2194_rc" \
+            "$(if [ -e "$_ARCH_DISPOSITION_REFUSAL_FILE" ]; then printf 'present'; else printf 'absent'; fi)"
+        rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    )
+    assert_eq "mika#2194 (vol 5, AC3-): $m2194_fn sur réponse saine ne refuse rien" \
+        "tok=[READY] rc=0 refus=absent" "$M2194_SAIN"
+done
+
+# L'annexe, par le comportement : le motif atteint le `RESULT` une fois et une
+# seule (idempotence, deux appels), et un `RESULT` sans refus en attente sort
+# intact (polarité négative).
+M2194_ANNEXE=$(
+    printf '%s' 'subcommand_error: sonde' > "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    RESULT="corps du résultat"
+    _annex_arch_disposition_refusal
+    _annex_arch_disposition_refusal
+    rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    printf '%s' "$RESULT"
+)
+assert_eq "mika#2194 (vol 5, AC3+): l'annexe porte le motif dans le RESULT, une seule fois" \
+    "1" "$(grep -cF -- 'REFUSED (arch-disposition, mika#2194) subcommand_error: sonde' <<<"$M2194_ANNEXE" || true)"
+assert_contains "mika#2194 (vol 5, AC3+): l'annexe garde le corps du RESULT" \
+    "corps du résultat" "$M2194_ANNEXE"
+M2194_ANNEXE_VIDE=$(
+    rm -f "$_ARCH_DISPOSITION_REFUSAL_FILE"
+    RESULT="corps du résultat"
+    _annex_arch_disposition_refusal
+    printf '%s' "$RESULT"
+)
+assert_eq "mika#2194 (vol 5, AC3-): sans refus en attente, l'annexe laisse le RESULT intact" \
+    "corps du résultat" "$M2194_ANNEXE_VIDE"
 
 # ============================================================================
 # mika#2608 R6 — l'inventaire du jeton dans `canonical-tokens.tsv`, fermé à UNE
@@ -11282,7 +12587,11 @@ assert_eq "mika#2626 (V5): et ce site est DANS le lecteur" "1" \
 # la classe de panne qu'il existe pour empêcher (mika#2205).
 M2626_CALLERS=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" \
     | grep -cE '^[[:space:]]*(if |local |[A-Za-z_]+=)?.*_remote_branch_exists[[:space:]]' || true)
-assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT deux appelants du lecteur" "2" \
+# mika#2976 AC9 ajoute le TROISIÈME : `_branch_reuse_verdict` demande au
+# distant si la branche existe avant de lire la ref de suivi, et il le demande
+# au lecteur unique plutôt qu'à un second `ls-remote --exit-code` — c'est
+# exactement ce que ce test protège. Le compte suit, il ne s'élargit pas.
+assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT trois appelants du lecteur" "3" \
     "$M2626_CALLERS"
 
 # Contrôle de bonne foi, DANS LES DEUX SENS, et chaque sens exerce le prédicat
@@ -11480,6 +12789,9 @@ _t2636_revise_probe() {
         _run_pilot_sandboxed() {
             local n; n=$(( $(cat "$t2636_counter") + 1 ))
             printf '%s\n' "$n" > "$t2636_counter"
+            if [ -n "${T2636_SIZE_BODY_OUT:-}" ] && [ -f "$t2636_wt/.iterate/findings-1-size.md" ]; then
+                cp "$t2636_wt/.iterate/findings-1-size.md" "$T2636_SIZE_BODY_OUT"
+            fi
             case "$t2636_behaviour" in
                 wipe) rm -f "$t2636_wt/.iterate/findings-1.md" ;;
                 second) [ "$n" -ge 2 ] && printf '\n## 6. Taille estimée\n\nTotal estimé : 400 lignes\n' >> "$t2636_plan" ;;
@@ -11536,6 +12848,17 @@ assert_contains "S1: l'échec de second tour est DIT" \
 
 # Et quand la seconde tentative réussit, elle se tait : l'événement d'échec est
 # réservé à l'échec, sinon il ne mesure plus rien.
+# mika#2693 (revue, P1) — le corps du finding de rattrapage porte le plafond et
+# la borne de CE ticket, pas des chevrons. Sans labels : le défaut de flotte.
+t2693_size_body=$(mktemp)
+T2636_SIZE_BODY_OUT="$t2693_size_body" _t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "never" >/dev/null
+assert_contains "mika#2693 P1: le finding de rattrapage rend le plafond du ticket" \
+    'Le plafond de CE ticket est de 150 tours' "$(cat "$t2693_size_body")"
+assert_not_contains "mika#2693 P1: et ne laisse aucun placeholder non rendu" \
+    '__PLAN_SIZE_' "$(cat "$t2693_size_body")"
+assert_contains "mika#2693 P1 contre-vacuité: le corps capturé est bien le finding F-SIZE" \
+    'F-SIZE [BLOQUANT]' "$(cat "$t2693_size_body")"
+rm -f "$t2693_size_body"
 T2636_S1B=$(_t2636_revise_probe "$T2636_FINDINGS_WITH_SIZE" "no" "second")
 assert_eq "S1: seconde tentative réussie ⇒ toujours une seule relance" \
     "2" "$(_t2636_field 2 "$T2636_S1B")"
@@ -11923,14 +13246,14 @@ assert_contains "S13-bis: et la ligne de total que \$_PLAN_SIZE_TOTAL_RE extrait
     'Total estimé : 215 lignes' "${_PLAN_SIZE_FORMAT_SPEC:-}"
 assert_contains "S13-bis: la règle du groomeur interpole le spec" \
     "${_PLAN_SIZE_FORMAT_SPEC:-ABSENT}" "${_PLAN_SIZE_RULE:-}"
-# Les deux sites d'interpolation, et PAS un de plus : la règle, et le finding
-# synthétique. Un troisième texte qui re-taperait le format est la régression
-# que ce scan refuse — et on l'y route vers la constante, on n'ajoute pas
-# d'exception (doctrine mika#2201).
-assert_eq "S13-bis: exactement deux sites interpolent \$_PLAN_SIZE_FORMAT_SPEC" "2" \
+# Un seul site d'interpolation, le gabarit de la règle. Le finding synthétique
+# remet la règle RENDUE (mika#2693) : un second texte qui re-taperait le format
+# est la régression que ce scan refuse — on l'y route vers la constante, on
+# n'ajoute pas d'exception (doctrine mika#2201).
+assert_eq "S13-bis: exactement un site interpole \$_PLAN_SIZE_FORMAT_SPEC" "1" \
     "$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '${_PLAN_SIZE_FORMAT_SPEC}' || true)"
-assert_contains "S13-bis: le finding synthétique du rattrapage est l'un des deux" \
-    '${_PLAN_SIZE_FORMAT_SPEC}' \
+assert_contains "S13-bis: le finding synthétique du rattrapage rend la règle sur la ligne de son résolveur" \
+    '_plan_size_rule "$_PILOT_MAX_TURNS"; _size_rule="$_PLAN_SIZE_RULE"' \
     "$(sed -n '/^_plan_size_retry_if_section_still_missing() {/,/^}/p' "$DISPATCH_LIB")"
 # Contre-vacuité : le scan voit bien la constante, et il la voit DÉFINIE une fois.
 assert_eq "S13-bis contre-vacuité: la constante a un site de définition unique" "1" \
@@ -12228,6 +13551,714 @@ rien')"
 T2636_SOURCE_SCAN_ALLOWLIST=()
 assert_eq "mika#2636: table d'exceptions des trois scans de source (S8, S10, S11) — zero entries" \
     "0" "${#T2636_SOURCE_SCAN_ALLOWLIST[@]}"
+
+# ===========================================================================
+# mika#2693 — la SECONDE borne du Plan-Size Gate est PAR VOL, et en TOURS
+#
+# Le 2026-10-14, trois vols sont morts au plafond de tours EN PASSANT la borne
+# par PR de mika#2636 : mika#2683 (832 estimées, 1 432 réelles, mort au tour 201
+# dans `ce-simplify-code`), mika#2654 (880/1 160, 201), mika#2687 vol 1
+# (443/994, 151). Le travail tenait dans le vol — dernier commit de travail à
+# t171, t177, t136 — mais pas la FIN DE PIPELINE, qui coûte des TOURS et non des
+# lignes. Et la contrainte dépend du plafond DU ticket : 150 par défaut, 200 avec
+# `loop-substrate`.
+#
+# Les deux bornes cohabitent, et la plus serrée mord. Celle de mika#2636 reste
+# intacte : S1–S18 et S13-bis doivent passer SANS UNE LIGNE MODIFIÉE (AC4).
+#
+# V1 résolveur et paliers · V2 AC3, deux bornes selon le label · V3 co-location
+# et non-impression · V4 parité des deux prompts architecte (AC2) · V5 règle
+# injectée et format prescrit en forme · V6 anti-vacuité.
+# ===========================================================================
+
+echo ""
+echo 'Test: mika#2693 — la borne PAR VOL, dérivée du plafond de tours (V1–V6)'
+echo "-----------------------------------------------------------------------"
+
+# --- Outillage local de section ---------------------------------------------
+
+# Sonde du résolveur de borne. `$1` = le plafond passé ; `__EMPTY__` demande la
+# chaîne vide, c'est-à-dire le budget désarmé.
+_t2693_bound_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        t2693_c="$1"
+        if [ "$t2693_c" = "__EMPTY__" ]; then t2693_c=""; fi
+        _plan_size_per_flight_bound "$t2693_c"
+        printf '%s|%s|%s|%s' "$_PLAN_SIZE_PER_FLIGHT_BOUND" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE" \
+            "${_PLAN_SIZE_PER_FLIGHT_NOTE:-}"
+    )
+}
+
+# Sonde de la CHAÎNE RÉELLE, et c'est ce qui fait d'elle la sonde d'AC3 :
+# `LABELS` -> `_pilot_max_turns` -> `_plan_size_per_flight_bound`. Une sonde sur
+# le résolveur seul ne verrait pas qu'un appariement de label relâché donne la
+# borne LARGE à un ticket qui n'y a pas droit.
+_t2693_chain_probe() {
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PILOT_MAX_TURNS
+        _pilot_max_turns "$1"; _plan_size_per_flight_bound "$_PILOT_MAX_TURNS"
+        printf '%s|%s|%s' "$_PLAN_SIZE_PER_FLIGHT_BOUND" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING" \
+            "$_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE"
+    )
+}
+
+# Les deux plafonds de sonde du PLANCHER, dérivés des constantes (mika#2707, X1).
+# Le plancher de pipeline est une SOMME de deux constantes ; le jour où l'une
+# bouge, un littéral `85` fait tirer V1 et W3 pour une raison qui n'est pas un
+# défaut — et, pire, un littéral choisi juste sous l'ancien plancher passe
+# AU-DESSUS du nouveau et mesure le bras nominal du résolveur en se croyant sur
+# le plancher. Le détecteur qui tient cette dérivation est X1, plus bas.
+#
+# Leur non-vacuité est assertée ICI, avant V1, et non plus bas avec le reste :
+# une valeur vide passée à `_t2693_bound_probe` prend le bras du budget DÉSARMÉ
+# (`243|150|disarmed_fallback|`), et V1 resterait VERTE en ayant mesuré un autre
+# bras que celui qu'elle nomme.
+T2707_FLOOR=$(( ${_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS:-0} + ${_PLAN_SIZE_FLIGHT_TAIL_TURNS:-0} ))
+T2707_UNDER=$(( T2707_FLOOR - 15 ))
+assert_eq "X1 contre-vacuité: le plancher dérivé est un entier strictement positif" "oui" \
+    "$([ "$T2707_FLOOR" -gt 0 ] && echo oui || echo "non ($T2707_FLOOR)")"
+assert_eq "X1 contre-vacuité: le plafond SOUS le plancher l'est aussi" "oui" \
+    "$([ "$T2707_UNDER" -gt 0 ] && echo oui || echo "non ($T2707_UNDER)")"
+
+# --- V1 : le résolveur de borne, ses paliers, son plancher ------------------
+#
+# ROUGE AVANT : la fonction n'existait pas.
+#
+# Les deux dernières lignes sont le contrôle du PLANCHER. Un plafond au niveau
+# du plancher de pipeline (orientation + fin de pipeline, dérivé en
+# `$T2707_FLOOR`) ou en dessous donne un nombre de tours de travail nul ou
+# négatif, et la borne doit valoir 0 — JAMAIS un négatif, qui serait « un
+# nombre plausible, présenté avec autorité, faux », la classe que l'ancre de
+# `_PLAN_SIZE_TOTAL_RE` a déjà dû fermer.
+
+assert_eq "V1: plafond 200 ⇒ borne 429, provenance resolved" "429|200|resolved|" \
+    "$(_t2693_bound_probe 200)"
+assert_eq "V1: plafond 150 ⇒ borne 279, provenance resolved" "279|150|resolved|" \
+    "$(_t2693_bound_probe 150)"
+assert_eq "V1: plafond 120 ⇒ borne 189 (troncature entière assumée)" "189|120|resolved|" \
+    "$(_t2693_bound_probe 120)"
+assert_eq "V1: plafond VIDE (rollback) ⇒ repli 150, provenance disarmed_fallback" \
+    "279|150|disarmed_fallback|" "$(_t2693_bound_probe __EMPTY__)"
+assert_eq "V1: plafond $T2707_FLOOR (= le plancher) ⇒ borne 0, jamais un négatif" \
+    "0|$T2707_FLOOR|resolved|ceiling_below_pipeline_floor" \
+    "$(_t2693_bound_probe "$T2707_FLOOR")"
+assert_eq "V1: plafond $T2707_UNDER (sous le plancher) ⇒ borne 0, et la note le dit" \
+    "0|$T2707_UNDER|resolved|ceiling_below_pipeline_floor" \
+    "$(_t2693_bound_probe "$T2707_UNDER")"
+# Le repli n'est PAS 200 : ce 200 appartient au `maxTurns` amont de claude-pilot,
+# un composant qu'on ne possède pas, et un rollback est une posture d'incident.
+assert_not_contains "V1: le repli de budget désarmé ne vaut PAS la borne de 200 tours" \
+    "429" "$(_t2693_bound_probe __EMPTY__)"
+
+# --- V2 : AC3 — le MÊME plan donne deux bornes selon le label --------------
+#
+# ROUGE AVANT : rien ne dérivait de borne d'un plafond.
+
+assert_eq "V2 (AC3): sans loop-substrate ⇒ plafond 150, borne 279" "279|150|resolved" \
+    "$(_t2693_chain_probe "p1-important,ready")"
+assert_eq "V2 (AC3): avec loop-substrate ⇒ plafond 200, borne 429" "429|200|resolved" \
+    "$(_t2693_chain_probe "p1-important,ready,loop-substrate")"
+# Contrôle négatif PORTEUR : l'appariement de `_pilot_label_turn_ceiling` est
+# EXACT. Un glob de sous-chaîne à la manière de `_label_to_type` rendrait 429 —
+# c'est-à-dire la borne large sur un ticket qui n'y a pas droit.
+assert_eq "V2: appariement exact — 'not-loop-substrate' ⇒ 279, jamais 429" "279|150|resolved" \
+    "$(_t2693_chain_probe "not-loop-substrate")"
+assert_eq "V2: idem pour un suffixe — 'loop-substrate-v2' ⇒ 279" "279|150|resolved" \
+    "$(_t2693_chain_probe "loop-substrate-v2")"
+assert_eq "V2: aucun label ⇒ le défaut de flotte, donc 279" "279|150|resolved" \
+    "$(_t2693_chain_probe "")"
+
+# --- V3 : co-location et non-impression (patron S11 / mika#2496) -----------
+#
+# ROUGE PAR MUTATION, consigné : rendre le résolveur imprimant (`printf` en tête
+# de ligne au lieu d'une assignation) fait tirer la 3e assertion ; lui faire
+# relire `PILOT_LABEL_TURN_CEILINGS` fait tirer la 5e ; sortir une lecture de
+# `$_PLAN_SIZE_PER_FLIGHT_BOUND` de la ligne de son résolveur fait tirer la 1re.
+#
+# Le scan porte sur TOUTE la famille `_PLAN_SIZE_PER_FLIGHT_*`, pas seulement sur
+# la borne : les trois autres globales (plafond, provenance, note) se lisent
+# périmées exactement aussi facilement, et une exception pour elles serait la
+# moitié manquante de la garde.
+
+T2693_LOGICAL=$(_mika2496_logical_invocations "$DISPATCH_LIB")
+T2693_READS=$(printf '%s\n' "$T2693_LOGICAL" \
+    | grep -E '\$\{?_PLAN_SIZE_PER_FLIGHT_[A-Z_]+' || true)
+T2693_UNCOLOCATED=$(printf '%s\n' "$T2693_READS" \
+    | grep -vE '_plan_size_per_flight_bound' | grep -E . || true)
+assert_eq "V3: chaque lecture de \$_PLAN_SIZE_PER_FLIGHT_* appelle le résolveur sur la même invocation" \
+    "" "$T2693_UNCOLOCATED"
+# Contre-vacuité : le scan voit bien des lectures. VUE ROUGE (`non-trouvé`) sur
+# l'arbre où le résolveur n'était encore lu par personne — sans elle, supprimer
+# tous les lecteurs laisserait l'assertion ci-dessus verte et la garde aveugle.
+assert_eq "V3 contre-vacuité: au moins une lecture de \$_PLAN_SIZE_PER_FLIGHT_* existe" "yes" \
+    "$([ -n "$T2693_READS" ] && echo yes || echo non-trouvé)"
+
+T2693_RESOLVER_SRC=$(sed -n '/^_plan_size_per_flight_bound()/,/^}/p' "$DISPATCH_LIB")
+assert_eq "V3: _plan_size_per_flight_bound a bien été trouvée (guards the guard)" "yes" \
+    "$([ -n "$T2693_RESOLVER_SRC" ] && echo yes || echo no)"
+assert_eq "V3 × mika#2039: le résolveur n'imprime pas" "0" \
+    "$(printf '%s\n' "$T2693_RESOLVER_SRC" | grep -cE '^[[:space:]]*(printf|echo)[[:space:]]' || true)"
+assert_eq "V3 × mika#2039: aucune substitution \$(_plan_size_per_flight_bound) ne subsiste" "0" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF '$(_plan_size_per_flight_bound)' || true)"
+# mika#2542 AC5 : `PILOT_LABEL_TURN_CEILINGS` a UN SEUL lecteur. Un second
+# lecteur de label serait la seconde table de classification de mika#2539.
+assert_eq "V3 × mika#2542 AC5: le résolveur ne relit PAS la table des labels" "0" \
+    "$(printf '%s\n' "$T2693_RESOLVER_SRC" | grep -cF 'PILOT_LABEL_TURN_CEILINGS' || true)"
+# Les quatre paramètres ont un site de DÉFINITION unique — c'est la moitié
+# « un seul site de vérité » de l'AC2 que V4 complète côté prompts.
+for t2693_const in _PLAN_SIZE_FLIGHT_ORIENTATION_TURNS _PLAN_SIZE_FLIGHT_TAIL_TURNS \
+    _PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS _PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT; do
+    assert_eq "V3 (AC2): $t2693_const a un site de définition unique" "1" \
+        "$(grep -cE "^${t2693_const}=" "$DISPATCH_LIB" || true)"
+done
+# L'annulation des deux mises à l'échelle est DITE au site : sans ce commentaire,
+# un recalibrage du débit à 9 lignes/tour s'écrirait `9` et diviserait la borne
+# par cent en croyant la corriger.
+assert_contains "V3: le site dit l'annulation des deux mises à l'échelle" \
+    "ÉCRIT \`900\`, JAMAIS \`9\`" "$(sed -n '/^# mika#2693 — LA SECONDE BORNE/,/^_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=/p' "$DISPATCH_LIB")"
+
+# --- X2 : les exemples travaillés en prose sont tenus par le résolveur ------
+#
+# Le bloc de V3 porte DEUX exemples travaillés — `plafond 200 -> 143 × 900 / 300
+# = 429` et son jumeau à 150 — et c'est précisément ce qui le rend recalibrable
+# plutôt qu'un nombre nu. Mais rien ne les reliait au résolveur : un littéral de
+# prose SURVIT au recalibrage en mentant, et il mentirait au seul lecteur qui le
+# consulte — celui qui s'apprête à redéplacer une constante. C'est exactement la
+# classe de défaut qu'X1 ferme pour le plancher, du côté prose cette fois.
+#
+# ROUGE PAR MUTATION, consigné : remettre `= 431` sur la ligne du plafond 200
+# fait tirer la 3e assertion ; supprimer une des deux lignes fait tirer la 1re ;
+# écrire les deux au même nombre fait tirer la 2e.
+#
+# La boucle est un `for` sur une chaîne, PAS un `while read` sur un tube :
+# `assert_eq` incrémente les compteurs globaux `PASS`/`FAIL`, qu'un sous-shell de
+# tube jetterait en silence — la sonde compterait vert sans rien avoir compté.
+
+T2707_WORKED=$(sed -n '/^# mika#2693 — LA SECONDE BORNE/,/^_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS=/p' "$DISPATCH_LIB" \
+    | sed -nE 's/^#[[:space:]]+plafond ([0-9]+) ->.*= ([0-9]+)$/\1:\2/p')
+
+# Contre-vacuité, deux fois : le bloc a bien livré DEUX exemples, et leurs deux
+# bornes sont distinctes. Sans la seconde, deux lignes rendant le même nombre
+# passeraient pour un couple de paliers alors qu'elles mesurent un seul bras.
+assert_eq "X2 contre-vacuité: exactement deux exemples travaillés sont extraits" "2" \
+    "$(printf '%s\n' "$T2707_WORKED" | grep -cE '^[0-9]+:[0-9]+$' || true)"
+assert_eq "X2 contre-vacuité: les deux bornes extraites sont distinctes" "2" \
+    "$(printf '%s\n' "$T2707_WORKED" | grep -oE ':[0-9]+$' | sort -u | grep -c . || true)"
+
+for t2707_pair in $T2707_WORKED; do
+    t2707_c="${t2707_pair%%:*}"
+    t2707_b="${t2707_pair##*:}"
+    assert_eq "X2: l'exemple travaillé du plafond $t2707_c égale ce que rend le résolveur" \
+        "$t2707_b" "$(_t2636_field 1 "$(_t2693_bound_probe "$t2707_c")")"
+done
+
+# Fire-Disposition (a) : ARMÉE, table d'exceptions DÉCLARÉE VIDE et assertée
+# telle (doctrine mika#2201). Une exception ici serait un exemple travaillé que
+# le résolveur contredit — c'est-à-dire exactement le mensonge que X2 ferme.
+T2707_PROSE_ALLOWLIST=()
+assert_eq "X2: table d'exceptions des exemples travaillés en prose — zero entries" \
+    "0" "${#T2707_PROSE_ALLOWLIST[@]}"
+
+# --- V5 : la règle injectée, sa récence, sa conditionnalité ----------------
+#
+# ROUGE AVANT : le gabarit ne portait qu'un seuil, et aucun plafond.
+#
+# Miroir du site d'injection RÉEL, plafond compris. `_t2636_inject` reste
+# l'aîné et appelle `_plan_size_rule` SANS argument — c'est AC4, et c'est aussi
+# la démonstration que la signature est rétro-compatible : il résout 150, le
+# repli fail-safe. Ce miroir-ci est celui qui passe un plafond.
+_t2693_inject() {
+    local skill="$1" ceiling="${2:-}" repo="${3:-mika}" issue_num="${4:-2693}"
+    local prompt="${repo}#${issue_num}"
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PR_BODY_CONTAINMENT_RULE")
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PILOT_SCRATCH_RULE")
+    if [ "$skill" = "dev-groom" ]; then
+        prompt=$(printf '%s\n\n%s' "$prompt" "$_FIRE_DISPOSITION_RULE")
+        _plan_size_rule "$ceiling"; prompt=$(printf '%s\n\n%s' "$prompt" "$_PLAN_SIZE_RULE")
+    fi
+    printf '%s' "$prompt"
+}
+
+T2693_GROOM_200=$(_t2693_inject "dev-groom" "200")
+T2693_GROOM_150=$(_t2693_inject "dev-groom" "150")
+T2693_PILOT=$(_t2693_inject "dev-pilot" "200")
+
+# V2 (AC3), moitié comportementale : LA RÈGLE PORTE DEUX NOMBRES DIFFÉRENTS. Les
+# sondes de résolveur plus haut montrent que le calcul distingue les paliers ;
+# celles-ci montrent que la distinction ARRIVE AU GROOMEUR, ce qui est le seul
+# endroit où elle a un effet.
+assert_contains "V2 (AC3) × V5: à 200 tours la règle porte la borne 429" \
+    "429 lignes estimées" "$T2693_GROOM_200"
+assert_contains "V2 (AC3) × V5: et son plafond" \
+    "plafond de CE ticket est de 200 tours" "$T2693_GROOM_200"
+assert_not_contains "V2 (AC3) × V5: à 200 tours elle ne porte PAS 279" \
+    "279 lignes estimées" "$T2693_GROOM_200"
+assert_contains "V2 (AC3) × V5: à 150 tours la règle porte la borne 279" \
+    "279 lignes estimées" "$T2693_GROOM_150"
+assert_contains "V2 (AC3) × V5: et son plafond" \
+    "plafond de CE ticket est de 150 tours" "$T2693_GROOM_150"
+assert_not_contains "V2 (AC3) × V5: à 150 tours elle ne porte PAS 429" \
+    "429 lignes estimées" "$T2693_GROOM_150"
+
+# La DÉRIVATION est écrite, et sous la forme exacte que le format prescrit — pas
+# « / 3,0 » là où le format dit « / 3 ». Vue ROUGE à la sonde : la première
+# rédaction faisait diverger la forme donnée de la forme demandée, dès la
+# première ligne du § que le groomeur doit écrire.
+assert_contains "V5: la règle écrit la dérivation, pas seulement le nombre" \
+    "(200 − 27 − 30) × 9 / 3" "$T2693_GROOM_200"
+assert_contains "V5: idem au palier 150" \
+    "(150 − 27 − 30) × 9 / 3" "$T2693_GROOM_150"
+assert_not_contains "V5: un dixième nul ne s'écrit pas (« / 3 », jamais « / 3,0 »)" \
+    "/ 3,0" "$T2693_GROOM_200"
+# Depuis le recalibrage de mika#2707 le DÉBIT a lui aussi un dixième nul (900 ⇒
+# « 9 »), ce qui n'était pas le cas de 750 ⇒ « 7,5 » : la moitié manquante de la
+# garde ci-dessus devient portante le jour où elle le devient.
+assert_not_contains "V5: idem côté débit (« × 9 », jamais « × 9,0 »)" \
+    "× 9,0" "$T2693_GROOM_200"
+# La borne par PR de mika#2636 est toujours là : les deux cohabitent, la règle
+# n'en a pas remplacé une par l'autre (AC4, moitié comportementale).
+assert_contains "V5 (AC4): la borne par PR de mika#2636 est toujours portée" \
+    "Au-dessus de 1000 lignes" "$T2693_GROOM_200"
+assert_contains "V5: et la règle dit que la plus serrée MORD" \
+    "LA PLUS SERRÉE MORD" "$T2693_GROOM_200"
+# Les trois choses sans lesquelles la règle ne serait qu'un nombre.
+assert_contains "V5: la règle nomme le découpage en VOLS" \
+    "DÉCOUPE EN VOLS" "$T2693_GROOM_200"
+assert_contains "V5: et la ligne qui nomme la suite" \
+    'Tracked in:' "$T2693_GROOM_200"
+assert_contains "V5 (AC2): la règle CITE son site de vérité" \
+    '`_plan_size_per_flight_bound` dans `skills/bundled/_shared/dispatch-lib.sh`' \
+    "$T2693_GROOM_200"
+assert_contains "V5: et le document où vit la justification des paramètres" \
+    'une-estimation-de-taille-se-compare-a-un-seuil-dans-sa-propre-unite.md' \
+    "$T2693_GROOM_200"
+assert_contains "V5: la règle dit que l'architecte juge le VOL COURANT" \
+    "jamais la somme des vols" "$T2693_GROOM_200"
+# Aucun placeholder ne survit à la substitution. Un `__…__` qui passe est la
+# régression la plus bête et la plus probable de ce gabarit : il part en prompt
+# tel quel et le groomeur lit un gabarit au lieu d'un nombre.
+assert_eq "V5: aucun placeholder __…__ ne survit dans la règle rendue" "0" \
+    "$(printf '%s\n' "$T2693_GROOM_200" | grep -cE '__[A-Z_]+__' || true)"
+assert_eq "V5: idem au palier 150" "0" \
+    "$(printf '%s\n' "$T2693_GROOM_150" | grep -cE '__[A-Z_]+__' || true)"
+# Contre-vacuité du scan de placeholder : le GABARIT, lui, en porte bien quatre.
+assert_eq "V5 contre-vacuité: le gabarit porte bien quatre placeholders distincts" "4" \
+    "$(printf '%s\n' "${_PLAN_SIZE_RULE_TEMPLATE:-}" | grep -oE '__[A-Z_]+__' | sort -u | wc -l | tr -d ' ')"
+
+# Le FORMAT PRESCRIT porte les deux lignes de déclaration EN FORME. Il est
+# interpolé à deux sites (S13-bis) dont l'un — le finding synthétique du
+# rattrapage — ne connaît aucun plafond : y figer une valeur lui ferait
+# prescrire un nombre qu'il n'a aucun moyen de vérifier.
+assert_contains "V5: le format prescrit la ligne de plafond" \
+    'Plafond de tours :' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_contains "V5: et la ligne de borne par vol" \
+    'Borne par vol :' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_contains "V5: le format porte des chevrons, donc une FORME" \
+    '<plafond>' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+for t2693_val in 200 431 243; do
+    assert_not_contains "V5: le format ne FIGE pas la valeur $t2693_val" \
+        "$t2693_val" "${_PLAN_SIZE_FORMAT_SPEC:-}"
+done
+assert_contains "V5: le format dit que l'architecte n'a QUE le plan pour l'apprendre" \
+    'jamais les labels' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_contains "V5: et nomme le repli à 150 d'un plan muet" \
+    'plafond de 150 tours' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+
+# Conditionnalité, récence, et l'invariant de position de mika#138 — les trois
+# propriétés que S13 tient pour la borne par PR, re-tenues pour celle-ci parce
+# que le site d'injection a changé de forme (le résolveur de plafond s'y est
+# ajouté) et qu'un changement de forme est exactement ce qui les casse.
+assert_not_contains "V5: la règle n'est PAS injectée pour SKILL=dev-pilot" \
+    'SECONDE BORNE (mika#2693)' "$T2693_PILOT"
+assert_contains "V5: mais dev-pilot reçoit bien la règle inconditionnelle voisine" \
+    'RÈGLE DE DISPATCH (mika#2211)' "$T2693_PILOT"
+# mika#138, invariant de position 2 : si la première ligne cesse d'être
+# `<repo>#<num>`, le dispatch tombe en mode free-text et AUCUN worktree n'est
+# créé. Le plafond résolu juste avant l'injection ne doit rien préfixer.
+assert_eq "V5 × mika#138: la première ligne du PROMPT reste exactement mika#2693" "mika#2693" \
+    "$(printf '%s' "$T2693_GROOM_200" | head -1)"
+assert_eq "V5 × mika#138: idem sur le chemin dev-pilot" "mika#2693" \
+    "$(printf '%s' "$T2693_PILOT" | head -1)"
+# LA RÉCENCE EST LE SEUL LEVIER d'une règle en fin d'un prompt de 16 KiB, et la
+# seconde borne est la DERNIÈRE chose que lit un groomeur.
+T2693_LN_FD=$(printf '%s\n' "$T2693_GROOM_200" | grep -n 'RÈGLE DE GROOMING (mika#2306)' | head -1 | cut -d: -f1)
+T2693_LN_PF=$(printf '%s\n' "$T2693_GROOM_200" | grep -n 'SECONDE BORNE (mika#2693)' | head -1 | cut -d: -f1)
+assert_eq "V5: la borne par vol vient APRÈS la règle mika#2306" "yes" \
+    "$([ -n "$T2693_LN_FD" ] && [ -n "$T2693_LN_PF" ] && [ "$T2693_LN_PF" -gt "$T2693_LN_FD" ] && echo yes || echo no)"
+T2693_TAIL=$(printf '%s\n' "$T2693_GROOM_200" | tail -1)
+assert_eq "V5: et elle est le DERNIER bloc du prompt (sa phrase de clôture le termine)" "yes" \
+    "$(case "$T2693_TAIL" in *"déjà résolus pour toi."*) echo yes ;; *) echo "non: $T2693_TAIL" ;; esac)"
+
+# La co-location du PLAFOND au site d'injection. `$_PILOT_MAX_TURNS` est posé
+# par `_pilot_max_turns` et par personne d'autre ; un site qui le lirait sans
+# l'appeler lirait l'état d'un autre dispatch. Scan mika#2496 déjà en place plus
+# haut dans ce fichier, re-tenu ici sur le nouveau lecteur.
+T2693_INJ_UNCOLOCATED=$(_mika2496_logical_invocations "$DISPATCH_LIB" \
+    | grep -E '\$\{?_PILOT_MAX_TURNS\b' | grep -vE '_pilot_max_turns' || true)
+assert_eq "V5 × mika#2496: chaque lecture de \$_PILOT_MAX_TURNS reste co-localisée" "" \
+    "$T2693_INJ_UNCOLOCATED"
+# La conditionnalité se lit par APPARTENANCE AU BLOC, jamais par un préfixe —
+# sinon déplacer l'injection d'une ligne APRÈS le `fi` reste vert, et c'est la
+# régression exacte que ce scan existe pour attraper (leçon de S13).
+T2693_GROOM_BLOCK=$(printf '%s\n' "$T2636_SUW_SRC" \
+    | sed -n '/if \[ "\$SKILL" = "dev-groom" \]; then/,/^        fi/p')
+assert_eq "V5 contre-vacuité: le bloc gardé sur le skill a bien été extrait" "non-vide" \
+    "$([ -n "$T2693_GROOM_BLOCK" ] && echo non-vide || echo vide)"
+assert_contains "V5: la résolution du plafond vit DANS la branche gardée sur le skill" \
+    '_pilot_max_turns' "$T2693_GROOM_BLOCK"
+assert_contains "V5: et le plafond est bien PASSÉ à la règle, pas lu par portée" \
+    '_plan_size_rule "$_PILOT_MAX_TURNS"' "$T2693_GROOM_BLOCK"
+
+# --- V4 (AC2) : parité des deux prompts architecte, du type S14 ------------
+#
+# ROUGE AVANT, consigné : sur les prompts nus, les six extractions rendaient la
+# chaîne VIDE et les six assertions de parité ont tiré — c'est exactement la
+# divergence MUETTE que S14 existe pour refuser, transposée aux quatre
+# paramètres de la borne par vol.
+#
+# Le jugement vit chez l'architecte, dont le `system_prompt.md` est STATIQUE :
+# aucune interpolation au dispatch. Les quatre paramètres et les deux bornes de
+# référence vivent donc littéraux dans les deux prompts et en variables dans
+# dispatch-lib. Doublon assumé, du même type que le seuil de S14, et tenu par le
+# même moyen — sans ce test, recalibrer le débit laisserait les deux prompts sur
+# l'ancienne borne et rien ne le dirait.
+#
+# LA FENÊTRE DE S14 EST RÉUTILISÉE TELLE QUELLE, et le sous-bloc est en `####`
+# pour cette raison : `sed -n '/^### Plan-Size Gate/,/^### /p'` ne s'arrête pas
+# sur `#### `, donc le sous-bloc entre dans la fenêtre des deux tests sans
+# qu'aucune ligne de S14 ne bouge (AC4).
+
+T2693_B200=$(_t2693_bound_probe 200)
+T2693_B150=$(_t2693_bound_probe 150)
+T2693_EXPECT_B200=$(_t2636_field 1 "$T2693_B200")
+T2693_EXPECT_B150=$(_t2636_field 1 "$T2693_B150")
+# Le 150 des prompts est le DÉFAUT DE FLOTTE, pas un nombre choisi : on le tient
+# contre ce que la chaîne réelle résout quand le budget est désarmé.
+T2693_EXPECT_FALLBACK=$(_t2636_field 2 "$(_t2693_bound_probe __EMPTY__)")
+
+for t2693_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    t2693_pf="$SCRIPT_DIR/../$t2693_prompt/system_prompt.md"
+    if [ -r "$t2693_pf" ]; then
+        t2693_gate=$(sed -n '/^### Plan-Size Gate/,/^### /p' "$t2693_pf")
+        t2693_sub=$(printf '%s\n' "$t2693_gate" | sed -n '/^#### Per-flight bound/,$p')
+        assert_eq "V4: $t2693_prompt porte le sous-bloc de borne par vol" "non-vide" \
+            "$([ -n "$t2693_sub" ] && echo non-vide || echo vide)"
+
+        # Les quatre paramètres, extraits à l'ancre et comparés aux CONSTANTES
+        # SHELL. C'est la moitié « un seul site de vérité » de l'AC2 : le site
+        # décide, le prompt récite, et ce test interdit qu'ils se séparent.
+        t2693_orient=$(sed -nE 's/^\*\*Per-flight parameters:\*\* orientation ([0-9]+) turns.*/\1/p' "$t2693_pf" | head -1)
+        t2693_tail=$(sed -nE 's/^\*\*Per-flight parameters:\*\*.*pipeline tail ([0-9]+) turns.*/\1/p' "$t2693_pf" | head -1)
+        t2693_rate=$(sed -nE 's/^\*\*Per-flight parameters:\*\*.*throughput ([0-9]+) lines per 100 turns.*/\1/p' "$t2693_pf" | head -1)
+        t2693_factor=$(sed -nE 's/^\*\*Per-flight parameters:\*\*.*factor ([0-9]+) %.*/\1/p' "$t2693_pf" | head -1)
+        assert_eq "V4 (AC2): $t2693_prompt — orientation égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_ORIENTATION_TURNS" "$t2693_orient"
+        assert_eq "V4 (AC2): $t2693_prompt — fin de pipeline égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_TAIL_TURNS" "$t2693_tail"
+        assert_eq "V4 (AC2): $t2693_prompt — débit égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS" "$t2693_rate"
+        assert_eq "V4 (AC2): $t2693_prompt — facteur égale la constante shell" \
+            "$_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT" "$t2693_factor"
+
+        # Les deux bornes de référence sont comparées à ce que le RÉSOLVEUR
+        # calcule, jamais à un littéral retapé dans le test : un test qui
+        # répéterait 431 serait un troisième site de vérité.
+        t2693_ref200=$(sed -nE 's/^\*\*Reference bounds:\*\* ([0-9]+) estimated lines at a 200-turn ceiling.*/\1/p' "$t2693_pf" | head -1)
+        # Pas de `·` dans l'ancre : un séparateur multi-octets fait dépendre
+        # l'extraction de la locale du runner, et un test qui rend la chaîne
+        # vide hors UTF-8 serait vert pour la mauvaise raison.
+        t2693_ref150=$(sed -nE 's/^\*\*Reference bounds:\*\*.* ([0-9]+) at a 150-turn ceiling.*/\1/p' "$t2693_pf" | head -1)
+        assert_eq "V4 (AC2): $t2693_prompt — borne de référence à 200 tours = résolveur" \
+            "$T2693_EXPECT_B200" "$t2693_ref200"
+        assert_eq "V4 (AC2): $t2693_prompt — borne de référence à 150 tours = résolveur" \
+            "$T2693_EXPECT_B150" "$t2693_ref150"
+
+        # Le repli d'un plan MUET. C'est la direction prudente, et c'est le seul
+        # endroit où l'architecte décide sans information : borne plus serrée ⇒
+        # plan plus petit ⇒ jamais une mort par volume.
+        t2693_fb=$(printf '%s\n' "$t2693_sub" | sed -nE 's/.*takes \*\*([0-9]+) turns\*\* \(fail-safe.*/\1/p' | head -1)
+        assert_eq "V4: $t2693_prompt — un plan sans déclaration est jugé sur le défaut de flotte" \
+            "$T2693_EXPECT_FALLBACK" "$t2693_fb"
+
+        # Le sous-bloc cite son site de vérité et nomme la ligne qui rachète un
+        # dépassement. Sans `Tracked in:` nommé, la branche 4 est une porte
+        # ouverte : « j'ai découpé » sans dire où va la suite.
+        assert_contains "V4 (AC2): $t2693_prompt — le sous-bloc CITE le site de vérité" \
+            '_plan_size_per_flight_bound' "$t2693_sub"
+        assert_contains "V4: $t2693_prompt — et nomme la ligne \`Tracked in:\`" \
+            'Tracked in:' "$t2693_sub"
+        assert_contains "V4: $t2693_prompt — il nomme les deux lignes de déclaration du plan" \
+            'Plafond de tours' "$t2693_sub"
+        assert_contains "V4: $t2693_prompt — et juge le VOL COURANT, pas la somme" \
+            'never the sum of flights' "$t2693_sub"
+        # La borne par PR est intacte dans la même fenêtre : les deux bornes
+        # cohabitent dans le prompt comme dans le shell (AC4).
+        assert_contains "V4 (AC4): $t2693_prompt — le seuil par PR de mika#2636 est intact" \
+            '**Threshold:** 1000 lines of code outside `docs/`.' "$t2693_gate"
+    else
+        assert_eq "V4: $t2693_prompt/system_prompt.md lisible" "lisible" \
+            "fichier introuvable: $t2693_pf"
+    fi
+done
+
+# Les verdicts sont ceux qui existent déjà — aucun mode d'échec neuf. Première
+# passe ITERATE, seconde ESCALATE, et la seconde est sans recours : un sous-bloc
+# qui offrirait ITERATE à la seconde passe inventerait une troisième passe.
+T2693_SUB_FIRST=$(sed -n '/^#### Per-flight bound/,/^### /p' "$SCRIPT_DIR/../mika-arch-groom-ticket/system_prompt.md")
+T2693_SUB_SECOND=$(sed -n '/^#### Per-flight bound/,/^### /p' "$SCRIPT_DIR/../mika-arch-second-review/system_prompt.md")
+assert_contains "V4: le sous-bloc de première passe rend ITERATE" \
+    '`ITERATE`' "$T2693_SUB_FIRST"
+assert_contains "V4: celui de seconde passe rend ESCALATE" \
+    '`ESCALATE`' "$T2693_SUB_SECOND"
+assert_not_contains "V4: et la seconde passe n'offre PAS ITERATE (pas de troisième passe)" \
+    '`ITERATE`' "$T2693_SUB_SECOND"
+# Contre-vacuité de l'assertion ci-dessus : elle ne serait rien sur un bloc vide,
+# et c'est l'état où ce test est né. Les deux sous-blocs sont lus NON VIDES avant
+# qu'on conclue quoi que ce soit de leur contenu.
+assert_eq "V4 contre-vacuité: les deux sous-blocs de verdict sont lus non vides" "oui|oui" \
+    "$([ -n "$T2693_SUB_FIRST" ] && printf 'oui' || printf 'non')|$([ -n "$T2693_SUB_SECOND" ] && printf 'oui' || printf 'non')"
+
+# --- V6 : anti-vacuité et hermétisme de toute la section -------------------
+#
+# Une section de test peut passer en entier sans rien avoir mesuré : fenêtre
+# vide, fichier absent lu comme « rien à reprocher », sonde qui interroge le
+# réseau au lieu du dépôt. Les quatre assertions ci-dessous sont les gardes de
+# ces quatre façons-là, et elles sont la raison pour laquelle le bloc `else` de
+# la boucle V4 asserte au lieu de passer en silence.
+
+# 1. La fenêtre de gate des deux prompts est non vide — même garde que S14, sur
+#    la même fenêtre, parce que V4 en dépend entièrement.
+for t2693_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    assert_eq "V6: $t2693_prompt — la fenêtre de Plan-Size Gate est lue non vide" "non-vide" \
+        "$([ -n "$(sed -n '/^### Plan-Size Gate/,/^### /p' "$SCRIPT_DIR/../$t2693_prompt/system_prompt.md")" ] \
+            && echo non-vide || echo vide)"
+    assert_eq "V6: $t2693_prompt/system_prompt.md est bien LISIBLE, pas absent" "lisible" \
+        "$([ -r "$SCRIPT_DIR/../$t2693_prompt/system_prompt.md" ] && echo lisible || echo "absent")"
+done
+
+# 2. Le bloc de test lui-même est extrait non vide. Une section renommée ou
+#    déplacée qui ne s'exécuterait plus serait silencieusement « verte ».
+assert_eq "V6 contre-vacuité: le bloc de test mika#2693 est extrait non vide" "non-vide" \
+    "$([ -n "$(sed -n '/^# mika#2693 — la SECONDE borne du Plan-Size Gate/,/^# mika#2641 —/p' "$0")" ] \
+        && echo non-vide || echo vide)"
+
+# 3. HERMÉTISME : aucune sonde de cette section n'appelle `gh`. Tout ce qu'elle
+#    mesure est dans le dépôt — les labels sont passés en littéral à
+#    `_pilot_max_turns`, jamais lus sur un ticket. Un test qui interrogerait
+#    GitHub serait rouge hors réseau et vert pour la mauvaise raison.
+T2693_TEST_BLOCK=$(sed -n '/^# mika#2693 — la SECONDE borne du Plan-Size Gate/,/^# mika#2641 —/p' "$0")
+assert_eq "V6 hermétisme: la section n'invoque jamais \`gh\`" "0" \
+    "$(printf '%s\n' "$T2693_TEST_BLOCK" | grep -vE '^[[:space:]]*#' | grep -cE '(^|[^A-Za-z0-9_-])gh[[:space:]]' || true)"
+
+# 4. FIRE-DISPOSITION, option (a) : la table d'exceptions des scans de source de
+#    cette section est DÉCLARÉE et VIDE, et son vide est asserté à l'exécution.
+#    Déclarée pour que le prochain qui veut y mettre une entrée voie d'abord
+#    qu'elle existe exprès ; assertée vide pour qu'une entrée ajoutée en
+#    silence tire. Les détecteurs partent ARMÉS — doctrine mika#2201 : on route
+#    le site vers la règle, on n'ajoute pas d'exception.
+T2693_SOURCE_SCAN_ALLOWLIST=()
+assert_eq "V6: table d'exceptions des scans de source (V3, V5, V6) — zero entries" \
+    "0" "${#T2693_SOURCE_SCAN_ALLOWLIST[@]}"
+
+# --- V7 : le diagnostic résolu ARRIVE au groomeur --------------------------
+#
+# ROUGE AVANT : `_PLAN_SIZE_PER_FLIGHT_CEILING_SOURCE` et
+# `_PLAN_SIZE_PER_FLIGHT_NOTE` étaient résolues puis jetées — write-only partout
+# sauf dans les sondes de V1/V2. Le plan engageait l'inverse au § du plancher :
+# « la règle injectée DIT alors au groomeur que le plafond en vigueur ne peut
+# héberger aucune implémentation ». UN DIAGNOSTIC CALCULÉ PUIS TU EST PIRE QU'UN
+# DIAGNOSTIC ABSENT : la globale existe, la sonde la voit, et la garde se relit
+# comme posée alors que personne ne la reçoit. Trouvé par la revue de code de ce
+# vol, pas par le pilote.
+#
+# Le groomeur est le destinataire, pas l'opérateur : l'implémentation part dans
+# la même seconde que le succès du groom (mika#1614), donc aucune fenêtre ne
+# s'ouvre pour qu'un humain lise un WARN de stderr avant que le plan soit écrit.
+_plan_size_rule "200"; T2693_RULE_200="$_PLAN_SIZE_RULE"
+_plan_size_rule "150"; T2693_RULE_150="$_PLAN_SIZE_RULE"
+_plan_size_rule "";    T2693_RULE_DISARMED="$_PLAN_SIZE_RULE"
+# Le quatrième rendu est celui du PLANCHER, et son plafond est DÉRIVÉ (mika#2707,
+# X1) : écrit en littéral, il passait AU-DESSUS du plancher dès que la queue est
+# recalibrée, `_plan_size_rule` cessait d'alerter, et les quatre assertions de
+# plancher ci-dessous tiraient sans qu'aucun défaut existe. Trouvé par la
+# mutation de X1 ; ce site n'était PAS dans l'inventaire d'ancres du plan.
+_plan_size_rule "$T2707_UNDER";  T2693_RULE_FLOOR="$_PLAN_SIZE_RULE"
+
+# Contre-vacuité d'abord : les quatre rendus existent. Sans elle, un
+# `_plan_size_rule` qui rendrait la chaîne vide ferait passer les quatre
+# `assert_not_contains` ci-dessous.
+for t2693_body in "$T2693_RULE_200" "$T2693_RULE_150" "$T2693_RULE_DISARMED" \
+    "$T2693_RULE_FLOOR"; do
+    assert_eq "V7 contre-vacuité: les quatre règles rendues ne sont pas vides" "non-vide" \
+        "$([ -n "$t2693_body" ] && echo non-vide || echo vide)"
+done
+
+# Le cas NOMINAL ne gagne pas une ligne — c'est la moitié qui empêche l'alerte
+# de devenir du bruit permanent qu'on cesse de lire.
+assert_not_contains "V7: un plafond de 200 ne porte AUCUNE alerte" \
+    'ALERTE PLAFOND' "$T2693_RULE_200"
+assert_not_contains "V7: un plafond de 150 ne porte AUCUNE alerte" \
+    'ALERTE PLAFOND' "$T2693_RULE_150"
+
+# Budget DÉSARMÉ : la provenance `disarmed_fallback` est dite, et elle est dite
+# comme telle — ni « défaut » ni un label, parce que le groomeur doit écrire une
+# parenthèse vraie sur la ligne `Plafond de tours :`.
+assert_contains "V7: un budget désarmé est DIT au groomeur" \
+    'ALERTE PLAFOND' "$T2693_RULE_DISARMED"
+assert_contains "V7: et il est nommé comme désarmé" 'DÉSARMÉ' "$T2693_RULE_DISARMED"
+assert_contains "V7: la provenance à écrire est le repli, pas un label" \
+    'repli fail-safe' "$T2693_RULE_DISARMED"
+assert_not_contains "V7: le désarmement n'emprunte pas la phrase du plancher" \
+    'AUCUNE' "$T2693_RULE_DISARMED"
+
+# PLANCHER : la note `ceiling_below_pipeline_floor` dit au groomeur de ne pas
+# écrire de plan et de remonter le plafond. La borne de 0 seule ne le dirait
+# pas : lue sans la phrase, elle se confond avec « découpe plus fin ».
+assert_contains "V7: un plafond sous le plancher est DIT au groomeur" \
+    'ALERTE PLAFOND' "$T2693_RULE_FLOOR"
+assert_contains "V7: et il dit qu'aucune implémentation ne tient" \
+    'ne peut héberger AUCUNE' "$T2693_RULE_FLOOR"
+assert_contains "V7: et il nomme la remontée à l'opérateur" \
+    "remonte-le" "$T2693_RULE_FLOOR"
+assert_not_contains "V7: le plancher n'emprunte pas la phrase du désarmement" \
+    'DÉSARMÉ' "$T2693_RULE_FLOOR"
+
+# RÉCENCE (S13) : l'alerte est le DERNIER paragraphe de la règle, qui est
+# elle-même le dernier bloc du prompt. Une alerte posée avant la citation du
+# site de vérité perdrait le seul levier qu'a une consigne en fin de 16 KiB.
+assert_contains "V7 récence: l'alerte plancher est le dernier mot de la règle" \
+    "l'opérateur." \
+    "$(printf '%s\n' "$T2693_RULE_FLOOR" | grep -vE '^[[:space:]]*$' | tail -1)"
+assert_contains "V7 récence: l'alerte de désarmement est le dernier mot de la règle" \
+    'défaut' \
+    "$(printf '%s\n' "$T2693_RULE_DISARMED" | grep -vE '^[[:space:]]*$' | tail -1)"
+
+# --- V7-bis : les deux 150 sont tenus ensemble -----------------------------
+#
+# Le repli de `_plan_size_per_flight_bound` et le défaut de flotte de
+# `_pilot_max_turns` sont le MÊME nombre pour la même raison, et mika#2542 (AC9)
+# épingle `local _default="150"` littéralement — on ne peut donc pas hisser une
+# constante partagée sans toucher au test d'un autre ticket. La duplication est
+# alors FORCÉE, et c'est exactement le cas où un test de parité la tient :
+# retoucher le défaut de flotte sans retoucher le repli laisserait V1 et V4
+# vertes, les deux prompts statiques à 150, et la divergence MUETTE — le défaut
+# que toute cette section existe pour refuser.
+T2693_FLEET_DEFAULT=$(sed -n '/^_pilot_max_turns()/,/^}/p' "$DISPATCH_LIB" \
+    | sed -n 's/^[[:space:]]*local _default="\([0-9]\{1,\}\)".*/\1/p')
+T2693_FLIGHT_FALLBACK=$(sed -n '/^_plan_size_per_flight_bound()/,/^}/p' "$DISPATCH_LIB" \
+    | sed -n 's/^[[:space:]]*_ceiling="\([0-9]\{1,\}\)".*/\1/p')
+assert_eq "V7-bis contre-vacuité: le défaut de flotte a bien été extrait" "yes" \
+    "$([ -n "$T2693_FLEET_DEFAULT" ] && echo yes || echo non-trouvé)"
+assert_eq "V7-bis contre-vacuité: le repli de la borne a bien été extrait" "yes" \
+    "$([ -n "$T2693_FLIGHT_FALLBACK" ] && echo yes || echo non-trouvé)"
+assert_eq "V7-bis: le repli de la borne par vol EST le défaut de flotte" \
+    "$T2693_FLEET_DEFAULT" "$T2693_FLIGHT_FALLBACK"
+
+# --- V7-ter : la dérivation affichée reproduit la borne --------------------
+#
+# Le rendu humain des deux mises à l'échelle garde UN chiffre après la virgule
+# (`% 100 / 10`). C'est exact tant que les deux constantes sont des multiples de
+# 10 — et ça cesse de l'être en silence sinon : un débit recalibré à 775 ferait
+# écrire « × 7,7 / 2 » (442) à côté d'une borne de 445, et la § 2 de la règle
+# demande au groomeur d'écrire CETTE dérivation comme ce qui rend la borne
+# recalibrable. On épingle donc la précondition là où un recalibrage la casse,
+# au lieu de généraliser un formateur dont personne n'a besoin aujourd'hui.
+assert_eq "V7-ter: le débit est un multiple de 10 (rendu décimal exact)" "0" \
+    "$(( ${_PLAN_SIZE_FLIGHT_LOC_PER_100_TURNS:-7} % 10 ))"
+assert_eq "V7-ter: le facteur est un multiple de 10 (rendu décimal exact)" "0" \
+    "$(( ${_PLAN_SIZE_FLIGHT_ESTIMATE_FACTOR_PCT:-7} % 10 ))"
+
+# --- V7-quater : le format ne retape plus les quatre paramètres ------------
+#
+# Trouvé par la revue de code : le format prescrivait « (<plafond> − 27 − 30)
+# × 9 / 3 », c'est-à-dire un CINQUIÈME site de vérité que rien ne tenait.
+# `_PLAN_SIZE_FORMAT_SPEC` est interpolée à deux sites (S13-bis) et le second —
+# le finding synthétique du rattrapage — n'appelle jamais `_plan_size_rule` : là,
+# ces littéraux étaient la seule formule que le groomeur voyait.
+for t2693_chev in '<orientation>' '<fin de pipeline>' '<débit>' '<facteur>'; do
+    assert_contains "V7-quater: le format porte $t2693_chev à chevrons" \
+        "$t2693_chev" "${_PLAN_SIZE_FORMAT_SPEC:-}"
+done
+assert_not_contains "V7-quater: le format ne retape pas orientation et fin de pipeline" \
+    '− 27 − 30' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+assert_not_contains "V7-quater: le format ne retape pas débit et facteur" \
+    '9 / 3' "${_PLAN_SIZE_FORMAT_SPEC:-}"
+# Et la dérivation EN VALEUR reste bien celle que la règle rend, elle.
+assert_contains "V7-quater: la règle, elle, rend la dérivation en valeur" \
+    '(200 − 27 − 30) × 9 / 3' "$T2693_RULE_200"
+
+# --- X1 : le plancher est dérivé -------------------------------------------
+#
+# mika#2707 recalibrera `_PLAN_SIZE_FLIGHT_TAIL_TURNS` dès que cinq vols
+# post-#2695 auront déposé leur ligne `plan_size_estimate`. Ce jour-là, le
+# plancher de pipeline — `orientation + fin de pipeline` — se DÉPLACE. Les CINQ
+# sondes à plafond de plancher le dérivent désormais (`$T2707_FLOOR` /
+# `$T2707_UNDER`, outillage de section) : deux en V1, une en V7, deux en W3.
+# Ce détecteur est ce qui empêche la dérivation de pourrir par le prochain qui
+# retape un nombre — et c'est lui qui a trouvé la cinquième, celle de V7, que
+# l'inventaire d'ancres du plan ne recensait pas.
+#
+# Pourquoi un détecteur et pas la seule bonne volonté : V1 épingle ses bornes
+# (431, 243, 131) en LITTÉRAL exprès — doctrine D3, c'est la seule assertion qui
+# vérifie l'ARITHMÉTIQUE, et la dériver la rendrait tautologique. Le plancher,
+# lui, n'est pas une borne calculée : c'est la SOMME de deux constantes. Le
+# littéral y est donc un doublon, pas une épingle — et la frontière entre les
+# deux ne se lit pas dans le code, d'où cette assertion qui la dit.
+#
+# L'ancre est le NOM de la sonde suivi de ses arguments, et le dernier d'entre
+# eux. JAMAIS le nombre nu : un `85` nu vit aussi dans un seuil, un numéro de
+# ligne, une phrase de prose — mika#2050 a mesuré ce faux positif-là sur un
+# autre jeton, et la leçon vaut pour celui-ci.
+#
+# ROUGE PAR MUTATION, consigné : réécrire `_t2693_bound_probe 85` à la place de
+# `_t2693_bound_probe "$T2707_FLOOR"` en V1 porte le compte à 1 et fait tirer.
+# Vider l'un des deux blocs extraits fait tirer la contre-vacuité de fenêtre ;
+# renommer une sonde fait tirer celle du scan.
+
+T2707_BLOCK_2693=$(sed -n '/^# mika#2693 — la SECONDE borne du Plan-Size Gate/,/^# mika#2641 —/p' "$0")
+T2707_BLOCK_2701=$(sed -n '/^# mika#2701 — PORTE 3 : la ligne/,/^# --- dispatch-lib parse toujours ---/p' "$0")
+assert_eq "X1 contre-vacuité: les deux blocs de sondes sont extraits non vides" "oui|oui" \
+    "$([ -n "$T2707_BLOCK_2693" ] && printf oui || printf non)|$([ -n "$T2707_BLOCK_2701" ] && printf oui || printf non)"
+
+# Tous les appels des TROIS sondes à plafond des deux blocs, réduits à leur
+# DERNIER argument — celui qui porte le plafond. Les commentaires sont retirés
+# d'abord : la prose ci-dessus nomme les sondes exprès.
+#
+# `)` et `;` sont HORS de la classe d'arguments, et c'est ce qui rend le dernier
+# champ juste : sans le `;`, le match avale gloutonnement l'affectation qui suit
+# la commande, `$NF` vaut `T2693_RULE_FLOOR=…` au lieu de `70`, et le détecteur
+# rend 0 sur un littéral bien présent. Mesuré par mutation, pas supposé.
+# Les guillemets tombent ensuite : `_plan_size_rule "70"` est un littéral.
+T2707_PROBE_CEILINGS=$(printf '%s\n%s\n' "$T2707_BLOCK_2693" "$T2707_BLOCK_2701" \
+    | grep -vE '^[[:space:]]*#' \
+    | grep -oE '(_t2693_bound_probe|_t2701_emit_probe|_plan_size_rule)([[:space:]]+[^[:space:]);]+)+' \
+    | awk '{ print $NF }' \
+    | tr -d '"' || true)
+# Contre-vacuité du scan : un renommage de sonde lui ferait rendre `0` pour la
+# mauvaise raison — « vert parce qu'il n'a rien lu », la classe même que X1 ferme.
+assert_eq "X1 contre-vacuité: le scan a bien trouvé des appels de sonde" "oui" \
+    "$([ -n "$T2707_PROBE_CEILINGS" ] && printf oui || printf non)"
+
+assert_eq "X1: aucune sonde ne retape le plancher ($T2707_FLOOR) en littéral" "0" \
+    "$(printf '%s\n' "$T2707_PROBE_CEILINGS" | grep -cxF "$T2707_FLOOR" || true)"
+assert_eq "X1: ni le plafond sous le plancher ($T2707_UNDER)" "0" \
+    "$(printf '%s\n' "$T2707_PROBE_CEILINGS" | grep -cxF "$T2707_UNDER" || true)"
+
+# FIRE-DISPOSITION, option (a) : la table d'exceptions de CE détecteur est
+# DÉCLARÉE et VIDE, et son vide est asserté à l'exécution. Déclarée pour que le
+# prochain qui veut y mettre une entrée voie d'abord qu'elle existe exprès ;
+# assertée vide pour qu'une entrée ajoutée en silence tire. Les détecteurs
+# partent ARMÉS — doctrine mika#2201 : on route le site vers la règle.
+T2707_FLOOR_LITERAL_ALLOWLIST=()
+assert_eq "X1: table d'exceptions des littéraux de plancher — zero entries" \
+    "0" "${#T2707_FLOOR_LITERAL_ALLOWLIST[@]}"
 
 # ===========================================================================
 # mika#2641 — une réponse d'architecte sans disposition lisible est RELANCÉE
@@ -12613,44 +14644,39 @@ M2641_RETRY_EMPTY_REASON=$(printf '%s\n' "$M2641_RETRY_EMPTY" | grep '^reason=' 
 assert_contains "mika#2641 (V5-bis): le motif nomme la RELANCE, pas la 2e passe" \
     "second-pass retry returned an EMPTY .content" "$M2641_RETRY_EMPTY_REASON"
 
-# --- V4 (R5/D7) : le prompt de relance est COURT, et le seuil est LU --------
+# --- V4 (réécrit par mika#2996) : le prompt de relance porte le plan --------
 #
-# `mika-arch-second-review` déclare `review_anchor_min_brief_chars` : en dessous,
-# la garde d'ancrage mika#2037 ne s'arme pas. Un prompt de relance au-dessus
-# l'armerait — et l'architecte, qui n'a pas le brief sous les yeux dans un
-# re-prompt, ne peut produire aucune ancre ; le moteur retire alors la
-# disposition (tier 0) ou réécrit la réponse en escalade (tier 0b), et
-# `_parse_verdict` rend ESCALATE. Le correctif produirait exactement le terminal
-# qu'il existe pour empêcher.
-#
-# Le seuil est lu DEPUIS LE MANIFESTE, jamais recopié : un seuil durci dans le
-# `skill.toml` sans que le prompt rétrécisse doit faire rougir ce test.
+# V4 asserta d'abord l'inverse : prompt COURT, sous `review_anchor_min_brief_chars`,
+# pour que la garde d'ancrage mika#2037 ne s'arme pas sur un brief sans le plan.
+# Ce contrat laissait passer un `Verdict: GROOMED` sans aucune preuve au tour de
+# relance (mika#2996, trace `15ea28bd` pour la première passe). Le prompt porte
+# désormais le plan, donc la garde s'arme et l'architecte a de quoi citer. Le
+# câblage à l'octet est épinglé par le bloc mika#2996 en fin de fichier ; ici on
+# garde la mesure (anti-vacuité) et on pose le nouveau sens de l'inégalité :
+# le prompt est PLUS LONG que le plan qu'il porte.
 M2641_ANCHOR_MANIFEST="$SCRIPT_DIR/../mika-arch-second-review/skill.toml"
-M2641_ANCHOR_THRESHOLD=$(grep -E '^[[:space:]]*review_anchor_min_brief_chars[[:space:]]*=' \
-    "$M2641_ANCHOR_MANIFEST" 2>/dev/null | head -1 | sed 's/.*=[[:space:]]*//' | tr -d ' \r' || true)
-
-if [ -z "$M2641_ANCHOR_THRESHOLD" ]; then
-    echo "SKIP: mika#2641 (V4) — review_anchor_min_brief_chars absent de $M2641_ANCHOR_MANIFEST"
-    SKIPPED=$((SKIPPED + 1))
+M2641_RETRY_BYTES=$(printf '%s\n' "$M2641_RECOVERED" | grep '^retry_prompt_bytes=' \
+    | head -1 | cut -d= -f2 || true)
+if [ "${M2641_RETRY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
+    PASS=$((PASS + 1))
+    echo "  ✓ mika#2641 (V4): le prompt de relance a été mesuré (${M2641_RETRY_BYTES} octets)"
 else
-    M2641_RETRY_BYTES=$(printf '%s\n' "$M2641_RECOVERED" | grep '^retry_prompt_bytes=' \
-        | head -1 | cut -d= -f2 || true)
-    # Anti-vacuité : un prompt de 0 octet satisferait l'inégalité en ne
-    # mesurant rien (la sonde n'aurait pas tourné, ou le fichier aurait disparu).
-    if [ "${M2641_RETRY_BYTES:-0}" -gt 0 ] 2>/dev/null; then
-        PASS=$((PASS + 1))
-        echo "  ✓ mika#2641 (V4): le prompt de relance a été mesuré (${M2641_RETRY_BYTES} octets)"
-    else
-        FAIL=$((FAIL + 1))
-        echo "  ✗ mika#2641 (V4): le prompt de relance n'a PAS été mesuré (vide ou sonde muette)"
-    fi
-    if [ "${M2641_RETRY_BYTES:-0}" -lt "$M2641_ANCHOR_THRESHOLD" ] 2>/dev/null; then
-        PASS=$((PASS + 1))
-        echo "  ✓ mika#2641 (V4): le prompt de relance (${M2641_RETRY_BYTES}) est sous le seuil d'ancrage (${M2641_ANCHOR_THRESHOLD})"
-    else
-        FAIL=$((FAIL + 1))
-        echo "  ✗ mika#2641 (V4): le prompt de relance (${M2641_RETRY_BYTES}) ATTEINT le seuil d'ancrage (${M2641_ANCHOR_THRESHOLD}) — il armerait la garde mika#2037"
-    fi
+    FAIL=$((FAIL + 1))
+    echo "  ✗ mika#2641 (V4): le prompt de relance n'a PAS été mesuré (vide ou sonde muette)"
+fi
+M2641_PLAN_BYTES=$( {
+    echo "# Plan rejouant la signature mika#2641"
+    echo "**Ticket:** mika issue#2641"
+    for i in $(seq 1 14); do
+        echo "Ligne de corps $i — rembourrage rembourrage rembourrage."
+    done
+} | wc -c | tr -d ' ')
+if [ "${M2641_RETRY_BYTES:-0}" -gt "$M2641_PLAN_BYTES" ] 2>/dev/null; then
+    PASS=$((PASS + 1))
+    echo "  ✓ mika#2641 (V4, mika#2996): le prompt de relance (${M2641_RETRY_BYTES}) dépasse le plan qu'il porte (${M2641_PLAN_BYTES})"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ mika#2641 (V4, mika#2996): le prompt de relance (${M2641_RETRY_BYTES}) ne peut pas porter le plan (${M2641_PLAN_BYTES}) — la garde d'ancrage ne s'armerait pas"
 fi
 
 # --- S-c : scan de cardinalité des appels à `_escalate_groom` ---------------
@@ -12664,11 +14690,18 @@ fi
 # fonction change (classe mika#2205, même raison qui a fait asserter
 # `cardinality == 3` dans le scan de mika#2496).
 #
-# Il y a DEUX assertions de cardinalité à 5, et leur redondance est délibérée :
+# Il y a DEUX assertions de cardinalité, et leur redondance est délibérée :
 # celle de la section ESCALATE lit le corps de `_iterate_groom_loop` par
 # `declare -f`, celle-ci lit le FICHIER ENTIER. Elles peuvent donc divergir — un
 # appel placé hors de la boucle rougit celle-ci et pas l'autre, un appel écrit
 # sans guillemets l'inverse — et c'est exactement pourquoi les deux restent.
+#
+# Depuis mika#2996 elles DIVERGENT, à 5 et à 6, et c'est la divergence prévue :
+# le sixième appel vit dans `_halt_groom_on_reader_refusal`, un corps que
+# `declare -f _iterate_groom_loop` ne montre pas. Le garde est une fonction
+# unique appelée aux trois sites de lecture plutôt que trois escalades recopiées
+# (mika#2158), donc le scan par `declare -f` reste à 5 sans rien relâcher : les
+# cinq terminaux de la boucle y sont toujours tous.
 _m2641_escalate_call_sites() {
     # Les APPELS, jamais la définition ni la prose : ligne dont le premier mot
     # est `_escalate_groom` suivi d'un espace et d'un argument.
@@ -12676,16 +14709,16 @@ _m2641_escalate_call_sites() {
 }
 M2641_CALL_LINES=$(_m2641_escalate_call_sites)
 M2641_CALL_COUNT=$(printf '%s' "$M2641_CALL_LINES" | grep -c . || true)
-assert_eq "mika#2641 (S-c): exactement cinq sites appellent _escalate_groom" \
-    "5" "$M2641_CALL_COUNT"
+assert_eq "mika#2641 (S-c): exactement six sites appellent _escalate_groom (mika#2996)" \
+    "6" "$M2641_CALL_COUNT"
 # Chaque site nomme sa cause PAR LA CONSTANTE, jamais par un littéral recopié.
 # C'est le prédicat plus fort des deux : il attrape à la fois le site qui omet
 # l'argument ET celui qui retape la valeur de fil à la main — or le format de
 # fil n'est exact que tant qu'il a un site de définition unique (D4).
 M2641_CAUSED_COUNT=$(printf '%s\n' "$M2641_CALL_LINES" \
-    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE)"[[:space:]]*$' || true)
-assert_eq "mika#2641 (S-c): les cinq sites passent une cause explicite, par la constante" \
-    "5" "$M2641_CAUSED_COUNT"
+    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE|DISPOSITION_READER_REFUSED)"[[:space:]]*$' || true)
+assert_eq "mika#2641 (S-c): les six sites passent une cause explicite, par la constante" \
+    "6" "$M2641_CAUSED_COUNT"
 
 # Le format de fil a un site de définition unique de chaque côté (D4). Côté
 # shell : une affectation, pas deux.
@@ -12726,14 +14759,3233 @@ assert_eq "mika#2641 (R-b): le prompt correctif a une définition unique" \
 # Les appels, jamais la définition : `$(_second_pass_retry_prompt)` en
 # substitution de commande. La forme réelle est `local x; x=$(...)` sur une
 # ligne, donc le prédicat porte sur la substitution et non sur le début de ligne.
-M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt\)' "$DISPATCH_LIB" || true)
-assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent" \
+# Depuis mika#2996 chaque appel passe le plan : un site qui l'oublierait
+# relancerait sans plan, donc sans garde armée, et ne serait pas compté ici.
+M2641_HELPER_CALLS=$(grep -cE '\$\(_second_pass_retry_prompt "\$plan_path"\)' "$DISPATCH_LIB" || true)
+assert_eq "mika#2641 (R-b): les deux sites de seconde passe l'appellent, avec le plan (mika#2996)" \
     "2" "$M2641_HELPER_CALLS"
+M2996_FIRST_CALLS=$(grep -cE '\$\(_first_pass_retry_prompt "\$plan_path"\)' "$DISPATCH_LIB" || true)
+assert_eq "mika#2996: le site de première passe appelle son prompt correctif avec le plan" \
+    "1" "$M2996_FIRST_CALLS"
+
+# ===========================================================================
+# mika#2701 — PORTE 3 : la ligne `plan_size_estimate` porte la borne PAR VOL
+#
+# mika#2693 a livré les deux portes qui DÉCIDENT de la borne par vol — la règle
+# injectée au groomeur, et les deux gates architecte — et a laissé hors
+# périmètre, nommément, la porte qui MESURE. C'est ce bloc.
+#
+# La ligne émise au dispatch d'implémentation gagne quatre champs, dérivés du
+# plafond RÉELLEMENT PASSÉ EN ARGV (D1) : `per_flight_bound_loc=`, `ceiling=`,
+# `ceiling_source=`, `per_flight_verdict=`. Elle ne refuse JAMAIS (W4), et la
+# file groomée entière le lui doit : un plan déjà groomé ne repasse par aucune
+# porte de groom au dispatch suivant, donc refuser ici gèlerait d'un coup tout
+# `docs/plans/`. Détection permissive, décision stricte — la répartition des
+# trois portes de mika#2636, inchangée.
+#
+# W1 les quatre champs aux deux paliers · W2 le désarmement · W2-bis un plafond
+# d'argv illisible · W3 le plancher, et la note est CONDITIONNELLE · W4 porte 3
+# ne refuse rien · W5 un total illisible rend `unknown` dans les DEUX unités ·
+# W6 l'ARGV décide, par un discriminant COMPORTEMENTAL · W7 anti-vacuité,
+# hermétisme, ordre des champs.
+#
+# PLACÉ APRÈS LA SECTION mika#2641, et c'est mécanique : la contre-vacuité V6 de
+# mika#2693 extrait sa propre fenêtre entre son titre et le titre de la section
+# mika#2641. Un bloc neuf glissé dans cet intervalle y entrerait, et V6
+# mesurerait alors autre chose que ce que son commentaire annonce — elle
+# passerait encore, ce qui est la pire des deux issues.
+# ===========================================================================
+
+echo ""
+echo 'Test: mika#2701 — porte 3, la ligne porte la borne PAR VOL (W1–W7)'
+echo "-----------------------------------------------------------------------"
+
+# --- Outillage local de section ---------------------------------------------
+
+# Sonde de la ligne de porte 3. Elle passe l'argv TEL QUEL à l'émetteur, et
+# c'est tout le sujet : AC1 veut que le plafond vienne de là et de nulle part
+# ailleurs. `_t2636_emit_probe` n'est pas touchée — elle fige `--max-turns 150`
+# dans son argv, et elle est sous AC4.
+#
+# `$1` = valeur de `_PLAN_SIZE_TOTAL` (vide ⇒ `total_loc=absent`)
+# `$2` = plafond à poser dans l'argv ; `__NONE__` ⇒ `--max-turns` ABSENT, ce que
+#        produit un budget désarmé (`${_PILOT_MAX_TURNS:+--max-turns …}`)
+# `$3` = (optionnel) CSV de labels ; non vide, LA CHAÎNE RÉELLE EST JOUÉE —
+#        le résolveur de plafond tourne avant l'émetteur, comme au site de
+#        lancement, donc l'état amont est posé dans la portée. Sans lui, W6
+#        prouverait « l'argv gagne » contre un environnement vide, c'est-à-dire
+#        contre rien.
+# `$4` = (optionnel) valeur de `PILOT_MAX_TURNS` dans l'environnement
+#
+# Rend `rc=<rc>` sur la PREMIÈRE ligne, puis le stderr de l'émetteur. Le rc est
+# ce qui fait de W4 une preuve, et non une impression.
+_t2701_emit_probe() {
+    local t2701_total="$1" t2701_mt="${2:-__NONE__}" t2701_lbl="${3-}" t2701_env="${4-}"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        unset PLAN_SIZE_MAX_LOC PILOT_MAX_TURNS
+        t2701_argv=(claude-pilot -p --output-format stream-json)
+        if [ "$t2701_mt" != "__NONE__" ]; then
+            t2701_argv+=(--max-turns "$t2701_mt")
+        fi
+        if [ -n "$t2701_env" ]; then export PILOT_MAX_TURNS="$t2701_env"; fi
+        if [ -n "$t2701_lbl" ]; then _pilot_max_turns "$t2701_lbl"; fi
+        _PLAN_SIZE_PLAN_PATH="$T2701_PLAN_PATH"
+        _PLAN_SIZE_TOTAL="$t2701_total"
+        t2701_err=$(_emit_pilot_budget_line "${t2701_argv[@]}" 2>&1 >/dev/null)
+        printf 'rc=%s\n%s' "$?" "$t2701_err"
+    )
+}
+
+T2701_PLAN_PATH="docs/plans/sonde-2701-plan.md"
+_t2701_rc()   { printf '%s' "$1" | head -1 | cut -d= -f2; }
+_t2701_err()  { printf '%s' "$1" | tail -n +2; }
+_t2701_line() { printf '%s' "$1" | grep -F 'dispatch-lib: plan_size_estimate ' | head -1; }
+
+# Les deux bornes de référence sont CALCULÉES par le résolveur, jamais retapées
+# en littéral : un test qui réécrirait 431 serait un troisième site de vérité, et
+# il survivrait au recalibrage du ticket de suivi EN MENTANT. Règle posée par V4
+# de mika#2693, reprise telle quelle.
+T2701_B200=$(_t2636_field 1 "$(_t2693_bound_probe 200)")
+T2701_B150=$(_t2636_field 1 "$(_t2693_bound_probe 150)")
+assert_eq "W1 contre-vacuité: les deux bornes de référence sont calculées et distinctes" "yes" \
+    "$([ -n "$T2701_B200" ] && [ -n "$T2701_B150" ] && [ "$T2701_B200" != "$T2701_B150" ] \
+        && echo yes || echo "non: '$T2701_B200' / '$T2701_B150'")"
+
+# --- W1 : les quatre champs, aux deux paliers de plafond --------------------
+#
+# ROUGE AVANT : la ligne ne portait aucun des quatre champs.
+
+T2701_P200_400=$(_t2701_emit_probe 400 200)
+T2701_P200_500=$(_t2701_emit_probe 500 200)
+T2701_P150_400=$(_t2701_emit_probe 400 150)
+T2701_P150_200=$(_t2701_emit_probe 200 150)
+
+# Contre-vacuité AVANT toute conclusion : les quatre sondes ont bien produit une
+# ligne. Un émetteur muet rendrait rouges les `assert_contains` ci-dessous, mais
+# VERTS tous les `assert_not_contains` de W2, W3, W5 et W6.
+for t2701_out in "$T2701_P200_400" "$T2701_P200_500" "$T2701_P150_400" "$T2701_P150_200"; do
+    assert_eq "W1 contre-vacuité: la sonde rend une ligne plan_size_estimate" "non-vide" \
+        "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
+done
+
+assert_contains "W1: plafond 200, total 400 ⇒ borne $T2701_B200, resolved, under_bound" \
+    "per_flight_bound_loc=${T2701_B200} ceiling=200 ceiling_source=resolved per_flight_verdict=under_bound" \
+    "$(_t2701_line "$T2701_P200_400")"
+assert_contains "W1: plafond 200, total 500 ⇒ même borne, verdict over_bound" \
+    "per_flight_bound_loc=${T2701_B200} ceiling=200 ceiling_source=resolved per_flight_verdict=over_bound" \
+    "$(_t2701_line "$T2701_P200_500")"
+assert_contains "W1: plafond 150, total 400 ⇒ borne $T2701_B150, resolved, over_bound" \
+    "per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=over_bound" \
+    "$(_t2701_line "$T2701_P150_400")"
+assert_contains "W1: plafond 150, total 200 ⇒ même borne, verdict under_bound" \
+    "per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=under_bound" \
+    "$(_t2701_line "$T2701_P150_200")"
+
+# LE CŒUR DE W1 : le MÊME total (400) rend deux verdicts PAR VOL opposés selon le
+# plafond, pendant que le verdict PAR PR, lui, ne bouge pas. C'est la moitié qui
+# prouve que le champ neuf mesure bien le vol, et n'est pas une seconde lecture
+# du seuil par PR sous un autre nom.
+assert_contains "W1 (le cœur): à total 400 égal, le verdict par PR est le même aux deux plafonds" \
+    "total_loc=400 threshold_loc=1000 verdict=under_threshold" \
+    "$(_t2701_line "$T2701_P150_400")"
+assert_contains "W1 (le cœur): …et celui par PR l'est aussi sur l'autre palier" \
+    "total_loc=400 threshold_loc=1000 verdict=under_threshold" \
+    "$(_t2701_line "$T2701_P200_400")"
+
+# --- W2 : AC3, moitié désarmée ----------------------------------------------
+#
+# ROUGE AVANT : aucun champ de provenance n'existait.
+
+T2701_DISARMED=$(_t2701_emit_probe 400 __NONE__)
+T2701_DISARMED_LINE=$(_t2701_line "$T2701_DISARMED")
+assert_eq "W2 contre-vacuité: la sonde désarmée rend bien une ligne" "non-vide" \
+    "$([ -n "$T2701_DISARMED_LINE" ] && echo non-vide || echo vide)"
+
+assert_contains "W2 (AC3): budget désarmé ⇒ ceiling_source=disarmed_fallback" \
+    "ceiling_source=disarmed_fallback" "$T2701_DISARMED_LINE"
+# D2 : `ceiling=` porte le plafond RÉSOLU. Sans le 150, le 243 qui l'accompagne
+# serait un nombre sans dérivation possible — « un nombre plausible, présenté
+# avec autorité », la classe que l'ancre de `_PLAN_SIZE_TOTAL_RE` a dû fermer.
+assert_contains "W2 (D2): et ceiling=150, le plafond RÉSOLU" \
+    "ceiling=150 ceiling_source=disarmed_fallback" "$T2701_DISARMED_LINE"
+assert_not_contains "W2 (D2): la ligne n'écrit JAMAIS ceiling=none" \
+    "ceiling=none" "$T2701_DISARMED_LINE"
+assert_contains "W2: la borne du repli est celle de 150 tours" \
+    "per_flight_bound_loc=${T2701_B150} " "$T2701_DISARMED_LINE"
+# Le repli n'emprunte PAS le `maxTurns=200` amont de claude-pilot : ce 200
+# appartient à un composant qu'on ne possède pas, et un rollback est une posture
+# d'incident.
+assert_not_contains "W2: le repli ne prend JAMAIS la borne de 200 tours" \
+    "per_flight_bound_loc=${T2701_B200}" "$T2701_DISARMED_LINE"
+# Les deux faits se lisent ENSEMBLE, sans jointure : la valeur brute d'argv est
+# sur la ligne immédiatement au-dessus, et `ceiling_source=` est le lien.
+assert_contains "W2: la ligne sœur pilot_budget_armed max_turns=none est sur la même sortie" \
+    "pilot_budget_armed max_turns=none" "$(_t2701_err "$T2701_DISARMED")"
+
+# --- W2-bis : D4, un plafond d'argv illisible a sa propre ligne -------------
+#
+# Population mesurée aujourd'hui : VIDE — le résolveur amont n'assigne jamais que
+# `""` ou des chiffres. Le garde-fou existe pour la raison opératoire :
+# `_plan_size_per_flight_bound` fait de l'ARITHMÉTIQUE sur son argument, et
+# l'argv est la seule entrée de cette fonction qui ne vienne pas d'un résolveur
+# de la maison.
+
+T2701_BADMT=$(_t2701_emit_probe 400 abc)
+assert_eq "W2-bis contre-vacuité: la sonde à plafond illisible rend bien du stderr" "non-vide" \
+    "$([ -n "$(_t2701_err "$T2701_BADMT")" ] && echo non-vide || echo vide)"
+assert_contains "W2-bis (D4): un plafond d'argv illisible obtient sa propre ligne" \
+    "plan_size_flight_ceiling_invalid" "$(_t2701_err "$T2701_BADMT")"
+assert_contains "W2-bis (D4): puis la borne retombe sur le repli, provenance dite" \
+    "ceiling=150 ceiling_source=disarmed_fallback" "$(_t2701_line "$T2701_BADMT")"
+assert_not_contains "W2-bis: aucune arithmétique n'est tentée sur la valeur illisible" \
+    "ceiling=abc" "$(_t2701_line "$T2701_BADMT")"
+# Contre-vacuité de la première : le cas nominal n'émet PAS cette ligne. Sans
+# elle, une ligne `*_invalid` émise inconditionnellement passerait pour une garde.
+assert_not_contains "W2-bis: un plafond valide n'émet AUCUNE ligne *_ceiling_invalid" \
+    "plan_size_flight_ceiling_invalid" "$(_t2701_err "$T2701_P200_400")"
+
+# --- W3 : AC3, moitié plancher, et la note est CONDITIONNELLE ---------------
+#
+# ROUGE PAR MUTATION, consigné : émettre la note inconditionnellement fait tirer
+# la dernière assertion ; écrire `${_PLAN_SIZE_PER_FLIGHT_NOTE}` sans le `:+`
+# produit un `per_flight_note=` vide et la fait tirer aussi.
+
+T2701_FLOOR_UNDER=$(_t2701_emit_probe 400 "$T2707_UNDER")
+T2701_FLOOR_EXACT=$(_t2701_emit_probe 400 "$T2707_FLOOR")
+for t2701_out in "$T2701_FLOOR_UNDER" "$T2701_FLOOR_EXACT"; do
+    assert_eq "W3 contre-vacuité: la sonde de plancher rend bien une ligne" "non-vide" \
+        "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
+done
+
+assert_contains "W3 (AC3): plafond $T2707_UNDER (sous le plancher) ⇒ borne 0, et la note le DIT" \
+    "per_flight_bound_loc=0 ceiling=$T2707_UNDER ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
+    "$(_t2701_line "$T2701_FLOOR_UNDER")"
+assert_contains "W3 (AC3): plafond $T2707_FLOOR (= le plancher exact) ⇒ même chose" \
+    "per_flight_bound_loc=0 ceiling=$T2707_FLOOR ceiling_source=resolved per_flight_verdict=over_bound per_flight_note=ceiling_below_pipeline_floor" \
+    "$(_t2701_line "$T2701_FLOOR_EXACT")"
+assert_not_contains "W3: et JAMAIS une borne négative" \
+    "per_flight_bound_loc=-" "$(_t2701_line "$T2701_FLOOR_UNDER")"
+# LA MOITIÉ QUI COMPTE, et qui est aussi la contre-vacuité des deux précédentes :
+# sans elle, une note émise inconditionnellement les ferait passer toutes les deux.
+assert_not_contains "W3 (D4): un plafond de 200 ne porte AUCUN per_flight_note=" \
+    "per_flight_note=" "$(_t2701_line "$T2701_P200_400")"
+assert_not_contains "W3 (D4): ni un plafond de 150" \
+    "per_flight_note=" "$(_t2701_line "$T2701_P150_400")"
+
+# --- W4 : AC2, PORTE 3 NE REFUSE RIEN ---------------------------------------
+#
+# ROUGE PAR MUTATION : insérer un `return 1` après l'émission fait tirer la
+# première assertion.
+#
+# Un plan à 900 lignes dispatché à 150 tours PASSE la borne par PR (1 000) et
+# explose la borne par vol (243). C'est exactement la population que porte 3 doit
+# MESURER sans la bloquer : un plan déjà groomé ne repasse par aucune porte de
+# groom au dispatch suivant, donc refuser ici gèlerait tout `docs/plans/`.
+
+T2701_BIG=$(_t2701_emit_probe 900 150)
+T2701_BIG_ERR=$(_t2701_err "$T2701_BIG")
+assert_eq "W4 contre-vacuité: la sonde du gros plan rend bien du stderr" "non-vide" \
+    "$([ -n "$T2701_BIG_ERR" ] && echo non-vide || echo vide)"
+
+assert_eq "W4 (AC2): l'émetteur rend 0 sur un plan très au-dessus de la borne par vol" \
+    "0" "$(_t2701_rc "$T2701_BIG")"
+assert_contains "W4 (AC2): et la ligne est émise, COMPLÈTE" \
+    "total_loc=900 threshold_loc=1000 verdict=under_threshold per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=over_bound" \
+    "$(_t2701_line "$T2701_BIG")"
+for t2701_refus in 'REFUSED' 'abort' 'PIPELINE FAILURE'; do
+    assert_not_contains "W4 (AC2): aucun vocabulaire de refus sur la sortie — $t2701_refus" \
+        "$t2701_refus" "$T2701_BIG_ERR"
+done
+# LE CONTRÔLE QUI COMPTE : la ligne émise AVANT est toujours là, donc rien n'a
+# été court-circuité en amont. Sans elle, une fonction qui sortirait en tête
+# rendrait les trois `assert_not_contains` ci-dessus verts.
+assert_contains "W4: la ligne pilot_budget_armed, émise AVANT, est toujours là" \
+    "pilot_budget_armed max_turns=150" "$T2701_BIG_ERR"
+
+# --- W5 : un total illisible rend `unknown`, dans les DEUX unités -----------
+#
+# ROUGE AVANT : le champ n'existait pas. ROUGE PAR MUTATION : sortir le calcul
+# par vol du `case` lui fait comparer `absent` à un entier.
+#
+# Les deux verdicts partagent la MÊME branche de parsabilité, et ce test est ce
+# qui interdit qu'ils divergent — un `per_flight_verdict=under_bound` sur un
+# total absent serait un `0` déguisé en mesure (*un `null` n'est jamais un `0`*,
+# mika#2331).
+
+T2701_ABSENT=$(_t2701_emit_probe "" 150)
+T2701_UNPARSABLE=$(_t2701_emit_probe "mille-deux-cents" 150)
+for t2701_out in "$T2701_ABSENT" "$T2701_UNPARSABLE"; do
+    assert_eq "W5 contre-vacuité: la sonde à total illisible rend bien une ligne" "non-vide" \
+        "$([ -n "$(_t2701_line "$t2701_out")" ] && echo non-vide || echo vide)"
+done
+
+assert_contains "W5: total absent ⇒ verdict=unknown ET per_flight_verdict=unknown" \
+    "total_loc=absent threshold_loc=1000 verdict=unknown per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=unknown" \
+    "$(_t2701_line "$T2701_ABSENT")"
+# Les deux VALEURS restent distinctes sur la ligne, parce que leurs remèdes sont
+# opposés — groomer le plan, ou réparer le motif.
+assert_contains "W5: total illisible ⇒ idem, et la valeur reste distincte d'absent" \
+    "total_loc=mille-deux-cents threshold_loc=1000 verdict=unknown per_flight_bound_loc=${T2701_B150} ceiling=150 ceiling_source=resolved per_flight_verdict=unknown" \
+    "$(_t2701_line "$T2701_UNPARSABLE")"
+assert_not_contains "W5: un total absent ne rend JAMAIS un verdict par vol chiffré" \
+    "per_flight_verdict=under_bound" "$(_t2701_line "$T2701_ABSENT")"
+assert_not_contains "W5: ni sur un total illisible" \
+    "per_flight_verdict=over_bound" "$(_t2701_line "$T2701_UNPARSABLE")"
+
+# --- W6 : AC1, L'ARGV DÉCIDE, et le discriminant est COMPORTEMENTAL ---------
+#
+# ROUGE PAR MUTATION, consigné : remplacer le plafond d'argv par l'état amont
+# `$_PILOT_MAX_TURNS` fait tirer le discriminant comportemental ET la troisième
+# assertion de source — les deux moitiés, ce qui est la preuve qu'elles mesurent
+# la même chose par deux chemins.
+#
+# `loop-substrate` dans les labels ET 200 dans l'environnement, mais
+# `--max-turns 150` dans l'argv. Un scan de source seul dirait « le mot `LABELS`
+# n'apparaît pas », ce qui est vrai de n'importe quel code qui lirait le plafond
+# par une autre porte dérobée.
+
+T2701_ARGV_WINS=$(_t2701_emit_probe 400 150 "p1-important,ready,loop-substrate" 200)
+T2701_ARGV_LINE=$(_t2701_line "$T2701_ARGV_WINS")
+assert_eq "W6 contre-vacuité: la sonde de discriminant rend bien une ligne" "non-vide" \
+    "$([ -n "$T2701_ARGV_LINE" ] && echo non-vide || echo vide)"
+# CONTRÔLE POSITIF de la sonde : la chaîne amont a réellement tourné et a
+# réellement résolu 200 par le label. Sans lui, « l'argv gagne » se prouverait
+# contre un environnement vide, c'est-à-dire contre rien.
+assert_contains "W6 contre-vacuité: la chaîne amont a bien résolu 200 par le label" \
+    "source=label label=loop-substrate" "$(_t2701_err "$T2701_ARGV_WINS")"
+
+assert_contains "W6 (AC1): l'ARGV décide — ceiling=150 malgré loop-substrate" \
+    "ceiling=150 ceiling_source=resolved" "$T2701_ARGV_LINE"
+assert_contains "W6 (AC1): et la borne dérivée est celle de 150 tours" \
+    "per_flight_bound_loc=${T2701_B150} " "$T2701_ARGV_LINE"
+assert_not_contains "W6: la ligne ne porte JAMAIS le plafond que les labels résolvent" \
+    "ceiling=200" "$T2701_ARGV_LINE"
+assert_not_contains "W6: ni la borne de 200 tours" \
+    "per_flight_bound_loc=${T2701_B200}" "$T2701_ARGV_LINE"
+
+# Les trois assertions de source, qui sont le DÉTECTEUR.
+T2701_EMIT_SRC=$(sed -n '/^_emit_pilot_budget_line()/,/^}/p' "$DISPATCH_LIB" \
+    | grep -vE '^[[:space:]]*#')
+assert_eq "W6 contre-vacuité: le corps de _emit_pilot_budget_line a bien été extrait" "non-vide" \
+    "$([ -n "$T2701_EMIT_SRC" ] && echo non-vide || echo vide)"
+# mika#2542 AC5 : `PILOT_LABEL_TURN_CEILINGS` a UN SEUL lecteur. Un second
+# lecteur de label serait la seconde table de classification de mika#2539.
+assert_eq "W6 × mika#2542 AC5: l'émetteur ne nomme pas la table des labels" "0" \
+    "$(printf '%s\n' "$T2701_EMIT_SRC" | grep -cF 'PILOT_LABEL_TURN_CEILINGS' || true)"
+assert_eq "W6 (AC1): l'émetteur ne lit pas LABELS et ne résout pas le plafond" "0" \
+    "$(printf '%s\n' "$T2701_EMIT_SRC" | grep -cE '(\$\{?LABELS\b|_pilot_max_turns)' || true)"
+# L'ancre porte `\b`, donc les trois champs de diagnostic que l'émetteur lit
+# légitimement (`_SOURCE`, `_INVALID`, `_LABEL`) ne sont PAS appariés. C'est
+# l'ancre que V5 de mika#2693 emploie déjà, reprise telle quelle.
+assert_eq "W6 (D1): l'émetteur ne lit pas \$_PILOT_MAX_TURNS au sens strict" "0" \
+    "$(printf '%s\n' "$T2701_EMIT_SRC" | grep -cE '\$\{?_PILOT_MAX_TURNS\b' || true)"
+# Contre-vacuité de l'ancre elle-même : les champs de diagnostic SONT bien lus,
+# donc une ancre trop large tirerait au lieu de dormir.
+assert_eq "W6 contre-vacuité: les champs de diagnostic amont sont bien lus, eux" "yes" \
+    "$(grep -qE -- '\$\{?_PILOT_MAX_TURNS_(SOURCE|INVALID|LABEL)' <<<"$T2701_EMIT_SRC" \
+        && echo yes || echo non-trouvé)"
+
+# --- W7 : anti-vacuité, hermétisme, et l'ordre des champs -------------------
+
+# `plan=` EST LE DERNIER CHAMP : assertion sur le SUFFIXE, pas sur la présence.
+# C'est la propriété de parsabilité de la ligne — `plan=` porte un chemin, donc
+# la seule valeur qui pourrait un jour contenir un espace ; un champ terminal
+# reste parsable, un champ au milieu ne l'est plus. Elle se perd en ajoutant un
+# champ sans y penser, et aucune assertion de présence ne le verrait.
+assert_eq "W7: plan= est le DERNIER champ de la ligne" "yes" \
+    "$(case "$(_t2701_line "$T2701_P200_400")" in
+        *" plan=${T2701_PLAN_PATH}") echo yes ;;
+        *) echo "non: $(_t2701_line "$T2701_P200_400")" ;;
+    esac)"
+assert_eq "W7: …y compris quand per_flight_note= s'intercale" "yes" \
+    "$(case "$(_t2701_line "$T2701_FLOOR_UNDER")" in
+        *"per_flight_note=ceiling_below_pipeline_floor plan=${T2701_PLAN_PATH}") echo yes ;;
+        *) echo "non: $(_t2701_line "$T2701_FLOOR_UNDER")" ;;
+    esac)"
+
+# Les quatre champs sur UNE SEULE ligne, dans l'ordre prescrit — une assertion
+# sur la ligne entière, et non quatre `contains` indépendants qui passeraient sur
+# quatre lignes différentes.
+assert_contains "W7: les quatre champs sont sur UNE ligne, dans l'ordre prescrit" \
+    "verdict=under_threshold per_flight_bound_loc=${T2701_B200} ceiling=200 ceiling_source=resolved per_flight_verdict=under_bound plan=" \
+    "$(_t2701_line "$T2701_P200_400")"
+
+# UN SEUL SITE D'ÉMISSION. Redondant avec S10 de mika#2636, et assumé comme tel :
+# S10 est sous AC4 et ne doit pas bouger, celle-ci dit POURQUOI les champs neufs
+# n'ont pas le droit de s'émettre ailleurs.
+assert_eq "W7: un seul site d'émission de plan_size_estimate" "1" \
+    "$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cF 'plan_size_estimate total_loc=' || true)"
+
+# Le bloc de test lui-même est extrait non vide : une section renommée ou
+# déplacée qui ne s'exécuterait plus serait silencieusement « verte ».
+T2701_TEST_BLOCK=$(sed -n '/^# mika#2701 — PORTE 3 : la ligne/,/^# --- dispatch-lib parse toujours/p' "$0")
+assert_eq "W7 contre-vacuité: le bloc de test mika#2701 est extrait non vide" "non-vide" \
+    "$([ -n "$T2701_TEST_BLOCK" ] && echo non-vide || echo vide)"
+
+# HERMÉTISME : aucune sonde de cette section n'appelle `gh`. Tout est passé en
+# littéral à l'émetteur. Un test qui interrogerait GitHub serait rouge hors
+# réseau et vert pour la mauvaise raison.
+assert_eq "W7 hermétisme: la section n'invoque jamais \`gh\`" "0" \
+    "$(printf '%s\n' "$T2701_TEST_BLOCK" | grep -vE '^[[:space:]]*#' | grep -cE '(^|[^A-Za-z0-9_-])gh[[:space:]]' || true)"
+
+# FIRE-DISPOSITION, option (a) : la table d'exceptions des scans de source de
+# cette section est DÉCLARÉE et VIDE, et son vide est asserté à l'exécution.
+# Déclarée pour que le prochain qui veut y mettre une entrée voie d'abord qu'elle
+# existe exprès ; assertée vide pour qu'une entrée ajoutée en silence tire. Les
+# détecteurs partent ARMÉS — doctrine mika#2201.
+T2701_SOURCE_SCAN_ALLOWLIST=()
+assert_eq "W7: table d'exceptions des scans de source (W6, W7) — zero entries" \
+    "0" "${#T2701_SOURCE_SCAN_ALLOWLIST[@]}"
 
 # --- dispatch-lib parse toujours -------------------------------------------
 T2545_RC=0
 bash -n "$DISPATCH_LIB" 2>/dev/null || T2545_RC=$?
 assert_eq "dispatch-lib.sh passe bash -n" "0" "$T2545_RC"
+
+# --- mika#2029 : un démon qui porte du code d'egress ne survit plus à son code
+
+echo ""
+echo "Test mika#2029: fraîcheur du démon helper — le code installé bat la vivacité"
+echo "------------------------------------------------------------"
+
+# `_pilot_flight_fixture <état> <répertoire>` — pose dans <répertoire> l'état des
+# fichiers qu'un pilote laisse derrière lui, tel qu'il a été MESURÉ sur l'hôte
+# (mika#3031). Partagé par les DEUX sondes de fraîcheur, pour qu'elles ne
+# puissent pas en porter deux copies qui divergeraient le jour où l'une bouge.
+#
+# CE QUE LA MESURE DIT. Le `.log` naît au lancement du pilote et s'écrit jusqu'à
+# sa sortie ; le `.stderr` naît À LA SORTIE — il est copié après `PILOT_EXIT=$?`.
+# Pendant le vol, il n'existe pas. Sur trois vols mesurés, l'écart entre la
+# dernière écriture du `.log` et la naissance du `.stderr` va de +0,6 s à +3,3 s.
+#
+# CE QUE LES FIXTURES D'AVANT FABRIQUAIENT. Un `*.stderr` frais, c'est-à-dire
+# l'état d'un pilote DÉJÀ SORTI — jamais celui d'un vol. Les deux tests de
+# déférence étaient donc verts sur un état qui n'arrive pas pendant un vol, et
+# muets sur le seul qui arrive.
+#
+# L'ÂGE posé sur le `.log` est ce qui discrimine un vol d'un `.log` orphelin pour
+# de bon : l'hôte en porte 878 sur 3 539 `.log`, et le plus jeune orphelin MORT a
+# 11,5 jours. Un signal qui ne regarderait que l'appariement resterait vrai à
+# jamais sur ces 878, donc gèlerait la relance pour toujours — c'est-à-dire
+# mika#2780 réintroduit par le correctif de mika#3031.
+_pilot_flight_fixture() {   # $1 = état, $2 = répertoire de logs
+    local state="$1" dir="$2" id age_s
+    case "$state" in
+        # un vol qui vient de naître, puis un vol plus vieux que l'ancienne
+        # fenêtre de 300 s : la déférence ne doit dépendre d'aucune fenêtre tant
+        # qu'un pilote vole
+        deferred)     id=vol-en-cours; age_s=0 ;;
+        deferred_old) id=vol-ancien;   age_s=600 ;;
+        # un pilote SORTI : les deux fichiers, tous deux frais. Il n'a plus de
+        # tunnel CONNECT à couper, donc il ne doit plus rien différer
+        exited)       id=vol-sorti;    age_s=0 ;;
+        # un `.log` que plus aucun pilote n'écrit et que plus aucun `.stderr` ne
+        # viendra apparier
+        orphan)       id=vol-orphelin; age_s=259200 ;;
+        *)            return 0 ;;
+    esac
+    printf 'ligne de vol %s\n' "$id" > "$dir/$id.log"
+    if [ "$state" = exited ]; then
+        printf 'sortie de %s\n' "$id" > "$dir/$id.stderr"
+    fi
+    if [ "$age_s" -gt 0 ]; then
+        touch -d "-${age_s} seconds" "$dir/$id.log"
+    fi
+    return 0
+}
+
+# CONTRÔLE DE L'INSTRUMENT, et il est tiré AVANT les assertions qui en dépendent.
+#
+# L'âge de la fixture est posé par `touch -d` sous forme relative. Sur un `touch`
+# qui ne la connaît pas, le `.log` resterait FRAIS : `vol-ancien` deviendrait
+# indiscernable de `vol-en-cours`, `vol-orphelin` d'un vol, et les deux
+# assertions passeraient au vert sur le mauvais état. Cette ligne mesure donc
+# l'âge plutôt que de le supposer — et elle est aussi la forme la plus nue de ce
+# que le vol établit : un `.log` de 600 s est HORS d'une fenêtre de 300 s, donc
+# tout prédicat fenêtré à 300 s rend faux sur un vol de cet âge.
+T3031_FIXTURE_DIR=$(mktemp -d)
+_pilot_flight_fixture deferred_old "$T3031_FIXTURE_DIR"
+T3031_FIXTURE_AGE="$(
+    _cut300=$(date -u -d "-300 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    _cut1800=$(date -u -d "-1800 seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+    _in300=$(find "$T3031_FIXTURE_DIR" -maxdepth 1 -name '*.log' \
+        -newermt "${_cut300:-1970-01-01T00:00:00Z}" -print -quit 2>/dev/null)
+    _in1800=$(find "$T3031_FIXTURE_DIR" -maxdepth 1 -name '*.log' \
+        -newermt "${_cut1800:-1970-01-01T00:00:00Z}" -print -quit 2>/dev/null)
+    printf '%s %s' \
+        "$([ -n "$_in300" ] && echo dedans || echo dehors)" \
+        "$([ -n "$_in1800" ] && echo dedans || echo dehors)"
+)"
+assert_eq "mika#3031 instrument: un vol de 600 s est hors d'une fenêtre de 300 s, dans celle de 1800 s" \
+    "dehors dedans" "$T3031_FIXTURE_AGE"
+rm -rf "$T3031_FIXTURE_DIR"
+
+# L'autre moitié du contrôle : AUCUNE fixture de vol ne pose de `.stderr`. C'est
+# la propriété que les fixtures d'avant violaient, et un `.stderr` qui
+# reviendrait en douce rendrait les tests de déférence verts pour la mauvaise
+# raison. Compté sur les quatre états à la fois, `<.log>/<.stderr>`.
+T3031_FIXTURE_SHAPE="$(
+    for _s in deferred deferred_old exited orphan; do
+        _d=$(mktemp -d)
+        _pilot_flight_fixture "$_s" "$_d"
+        printf '%s=%s/%s ' "$_s" \
+            "$(find "$_d" -maxdepth 1 -name '*.log' 2>/dev/null | wc -l | tr -d ' ')" \
+            "$(find "$_d" -maxdepth 1 -name '*.stderr' 2>/dev/null | wc -l | tr -d ' ')"
+        rm -rf "$_d"
+    done
+)"
+assert_eq "mika#3031 instrument: seul l'état « sorti » pose un \`.stderr\`" \
+    "deferred=1/0 deferred_old=1/0 exited=1/1 orphan=1/0 " "$T3031_FIXTURE_SHAPE"
+
+# `_daemon_freshness_probe <état> [lib]` — monte un VRAI porteur de port sur un
+# port éphémère, met l'état en place, rappelle `_ensure_pilot_helper`, et rend
+# ce que la garde en a fait :
+#
+#   rc=<n> token=<fresh|stale|stale_deferred|undecidable|none> launches=<n>
+#   first=<alive|dead> listening=<yes|no>
+#
+# `token=none` est l'état NOMINAL silencieux : `fresh` n'écrit rien (D5).
+#
+# Le second paramètre est le CROCHET DE CONTRE-VACUITÉ (V5) : pointé sur une
+# copie de `main`, l'état `stale` y rend `token=none launches=1 first=alive` —
+# le chemin « already alive » y retourne 0 en silence, sans jamais regarder
+# quelle version écoute. C'est la mesure qui dit que ce bloc n'est pas vide.
+_daemon_freshness_probe() {
+    local state="$1" lib="${2:-$DISPATCH_LIB}"
+    local tmp port bin addon ghaddon ca err rc token launches first listening p i
+
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/bin" "$tmp/pilotlogs" "$tmp/helperlog"
+    : > "$tmp/launches"
+
+    # Port éphémère, JAMAIS 8892 (R4) : la suite tourne sur l'hôte de
+    # l'opérateur et ne doit toucher aucun démon réel. Rien ici n'appelle
+    # `fuser -k` : la sonde tue par pid, et uniquement les pids que son propre
+    # faux démon a inscrits.
+    port=$(python3 -c '
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+')
+    bin="$tmp/bin/mitmdump"
+    addon="$tmp/bin/anthropic-addon.py"
+    ghaddon="$tmp/bin/github-addon.py"
+    ca="$tmp/bin/ca.pem"
+
+    # Un faux mitmdump qui ÉCOUTE VRAIMENT : la garde juge un porteur de port,
+    # pas un nom de processus. Il inscrit son propre pid — `exec` le conserve —
+    # pour que la sonde compte les lancements et sache si le premier porteur a
+    # bien été tué.
+    cat > "$bin" <<'FAKE_MITMDUMP'
+#!/bin/bash
+_port=""; _prev=""
+for _a in "$@"; do [ "$_prev" = "--listen-port" ] && _port="$_a"; _prev="$_a"; done
+echo "$$" >> "$(dirname "$0")/../launches"
+exec python3 -c '
+import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(5)
+time.sleep(120)
+' "$_port"
+FAKE_MITMDUMP
+    chmod +x "$bin"
+    printf '# anthropic addon\n' > "$addon"
+    printf '# github addon\n' > "$ghaddon"
+    printf '# ca\n' > "$ca"
+
+    # Le code est posé AVANT le lancement : c'est l'état nominal, et le contrôle
+    # négatif V1 en dépend. La seconde pleine met la comparaison de mtime hors de
+    # portée d'un `[ -nt ]` qui ne comparerait que les secondes.
+    sleep 1.1
+
+    err="$tmp/err"
+    (
+        # shellcheck disable=SC1090
+        source "$lib"
+        _PILOT_HELPER_BIN="$bin"
+        _PILOT_HELPER_PORT="$port"
+        _PILOT_HELPER_ADDON="$addon"
+        _PILOT_GH_HELPER_ADDON="$ghaddon"
+        _PILOT_HELPER_CA="$ca"
+        _PILOT_HELPER_LOG="$tmp/helperlog/helper.log"
+        PILOT_LOG_DIR="$tmp/pilotlogs"
+
+        _ensure_pilot_helper >/dev/null 2>&1 || true   # amorçage : le démon d'origine
+
+        # `make install` réécrit l'addon sous le démon déjà lancé.
+        case "$state" in
+            stale|deferred|deferred_old|exited|orphan|undecidable)
+                sleep 1.1; touch "$ghaddon" ;;
+        esac
+        # L'état des fichiers de vol, mesuré plutôt que fabriqué (mika#3031).
+        _pilot_flight_fixture "$state" "$tmp/pilotlogs"
+        if [ "$state" = undecidable ]; then
+            # Un porteur que la découverte ne rend pas. L'état de PÉREMPTION est
+            # identique à V2 : seule la lisibilité du porteur change, donc la
+            # sonde distingue bien `undecidable` de `stale`.
+            fuser() { return 1; }
+        fi
+
+        _ensure_pilot_helper >/dev/null 2>"$err"
+    ) && rc=0 || rc=$?
+
+    token=$(grep -oE -m1 'pilot_daemon_freshness\.[a-z_]+' "$err" 2>/dev/null || true)
+    token="${token#pilot_daemon_freshness.}"
+    [ -n "$token" ] || token=none
+    launches=$(wc -l < "$tmp/launches" | tr -d ' ')
+
+    p=$(head -1 "$tmp/launches" 2>/dev/null || true)
+    first=dead
+    i=0
+    while [ $i -lt 10 ]; do
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then first=alive; else first=dead; break; fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+
+    listening=no
+    if python3 -c '
+import socket, sys
+s = socket.socket()
+s.settimeout(1)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1]))); s.close()
+except OSError:
+    sys.exit(1)
+' "$port" 2>/dev/null; then listening=yes; fi
+
+    while read -r p; do kill "$p" 2>/dev/null || true; done < "$tmp/launches"
+    rm -rf "$tmp"
+    printf 'rc=%s token=%s launches=%s first=%s listening=%s' \
+        "$rc" "$token" "$launches" "$first" "$listening"
+}
+
+# SKIP BRUYANT (mika#2149, troisième colonne) : sans `fuser`, la découverte du
+# porteur rend `undecidable` partout et les quatre sondes mesureraient le même
+# rien. Un bloc de porte qui n'a pas pu s'armer ne doit pas se lire comme un vert.
+if ! command -v fuser >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2029 — 'fuser' introuvable : la garde de fraîcheur identifie"
+    echo "    le porteur du port par identité de socket et ne peut rien mesurer sans lui."
+    echo "    Remède : installer psmisc (Debian/Ubuntu) ou sys-process/psmisc (Gentoo)."
+else
+    # V1 — CONTRÔLE NÉGATIF, et contrôle de l'instrument : le comparateur est
+    # l'ordre des mtimes entre un fichier et `/proc/<pid>` (D2). Un `/proc/<pid>`
+    # dont le mtime ne serait PAS l'instant de démarrage rendrait cette ligne
+    # rouge — c'est le signal de bascule vers le repli nommé du plan
+    # (`/proc/<pid>/stat` champ 22 + `btime`), et la raison pour laquelle V1
+    # s'écrit en premier.
+    assert_eq "V1 contrôle négatif: code posé avant le démon ⇒ fresh, silencieux, aucun TERM" \
+        "rc=0 token=none launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe fresh)"
+
+    # V2 — CONTRÔLE POSITIF. Un addon réinstallé sous le démon : jeton `stale`,
+    # le porteur d'origine est mort, un nouveau démon écoute.
+    assert_eq "V2 contrôle positif: addon réinstallé ⇒ stale, porteur mort, démon relancé" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_daemon_freshness_probe stale)"
+
+    # V3 — DÉFÉRENCE (D4). Même état que V2, plus l'état MESURÉ d'un vol dans
+    # PILOT_LOG_DIR — un `.log` qui s'écrit, aucun `.stderr`. Tuer le mitmdump
+    # sous un pilote qui stream fabriquerait la classe de panne que mika#2029
+    # existe pour éteindre. Aucun TERM, rc 0, et le prochain dispatch sans frère
+    # en vol relancera (auto-guérissant).
+    assert_eq "V3 déférence: pilote frère en vol ⇒ stale_deferred, aucun TERM" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe deferred)"
+
+    # V3b — LE VOL QUI DURE. Même état que V3, le `.log` vieilli de 600 s. C'est
+    # l'état que les 7 relances mesurées par le ticket ont rencontré : leurs vols
+    # avaient 79, 103, 189, 512, 679, 1 351 et 1 439 s. Un prédicat fenêtré à
+    # 300 s rend faux sur cinq d'entre eux, et c'est exactement ce que fait
+    # celui d'avant — voir le test de bonne foi plus bas.
+    assert_eq "V3b déférence: un vol de plus de 300 s diffère quand même" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe deferred_old)"
+
+    # V3c — LE PILOTE SORTI NE DIFFÈRE PLUS. Les deux fichiers, tous deux frais.
+    # Le `.stderr` quitte le prédicat : il naît à la sortie, il ne témoigne
+    # d'aucun vol, et sa seule contribution d'avant était de différer la relance
+    # 300 s après chaque vol FINI. Un pilote sorti n'a plus de tunnel CONNECT à
+    # couper, donc le démon périmé est relancé tout de suite.
+    assert_eq "V3c sorti: \`.log\` et \`.stderr\` tous deux frais ⇒ stale, relance" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_daemon_freshness_probe exited)"
+
+    # V3d — LE CONTRÔLE NÉGATIF QUI COMPTE VRAIMENT (AC2). Un `.log` de trois
+    # jours sans `.stderr` : un vol tué par SIGKILL n'en aura jamais. L'hôte en
+    # porte 878, et un appariement SANS plafond d'ancienneté resterait vrai sur
+    # eux à jamais — la relance gelée pour toujours, c'est-à-dire mika#2780
+    # réintroduit par ce correctif-ci. Le plafond est donc armé, et cette ligne
+    # est ce qui le tient.
+    assert_eq "V3d orphelin: un \`.log\` de 3 jours sans \`.stderr\` ⇒ stale, relance" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_daemon_freshness_probe orphan)"
+
+    # V4 — INDÉCIDABLE. Le port est tenu, mais la découverte ne rend pas son
+    # porteur. « On ne sait pas » n'est pas « périmé » : aucun TERM, rc 0, et la
+    # ligne le dit plutôt que de laisser le silence passer pour un verdict.
+    assert_eq "V4 indécidable: porteur non identifiable ⇒ undecidable, aucun TERM" \
+        "rc=0 token=undecidable launches=1 first=alive listening=yes" \
+        "$(_daemon_freshness_probe undecidable)"
+
+    # V5 — CONTRE-VACUITÉ, constatée le 2026-10-16 et consignée dans la PR. Le
+    # crochet `lib` ci-dessus, pointé sur une copie de `main`
+    # (`git show origin/main:skills/bundled/_shared/dispatch-lib.sh`), rend sur
+    # l'état EXACT de V2 :
+    #
+    #     rc=0 token=none launches=1 first=alive listening=yes
+    #
+    # Aucun jeton, aucune relance, le porteur périmé sert encore. C'est la panne
+    # de mika#2029 reproduite à la demande, et la preuve que les quatre lignes
+    # ci-dessus mesurent le correctif plutôt que le décor. Non assertée en
+    # permanence : l'exécuter exigerait de lire une autre révision depuis la
+    # suite, donc un test vert hors réseau et rouge en archive détachée.
+fi
+
+# Le jeton `fresh` ne doit JAMAIS écrire de ligne : une ligne par dispatch sur
+# l'état nominal noierait les quatre autres. Le verdicteur en porte donc
+# exactement TROIS — `undecidable`, `stale_deferred`, `stale` — et le quatrième
+# (`stale_unstoppable`) vit chez l'arrêteur. Compté plutôt que cherché : un `0`
+# serait aussi ce que rendrait une extraction vide.
+T2029_VERDICT_BLOCK=$(awk '/^_pilot_daemon_freshness\(\)/,/^}$/' "$DISPATCH_LIB")
+assert_eq "mika#2029: le verdicteur écrit 3 lignes nommées, aucune pour \`fresh\`" \
+    "3 0" \
+    "$(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.' || true) $(printf '%s\n' "$T2029_VERDICT_BLOCK" | grep -c 'pilot_daemon_freshness\.fresh' || true)"
+
+# --- mika#3031 : bonne foi — les trois causes sont reproductibles -------------
+
+echo ""
+echo "Test mika#3031: bonne foi — chaque cause du signal « frère en vol » se rejoue"
+echo "------------------------------------------------------------"
+
+# T3 (AC3) — LA CAUSE A, reproduite à la demande. Sur la fixture d'un vol de
+# 600 s, le prédicat d'AVANT et celui d'APRÈS sont tirés côte à côte, et ils ne
+# disent pas la même chose : l'ancien rend FAUX sur un pilote vivant.
+#
+# L'ancien prédicat est RECOPIÉ EN LIGNE plutôt que lu dans une autre révision.
+# C'est la raison pour laquelle V5 et R4 ne sont, eux, pas assertés en
+# permanence : lire `origin/main` depuis la suite donnerait un test vert hors
+# réseau et rouge en archive détachée. Il tient en un `find`, donc le recopier ne
+# coûte rien et le garde exécutable partout.
+T3031_T3_DIR=$(mktemp -d)
+_pilot_flight_fixture deferred_old "$T3031_T3_DIR"
+T3031_T3="$(
+    # shellcheck disable=SC1090
+    source "$DISPATCH_LIB" 2>/dev/null || true
+    _old=$(find "$T3031_T3_DIR" -maxdepth 1 -name '*.stderr' \
+        -newermt "-300 seconds" -print -quit 2>/dev/null)
+    PILOT_LOG_DIR="$T3031_T3_DIR"
+    _pilot_sibling_pilot_in_flight; _rc=$?
+    case "$_rc" in
+        0) _new=vrai ;;
+        1) _new=faux ;;
+        *) _new="rc$_rc" ;;
+    esac
+    printf 'avant=%s après=%s' "$([ -n "$_old" ] && echo vrai || echo faux)" "$_new"
+)"
+assert_eq "T3 bonne foi (cause A): sur un vol de 600 s, l'ancien prédicat rend faux, le nouveau vrai" \
+    "avant=faux après=vrai" "$T3031_T3"
+rm -rf "$T3031_T3_DIR"
+
+# T4 — CONTRÔLE DE FORME DU TIMESTAMP, sur un `.log` posé à un mtime CONNU
+# plutôt qu'à un âge relatif : les deux coupures encadrent cet instant à une
+# seconde près, de part et d'autre, donc une forme mal interprétée ne peut pas
+# rendre la bonne réponse par chance.
+#
+# Ce que la ligne établit : la forme ISO 8601 absolue — celle que le prédicat
+# emploie — est exacte DANS LES DEUX SENS. C'est l'assertion qui compte, parce
+# qu'un `-newermt` mal interprété ne lève aucune erreur : il rend simplement le
+# mauvais ensemble, et le signal devient faux en silence.
+#
+# Elle mesure `@epoch` en regard, et la mesure CORRIGE le grooming de ce ticket :
+# la forme epoch est exacte elle aussi sous les deux `find` de ce parc (GNU
+# findutils 4.10.0 et bfs 4.1.1). Le § M3 du plan lui prêtait une mauvaise
+# interprétation ; le re-calcul montre que l'erreur était dans ses deux libellés
+# d'instants, non dans la réponse de `find`. L'ISO absolu reste la forme retenue
+# pour une autre raison, qui tient : c'est la seule que GNU documente. Que la
+# source n'emploie ni l'une ni l'autre des deux autres formes est une propriété
+# STRUCTURELLE, tenue par le scan S2 et non par cette ligne.
+#
+# `date -u -d` et `touch -d` en forme absolue sont supposés GNU, comme partout
+# ailleurs dans cette suite (`_pilot_flight_fixture` vieillit déjà par `touch -d`).
+T3031_T4_DIR=$(mktemp -d)
+printf 'ligne de vol\n' > "$T3031_T4_DIR/connu.log"
+touch -d "2026-03-18T12:00:00Z" "$T3031_T4_DIR/connu.log"
+T3031_T4="$(
+    _t4_probe() {   # $1 = instant de coupure ; rend trouve|rien
+        if [ -n "$(find "$T3031_T4_DIR" -maxdepth 1 -name '*.log' \
+            -newermt "$1" -print -quit 2>/dev/null)" ]; then echo trouve; else echo rien; fi
+    }
+    printf 'iso_avant=%s iso_apres=%s epoch_avant=%s epoch_apres=%s' \
+        "$(_t4_probe '2026-03-18T11:59:59Z')" \
+        "$(_t4_probe '2026-03-18T12:00:01Z')" \
+        "$(_t4_probe "@$(date -u -d '2026-03-18T11:59:59Z' +%s)")" \
+        "$(_t4_probe "@$(date -u -d '2026-03-18T12:00:01Z' +%s)")"
+)"
+assert_eq "T4 forme du timestamp: l'ISO absolu est exact dans les deux sens sur un mtime connu" \
+    "iso_avant=trouve iso_apres=rien epoch_avant=trouve epoch_apres=rien" "$T3031_T4"
+rm -rf "$T3031_T4_DIR"
+
+# T5 — LA CAUSE B, tenue SANS dépendre du `find` de l'hôte. Un `find` hostile qui
+# refuse tout instant relatif est monté par surcharge, et le signal doit rester
+# vrai sur la fixture d'un vol. Sous un `find` réel la ligne ne prouverait rien :
+# elle serait verte là où la forme relative est acceptée (les deux
+# implémentations de ce parc) et n'aurait jamais tiré sur celle qui la refuse.
+#
+# La surcharge n'existe QUE dans le sous-shell de la sonde — définie au niveau du
+# fichier, elle fuirait dans tous les blocs suivants.
+#
+# Elle TRACE tout `-newermt` qu'elle voit passer dans `$_T3031_T5_TRACE`, et cette
+# trace est ce qui rend T5 non vide. Sans elle, T5 serait vert aussi bien quand la
+# surcharge est atteinte que quand elle ne l'est pas — un doublon de V3b déguisé
+# en mesure, puisque le prédicat corrigé ne passe plus aucun instant relatif.
+_t3031_hostile_find() {
+    local _prev="" _a
+    for _a in "$@"; do
+        if [ "$_prev" = "-newermt" ]; then
+            [ -n "${_T3031_T5_TRACE:-}" ] && printf '%s\n' "$_a" >> "$_T3031_T5_TRACE"
+            case "$_a" in
+                -*|+*)
+                    echo "find: hostile (mika#3031): refuse un instant relatif : $_a" >&2
+                    return 1 ;;
+            esac
+        fi
+        _prev="$_a"
+    done
+    command find "$@"
+}
+
+# CONTRÔLE DE L'INSTRUMENT, tiré avant l'assertion qui en dépend : la surcharge
+# refuse-t-elle VRAIMENT le relatif, et laisse-t-elle VRAIMENT passer l'ISO ? Une
+# surcharge qui déléguerait tout rendrait T5 vert sans rien avoir mesuré.
+T3031_T5_INSTRUMENT="$(
+    _d=$(mktemp -d)
+    printf 'x\n' > "$_d/a.log"
+    find() { _t3031_hostile_find "$@"; }
+    _rel=$(find "$_d" -maxdepth 1 -name '*.log' -newermt "-1800 seconds" -print -quit 2>/dev/null)
+    _iso=$(find "$_d" -maxdepth 1 -name '*.log' -newermt "1970-01-01T00:00:00Z" -print -quit 2>/dev/null)
+    printf 'relatif=%s iso=%s' \
+        "$([ -n "$_rel" ] && echo passe || echo refuse)" \
+        "$([ -n "$_iso" ] && echo passe || echo refuse)"
+    rm -rf "$_d"
+)"
+assert_eq "mika#3031 instrument: le \`find\` hostile refuse le relatif et accepte l'ISO" \
+    "relatif=refuse iso=passe" "$T3031_T5_INSTRUMENT"
+
+if ! command -v fuser >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP T5 mika#3031 — 'fuser' introuvable : la sonde de fraîcheur ne peut"
+    echo "    rien mesurer sans lui (même cause que le SKIP de mika#2029 ci-dessus)."
+    echo "    Remède : installer psmisc (Debian/Ubuntu) ou sys-process/psmisc (Gentoo)."
+else
+    T3031_T5_TRACE_FILE=$(mktemp)
+    T3031_T5="$(
+        _T3031_T5_TRACE="$T3031_T5_TRACE_FILE"
+        find() { _t3031_hostile_find "$@"; }
+        _daemon_freshness_probe deferred_old
+    )"
+    # `vu=oui` dit que la surcharge a bien été ATTEINTE dans le sous-shell de la
+    # sonde, et `relatif=0` qu'aucun des instants qui y sont passés n'était
+    # relatif — donc que le vert ci-dessus est celui du prédicat corrigé sous un
+    # `find` hostile, et non celui d'un `find` réel qui n'aurait rien refusé.
+    T3031_T5_SEEN="$(
+        _n=$(wc -l < "$T3031_T5_TRACE_FILE" | tr -d ' ')
+        _rel=$(grep -cE '^[-+]' "$T3031_T5_TRACE_FILE" || true)
+        printf 'vu=%s relatif=%s' "$([ "$_n" -gt 0 ] && echo oui || echo non)" "$_rel"
+    )"
+    rm -f "$T3031_T5_TRACE_FILE"
+    assert_eq "T5 bonne foi (cause B): sous un \`find\` qui refuse le relatif, le vol diffère quand même" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" "$T3031_T5"
+    assert_eq "T5 anti-vacuité: la surcharge est atteinte, et aucun instant relatif n'y passe" \
+        "vu=oui relatif=0" "$T3031_T5_SEEN"
+fi
+
+# --- mika#3031 : deux scans refusent le retour du prédicat et de l'offset -----
+
+echo ""
+echo "Test mika#3031: deux scans structurels — un seul signal, aucune coupure relative"
+echo "------------------------------------------------------------"
+
+# FIRE-DISPOSITION, option (a) pour les deux scans ci-dessous : la table
+# d'exceptions est DÉCLARÉE et VIDE, et son vide est asserté à l'exécution.
+# Déclarée pour que le prochain qui veut y mettre une entrée voie d'abord qu'elle
+# existe exprès ; assertée vide pour qu'une entrée ajoutée en silence tire. Les
+# détecteurs partent ARMÉS — doctrine mika#2201. C'est cette assertion-ci qui
+# empêche l'allowlist de devenir celle que mika#2309 condamne : y ajouter une
+# entrée sans nommer sa donnée et son ticket rougit la suite.
+T3031_SIBLING_PREDICATE_ALLOWLIST=()
+assert_eq "S1: table d'exceptions du scan « un seul prédicat frère en vol » — zero entries" \
+    "0" "${#T3031_SIBLING_PREDICATE_ALLOWLIST[@]}"
+T3031_RELATIVE_NEWERMT_ALLOWLIST=()
+assert_eq "S2: table d'exceptions du scan \`-newermt\` relatif — zero entries" \
+    "0" "${#T3031_RELATIVE_NEWERMT_ALLOWLIST[@]}"
+
+# S1 (AC4) — UN SEUL PRÉDICAT « frère en vol », donc un seul signal pour les deux
+# démons. Le relais et le `mitmdump` passent déjà par le même verdicteur ; ce que
+# ce scan refuse, c'est le geste qui les séparerait — un second prédicat écrit
+# pour l'un des deux, qui dériverait du premier le jour où l'un est touché (D1).
+#
+# COMPTÉ, JAMAIS CHERCHÉ : un `grep -c` qui rend `0` est aussi ce que rendrait une
+# extraction vide. Les deux nombres sont donc non nuls et assertés ensemble — une
+# définition, un appel.
+T3031_S1_DEFS=$(grep -cE '^_pilot_sibling_pilot_in_flight\(\)' "$DISPATCH_LIB" || true)
+T3031_S1_MENTIONS=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" \
+    | grep -cE '_pilot_sibling_pilot_in_flight' || true)
+assert_eq "S1 (AC4): un seul prédicat « frère en vol », appelé une seule fois" \
+    "defs=1 appels=1" \
+    "defs=$T3031_S1_DEFS appels=$((T3031_S1_MENTIONS - T3031_S1_DEFS))"
+
+# S2 — AUCUNE COUPURE `-newermt` EN FORME RELATIVE NI `@epoch`. La forme ISO 8601
+# absolue est la seule que GNU documente, donc la seule sur laquelle on puisse
+# écrire un invariant qui vaille sur un `find` qu'on n'a pas mesuré. Un lecteur
+# futur qui « simplifierait » vers `-newermt "-1800 seconds"` économiserait un
+# `date` et rendrait le signal dépendant de l'implémentation présente sur le PATH
+# du démon — sans aucune erreur, puisque les deux formes marchent ici.
+#
+# LE TOTAL EST ASSERTÉ EN REGARD DU ZÉRO, et c'est tout le sujet : un `relatif=0`
+# serait aussi ce que rendrait la DISPARITION de la ligne. Le couple dit donc
+# « il y a bien une coupure, et elle n'est pas relative » plutôt que « je n'ai
+# rien trouvé ».
+T3031_S2_TOTAL=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" | grep -cE -- '-newermt' || true)
+T3031_S2_RELATIVE=$(grep -vE '^[[:space:]]*#' "$DISPATCH_LIB" \
+    | grep -cE -- '-newermt[[:space:]]+"?[-+@]' || true)
+assert_eq "S2: une seule coupure \`-newermt\`, et elle n'est ni relative ni \`@epoch\`" \
+    "total=1 relatif=0" \
+    "total=$T3031_S2_TOTAL relatif=$T3031_S2_RELATIVE"
+
+# ANTI-VACUITÉ DU MOTIF DE S2 : il APPARIE-T-IL les trois formes qu'il refuse ?
+# Sans cette ligne, `relatif=0` serait aussi la réponse d'une expression cassée,
+# et le scan passerait vert sur le jour même où quelqu'un réécrit la coupure en
+# relatif. Tiré sur des lignes synthétiques, jamais sur la source.
+T3031_S2_MOTIF="$(
+    _m() { printf '%s\n' "$1" | grep -cE -- '-newermt[[:space:]]+"?[-+@]' || true; }
+    printf 'moins=%s plus=%s epoch=%s nu=%s iso=%s var=%s' \
+        "$(_m '    -newermt "-1800 seconds" \')" \
+        "$(_m '    -newermt "+1800 seconds" \')" \
+        "$(_m '    -newermt "@1762244000" \')" \
+        "$(_m '    -newermt -1800 \')" \
+        "$(_m '    -newermt "2026-03-18T12:00:00Z" \')" \
+        "$(_m '    -newermt "$_cut" 2>/dev/null)" || true')"
+)"
+assert_eq "S2 anti-vacuité: le motif apparie bien le relatif et l'\`@epoch\`, et laisse passer l'ISO" \
+    "moins=1 plus=1 epoch=1 nu=1 iso=0 var=0" "$T3031_S2_MOTIF"
+
+# --- mika#2780 : la fraîcheur couvre le SECOND porteur, le relais d'egress ----
+
+echo ""
+echo "Test mika#2780: fraîcheur du relais d'egress — le code installé bat la vivacité"
+echo "------------------------------------------------------------"
+
+# `_relay_freshness_probe <état> [lib]` — jumeau de `_daemon_freshness_probe`,
+# pour l'autre porteur : il monte un VRAI porteur de SOCKET UNIX dans un
+# `mktemp -d`, met l'état en place, rappelle `_ensure_pilot_egress_proxy`, et
+# rend ce que la garde en a fait, dans la même ligne de mesure :
+#
+#   rc=<n> token=<fresh|stale|stale_deferred|undecidable|none> launches=<n>
+#   first=<alive|dead> listening=<yes|no>
+#
+# `token=none` est l'état NOMINAL silencieux : `fresh` n'écrit rien (D5).
+#
+# POURQUOI UN JUMEAU ET NON UN HARNAIS BIMODAL. Rendre `_daemon_freshness_probe`
+# bimodal demanderait de paramétrer son faux démon, ses variables de lanceur, la
+# fonction appelée et sa sonde finale — un refactor dont le chemin `mitmdump`
+# est hors périmètre de ce ticket, et dont la casse se lirait comme une
+# régression du vol 2.
+#
+# Le second paramètre est le CROCHET DE CONTRE-VACUITÉ (R4 ci-dessous), de même
+# rôle que celui de V5.
+_relay_freshness_probe() {
+    local state="$1" lib="${2:-$DISPATCH_LIB}"
+    local tmp sock bin err rc token launches first listening p i
+
+    tmp=$(mktemp -d)
+    mkdir -p "$tmp/bin" "$tmp/pilotlogs" "$tmp/relaylog"
+    : > "$tmp/launches"
+
+    # Le socket vit dans le `mktemp -d`, JAMAIS `/tmp/mika-pilot-egress.sock` :
+    # c'est le socket de production de l'hôte de l'opérateur, et l'arrêteur tue
+    # par identité de socket. Même règle que le port éphémère côté mitmdump (R4
+    # du vol 2).
+    sock="$tmp/egress.sock"
+    bin="$tmp/bin/mika-pilot-egress-proxy"
+
+    # Un faux relais qui ÉCOUTE VRAIMENT sur AF_UNIX : la garde juge un porteur
+    # de socket, pas un nom de processus. Il inscrit son propre pid — `exec` le
+    # conserve — pour que la sonde compte les lancements et sache si le premier
+    # porteur a bien été tué. Le vrai lanceur passe `--host-unix --socket
+    # <chemin>`, et `env -i` ne lui laisse que la liste blanche (dont `PATH`).
+    #
+    # Il délie le chemin avant `bind()`, comme le vrai relais : un socket unix
+    # survit à la mort de son porteur, et un `bind()` nu y rendrait EADDRINUSE
+    # (mesure S4). Sans cette ligne, R2 échouerait sur le décor et non sur la
+    # règle.
+    cat > "$bin" <<'FAKE_RELAY'
+#!/bin/bash
+_sock=""; _prev=""
+for _a in "$@"; do [ "$_prev" = "--socket" ] && _sock="$_a"; _prev="$_a"; done
+echo "$$" >> "$(dirname "$0")/../launches"
+exec python3 -c '
+import os, socket, sys, time
+p = sys.argv[1]
+try:
+    os.unlink(p)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX)
+s.bind(p)
+s.listen(5)
+time.sleep(120)
+' "$_sock"
+FAKE_RELAY
+    chmod +x "$bin"
+
+    # Le code est posé AVANT le lancement : c'est l'état nominal, et le contrôle
+    # négatif R1 en dépend. La seconde pleine met la comparaison de mtime hors de
+    # portée d'un `[ -nt ]` qui ne comparerait que les secondes.
+    sleep 1.1
+
+    err="$tmp/err"
+    (
+        # shellcheck disable=SC1090
+        source "$lib"
+        _PILOT_EGRESS_PROXY_BIN="$bin"
+        _PILOT_EGRESS_SOCK="$sock"
+        MIKA_PILOT_EGRESS_LOG_DIR="$tmp/relaylog"
+        PILOT_LOG_DIR="$tmp/pilotlogs"
+
+        _ensure_pilot_egress_proxy >/dev/null 2>&1 || true   # amorçage
+
+        # `make install` réécrit le binaire sous le démon déjà lancé — c'est
+        # littéralement l'occurrence du 2026-10-18 (mika#2778).
+        case "$state" in
+            stale|deferred|deferred_old) sleep 1.1; touch "$bin" ;;
+        esac
+        # Même fixture que la sonde jumelle, et c'est le point : l'état d'un vol
+        # n'a pas deux définitions dans cette suite (mika#3031).
+        _pilot_flight_fixture "$state" "$tmp/pilotlogs"
+
+        _ensure_pilot_egress_proxy >/dev/null 2>"$err"
+    ) && rc=0 || rc=$?
+
+    token=$(grep -oE -m1 'pilot_daemon_freshness\.[a-z_]+' "$err" 2>/dev/null || true)
+    token="${token#pilot_daemon_freshness.}"
+    [ -n "$token" ] || token=none
+    launches=$(wc -l < "$tmp/launches" | tr -d ' ')
+
+    p=$(head -1 "$tmp/launches" 2>/dev/null || true)
+    first=dead
+    i=0
+    while [ $i -lt 10 ]; do
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then first=alive; else first=dead; break; fi
+        sleep 0.05
+        i=$((i + 1))
+    done
+
+    listening=no
+    if python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(1)
+try:
+    s.connect(sys.argv[1]); s.close()
+except OSError:
+    sys.exit(1)
+' "$sock" 2>/dev/null; then listening=yes; fi
+
+    while read -r p; do kill "$p" 2>/dev/null || true; done < "$tmp/launches"
+    rm -rf "$tmp"
+    printf 'rc=%s token=%s launches=%s first=%s listening=%s' \
+        "$rc" "$token" "$launches" "$first" "$listening"
+}
+
+# SKIP BRUYANT (mika#2149, troisième colonne), pour la même raison que le bloc
+# jumeau : sans `fuser`, la découverte du porteur rend `undecidable` partout et
+# les trois sondes mesureraient le même rien.
+if ! command -v fuser >/dev/null 2>&1; then
+    SKIPPED=$((SKIPPED + 1))
+    echo "  ⊘ SKIP mika#2780 — 'fuser' introuvable : la garde de fraîcheur identifie"
+    echo "    le porteur du socket par identité de socket et ne peut rien mesurer sans lui."
+    echo "    Remède : installer psmisc (Debian/Ubuntu) ou sys-process/psmisc (Gentoo)."
+else
+    # R1 — CONTRÔLE NÉGATIF, et assertion auto-nettoyante du détecteur
+    # (Fire-Disposition). Sans elle, un prédicat qui déraperait vers « toujours
+    # périmé » serait un redémarreur permanent déguisé en garde : il couperait
+    # les tunnels CONNECT de chaque dispatch, et sur CE porteur-ci une relance
+    # ratée refuse le dispatch (posture fail-closed de mika#2049).
+    assert_eq "R1 contrôle négatif: code posé avant le relais ⇒ fresh, silencieux, aucun TERM" \
+        "rc=0 token=none launches=1 first=alive listening=yes" \
+        "$(_relay_freshness_probe fresh)"
+
+    # R2 — CONTRÔLE POSITIF, le cas du ticket. Binaire réinstallé sous le relais
+    # déjà lancé : jeton `stale`, le porteur d'origine est mort, un nouveau
+    # relais écoute. C'est l'occurrence du 2026-10-18 réparée automatiquement, là
+    # où il avait fallu un `TERM` manuel par pid.
+    assert_eq "R2 contrôle positif: binaire réinstallé ⇒ stale, porteur mort, relais relancé" \
+        "rc=0 token=stale launches=2 first=dead listening=yes" \
+        "$(_relay_freshness_probe stale)"
+
+    # R3 — DÉFÉRENCE (D4). Même état que R2, plus l'état MESURÉ d'un vol dans
+    # PILOT_LOG_DIR — un `.log` qui s'écrit, aucun `.stderr`. Tuer le relais sous
+    # un pilote qui stream couperait ses tunnels CONNECT en vol — la classe de
+    # panne que mika#2029 existe pour éteindre. Aucun TERM, rc 0, et le prochain
+    # dispatch sans frère en vol relancera (auto-guérissant).
+    assert_eq "R3 déférence: pilote frère en vol ⇒ stale_deferred, aucun TERM" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_relay_freshness_probe deferred)"
+
+    # R3b — LE VOL QUI DURE, sur CE porteur-ci. C'est celui des deux dont la
+    # relance coupe les tunnels CONNECT du pilote, donc l'état des 7 relances
+    # mesurées par le ticket vaut d'être tenu ici aussi — et non délégué au
+    # verdicteur partagé comme l'est `undecidable` (voir R4). Les trois autres
+    # états de la sonde jumelle, eux, sont bien des propriétés du verdicteur.
+    assert_eq "R3b déférence: un vol de plus de 300 s diffère quand même" \
+        "rc=0 token=stale_deferred launches=1 first=alive listening=yes" \
+        "$(_relay_freshness_probe deferred_old)"
+
+    # R4 — CONTRE-VACUITÉ, constatée et consignée dans la PR. Le crochet `lib`
+    # ci-dessus, pointé sur une copie de `main`
+    # (`git show origin/main:skills/bundled/_shared/dispatch-lib.sh`), rend sur
+    # l'état EXACT de R2 :
+    #
+    #     rc=0 token=none launches=1 first=alive listening=yes
+    #
+    # Aucun jeton, aucune relance, le porteur périmé sert encore : le chemin
+    # « already alive » y retourne 0 sans jamais regarder quelle version écoute.
+    # C'est la panne de ce ticket reproduite à la demande, et la preuve que les
+    # trois lignes ci-dessus mesurent le correctif plutôt que le décor. Non
+    # assertée en permanence, pour la même raison que V5 : l'exécuter exigerait
+    # de lire une autre révision depuis la suite, donc un test vert hors réseau
+    # et rouge en archive détachée.
+    #
+    # Le quatrième état du verdicteur, `undecidable`, n'a pas de sonde ici : il
+    # est une propriété du VERDICTEUR PARTAGÉ, déjà tenue par V4, et sa
+    # conséquence côté relais est identique (conservation, `return 0`).
+    :
+fi
+
+echo ""
+echo "Test: mika#2194 — non-régression de forme du canal sur le corpus doré"
+echo "----------------------------------------------------------------------"
+
+# UN corpus, DEUX lecteurs — mais depuis la bascule du vol 5, UN SEUL des deux
+# mesure encore quelque chose, et ce bloc n'est plus celui-là.
+#
+# CE QUE CE BLOC ÉTAIT. Jusqu'au vol 4, `_parse_disposition` et `_parse_verdict`
+# décidaient elles-mêmes, en bash, indépendamment du Rust. Leur accord avec
+# crates/mika-agent/tests/arch_paraphrase_parity.rs sur le MÊME corpus et le MÊME
+# fichier d'attendus était donc une PREUVE DE PARITÉ : deux implémentations
+# écrites séparément tombaient d'accord, ou l'une des deux rougissait.
+#
+# CE QU'IL EST DEVENU. Le vol 5 a basculé les deux lecteurs : ils écrivent la
+# réponse dans un fichier et appellent `mika arch-disposition`, qui appelle le
+# MÊME `arch_disposition::decide` que le lecteur Rust. **Un lecteur comparé à
+# lui-même est toujours d'accord avec lui-même.** Ce bloc ne prouve donc plus la
+# parité, et le prétendre serait pire que de le supprimer.
+#
+# LA PREUVE, ELLE, EXISTE — et elle est ailleurs : c'est le commit `593a745c5`
+# (vol 4, PR #3014), où ce même bloc comparait le bash autonome au Rust sur ce
+# même corpus, et était vert. Immuable sur la branche. Une parité n'a pas besoin
+# d'être rejouée éternellement pour avoir eu lieu ; elle a besoin d'avoir été
+# mesurée une fois, sur un arbre qu'on peut nommer.
+#
+# POURQUOI LE GARDER ALORS. Parce qu'il mesure maintenant autre chose, qui n'a
+# aucun autre lecteur : la FORME DU CANAL. Que les deux enveloppes écrivent bien
+# le corps dans un fichier, appellent bien la sous-commande, rendent bien la
+# ligne 1 sur stdout, écrivent bien le fichier fuzzy sur un tier 2 et sur lui
+# seul, et n'avortent sur aucune des classes du corpus. Un canal cassé rougit
+# ici, sur les 28 classes du corpus plutôt que sur les trois cas d'un test
+# d'unité. C'est une non-régression, pas une preuve — et l'en-tête le dit
+# désormais au lieu de laisser croire le contraire.
+#
+# CE BLOC N'ASSERTE PAS LA COLONNE « tier ». La ligne 2 du canal l'expose
+# désormais, mais le shell ne la rend pas à ses appelants : les enveloppes la
+# consomment pour écrire le fichier fuzzy et la jettent (les trois appelants de
+# production ne lisent qu'un jeton — c'est leur contrat, et le vol 5 ne le touche
+# pas). Le lecteur Rust reste donc le seul lecteur de cette colonne.
+#
+# ET IL NE COMPARE LE FRAGMENT QUE SUR LES LIGNES DE TIER 2. Les quatre tiers de
+# tête décident sur un littéral et ne citent rien ; la prose écrite sur stderr
+# n'est pas un fragment. La moitié « aucun fragment hors du tier 2 » est tenue
+# côté Rust, où elle est une propriété du type (`Decision::fragment` est `None`).
+#
+# Rien à ajouter à scripts/suite-wiring.tsv : ce fichier est atteint par
+# `make test-dispatch-lib`, que ci.yml:85 nomme.
+
+M3_CORPUS="$SCRIPT_DIR/../../../crates/mika-agent/tests/fixtures/arch_paraphrase_texts"
+M3_TSV="$M3_CORPUS/expectations.tsv"
+
+# Anti-vacuité 1/3 — un lecteur qui ne lit aucun attendu est vert sur zéro cas.
+assert_eq "mika#2194 (anti-vacuité 1/3): le corpus d'attendus des cinq tiers existe" "yes" \
+    "$(if [ -f "$M3_TSV" ]; then printf 'yes'; else printf 'no'; fi)"
+
+M3_DECLARED=0
+if [ -f "$M3_TSV" ]; then
+    M3_DECLARED=$(grep -cv '^[[:space:]]*\(#\|$\)' "$M3_TSV" || true)
+fi
+# Anti-vacuité 2/3 — un corpus sans ligne ne prouve rien non plus.
+assert_eq "mika#2194 (anti-vacuité 2/3): le corpus des cinq tiers n'est pas vide" "yes" \
+    "$(if [ "$M3_DECLARED" -gt 0 ]; then printf 'yes'; else printf 'no'; fi)"
+
+# Sentinelle de sourcing — le sourcing dominant de cette suite est
+# `source "$DISPATCH_LIB" 2>/dev/null || true` (ligne 720) : il AVALE son échec.
+# Sans cette assertion, une dispatch-lib devenue insourçable rendrait ce bloc
+# muet et vert, parce que chaque appel de fonction inexistante échouerait de la
+# même façon que le corpus l'attend pour les classes inertes.
+assert_eq "mika#2194 (sentinelle): les deux lecteurs de production sont définis après le sourcing" "yes" \
+    "$(if declare -f _parse_disposition >/dev/null 2>&1 \
+          && declare -f _parse_verdict >/dev/null 2>&1; then printf 'yes'; else printf 'no'; fi)"
+
+# Sentinelle DE BASCULE — la même, retournée (mika#2194, vol 5).
+#
+# Elle a été écrite au vol 4 pour épingler l'état d'avant (`== 0` : les deux
+# lecteurs décident encore eux-mêmes) et pour ROUGIR le jour de la bascule,
+# forçant l'en-tête ci-dessus à changer de camp dans le même commit. Elle a fait
+# exactement cela. Elle n'est pas supprimée pour autant — une sentinelle
+# supprimée perd son information, une sentinelle inversée la retourne : elle
+# garde désormais que la bascule A EU LIEU, dans LES DEUX fonctions.
+#
+# `== 2`, soit une occurrence littérale par corps. `declare -f` efface les
+# commentaires, donc seule l'invocation réelle compte : un corps qui se
+# remettrait à décider en bash tout en gardant la doctrine en commentaire tombe
+# à 1 et rougit. Pas d'allowlist, parce que pas de population : elle lit deux
+# fonctions nommées. Le gabarit du `mktemp` des deux corps dit `mika-arch-dispo`
+# abrégé pour ne pas porter une seconde fois le motif — voir le bloc de doctrine
+# au-dessus des deux enveloppes dans dispatch-lib.sh.
+M3_SWITCHED=$({ declare -f _parse_disposition; declare -f _parse_verdict; } 2>/dev/null \
+    | grep -c 'arch-disposition' || true)
+assert_eq "mika#2194 (sentinelle de bascule): les deux lecteurs délèguent au moteur" \
+    "2" "$M3_SWITCHED"
+
+# La porte du binaire (mika#2194, vol 5 § 4). Depuis la bascule ce bloc a une
+# DÉPENDANCE DE BUILD : sans `mika`, chaque enveloppe prend son chemin de refus
+# et rend un jeton vide — ce que le corpus attend pour ses seules classes
+# inertes, donc le bloc rougirait partout ailleurs sans rien dire d'utile. Le
+# SKIP est bruyant, et c'est le cas développeur : en CI `cargo test` précède
+# `make test-dispatch-lib`.
+if [ "$M3_DECLARED" -gt 0 ] \
+    && mika_bin_or_skip "mika#2194 non-régression du canal (corpus doré)" \
+    && declare -f _parse_disposition >/dev/null 2>&1 \
+    && declare -f _parse_verdict >/dev/null 2>&1; then
+
+    M3_CASES=0
+    M3_BAD=0
+    M3_ERR=$(mktemp)
+
+    while IFS=$'\t' read -r m3_file m3_pass m3_token m3_frag m3_tier m3_class; do
+        case "$m3_file" in ''|'#'*) continue ;; esac
+        [ -n "${m3_pass:-}" ] || continue
+
+        # Anti-vacuité 3/3 — un attendu qui désigne un corps absent est un
+        # ÉCHEC, pas un saut : une ligne qui ne désigne rien ment avec
+        # l'autorité d'un inventaire.
+        m3_body_file="$M3_CORPUS/$m3_file"
+        if [ ! -f "$m3_body_file" ]; then
+            echo "    ✗ $m3_file — corps introuvable (anti-vacuité 3/3)"
+            M3_BAD=$((M3_BAD + 1)); continue
+        fi
+        m3_body=$(cat "$m3_body_file")
+        M3_CASES=$((M3_CASES + 1))
+
+        # Pas de `|| true` sur l'appel, et c'est délibéré — la raison a changé
+        # au vol 5, le geste non.
+        #
+        # Avant la bascule, l'absence tenait à une asymétrie des corps : le tier
+        # 1a de `_parse_verdict` ne portait pas le `|| true` de son jumeau, donc
+        # l'appel pouvait rendre un statut non nul. Les deux corps sont désormais
+        # des enveloppes identiques à la passe près, et elles rendent 0 sur TOUS
+        # leurs chemins — tiers 0 à 2, UNPARSED et refus compris — parce que les
+        # trois appelants de production capturent en `$(...)` nu sous errexit et
+        # que l'UNPARSED *est* leur chemin de reprise (mika#1823, mika#2641).
+        #
+        # Le `|| true` reste absent parce qu'il avalerait le jour où cela
+        # cesserait d'être vrai. Un statut non nul remonté ici est le signe que
+        # le contrat de retour des enveloppes a bougé — exactement la panne que
+        # ce bloc doit nommer plutôt que masquer.
+        : >"$M3_ERR"
+        case "$m3_pass" in
+            first)
+                m3_got=$(printf '%s' "$m3_body" | _parse_disposition 2>"$M3_ERR")
+                ;;
+            second)
+                m3_got=$(printf '%s' "$m3_body" | _parse_verdict 2>"$M3_ERR")
+                ;;
+            *)
+                echo "    ✗ $m3_file — passe hors format de fil : '$m3_pass'"
+                M3_BAD=$((M3_BAD + 1)); continue
+                ;;
+        esac
+
+        # Le fragment est la seconde moitié du contrat DU TIER 2 : le bash écrit
+        # sur stderr le texte MATCHÉ (grep -o rend l'entrée, casse comprise), pas
+        # le motif. Un lecteur qui rendrait le motif serait d'accord sur le jeton
+        # et faux dès qu'un corps capitalise son match.
+        m3_got_frag=$(sed -n "s/^.*(matched: '\(.*\)')\$/\1/p" "$M3_ERR" | head -1)
+
+        # Une colonne vide porte « - », jamais rien (voir l'en-tête du TSV).
+        m3_exp_token="$m3_token"
+        m3_exp_frag="$m3_frag"
+        if [ "$m3_exp_token" = "-" ]; then m3_exp_token=""; fi
+        if [ "$m3_exp_frag" = "-" ]; then m3_exp_frag=""; fi
+
+        if [ "$m3_got" != "$m3_exp_token" ]; then
+            echo "    ✗ $m3_file ($m3_pass) — jeton : attendu '${m3_exp_token:--}', obtenu '${m3_got:--}'"
+            M3_BAD=$((M3_BAD + 1))
+        elif [ "$m3_tier" = "2" ] && [ "$m3_got_frag" != "$m3_exp_frag" ]; then
+            echo "    ✗ $m3_file ($m3_pass) — fragment : attendu '${m3_exp_frag:--}', obtenu '${m3_got_frag:--}'"
+            M3_BAD=$((M3_BAD + 1))
+        fi
+    done < "$M3_TSV"
+
+    rm -f "$M3_ERR"
+
+    assert_eq "mika#2194: parité des cinq tiers sur le corpus doré (aucun écart)" \
+        "0" "$M3_BAD"
+
+    # Le compte de cas EST une assertion, pas un affichage : un `echo` ne
+    # rougit pas, et c'est précisément le mode de panne que l'anti-vacuité vise.
+    assert_eq "mika#2194: le lecteur bash nomme son compte de cas (non nul)" "yes" \
+        "$(if [ "$M3_CASES" -gt 0 ]; then printf 'yes'; else printf 'no'; fi)"
+    assert_eq "mika#2194: le lecteur bash exerce toutes les lignes déclarées du corpus" \
+        "$M3_DECLARED" "$M3_CASES"
+    echo "    → mika#2194 cinq tiers : $M3_CASES cas exercés (lecteur bash)"
+fi
+
+# ============================================================================
+# mika#2077 — l'honnêteté de terminaison du pilote de REVISE (V1–V15)
+# ============================================================================
+#
+# LE DÉFAUT MESURÉ. `_launch_revise_pilot` supprimait ses deux captures `mktemp`
+# sans jamais les ouvrir, et son unique prédicat était le sha256 du plan. Trois
+# populations s'effondraient donc dans une phrase unique — `WARN: plan unchanged
+# after revise pilot (exit=N)` — qui n'est vraie que de la première :
+#   1. le modèle a conclu et n'a rien changé ;
+#   2. `status: terminated` — la session a été TUÉE par un garde-fou ;
+#   3. `exit 78` — `_run_pilot_sandboxed` a refusé de bâtir le sandbox, donc
+#      aucun pilote n'a jamais existé.
+# Le site appelant aggravait : `_groom_warn "revise pilot did not converge"` est
+# une AFFIRMATION DE CONTENU, fausse sur (2) et (3), et bâtie dans le même
+# vocabulaire que l'enveloppe `PIPELINE FAILURE: grooming did not converge` —
+# donc doublement plausible, donc doublement coûteuse à mettre en doute. Un
+# opérateur qui la lisait ouvrait les findings de l'architecte et le plan ; la
+# cause était en amont du pilote.
+#
+# CE QUE CES QUINZE MESURES TIENNENT. V1–V10 passent par une SONDE
+# COMPORTEMENTALE calquée sur `_t2306_revise_probe` : la VRAIE
+# `_launch_revise_pilot` s'exécute, seul `_run_pilot_sandboxed` est redéfini
+# dans le sous-shell. Le stub écrit son JSON sur stdout — que la fonction
+# redirige déjà vers `$revise_stdout` — et sa ligne `[guardrail]` sur stderr,
+# donc c'est la fonction réelle qui capture, lit et classe. V11–V12 sont
+# structurelles (pas de recopie de table, forme d'extraction épinglée), V13–V14
+# sont l'anti-vacuité à DEUX copies régressées, V15 les préconditions.
+#
+# POURQUOI DEUX COPIES ET PAS UNE. Les deux défauts sont indépendants : retirer
+# le `unset` du mémo laisse les trois bras en place (seule V6 bascule), et
+# restaurer les messages d'origine laisse le mémo correct (V6 reste verte). Une
+# seule copie donnerait un vert sur la moitié non couverte — la leçon que le
+# vol 2 de ce même parapluie a dû écrire sur son propre `sed`.
+
+echo ""
+echo "Test: mika#2077 — honnêteté de terminaison du pilote de revise (V1–V15)"
+echo "------------------------------------------------------------------------"
+
+# --- Outillage de section ----------------------------------------------------
+
+# > 500 octets : `_find_issue_plan` filtre les plans plus courts (mika#1033).
+# Un fixture sous le seuil fait rendre « no plan file to revise », c'est-à-dire
+# un vert qui n'a rien exercé — le premier défaut qu'a eu la sonde mika#2306.
+# Le header nomme le ticket, sans quoi le tier 1 réfuterait le candidat.
+_t2077_write_plan() {
+    {
+        printf '# mika#2077 — plan de sonde\n\n**Ticket:** mika issue#2077\n\n## Probleme\n\n'
+        printf 'Corps de remplissage pour franchir le filtre des 500 octets applique par\n'
+        printf '_find_issue_plan a tous ses tiers de decouverte. Ce texte ne porte aucune\n'
+        printf 'signification pour la sonde : seule compte sa longueur, et le fait que la\n'
+        printf 'sonde ne le mute PAS, pour que pre_hash == post_hash et que la branche\n'
+        printf "d'echec — celle qui porte les trois populations — soit atteinte.\n\n"
+        printf 'Le seuil existe pour ecarter les fichiers-fantomes et les ebauches vides ;\n'
+        printf "il s'applique identiquement aux trois tiers, donc un plan trop court est\n"
+        printf 'invisible quelle que soit la façon dont il est nomme.\n\n'
+        printf '## Implementation Units\n\nU1 — un livrable quelconque.\n\n'
+        printf '## Acceptance criteria\n\nAC1 — la sonde tourne.\n'
+    } > "$1"
+}
+
+# La sonde. Un seul lancement par scénario : le rc transite par la sortie
+# étiquetée plutôt que par une seconde passe, parce que rejouer la fonction avec
+# un pilote inerte donnerait `pre_hash == post_hash` et un rc sans rapport.
+#
+# $1 = bibliothèque à sourcer (l'originale, ou une copie régressée)
+# $2 = `.status` du JSON rendu    ("" ⇒ champ vide)
+# $3 = `.subtype`                 ("" ⇒ absent, donc repli par scrape)
+# $4 = `.termination_reason`
+# $5 = `.api_error_status`
+# $6 = code de sortie du pilote simulé (78 ⇒ refus de containment, sans JSON)
+# $7 = mutate|keep — le pilote simulé modifie-t-il le plan ?
+# $8 = ligne `[guardrail] …` écrite sur le stderr DU REVISE ("" ⇒ aucune)
+# $9 = valeur pré-posée dans `_HALT_SUBTYPE_RESOLVED` ("" ⇒ mémo absent)
+#
+# Rend un rapport à lignes étiquetées :
+#   RC=<rc>   DIAG=<la globale publiée>   GLOBALS=<les six globales de session>
+#   STDERR_BEGIN puis le stderr de la fonction, tel quel.
+_t2077_probe() {
+    local lib="$1" st="$2" sub="$3" reason="$4" api="$5"
+    local rc_want="$6" mut="$7" guard="$8" memo="$9"
+    local root wt plan out
+    root=$(mktemp -d "${TMPDIR:-/tmp}/mika2077-probe-XXXXXX")
+    wt="$root/.claude/worktrees/fix-2077-probe/mika"
+    mkdir -p "$wt/docs/plans" "$wt/.iterate"
+    plan="$wt/docs/plans/2026-10-19-007-fix-2077-sonde-plan.md"
+    _t2077_write_plan "$plan"
+
+    # Findings NEUTRES : ni `Fire-Disposition` ni `Taille estimée`, sinon les
+    # deux rattrapages bornés de mika#2306 et mika#2636 tirent sur la branche de
+    # succès et relancent le pilote simulé — une mesure parasite.
+    printf 'F1 [BLOQUANT] — U2 laisse le choix de la structure de donnees a\n' \
+        > "$wt/.iterate/findings-1.md"
+    printf "l'implementeur. Tranche-le dans le plan.\n\nDisposition: ITERATE\n" \
+        >> "$wt/.iterate/findings-1.md"
+
+    # Le stderr du pilote PRINCIPAL, porteur d'une AUTRE halte. `STDERR_FILE`
+    # pointe dessus avant l'appel : une classification du revise qui le lirait
+    # rendrait `error_max_turns`, c'est-à-dire la halte de la mauvaise session.
+    printf '[guardrail] error_max_turns: the MAIN pilot halt, not this one\n' \
+        > "$root/main.stderr"
+
+    out=$(
+        # shellcheck disable=SC1090
+        source "$lib" 2>/dev/null || true
+        # Neutralisation RÉELLE : seul le lancement du pilote est shadowé, tout
+        # le reste de `_launch_revise_pilot` s'exécute tel quel. C'est la seule
+        # façon de prouver que la classification vient de la fonction.
+        _run_pilot_sandboxed() {
+            [ -z "$guard" ] || printf '%s\n' "$guard" >&2
+            if [ "$rc_want" -eq 78 ]; then
+                # Motif DÉLIBÉRÉMENT multi-ligne : les deux vrais le sont
+                # (`Cause:` / `Remedy:`), et c'est la propriété « une seule
+                # ligne » du diagnostic qui est en jeu — un saut de ligne dans
+                # `GROOM_LOOP_FAILURE_REASON` fait rendre `unterminated 's'
+                # command` au `sed` de `:12595` et perd TOUT le corps du RESULT.
+                _PILOT_SANDBOX_REFUSAL="probe refusal motive: the sandbox could not be built.
+Remedy: this motive is multi-line on purpose."
+                return 78
+            fi
+            # Une ligne de trace AVANT le JSON : `--verbose` en produit, donc
+            # `jq` sur le fichier entier échouerait. C'est ce que le
+            # `grep -m1 '^{'` existe pour franchir.
+            printf 'claude-pilot: verbose trace line, not JSON\n'
+            printf '{"status":"%s","subtype":"%s","termination_reason":"%s","api_error_status":"%s","session_id":"revise-sess-2077","turns":7,"duration_ms":4242}\n' \
+                "$st" "$sub" "$reason" "$api"
+            [ "$mut" != "mutate" ] || printf '\n<!-- revised by the probe -->\n' >> "$plan"
+            return "$rc_want"
+        }
+        # Les six globales du pilote PRINCIPAL, pré-posées à des sentinelles.
+        # V5 les relit octet pour octet après l'appel.
+        SESSION_ID="main-sess-KEEPME"; SUBTYPE="main_subtype_KEEPME"
+        STATUS="main_status_KEEPME";   TURNS="99"; DURATION="123456"
+        TERMINATION_REASON="main reason KEEPME"
+        STDERR_FILE="$root/main.stderr"; LOG_ID="t2077-main"
+        [ -z "$memo" ] || _HALT_SUBTYPE_RESOLVED="$memo"
+        # Résidu d'une entrée antérieure : la remise à zéro à l'entrée est une
+        # exigence (R4), donc elle se mesure plutôt qu'elle ne se suppose.
+        REVISE_PILOT_HALT_DIAGNOSIS="stale-from-a-previous-entry"
+        WORKTREE_DIR="$wt"; ISSUE_NUM="2077"; REPO="mika"; CWD_ARGS="--cwd $wt"
+        set +e
+        # APPELER COMME LE SITE DE PRODUCTION APPELLE — `|| rc=$?`, pas un
+        # `set +e` suivi de `$?`. `_launch_revise_pilot` RÉTABLIT `set -e` dès
+        # la sortie du pilote (`dispatch-lib.sh:9380`, posture de ce fichier que
+        # les handlers sourcent sous `set -e`), donc un `set +e` posé par la
+        # sonde est défait par la fonction elle-même et son `return 1` tue le
+        # sous-shell AVANT les `printf` du rapport. Mesuré : rapport vide sur les
+        # cinq scénarios `keep` — exactement ceux qui rendent non-zéro, donc
+        # exactement la population que ce défaut concerne — pendant que le seul
+        # `mutate`, qui rend 0, passait. Une sonde muette sur la branche d'échec
+        # rend V13/V14 comptables d'échecs par vacuité : elles mesuraient
+        # `V1 V2 V3 V4 V5` au lieu de `V6`. Le `set +e` qui suit l'appel
+        # reprend la posture de la sonde, que la fonction vient de changer.
+        local _rc=0
+        _launch_revise_pilot "$wt/.iterate/findings-1.md" 2>"$root/err" >/dev/null \
+            || _rc=$?
+        set +e
+        printf 'RC=%s\n' "$_rc"
+        printf 'DIAG=%s\n' "$REVISE_PILOT_HALT_DIAGNOSIS"
+        printf 'GLOBALS=%s|%s|%s|%s|%s|%s\n' "$SESSION_ID" "$SUBTYPE" "$STATUS" \
+            "$TURNS" "$DURATION" "$TERMINATION_REASON"
+        printf 'STDERR_BEGIN\n'
+        cat "$root/err"
+    )
+    printf '%s' "$out"
+    rm -rf "$root"
+}
+
+# Les quatre gardes d'entrée, rejouées une par une. Elles sortaient toutes en
+# `return 1` sans rien publier, donc l'appelant n'avait que sa propre phrase de
+# contenu à offrir — sur une population où le pilote n'avait même pas démarré.
+# $1 = bibliothèque, $2 = unreadable|worktree|issue|plan
+_t2077_guard() {
+    local lib="$1" which="$2" root wt findings out
+    root=$(mktemp -d "${TMPDIR:-/tmp}/mika2077-guard-XXXXXX")
+    wt="$root/wt"; mkdir -p "$wt/docs/plans" "$wt/.iterate"
+    findings="$wt/.iterate/findings-1.md"
+    printf 'F1 — rien de particulier.\n\nDisposition: ITERATE\n' > "$findings"
+    # `plan` est la seule garde qui laisse `docs/plans` vide : les trois autres
+    # tirent avant que `_find_issue_plan` ne soit appelée.
+    [ "$which" = "unreadable" ] && findings="$root/absent/findings-1.md"
+    out=$(
+        # shellcheck disable=SC1090
+        source "$lib" 2>/dev/null || true
+        _run_pilot_sandboxed() {
+            printf 'the guard should have fired long before this\n'; return 0; }
+        REVISE_PILOT_HALT_DIAGNOSIS="stale-from-a-previous-entry"
+        WORKTREE_DIR="$wt"; ISSUE_NUM="2077"; REPO="mika"; LOG_ID="t2077g"
+        CWD_ARGS="--cwd $wt"
+        case "$which" in
+            worktree) WORKTREE_DIR="$root/absent-worktree" ;;
+            issue)    ISSUE_NUM="" ;;
+        esac
+        set +e
+        # Même forme que `_t2077_probe` et pour la même raison : l'appel se fait
+        # en `|| rc=$?`, comme le site de production.
+        local _rc=0
+        _launch_revise_pilot "$findings" >/dev/null 2>&1 || _rc=$?
+        set +e
+        printf 'RC=%s\nDIAG=%s\n' "$_rc" "$REVISE_PILOT_HALT_DIAGNOSIS"
+    )
+    printf '%s' "$out"
+    rm -rf "$root"
+}
+
+_t2077_f()   { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+_t2077_err() { printf '%s\n' "$1" | sed -n '/^STDERR_BEGIN$/,$p' | tail -n +2; }
+_t2077_yn()  { if grep -qF -- "$2" <<<"$1"; then printf 'yes'; else printf 'no'; fi; }
+_t2077_row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"; }
+
+T2077_GLOBALS_KEPT="main-sess-KEEPME|main_subtype_KEEPME|main_status_KEEPME|99|123456|main reason KEEPME"
+
+# `_t2077_measure <lib>` rend des quadruplets `ID<TAB>libellé<TAB>attendu<TAB>mesuré`.
+#
+# Pourquoi cette forme plutôt que des `assert_*` en ligne : les copies régressées
+# doivent être ÉVALUÉES, pas réassertées — V13/V14 ont besoin de l'ENSEMBLE EXACT
+# des identifiants qui basculent, et le réobtenir en relançant 1700 assertions
+# trois fois serait illisible autant que lent. Ici la même mesure sert aux trois
+# bibliothèques : vertes pour l'originale, comptées pour les copies.
+_t2077_measure() {
+    local lib="$1"
+    local r_term r_concl r_78 r_work r_scrape r_memo
+    local d_term d_concl d_78 d_memo e_work rep_term rep_concl
+    local g body subs leaks sub
+
+    # (1) tuée par un garde-fou, plan inchangé — la population (2) du défaut
+    r_term=$(_t2077_probe "$lib" terminated idle_timeout "no output for 900s" "" 1 keep "" "")
+    # (2) conclue sans réviser — la seule population dont la phrase était vraie
+    r_concl=$(_t2077_probe "$lib" success "" "" "" 0 keep "" "")
+    # (3) refus de containment — aucun pilote n'a existé
+    r_78=$(_t2077_probe "$lib" "" "" "" "" 78 keep "" "")
+    # (4) tuée MAIS ayant quand même écrit le plan (R7)
+    r_work=$(_t2077_probe "$lib" terminated stall_detected "12 turns without a tool call" "" 1 mutate "" "")
+    # (5) tuée sans `.subtype` : le repli doit scraper le stderr DU REVISE
+    r_scrape=$(_t2077_probe "$lib" terminated "" "" "" 1 keep \
+        '[guardrail] idle_timeout: scraped from the revise stderr' "")
+    # (6) mémo du pilote principal pré-posé : la contrainte (i-bis)
+    r_memo=$(_t2077_probe "$lib" terminated idle_timeout "no output for 900s" "" 1 keep "" error_max_turns)
+
+    d_term=$(_t2077_f DIAG "$r_term");   d_concl=$(_t2077_f DIAG "$r_concl")
+    d_78=$(_t2077_f DIAG "$r_78");       d_memo=$(_t2077_f DIAG "$r_memo")
+    e_work=$(_t2077_err "$r_work")
+    # Le RAPPORT = diagnostic + stderr. V2 et V3 portent sur lui et non sur le
+    # seul diagnostic : une copie qui ne publie RIEN ferait passer « le
+    # diagnostic ne contient pas `plan unchanged` » par vacuité, et l'assertion
+    # serait verte sur le défaut même qu'elle existe pour nommer.
+    rep_term="$d_term
+$(_t2077_err "$r_term")"
+    rep_concl="$d_concl
+$(_t2077_err "$r_concl")"
+
+    # --- V1 : une session `terminated` est un échec DE SESSION ---------------
+    _t2077_row V1 "une session tuée est nommée par son sous-type" \
+        yes "$(_t2077_yn "$d_term" idle_timeout)"
+    _t2077_row V1 "…et par sa classe de halte, issue de _halt_family" \
+        yes "$(_t2077_yn "$d_term" session_silent)"
+    _t2077_row V1 "…et l'indice de re-run voyage avec elle" \
+        yes "$(_t2077_yn "$d_term" investigate)"
+    _t2077_row V1 "sans .subtype, le repli scrape le stderr DU REVISE" \
+        yes "$(_t2077_yn "$(_t2077_f DIAG "$r_scrape")" idle_timeout)"
+    _t2077_row V1 "…et jamais celui du pilote principal" \
+        no "$(_t2077_yn "$(_t2077_f DIAG "$r_scrape")" error_max_turns)"
+
+    # --- V2 : …et ne se présente plus comme un refus du modèle --------------
+    _t2077_row V2 "le rapport d'une session tuée ne dit plus « plan unchanged »" \
+        no "$(_t2077_yn "$rep_term" 'plan unchanged')"
+    _t2077_row V2 "…il dit que la session a été TUÉE" \
+        yes "$(_t2077_yn "$rep_term" KILLED)"
+    _t2077_row V2 "…et il envoie l'opérateur au log, pas aux findings" \
+        yes "$(_t2077_yn "$rep_term" 'Read the revise log')"
+
+    # --- V3 : une session conclue garde la phrase de contenu ----------------
+    # Elle est gardée MOT POUR MOT parce que c'est ici, et ici seulement,
+    # qu'elle est vraie. C'est aussi pourquoi V3 reste verte sur la copie B.
+    _t2077_row V3 "une session conclue garde « plan unchanged after revise pilot »" \
+        yes "$(_t2077_yn "$rep_concl" 'plan unchanged after revise pilot')"
+    _t2077_row V3 "…et ne porte aucune classe de halte" \
+        no "$(_t2077_yn "$rep_concl" 'halt class')"
+
+    # --- V4 : un exit 78 est un pilote JAMAIS lancé -------------------------
+    _t2077_row V4 "un exit 78 dit que le pilote n'a JAMAIS été lancé" \
+        yes "$(_t2077_yn "$d_78" 'NEVER LAUNCHED')"
+    _t2077_row V4 "…et porte le motif de refus de containment" \
+        yes "$(_t2077_yn "$d_78" 'probe refusal motive')"
+    _t2077_row V4 "…sans classe de halte, qu'aucune session ne pourrait porter" \
+        no "$(_t2077_yn "$d_78" 'halt class')"
+
+    # --- V5 : aucune fuite VERS les globales (contrainte i) -----------------
+    _t2077_row V5 "les six globales du pilote principal sont intactes (halte)" \
+        "$T2077_GLOBALS_KEPT" "$(_t2077_f GLOBALS "$r_term")"
+    _t2077_row V5 "…aussi sur la branche de succès" \
+        "$T2077_GLOBALS_KEPT" "$(_t2077_f GLOBALS "$r_work")"
+    _t2077_row V5 "…aussi sur un refus de containment" \
+        "$T2077_GLOBALS_KEPT" "$(_t2077_f GLOBALS "$r_78")"
+
+    # --- V6 : aucune fuite DEPUIS le mémo (contrainte i-bis) ----------------
+    # Mesures NÉGATIVES à dessein : une copie qui ne publie rien doit rester
+    # verte ici, sinon la copie B échouerait sur V6 et le compte exact de V13
+    # cesserait de distinguer les deux défauts.
+    _t2077_row V6 "un mémo hérité ne traverse pas (sous-type)" \
+        no "$(_t2077_yn "$d_memo" error_max_turns)"
+    _t2077_row V6 "un mémo hérité ne traverse pas (classe)" \
+        no "$(_t2077_yn "$d_memo" budget_exhausted)"
+
+    # --- V7 : une seule ligne, et pas le marqueur retryable -----------------
+    _t2077_row V7 "le diagnostic d'une halte ne porte aucun saut de ligne" \
+        0 "$(printf '%s' "$d_term" | wc -l | tr -d ' ')"
+    _t2077_row V7 "celui d'un refus multi-ligne non plus" \
+        0 "$(printf '%s' "$d_78" | wc -l | tr -d ' ')"
+    _t2077_row V7 "celui d'une session conclue non plus" \
+        0 "$(printf '%s' "$d_concl" | wc -l | tr -d ' ')"
+    _t2077_row V7 "aucun des quatre ne porte le marqueur retryable" \
+        0 "$(printf '%s\n%s\n%s\n%s\n' "$d_term" "$d_concl" "$d_78" "$d_memo" \
+            | grep -cF 'PIPELINE FAILURE:' || true)"
+
+    # --- V8 : les quatre gardes d'entrée publient ---------------------------
+    for g in unreadable worktree issue plan; do
+        local gr gd
+        gr=$(_t2077_guard "$lib" "$g")
+        gd=$(_t2077_f DIAG "$gr")
+        _t2077_row V8 "la garde « $g » rend 1" 1 "$(_t2077_f RC "$gr")"
+        _t2077_row V8 "la garde « $g » publie un diagnostic non vide" \
+            non-vide "$(if [ -n "$gd" ]; then printf 'non-vide'; else printf 'vide'; fi)"
+        _t2077_row V8 "la garde « $g » dit que le pilote n'a jamais été lancé" \
+            yes "$(_t2077_yn "$gd" 'never launched')"
+    done
+    _t2077_row V8 "la globale est remise à zéro à l'entrée (aucun résidu après un succès)" \
+        "" "$(_t2077_f DIAG "$r_work")"
+
+    # --- V9 : le site appelant reporte le diagnostic ------------------------
+    _t2077_row V9 "le bras ITERATE lit REVISE_PILOT_HALT_DIAGNOSIS" \
+        yes "$(_t2077_yn "$(grep -A 3 -F '_launch_revise_pilot "$findings_file" || {' "$lib")" \
+            'REVISE_PILOT_HALT_DIAGNOSIS')"
+    _t2077_row V9 "la phrase de contenu nue a disparu de _groom_warn" \
+        0 "$(grep -cF '_groom_warn "revise pilot did not converge' "$lib" || true)"
+
+    # --- V10 : un terminated AVEC travail ne bloque rien (R7) ---------------
+    _t2077_row V10 "une session tuée qui a quand même révisé rend 0" \
+        0 "$(_t2077_f RC "$r_work")"
+    _t2077_row V10 "…et dit sa halte sur stderr" \
+        yes "$(_t2077_yn "$e_work" stall_detected)"
+    _t2077_row V10 "…en nommant que le plan A ÉTÉ révisé" \
+        yes "$(_t2077_yn "$e_work" 'plan WAS revised')"
+    _t2077_row V10 "…sans publier de diagnostic d'échec" \
+        "" "$(_t2077_f DIAG "$r_work")"
+
+    # --- V11 : la table de haltes n'est pas recopiée ------------------------
+    # La population de sous-types est DÉRIVÉE du `case` de `_halt_family` —
+    # jamais réécrite ici — donc un treizième sous-type amont entre dans le scan
+    # sans qu'on y touche. Même patron que T2539 S2.
+    body=$(sed -n '/^_classify_revise_halt() {$/,/^}$/p' "$lib")
+    subs=$(sed -n '/^_halt_family() {$/,/^}$/p' "$lib" \
+        | grep -oE '^        [a-z][a-z0-9_]*\)' | tr -d ' )' | sort -u)
+    _t2077_row V11 "le scan a bien trouvé la table amont (≥ 12 sous-types)" \
+        yes "$(if [ "$(printf '%s\n' "$subs" | grep -c . || true)" -ge 12 ]; then printf 'yes'; else printf 'no'; fi)"
+    _t2077_row V11 "le classeur de revise ne définit aucun sous-type littéral" \
+        yes "$(if [ -n "$body" ]; then printf 'yes'; else printf 'no'; fi)"
+    leaks=""
+    for sub in $subs; do
+        grep -qF -- "$sub" <<<"$body" && leaks="${leaks}${sub} "
+    done
+    _t2077_row V11 "aucun sous-type recopié dans _classify_revise_halt" \
+        "" "$(printf '%s' "$leaks" | sed 's/ *$//')"
+
+    # --- V12 : la forme d'extraction JSON est épinglée ----------------------
+    # Non factorisée à dessein : factoriser toucherait le post-flight du pilote
+    # principal, seule garantie d'honnêteté que ce vol ne doit pas déranger. La
+    # duplication est donc ÉPINGLÉE — une dérive rougit au lieu de vieillir.
+    _t2077_row V12 "trois sites extraient le premier objet JSON" \
+        3 "$(grep -cF "grep -m1 '^{'" "$lib" || true)"
+    _t2077_row V12 "les trois portent une forme identique à la variable près" \
+        1 "$(grep -F "grep -m1 '^{'" "$lib" \
+            | sed -E 's/^[[:space:]]*[A-Za-z_]+=/VAR=/; s/"\$[A-Za-z_]+"/"$VAR"/' \
+            | sort -u | grep -c . || true)"
+}
+
+# --- Les mesures, sur la bibliothèque réelle --------------------------------
+
+T2077_ROWS=$(_t2077_measure "$DISPATCH_LIB")
+while IFS=$'\t' read -r _t2077_id _t2077_label _t2077_exp _t2077_act; do
+    [ -n "$_t2077_id" ] || continue
+    assert_eq "$_t2077_id: $_t2077_label" "$_t2077_exp" "$_t2077_act"
+done <<<"$T2077_ROWS"
+
+# V15 — préconditions. La sonde ne lance aucun pilote réel : ni bwrap, ni
+# réseau, ni token. Les deux scans sont sur le TEXTE de cette section, donc un
+# futur ajout qui appellerait la forge rougirait ici.
+T2077_SECTION=$(sed -n "/^# mika#2077 — l'honnêteté de terminaison du pilote de REVISE/,\$p" "${BASH_SOURCE[0]}")
+assert_eq "V15: l'extraction de la section mika#2077 a trouvé la section" "yes" \
+    "$(if [ -n "$T2077_SECTION" ]; then printf 'yes'; else printf 'no'; fi)"
+assert_eq "V15: aucune invocation de forge, de réseau ou de bwrap en tête de commande" "0" \
+    "$(printf '%s\n' "$T2077_SECTION" | grep -cE '^[[:space:]]*(gh|curl|wget|bwrap)[[:space:]]' || true)"
+assert_eq "V15: ni en substitution" "0" \
+    "$(printf '%s\n' "$T2077_SECTION" | grep -cE '\$\((gh|curl|wget|bwrap)[[:space:]]' || true)"
+# La provenance du diagnostic est celle du pilote SIMULÉ : `revise-sess-2077`
+# n'existe nulle part ailleurs, donc aucun pilote réel n'a été joint.
+assert_contains "V15: la provenance mesurée est celle du pilote simulé" \
+    "revise-sess-2077" \
+    "$(_t2077_f DIAG "$(_t2077_probe "$DISPATCH_LIB" terminated idle_timeout "no output for 900s" "" 1 keep "" "")")"
+
+# --- V13 / V14 : anti-vacuité, deux copies régressées -----------------------
+
+T2077_REGROOT=$(mktemp -d "${TMPDIR:-/tmp}/mika2077-regressed-XXXXXX")
+T2077_COPY_A="$T2077_REGROOT/copy-a-no-memo-unset.sh"
+T2077_COPY_B="$T2077_REGROOT/copy-b-original-messages.sh"
+
+# Copie A — le `unset` du mémo retiré de `_classify_revise_halt`, et de là seul.
+# La classification reste entière : seule la contenance du mémo disparaît, donc
+# le classeur rend la halte du pilote PRINCIPAL comme halte du revise. C'est la
+# fausse attribution PIRE que celle d'avant — précise, donc crédible.
+awk '
+    /^_classify_revise_halt\(\) \{$/ { inside = 1 }
+    inside && /^}$/                  { inside = 0 }
+    inside && /^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$/ { next }
+    { print }
+' "$DISPATCH_LIB" > "$T2077_COPY_A"
+
+# Copie B — les deux messages d'origine restaurés : la phrase unique de
+# `_launch_revise_pilot` (sans aucune publication) et l'affirmation de contenu
+# du site appelant. Le mémo reste correct, donc V6 reste verte : c'est
+# exactement pourquoi une seule copie ne suffirait pas.
+awk '
+    /_groom_warn "\$\{REVISE_PILOT_HALT_DIAGNOSIS:-/ {
+        print "                _groom_warn \"revise pilot did not converge — preserving $findings_file for forensics\""
+        next
+    }
+    /# mika#2077 — LES TROIS POPULATIONS/ { skip = 1; next }
+    skip == 1 && /^    rm -f "\$revise_stdout" "\$revise_stderr"$/ {
+        print
+        print "    echo \"WARN: _launch_revise_pilot: plan unchanged after revise pilot (exit=$revise_exit)\" >&2"
+        print "    return 1"
+        skip = 2
+        next
+    }
+    skip == 2 && /^}$/ { print; skip = 0; next }
+    skip { next }
+    { print }
+' "$DISPATCH_LIB" > "$T2077_COPY_B"
+
+# Préalables — une copie qui ne diffère pas, ou qui ne parse pas, rendrait
+# l'anti-vacuité elle-même vacante : le compte d'échecs serait celui de
+# l'original, ou celui d'une bibliothèque qui ne se source pas du tout.
+T2077_RC_A=0; bash -n "$T2077_COPY_A" 2>/dev/null || T2077_RC_A=$?
+T2077_RC_B=0; bash -n "$T2077_COPY_B" 2>/dev/null || T2077_RC_B=$?
+assert_eq "V13 (préalable): la copie A passe bash -n" "0" "$T2077_RC_A"
+assert_eq "V14 (préalable): la copie B passe bash -n" "0" "$T2077_RC_B"
+assert_eq "V13 (préalable): la copie A a perdu exactement un unset du mémo" "1" \
+    "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$T2077_COPY_A" || true)"
+assert_eq "V13 (préalable): la copie A garde la classification intacte" "1" \
+    "$(grep -c '^_classify_revise_halt() {$' "$T2077_COPY_A" || true)"
+assert_eq "V14 (préalable): la copie B a retrouvé la phrase unique d'origine" "1" \
+    "$(grep -cF 'plan unchanged after revise pilot (exit=$revise_exit)" >&2' "$T2077_COPY_B" || true)"
+assert_eq "V14 (préalable): la copie B a retrouvé l'affirmation de contenu de l'appelant" "1" \
+    "$(grep -cF '_groom_warn "revise pilot did not converge' "$T2077_COPY_B" || true)"
+assert_eq "V14 (préalable): la copie B garde le unset du mémo aux deux sites" "2" \
+    "$(grep -c '^    unset _HALT_SUBTYPE_RESOLVED _HALT_GUARDRAIL_LINE$' "$T2077_COPY_B" || true)"
+
+# L'ENSEMBLE EXACT des identifiants qui basculent — pas un « au moins une a
+# rougi ». Un compte exact est ce qui distingue une anti-vacuité d'une
+# incantation : il dit aussi quelles mesures ne couvrent PAS ce défaut-là.
+_t2077_failing_ids() {
+    _t2077_measure "$1" | awk -F'\t' '$3 != $4 { print $1 }' | sort -u \
+        | tr '\n' ' ' | sed 's/ *$//'
+}
+assert_eq "V13 (anti-vacuité A): sans le unset du mémo, V6 échoue — et elle seule" \
+    "V6" "$(_t2077_failing_ids "$T2077_COPY_A")"
+assert_eq "V14 (anti-vacuité B): avec les messages d'origine, V1 V2 V4 V9 échouent — et elles seules" \
+    "V1 V2 V4 V9" "$(_t2077_failing_ids "$T2077_COPY_B")"
+
+rm -rf "$T2077_REGROOT"
+
+# ============================================================================
+# mika#2976 — la porte de reprise de branche (T1 à T6)
+# ============================================================================
+#
+# Trois `REBASE_CONFLICT` mesurés en huit jours, une racine : le nom de branche
+# est dérivé du ticket, donc le groom d'un vol 2 dérive le nom du vol 1 et le
+# dispatch reprend une branche déjà atterrie.
+#
+# Les six cas exercent `_branch_reuse_gate` — la production, pas une relecture de
+# sa table — sur un dépôt RÉEL, et lisent la ligne `branch_reuse_gate` qu'elle
+# émet. Chacun assertionne aussi les DEUX refs de la branche avant et après : un
+# verdict juste suivi d'un effet de bord faux passerait une assertion portée sur
+# le seul jeton.
+#
+# T3 et T4 sont deux contrôles négatifs distincts, et aucun n'est redondant : une
+# implémentation qui oublierait le bras « aucune PR » passerait T3 et casserait
+# T4 — et c'est le faux positif le plus coûteux du ticket, puisqu'il détruirait
+# le plan d'un vol qui attend son dispatch d'implémentation. T6 sépare « la porte
+# ne mord sur rien » de « la porte ne mesure rien ».
+
+echo ""
+echo "Test mika#2976: porte de reprise de branche (AC1/AC2/AC3)"
+echo "----------------------------------------------------------"
+
+# La mesure pose cinq globales ; un `$( )` autour d'elle n'en laisse sortir
+# aucune, et la ligne de l'AC4 dirait alors `pr=none unmerged=0 tips=none` sur
+# toute la population — un instrument qui mesure sa propre valeur par défaut.
+# Les six cas ci-dessous le détectent déjà par leurs assertions sur `pr=` et
+# `tips=` ; ce scan le nomme à la source, pour que le rouge dise *pourquoi*.
+T2976_GATE_FUNC=$(sed -n '/^_branch_reuse_gate()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976: le scan de la porte a du corps (bonne foi)" \
+    "_branch_reuse_verdict" "$T2976_GATE_FUNC"
+assert_not_contains "mika#2976: la porte ne capture PAS le verdict dans un sous-shell" \
+    '$(_branch_reuse_verdict' "$T2976_GATE_FUNC"
+assert_contains "mika#2976: la porte lit le jeton dans la globale" \
+    '_BRANCH_REUSE_VERDICT' "$T2976_GATE_FUNC"
+
+# La réinitialisation : le worktree part par le geste unique, la branche par un
+# seul `branch -f`. Pas de `branch -D` — ni ici ni ailleurs dans ce fichier : le
+# plan § 11 l'exclut, et un `-D` suivi d'un `-b` ouvrirait une fenêtre où la
+# branche n'existe plus, qu'un échec du second geste rendrait permanente.
+T2976_RESET_FUNC=$(sed -n '/^_reset_spent_branch()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976: le scan de la réinitialisation a du corps (bonne foi)" \
+    'origin/main' "$T2976_RESET_FUNC"
+assert_contains "mika#2976: la réinitialisation délègue le retrait au geste unique" \
+    '_stash_and_remove_worktree "$repo_dir" "$worktree_dir" "$worktree_dir" "$branch" set_up_worktree_spent' \
+    "$T2976_RESET_FUNC"
+assert_contains "mika#2976: la branche est posée par un seul branch -f" \
+    'git -C "$repo_dir" branch -f "$branch" origin/main' "$T2976_RESET_FUNC"
+assert_not_contains "mika#2976: aucun branch -D dans dispatch-lib (plan § 11)" \
+    'branch -D' "$(cat "$DISPATCH_LIB")"
+
+# Les sites d'appel, scannés depuis l'autre bout. Les scans de corps ci-dessus
+# passeraient sur un geste correct que personne n'appelle ; ceux-ci ferment
+# l'invariant mika#2449 — le troisième argument est le worktree CANONIQUE, et
+# jamais `$SUB_REPO_DIR`, qui est le checkout de déploiement.
+T2976_CALLS=$(grep -n '_stash_and_remove_worktree ' "$DISPATCH_LIB" | grep -v '^[0-9]*:_stash_and_remove_worktree()' || true)
+T2976_CALL_COUNT=$(printf '%s\n' "$T2976_CALLS" | grep -c . || true)
+if [ "$T2976_CALL_COUNT" -ge 2 ]; then
+    PASS=$((PASS + 1)); echo "  ✓ mika#2976: le geste unique a ses deux sites d'appel (relic + périmée)"
+else
+    FAIL=$((FAIL + 1)); echo "  ✗ mika#2976: le geste unique devrait avoir ≥2 sites d'appel, trouvé $T2976_CALL_COUNT"
+    echo "    actual: $T2976_CALLS"
+fi
+assert_not_contains "mika#2976: aucun site ne nomme SUB_REPO_DIR comme cible de récupération (mika#2449)" \
+    'SUB_REPO_DIR" "$SUB_REPO_DIR' "$T2976_CALLS"
+assert_contains "mika#2976: le site du relic nomme le worktree canonique" \
+    '_stash_and_remove_worktree "$SUB_REPO_DIR" "$existing_wt" "$WORKTREE_DIR" "$BRANCH" set_up_worktree_relic' \
+    "$T2976_CALLS"
+
+# Le site de la porte : `exit 1` et non `|| true`. Avec `|| true`, la halte de
+# l'AC3 poserait `RESULT` et le dispatch continuerait quand même sur la branche
+# qu'elle vient de déclarer en péril — un message d'arrêt sans arrêt.
+T2976_SET_UP=$(sed -n '/^_set_up_worktree()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976: le site de la porte arrête le dispatch sur la halte" \
+    'if ! _branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM"; then' \
+    "$T2976_SET_UP"
+assert_not_contains "mika#2976: la porte n'est pas appelée en || true" \
+    '_branch_reuse_gate "$SUB_REPO_DIR" "$REPO" "$BRANCH" "$WORKTREE_DIR" "$ISSUE_NUM" || true' \
+    "$T2976_SET_UP"
+# Le troisième bras du bloc reprise-ou-création est EXPLICITE : sans lui, la
+# correction serait héritée de la seconde tentative d'un repli écrit pour le
+# diagnostic de double échec de mika#1472, donc perdue au premier refactor.
+assert_contains "mika#2976: le bloc reprise-ou-création a un troisième bras explicite" \
+    'if [ "${BRANCH_SPENT:-0}" = "1" ]; then' "$T2976_SET_UP"
+assert_contains "mika#2976: une branche réinitialisée ne reprend pas un worktree" \
+    '[ "${BRANCH_SPENT:-0}" != "1" ] && [ -d "$WORKTREE_DIR" ]' "$T2976_SET_UP"
+
+# Harnais : `_fixture_setup` (bare file:// + clone) étendu d'une RACINE DE
+# WORKTREES portant le segment géré `/.claude/worktrees/`. Sans ce segment, le
+# terme T4 de `_assert_removable_worktree_path` (mika#1943) refuse tout retrait
+# et les six cas mesureraient la garde au lieu de la porte.
+_t2976_fixture() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+    T2976_ROOT=$(mktemp -d)
+    T2976_WT_ROOT="$T2976_ROOT/.claude/worktrees"
+    mkdir -p "$T2976_WT_ROOT"
+}
+
+_t2976_cleanup() {
+    _fixture_cleanup
+    rm -rf "$T2976_ROOT" 2>/dev/null || true
+}
+
+# `_t2976_commit <fichier> <contenu> <sujet>` — un commit sur la branche courante.
+_t2976_commit() {
+    printf '%s\n' "$2" > "$FIXTURE_CLONE/$1"
+    git -C "$FIXTURE_CLONE" add "$1" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "$3"
+}
+
+# Les DEUX refs en une chaîne, pour l'assertion « avant / après ». Une seule ref
+# lue laisserait passer un effet de bord sur l'autre — c'est précisément le
+# troisième cas du ticket, où la ref locale `origin/…` pointait sur un sha que
+# le distant ne portait plus.
+_t2976_refs() {
+    printf '%s|%s' \
+        "$(git -C "$FIXTURE_CLONE" rev-parse --verify --quiet "refs/heads/$1" || echo none)" \
+        "$(git -C "$FIXTURE_CLONE" rev-parse --verify --quiet "refs/remotes/origin/$1" || echo none)"
+}
+
+# --- T1 (AC2a) : branche LOCALE seule, PR mergée, tête absorbée par un squash --
+#
+# Le second cas du ticket : origin avait supprimé la branche au merge de la PR,
+# la branche locale et son worktree sont restés sur la tête approuvée.
+test_t2976_local_spent() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t1" wt="$T2976_WT_ROOT/fix-2976-t1"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Le squash : `main` reçoit le MÊME patch sous un autre sha. C'est ce que
+    # `rev-list --count` ne sait pas voir et que `--cherry-mark` voit.
+    # `-x` et non un cherry-pick nu : sur le même parent, dans la même seconde et
+    # sous la même identité, un cherry-pick nu rend le MÊME sha que `$tip`. Ce
+    # n'est plus un squash mais un fast-forward, la tête de branche est déjà
+    # `origin/main`, et l'assertion « la branche repart de origin/main » passe
+    # sans que rien n'ait bougé. La ligne `(cherry picked from …)` change le sha
+    # et laisse le patch-id intact. Même raison aux trois autres fixtures.
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    # La branche n'a JAMAIS été poussée : origin ne la porte pas.
+    if [ "$(git -C "$FIXTURE_CLONE" rev-parse main)" = "$tip" ]; then
+        _t2976_cleanup
+        echo "FAIL: fixture: le squash a rendu le sha de la branche, la scène n'est plus un squash"
+        return 0
+    fi
+
+    gh() { printf '[{"number":2971,"state":"MERGED"}]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t1.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t1.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=spent' <<<"$gate_log" || failures="${failures}verdict should be spent, log: $gate_log; "
+    grep -qF -- 'unmerged=0' <<<"$gate_log" || failures="${failures}unmerged should be 0; "
+    grep -qF -- 'pr=#2971 MERGED' <<<"$gate_log" || failures="${failures}pr field should name the merged PR; "
+    # La ref lue est la ref LOCALE : origin n'a jamais porté cette branche.
+    grep -qF -- 'tips=refs/heads/' <<<"$gate_log" || failures="${failures}tips should name the local ref; "
+    # L'EFFET (AC1) : la branche repart de `origin/main`, et son worktree a été
+    # retiré. Le jeton seul laisserait passer une décision juste sans effet.
+    grep -qF -- 'action=reset' <<<"$gate_log" || failures="${failures}action should be reset; "
+    [ "${BRANCH_SPENT:-x}" = "1" ] || failures="${failures}BRANCH_SPENT should be 1; "
+    local main_sha; main_sha=$(git -C "$FIXTURE_CLONE" rev-parse refs/remotes/origin/main)
+    [ "$after" = "$main_sha|none" ] || failures="${failures}branch should be reset to origin/main (got $after, want $main_sha|none, was $before); "
+    [ ! -d "$wt" ] || failures="${failures}spent worktree should be removed; "
+    [ "$rc" = "0" ] || failures="${failures}a reset must not halt (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T2 (AC2b) : branche SUR ORIGIN, PR mergée, en retard sur main ------------
+#
+# Le premier cas du ticket (mika#1727), sous forme réduite : la branche est à
+# deux commits de retard au lieu de 584. Le bras sous test est
+# `_remote_branch_exists`, pas le NOMBRE de commits de retard.
+test_t2976_remote_spent() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t2"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit feature.txt "v1" "feat(2976): le vol 1"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$tip" >/dev/null 2>&1
+    _t2976_commit other.txt "suite" "chore: un commit de plus sur main"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    # La ref LOCALE est retirée : la branche ne vit plus que sur origin.
+    # `update-ref -d` et non `branch -D` — la permission-policy du pilote refuse
+    # cette seconde forme d'un refus TERMINAL (plan mika#2976 § 11).
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/heads/$br"
+
+    gh() { printf '[{"number":1728,"state":"MERGED"}]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$T2976_WT_ROOT/fix-2976-t2" 1727 2>"$T2976_ROOT/t2.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t2.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=spent' <<<"$gate_log" || failures="${failures}verdict should be spent, log: $gate_log; "
+    grep -qF -- 'unmerged=0' <<<"$gate_log" || failures="${failures}unmerged should be 0; "
+    # La ref lue est la ref DISTANTE : la locale n'existe plus. C'est la moitié
+    # de la population qu'une lecture à une seule ref manquerait.
+    grep -qF -- 'tips=refs/remotes/origin/' <<<"$gate_log" || failures="${failures}tips should name the remote ref; "
+    case "$before" in none\|*) ;; *) failures="${failures}fixture should have no local ref ($before); " ;; esac
+    grep -qF -- 'action=reset' <<<"$gate_log" || failures="${failures}action should be reset; "
+    [ "${BRANCH_SPENT:-x}" = "1" ] || failures="${failures}BRANCH_SPENT should be 1; "
+    # La ref locale est POSÉE sur `origin/main` — et la ref DISTANTE n'a pas
+    # bougé. La réinitialisation est locale : rien ne pousse, rien ne supprime
+    # sur origin, et c'est `git push --force-with-lease` du post-vol qui tranchera
+    # au moment où il y aura quelque chose à pousser.
+    [ "$after" = "$(git -C "$FIXTURE_CLONE" rev-parse refs/remotes/origin/main)|${before#none|}" ] \
+        || failures="${failures}local ref should be origin/main and remote ref unmoved (got $after, was $before); "
+    [ "$rc" = "0" ] || failures="${failures}a reset must not halt (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T3 (AC2c, contrôle négatif) : une PR OUVERTE se reprend ------------------
+#
+# Le cas NOMINAL de reprise d'un vol en cours. Si ce test rougit, la porte a
+# cessé d'être une porte.
+test_t2976_open_pr_live() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t3" wt="$T2976_WT_ROOT/fix-2976-t3"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit wip.txt "travail en cours" "feat(2976): vol en cours"
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    # Deux PR sur le même head : une FERMÉE, une OUVERTE. C'est la population
+    # que le terme positif « il existe une PR mergée ou fermée » déclarerait
+    # périmée à tort, et c'est pourquoi le prédicat est formulé en négatif.
+    gh() { printf '[{"number":2900,"state":"CLOSED"},{"number":2983,"state":"OPEN"}]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t3.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t3.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=live' <<<"$gate_log" || failures="${failures}verdict should be live, log: $gate_log; "
+    grep -qF -- 'action=reuse' <<<"$gate_log" || failures="${failures}action should be reuse; "
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}BRANCH_SPENT should stay 0; "
+    [ "$rc" = "0" ] || failures="${failures}gate should not halt (rc=$rc); "
+    [ -d "$wt" ] || failures="${failures}worktree should be intact; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T4 (AC2c bis, second contrôle négatif) : AUCUNE PR se reprend ------------
+#
+# La branche de groom poussée avec son plan et pas encore implémentée. La traiter
+# comme périmée détruirait ce plan : le faux positif le plus coûteux du ticket.
+test_t2976_no_pr_live() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t4" wt="$T2976_WT_ROOT/fix-2976-t4"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "le plan, jamais implémenté" "docs(plans): groom mika#2976"
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    gh() { printf '[]\n'; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t4.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t4.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=live' <<<"$gate_log" || failures="${failures}verdict should be live, log: $gate_log; "
+    grep -qF -- 'action=reuse' <<<"$gate_log" || failures="${failures}action should be reuse; "
+    grep -qF -- 'pr=none' <<<"$gate_log" || failures="${failures}pr field should be none; "
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ -d "$wt" ] || failures="${failures}worktree should be intact; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T5 (AC3) : PR mergée, MAIS un patch absent de main ⇒ halte ---------------
+#
+# Une PR mergée ne prouve pas que TOUT ce que porte la branche est dans `main` :
+# un commit poussé après l'approbation, ou le résidu d'un `wip()` de la chaîne de
+# secours, y vit encore. C'est la population que la porte ne peut pas disposer
+# sans risque de perte.
+test_t2976_unmerged_work_halts() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t5" wt="$T2976_WT_ROOT/fix-2976-t5"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "le plan, mergé" "docs(plans): groom mika#2976"
+    local merged_tip; merged_tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    _t2976_commit rescue.txt "rescapé" "wip(2976): rescapé de la chaîne de secours"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # SEUL le plan atterrit sur main : le `wip()` n'y est pas.
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$merged_tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    gh() { printf '[{"number":2977,"state":"MERGED"}]\n'; }
+
+    local before after gate_log stashes rc=0
+    before=$(_t2976_refs "$br")
+    stashes=$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t5.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t5.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=unmerged_work' <<<"$gate_log" || failures="${failures}verdict should be unmerged_work, log: $gate_log; "
+    grep -qF -- 'unmerged=1' <<<"$gate_log" || failures="${failures}unmerged should be 1; "
+    # Le commit en péril est NOMMÉ, et pas seulement compté : c'est ce que
+    # l'opérateur lira pour le récupérer.
+    grep -qF -- "$lost" <<<"${_BRANCH_REUSE_COMMITS:-}" \
+        || failures="${failures}the unmerged commit should be named ($lost not in '${_BRANCH_REUSE_COMMITS:-}'); "
+    # L'effet, autant que le message : rien n'a bougé, rien n'a été stashé.
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ "$stashes" = "$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)" ] \
+        || failures="${failures}a stash entry was created; "
+    [ -d "$wt" ] || failures="${failures}worktree should be untouched; "
+    # La HALTE : un statut neuf, le sha en péril dans le corps, et la phrase sur
+    # l'effet — que le placement du site d'appel, en amont du nettoyage du relic,
+    # rend vraie.
+    grep -qF -- 'action=halt' <<<"$gate_log" || failures="${failures}action should be halt; "
+    [ "$rc" = "1" ] || failures="${failures}gate should halt the dispatch (rc=$rc); "
+    grep -qF -- 'STATUS=BRANCH_HAS_UNMERGED_WORK' <<<"${RESULT:-}" \
+        || failures="${failures}RESULT should carry the new status, got '${RESULT:-<empty>}'; "
+    grep -qF -- "$lost" <<<"${RESULT:-}" || failures="${failures}RESULT should name the unmerged sha; "
+    grep -qF -- '#2977 MERGED' <<<"${RESULT:-}" || failures="${failures}RESULT should name the terminal PR; "
+    grep -qF -- 'Nothing was reset, nothing was removed, nothing was stashed.' <<<"${RESULT:-}" \
+        || failures="${failures}RESULT should state its own non-effect; "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}BRANCH_SPENT should stay 0 on halt; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T6 (non-mesure) : `gh` muet sur une branche par ailleurs périmée ---------
+#
+# Sépare « la porte ne mord sur rien » de « la porte ne mesure rien ». Le régime
+# attendu de cette population est VIDE ; un non-zéro en production rougit le
+# relevé de l'AC4 plutôt que de passer pour une reprise nominale.
+test_t2976_undetermined() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t6" wt="$T2976_WT_ROOT/fix-2976-t6"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" cherry-pick -x "$tip" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+
+    # Aucune sortie réseau depuis le harness, et la mesure ÉCHOUE. `gh` n'est
+    # jamais invoqué via `command`, donc la fonction l'emporte (précédent
+    # `_t2492_recovery_probe`).
+    gh() { return 1; }
+
+    local before after gate_log rc=0
+    before=$(_t2976_refs "$br")
+    BRANCH_SPENT=0; RESULT=""
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$br" "$wt" 2976 2>"$T2976_ROOT/t6.err" || rc=$?
+    after=$(_t2976_refs "$br")
+    gate_log=$(cat "$T2976_ROOT/t6.err" 2>/dev/null || true)
+
+    local failures=""
+    grep -qF -- 'verdict=undetermined' <<<"$gate_log" || failures="${failures}verdict should be undetermined, log: $gate_log; "
+    grep -qF -- 'action=reuse_unmeasured' <<<"$gate_log" || failures="${failures}action should be reuse_unmeasured; "
+    [ "$before" = "$after" ] || failures="${failures}branch refs moved ($before -> $after); "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}BRANCH_SPENT should stay 0; "
+    [ "$rc" = "0" ] || failures="${failures}non-measure must not halt (rc=$rc); "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# mika#2976 vol 2 — T7 à T12 (plan § 13.5)
+#
+# Trois défauts du vol 1, relevés par la sonde d'AC4 : un squash de plusieurs
+# commits jugé `unmerged_work` (AC6, AC7), le plan du groom courant pris pour un
+# travail laissé derrière (AC8), une ref de suivi périmée lue comme vivante
+# (AC9). Chaque cas porte son contrôle négatif DANS LA MÊME FONCTION, sur la même
+# fixture : un vert du positif sans le rouge du négatif ne prouverait que la
+# complaisance de la porte.
+#
+# Les dates sont POSÉES, pas subies : la partition de l'AC8 lit la date de
+# commit contre `mergedAt`, et un test qui dépendrait de l'horloge de la machine
+# mesurerait l'horloge. Antérieur = 1700000000 (+ décalage), merge = 1700001000
+# (2023-11-14T22:30:00Z), postérieur = 1700002000.
+T2976_ANTE=1700000000
+T2976_MERGED_ISO="2023-11-14T22:30:00Z"
+T2976_POST=1700002000
+
+# `_t2976_commit_at <epoch> <fichier> <contenu> <sujet>` — un commit daté.
+_t2976_commit_at() {
+    printf '%s\n' "$3" > "$FIXTURE_CLONE/$2"
+    git -C "$FIXTURE_CLONE" add "$2" >/dev/null 2>&1
+    GIT_COMMITTER_DATE="@$1 +0000" GIT_AUTHOR_DATE="@$1 +0000" \
+        git -C "$FIXTURE_CLONE" commit -q -m "$4"
+}
+
+# La PR précédente, MERGÉE, avec son instant de fermeture.
+_t2976_gh_merged() {
+    gh() { printf '[{"number":2985,"state":"MERGED","mergedAt":"%s","closedAt":"%s"}]\n' \
+        "$T2976_MERGED_ISO" "$T2976_MERGED_ISO"; }
+}
+
+# `_t2976_run_gate <branche> <worktree> <tag>` — exerce la PRODUCTION et relève
+# l'avant, l'après, le journal, le rc et le compte de stash.
+_t2976_run_gate() {
+    T2976_BEFORE=$(_t2976_refs "$1")
+    T2976_STASHES=$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)
+    BRANCH_SPENT=0; RESULT=""; T2976_RC=0
+    _branch_reuse_gate "$FIXTURE_CLONE" mika "$1" "$2" 2976 2>"$T2976_ROOT/$3.err" || T2976_RC=$?
+    T2976_AFTER=$(_t2976_refs "$1")
+    T2976_LOG=$(cat "$T2976_ROOT/$3.err" 2>/dev/null || true)
+}
+
+# Les assertions d'une halte : verdict, action, rc, sha nommé, et rien n'a bougé.
+# Écrit les manquements sur stdout, préfixés de `$2`.
+_t2976_assert_halt() {
+    local named="$1" tag="$2" f=""
+    grep -qF -- 'verdict=unmerged_work' <<<"$T2976_LOG" || f="${f}${tag}: verdict should be unmerged_work, log: $T2976_LOG; "
+    grep -qF -- 'action=halt' <<<"$T2976_LOG" || f="${f}${tag}: action should be halt; "
+    [ "$T2976_RC" = "1" ] || f="${f}${tag}: gate should halt (rc=$T2976_RC); "
+    grep -qF -- 'STATUS=BRANCH_HAS_UNMERGED_WORK' <<<"${RESULT:-}" || f="${f}${tag}: RESULT should carry the halt status; "
+    grep -qF -- "$named" <<<"${RESULT:-}" || f="${f}${tag}: RESULT should name $named; "
+    [ "$T2976_BEFORE" = "$T2976_AFTER" ] || f="${f}${tag}: refs moved ($T2976_BEFORE -> $T2976_AFTER); "
+    [ "$T2976_STASHES" = "$(git -C "$FIXTURE_CLONE" stash list 2>/dev/null | grep -c . || true)" ] \
+        || f="${f}${tag}: a stash entry was created; "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || f="${f}${tag}: BRANCH_SPENT should stay 0; "
+    printf '%s' "$f"
+}
+
+# Les assertions d'une réinitialisation : la branche repart de origin/main.
+_t2976_assert_reset() {
+    local br="$1" wt="$2" tag="$3" f="" main_sha
+    main_sha=$(git -C "$FIXTURE_CLONE" rev-parse refs/remotes/origin/main)
+    grep -qF -- 'verdict=spent' <<<"$T2976_LOG" || f="${f}${tag}: verdict should be spent, log: $T2976_LOG; "
+    grep -qF -- 'action=reset' <<<"$T2976_LOG" || f="${f}${tag}: action should be reset; "
+    [ "${BRANCH_SPENT:-x}" = "1" ] || f="${f}${tag}: BRANCH_SPENT should be 1; "
+    [ "${T2976_AFTER%%|*}" = "$main_sha" ] || f="${f}${tag}: local ref should be origin/main (got $T2976_AFTER); "
+    [ ! -d "$wt" ] || f="${f}${tag}: spent worktree should be removed; "
+    [ "$T2976_RC" = "0" ] || f="${f}${tag}: a reset must not halt (rc=$T2976_RC); "
+    printf '%s' "$f"
+}
+
+# --- T7 : UN commit squashé, et son contrôle négatif --------------------------
+#
+# Le cas que le vol 1 savait déjà juger (E1), refait par un vrai `merge --squash`
+# et daté : il ne doit pas régresser. Négatif : la même branche portant en plus
+# un commit d'AVANT le merge, absent de `main`.
+test_t2976_single_squash() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t7" neg="fix/2976/t7-neg" wt="$T2976_WT_ROOT/fix-2976-t7"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg"
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2976): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "docs(plans): groom mika#2976 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    _t2976_run_gate "$br" "$wt" t7
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" positif)"
+    grep -qF -- 'containment=per_commit' <<<"$T2976_LOG" || failures="${failures}positif: containment should be per_commit; "
+    grep -qF -- 'current=0' <<<"$T2976_LOG" || failures="${failures}positif: current should be 0; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t7-neg" t7neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+    grep -qF -- 'containment=work' <<<"$T2976_LOG" || failures="${failures}négatif: containment should be work; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T8 (AC6) : plan + code squashés en UN commit, et son contrôle négatif ----
+#
+# La fixture que le vol 1 n'avait pas. `merge --squash`, jamais deux
+# `cherry-pick -x` : des cherry-picks garderaient les patch-ids individuels, E1
+# absorberait la branche et le test mesurerait le vol 1 (plan § 10, piège 2). La
+# fixture assertionne donc sa propre scène avant de mesurer.
+test_t2976_multi_squash() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t8" neg="fix/2976/t8-neg" wt="$T2976_WT_ROOT/fix-2976-t8"
+
+    local mb; mb=$(git -C "$FIXTURE_CLONE" rev-parse main)
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    local plan_sha; plan_sha=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    _t2976_commit_at "$((T2976_ANTE + 10))" code.txt "le code du vol 1" "fix(2976): le code du vol 1"
+    local code_sha; code_sha=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg"
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2976): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "fix(2976): le vol 1 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    # La scène : UN commit de plus que la merge-base sur main, et aucun des deux
+    # commits de la branche n'y est.
+    [ "$(git -C "$FIXTURE_CLONE" rev-list --count "$mb..main")" = "1" ] \
+        || failures="${failures}scène: main should carry exactly one squash commit; "
+    if git -C "$FIXTURE_CLONE" merge-base --is-ancestor "$plan_sha" main \
+        || git -C "$FIXTURE_CLONE" merge-base --is-ancestor "$code_sha" main; then
+        failures="${failures}scène: a branch commit reached main, this is not a squash; "
+    fi
+
+    _t2976_run_gate "$br" "$wt" t8
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" positif)"
+    grep -qF -- 'containment=cumulative' <<<"$T2976_LOG" || failures="${failures}positif: containment should be cumulative (E2), log: $T2976_LOG; "
+    grep -qF -- 'unmerged=0' <<<"$T2976_LOG" || failures="${failures}positif: unmerged should be 0; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t8-neg" t8neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+    grep -qF -- 'containment=work' <<<"$T2976_LOG" || failures="${failures}négatif: containment should be work; "
+    grep -qF -- '(not_found)' <<<"${RESULT:-}" || failures="${failures}négatif: RESULT should give the E2 reason; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T9 (AC7) : la topologie mesurée, avec le retard de `main` ----------------
+#
+# Le cas réel est `59010336a` contre le squash `fcb5148fd` (mika#2958) : patch
+# cumulé `9d6c12257..59010336a` et squash au même patch-id `402470424f…`. Sa
+# branche a été supprimée, donc un clone de CI ne porte pas l'objet ; la fixture
+# reproduit ce qui FAIT le cas : un commit tiers sur main touche un fichier de la
+# branche avant le squash, et main réécrit encore ce fichier après. Les deux
+# critères écartés par le plan (§ 1.2 et 1.3) sont épinglés : leur
+# réintroduction rougit ici, motif en clair.
+test_t2976_measured_topology() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t9" neg="fix/2976/t9-neg" wt="$T2976_WT_ROOT/fix-2976-t9"
+
+    printf '%s\n' l1 l2 l3 l4 l5 l6 l7 l8 l9 l10 l11 l12 > "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" add shared.txt >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "chore: shared.txt"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol" "docs(plans): groom mika#2958"
+    sed -i 's/^l2$/branche-2/' "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" add shared.txt >/dev/null 2>&1
+    GIT_COMMITTER_DATE="@$((T2976_ANTE + 10)) +0000" GIT_AUTHOR_DATE="@$((T2976_ANTE + 10)) +0000" \
+        git -C "$FIXTURE_CLONE" commit -q -m "feat(2958): le code"
+    local tip; tip=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg"
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2958): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Le tiers (le rôle de `milestone_read_audit`) : un fichier de la branche,
+    # et DANS le contexte de son hunk (l5 est à trois lignes de l2). C'est ce
+    # qui change le patch-id du squash en `-U3` : sans cette proximité, la scène
+    # ne mesurerait pas le défaut relevé par la revue du vol 2.
+    sed -i 's/^l5$/tiers-5/' "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" commit -q -am "feat: un autre ticket touche shared.txt"
+    local mb; mb=$(git -C "$FIXTURE_CLONE" merge-base main "$tip")
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "feat(2958): le vol (#2975)"
+    local sq_u3 cum_u3
+    sq_u3=$(git -C "$FIXTURE_CLONE" show HEAD | git -C "$FIXTURE_CLONE" patch-id --stable | awk '{print $1}')
+    cum_u3=$(git -C "$FIXTURE_CLONE" diff "$mb" "$tip" | git -C "$FIXTURE_CLONE" patch-id --stable | awk '{print $1}')
+    # main avance encore sur les lignes de la branche (le rôle du conflit de
+    # `merge-tree` mesuré au § 1.3).
+    sed -i 's/^branche-2$/main-2-reecrit/' "$FIXTURE_CLONE/shared.txt"
+    git -C "$FIXTURE_CLONE" commit -q -am "refactor: main réécrit la ligne"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    # La scène : avec le contexte, le patch cumulé et le squash DIFFÈRENT. C'est
+    # ce qui rend ce cas plus dur que T8, et ce qui oblige E2 à travailler en -U0.
+    [ -n "$sq_u3" ] && [ "$sq_u3" != "$cum_u3" ] \
+        || failures="${failures}scène: the -U3 patch-ids should differ (squash=$sq_u3 cumul=$cum_u3); "
+    # Critère écarté n°1 : le diff restreint aux fichiers n'est pas vide ici.
+    [ -n "$(git -C "$FIXTURE_CLONE" diff origin/main "$tip" -- shared.txt plan.md)" ] \
+        || failures="${failures}scène: the restricted diff should be non-empty (§ 1.2); "
+    # Critère écarté n°2 : merge-tree ne rend pas l'arbre de origin/main.
+    local mt; mt=$(git -C "$FIXTURE_CLONE" merge-tree --write-tree origin/main "$tip" 2>/dev/null | head -1 || true)
+    [ "$mt" != "$(git -C "$FIXTURE_CLONE" rev-parse 'origin/main^{tree}')" ] \
+        || failures="${failures}scène: merge-tree should not yield origin/main's tree (§ 1.3); "
+
+    _t2976_run_gate "$br" "$wt" t9
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" positif)"
+    grep -qF -- 'containment=cumulative' <<<"$T2976_LOG" || failures="${failures}positif: containment should be cumulative, log: $T2976_LOG; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t9-neg" t9neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T10 (non-mesure) : la fenêtre dépassée ne vaut pas absorption ------------
+#
+# La scène positive de T8, plafond à 0 : `window_too_large`. Sépare, pour le
+# relevé d'AC4, « du travail réel » (`work`) de « on n'a pas su » (`unmeasured`).
+# C'est aussi l'anti-vacuité de T8 : un plafond non lu ferait passer ce cas en
+# `cumulative`. Contrôle négatif : le même cas, plafond par défaut, se réinitialise.
+test_t2976_window_unmeasured() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t10" wt="$T2976_WT_ROOT/fix-2976-t10"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    _t2976_commit_at "$((T2976_ANTE + 10))" code.txt "le code du vol 1" "fix(2976): le code du vol 1"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "fix(2976): le vol 1 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures="" head_sha
+    head_sha=$(git -C "$FIXTURE_CLONE" rev-parse "$br")
+    local _BRANCH_REUSE_WINDOW_MAX=0
+    _t2976_run_gate "$br" "$wt" t10
+    failures="${failures}$(_t2976_assert_halt "$head_sha" plafond)"
+    grep -qF -- 'containment=unmeasured' <<<"$T2976_LOG" || failures="${failures}plafond: containment should be unmeasured, log: $T2976_LOG; "
+    grep -qF -- '(window_too_large)' <<<"${RESULT:-}" || failures="${failures}plafond: RESULT should name window_too_large; "
+    [ -d "$wt" ] || failures="${failures}plafond: worktree should be untouched; "
+
+    _BRANCH_REUSE_WINDOW_MAX=1000
+    _t2976_run_gate "$br" "$wt" t10neg
+    failures="${failures}$(_t2976_assert_reset "$br" "$wt" défaut)"
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T11 (AC8) : le plan du groom courant laisse partir dev-pilot -------------
+#
+# Le cas mesuré sur ce ticket : la branche recréée depuis `main` après le merge
+# de #2985 ne porte que le plan `0c9203aaf`, daté après le merge, et dev-pilot
+# `0be4647a` s'est arrêté dessus. Le plan est le vol COURANT : `live`, rien ne
+# bouge — surtout pas une réinitialisation, qui détruirait le plan. Négatif : la
+# même branche portant en plus un commit d'avant le merge, absent de `main`.
+test_t2976_current_flight() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local old="fix/2976/t11-vol1" br="fix/2976/t11" neg="fix/2976/t11-neg"
+    local wt="$T2976_WT_ROOT/fix-2976-t11"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$old"
+    _t2976_commit_at "$T2976_ANTE" plan.md "plan du vol 1" "docs(plans): groom mika#2976"
+    _t2976_commit_at "$((T2976_ANTE + 10))" code.txt "le code du vol 1" "fix(2976): le vol 1"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" merge -q --squash "$old" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" commit -q -m "fix(2976): le vol 1 (#2985)"
+    git -C "$FIXTURE_CLONE" push -q origin main
+
+    # Le re-groom : branche recréée depuis origin/main, un seul commit de plan,
+    # poussé. Le contrôle négatif part du même point.
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br" origin/main
+    _t2976_commit_at "$T2976_POST" plan2.md "plan du vol 2" "docs(plans): groom mika#2976 vol 2"
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" checkout -q -b "$neg" origin/main
+    _t2976_commit_at "$((T2976_ANTE + 20))" lost.txt "jamais mergé" "wip(2976): resté derrière"
+    local lost; lost=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    _t2976_commit_at "$T2976_POST" plan2.md "plan du vol 2" "docs(plans): groom mika#2976 vol 2"
+    local neg_plan; neg_plan=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" checkout -q main
+    git -C "$FIXTURE_CLONE" worktree add -q "$wt" "$br" >/dev/null 2>&1
+    _t2976_gh_merged
+
+    local failures=""
+    _t2976_run_gate "$br" "$wt" t11
+    grep -qF -- 'verdict=live' <<<"$T2976_LOG" || failures="${failures}positif: verdict should be live, log: $T2976_LOG; "
+    grep -qF -- 'action=reuse' <<<"$T2976_LOG" || failures="${failures}positif: action should be reuse; "
+    grep -qF -- 'current=1' <<<"$T2976_LOG" || failures="${failures}positif: current should be 1; "
+    [ "$T2976_BEFORE" = "$T2976_AFTER" ] || failures="${failures}positif: refs moved ($T2976_BEFORE -> $T2976_AFTER); "
+    [ "${BRANCH_SPENT:-x}" = "0" ] || failures="${failures}positif: BRANCH_SPENT should stay 0; "
+    [ "$T2976_RC" = "0" ] || failures="${failures}positif: gate should not halt (rc=$T2976_RC); "
+    [ -d "$wt" ] || failures="${failures}positif: worktree should be intact; "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t11-neg" t11neg
+    failures="${failures}$(_t2976_assert_halt "$lost" négatif)"
+    grep -qF -- 'current=1' <<<"$T2976_LOG" || failures="${failures}négatif: current should still count the plan; "
+    # Le plan du vol courant n'est PAS désigné comme travail en péril.
+    if grep -qF -- "$neg_plan" <<<"${RESULT:-}"; then
+        failures="${failures}négatif: the current-flight plan must not be named as unmerged; "
+    fi
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# --- T12 (AC9) : une ref de suivi périmée ne fait pas buter la porte ----------
+#
+# Un `git fetch` sans `--prune` ne retire jamais `refs/remotes/origin/<b>` : la
+# branche supprimée sur origin, la ref reste sur l'ancienne tête. Ici elle porte
+# même un travail absent de `main` — le pire cas — et la porte ne doit pas la
+# lire, puisque le distant répond que la branche n'existe plus. Négatif : la
+# même scène, branche VIVANTE sur origin, s'arrête.
+test_t2976_stale_tracking_ref() {
+    _t2976_fixture || { echo "FAIL: fixture"; return 0; }
+    local br="fix/2976/t12" neg="fix/2976/t12-neg"
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$br"
+    _t2976_commit_at "$T2976_ANTE" stale.txt "vieille tête" "wip(2976): vieille tête"
+    local stale_sha; stale_sha=$(git -C "$FIXTURE_CLONE" rev-parse HEAD)
+    git -C "$FIXTURE_CLONE" push -q origin "$br"
+    git -C "$FIXTURE_CLONE" branch -q "$neg"
+    git -C "$FIXTURE_CLONE" push -q origin "$neg"
+    git -C "$FIXTURE_CLONE" checkout -q main
+    # Suppression sur origin, puis la ref de suivi remise là où un fetch sans
+    # --prune l'aurait laissée. Les refs locales partent par update-ref.
+    git -C "$FIXTURE_CLONE" push -q origin --delete "$br" >/dev/null 2>&1
+    git -C "$FIXTURE_CLONE" update-ref "refs/remotes/origin/$br" "$stale_sha"
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/heads/$br"
+    git -C "$FIXTURE_CLONE" update-ref -d "refs/heads/$neg"
+    _t2976_gh_merged
+
+    local failures=""
+    [ -z "$(git -C "$FIXTURE_CLONE" ls-remote origin "refs/heads/$br")" ] \
+        || failures="${failures}scène: the branch should be gone from origin; "
+    _t2976_run_gate "$br" "$T2976_WT_ROOT/fix-2976-t12" t12
+    grep -qF -- "stale=refs/remotes/origin/$br" <<<"$T2976_LOG" || failures="${failures}positif: stale should name the tracking ref, log: $T2976_LOG; "
+    grep -qF -- 'verdict=unmerged_work' <<<"$T2976_LOG" && failures="${failures}positif: a stale ref must not halt the gate; "
+    grep -qF -- 'tips=none' <<<"$T2976_LOG" || failures="${failures}positif: the stale ref should not be read; "
+    [ "$T2976_RC" = "0" ] || failures="${failures}positif: gate should not halt (rc=$T2976_RC); "
+    [ "$T2976_BEFORE" = "$T2976_AFTER" ] || failures="${failures}positif: refs moved ($T2976_BEFORE -> $T2976_AFTER); "
+
+    _t2976_run_gate "$neg" "$T2976_WT_ROOT/fix-2976-t12-neg" t12neg
+    failures="${failures}$(_t2976_assert_halt "$stale_sha" négatif)"
+    grep -qF -- "tips=refs/remotes/origin/$neg" <<<"$T2976_LOG" || failures="${failures}négatif: the live tracking ref should be read; "
+    grep -qF -- 'stale=none' <<<"$T2976_LOG" || failures="${failures}négatif: stale should be none; "
+
+    _t2976_cleanup
+    if [ -z "$failures" ]; then echo "PASS"; else echo "FAIL: $failures"; fi
+}
+
+# Scans de bonne foi (plan § 6) : E2 a son instrument, la ligne porte ses champs,
+# le plafond se lit dans sa constante nommée.
+T2976_E2_FUNC=$(sed -n '/^_branch_cumulative_absorbed()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#2976 vol 2: E2 compare par patch-id --stable" 'patch-id --stable' "$T2976_E2_FUNC"
+assert_contains "mika#2976 vol 2: E2 balaie --no-merges" '--no-merges' "$T2976_E2_FUNC"
+assert_contains "mika#2976 vol 2: E2 lit le plafond dans sa constante" '_BRANCH_REUSE_WINDOW_MAX' "$T2976_E2_FUNC"
+assert_not_contains "mika#2976 vol 2: aucun littéral 1000 dans le corps d'E2" '1000' "$T2976_E2_FUNC"
+assert_contains "mika#2976 vol 2: la ligne porte containment=" 'containment=${_BRANCH_REUSE_CONTAINMENT' "$T2976_GATE_FUNC"
+assert_contains "mika#2976 vol 2: la ligne porte current=" 'current=${_BRANCH_REUSE_CURRENT' "$T2976_GATE_FUNC"
+assert_contains "mika#2976 vol 2: la ligne porte stale=" 'stale=${_BRANCH_REUSE_STALE' "$T2976_GATE_FUNC"
+
+for _t2976_case in \
+    "T1 (AC2a) branche locale d'un vol mergé: reset sur origin/main, worktree retiré|test_t2976_local_spent" \
+    "T2 (AC2b) branche sur origin d'un vol mergé: reset local, ref distante intacte|test_t2976_remote_spent" \
+    "T3 (AC2c) contrôle négatif — PR ouverte: verdict=live, rien ne bouge|test_t2976_open_pr_live" \
+    "T4 (AC2c bis) contrôle négatif — aucune PR: verdict=live, rien ne bouge|test_t2976_no_pr_live" \
+    "T5 (AC3) patch absent de main: halte sur BRANCH_HAS_UNMERGED_WORK|test_t2976_unmerged_work_halts" \
+    "T6 non-mesure — gh muet: verdict=undetermined, rien ne bouge|test_t2976_undetermined" \
+    "T7 un commit squashé: spent/per_commit ; négatif: commit antérieur absent, halte|test_t2976_single_squash" \
+    "T8 (AC6) plan + code squashés en un: spent/cumulative/reset ; négatif: halte|test_t2976_multi_squash" \
+    "T9 (AC7) topologie mesurée, critères écartés épinglés: spent/cumulative ; négatif: halte|test_t2976_measured_topology" \
+    "T10 non-mesure — fenêtre dépassée: unmeasured, halte ; négatif: plafond par défaut, reset|test_t2976_window_unmeasured" \
+    "T11 (AC8) plan postérieur au merge: live/reuse ; négatif: commit antérieur absent, halte|test_t2976_current_flight" \
+    "T12 (AC9) ref de suivi périmée non lue ; négatif: ref vivante, halte|test_t2976_stale_tracking_ref"; do
+    _t2976_label="${_t2976_case%%|*}"
+    _t2976_fn="${_t2976_case##*|}"
+    _t2976_out=$("$_t2976_fn" 2>/dev/null || echo "FAIL: harness aborted")
+    if [ "$_t2976_out" = "PASS" ]; then
+        PASS=$((PASS + 1)); echo "  ✓ mika#2976 $_t2976_label"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ mika#2976 $_t2976_label: $_t2976_out"
+    fi
+done
+
+# ===========================================================================
+# mika#2996 — chaque relance UNPARSED porte le plan en revue
+#
+# La garde d'ancrage de mika#2037 vérifie les citations de l'architecte contre
+# le brief du tour, et ne s'arme qu'au-dessus de `review_anchor_min_brief_chars`.
+# Une relance de ~380 caractères laissait donc passer sans preuve la disposition
+# qui fait avancer la chaîne — mesuré le 2026-10-31, trace `15ea28bd`, un
+# `READY-after-retry` sur la revue d'un autre plan.
+#
+# Le correctif fait porter le plan à la relance, entre deux lignes-marqueurs que
+# le moteur reconnaît (`review_anchor::anchor_reference`). Ce bloc épingle le
+# CÂBLAGE, sur les trois sites de relance de `_iterate_groom_loop` : le vrai
+# loop tourne, `_arch_ask` est stubbé au bord de processus, et le message de la
+# relance doit contenir le plan À L'OCTET entre les deux marqueurs. Le jugement
+# de la garde sur ce message est testé côté moteur, avec les mêmes fonctions
+# shell, par `tests/eval/grounding_regressions/review_anchor_unparsed_retry_2996.rs`.
+# ===========================================================================
+
+echo ""
+echo "Test: chaque relance UNPARSED porte le plan en revue (mika#2996)"
+echo "------------------------------------------------------------"
+
+T2996_BEGIN='----- BEGIN PLAN UNDER REVIEW (mika#2996) -----'
+T2996_END='----- END PLAN UNDER REVIEW (mika#2996) -----'
+
+# $1 = site : first | second-ready | second-iterate
+# Imprime `arch_calls=`, `retry_call=`, puis le message de la relance entre
+# RETRY_BEGIN / RETRY_END, et le plan entre PLAN_BEGIN / PLAN_END.
+_groom_retry_plan_probe_2996() {
+    local site="$1" tmp wt plan retry_call
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    plan="$wt/docs/plans/2026-10-31-001-fix-2996-relance-plan.md"
+    {
+        echo "# Plan rejouant la relance de mika#2996"
+        echo "**Ticket:** mika issue#2996"
+        for i in $(seq 1 40); do
+            echo "Ligne de corps $i — la relance doit porter ce plan, à l'octet près."
+        done
+    } > "$plan"
+    case "$site" in
+        first) retry_call=2 ;;
+        *)     retry_call=3 ;;
+    esac
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        export MIKA_ARCH_ASK_RETRY=0
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            cp -- "$2" "$tmp/prompt-$n" 2>/dev/null || true
+            case "$site:$n" in
+                first:1)          body="$UNPARSED_1772" ;;
+                first:2)          body='Disposition: READY' ;;
+                second-ready:1)   body='Disposition: READY' ;;
+                second-iterate:1) body='F1: un constat de première passe.
+
+Disposition: ITERATE' ;;
+                second-*:2)       body="$M2641_UNREADABLE" ;;
+                *)                body='Verdict: GROOMED' ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-session-2996"}}'
+        }
+        _write_canonical_callout() { return 0; }
+        _launch_revise_pilot() { return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="2996" REPO="mika" BRANCH="probe-2996"
+        _iterate_groom_loop >/dev/null 2>&1 || true
+
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'retry_call=%s\n' "$retry_call"
+        printf 'RETRY_BEGIN\n'
+        cat -- "$tmp/prompt-$retry_call" 2>/dev/null || true
+        printf 'RETRY_END\n'
+    )
+    rm -rf "$tmp"
+}
+
+# Le plan tel que la relance le porte : les lignes strictement entre les deux
+# marqueurs. Vide si l'un des deux manque.
+_t2996_enveloped_plan() {
+    awk -v b="$T2996_BEGIN" -v e="$T2996_END" '
+        $0 == b { inside = 1; seen_b = 1; next }
+        $0 == e { if (inside) { seen_e = 1 }; inside = 0; next }
+        inside  { buf = buf $0 "\n" }
+        END     { if (seen_b && seen_e) printf "%s", buf }'
+}
+
+T2996_EXPECTED_PLAN=$(
+    echo "# Plan rejouant la relance de mika#2996"
+    echo "**Ticket:** mika issue#2996"
+    for i in $(seq 1 40); do
+        echo "Ligne de corps $i — la relance doit porter ce plan, à l'octet près."
+    done
+)
+
+for _t2996_site in first second-ready second-iterate; do
+    _t2996_out=$(_groom_retry_plan_probe_2996 "$_t2996_site") || _t2996_out=""
+    _t2996_retry=$(printf '%s\n' "$_t2996_out" | sed -n '/^RETRY_BEGIN$/,/^RETRY_END$/p' | sed '1d;$d')
+    # Anti-vacuité : sur les trois sites, la relance est suivie d'un appel, donc
+    # trois appels architecte veulent dire que la relance a eu lieu.
+    assert_contains "mika#2996 ($_t2996_site): la sonde a mené la boucle jusqu'à la relance" \
+        "arch_calls=3" "$_t2996_out"
+    assert_contains "mika#2996 ($_t2996_site): le message est toujours le prompt correctif" \
+        "missing the required" "$_t2996_retry"
+    # Le cœur : le plan entier, à l'octet, entre les deux marqueurs.
+    _t2996_carried=$(printf '%s\n' "$_t2996_retry" | _t2996_enveloped_plan)
+    assert_eq "mika#2996 ($_t2996_site): la relance porte le plan à l'octet entre les marqueurs" \
+        "$T2996_EXPECTED_PLAN" "$_t2996_carried"
+done
+
+# Un plan devenu illisible ne donne pas une relance sans plan : la construction
+# échoue, et la boucle s'arrête au lieu de relancer sous le seuil de la garde.
+for _t2996_fn in _first_pass_retry_prompt _second_pass_retry_prompt; do
+    _t2996_rc=$(
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        if _t2996_f=$("$_t2996_fn" "/nonexistent/mika-2996-plan.md"); then
+            rm -f -- "$_t2996_f"; echo 0
+        else
+            echo 1
+        fi
+    )
+    assert_eq "mika#2996: $_t2996_fn refuse un plan illisible (pas de relance sans plan)" \
+        "1" "$_t2996_rc"
+done
+
+# ===========================================================================
+# mika#2996 — un refus du LECTEUR de disposition arrête le groom, sans relance
+#
+# Depuis la bascule du vol 5 de mika#2194, `_parse_disposition` et
+# `_parse_verdict` délèguent à `mika arch-disposition`. Sur un code `≥2` — ou sur
+# un `mktemp`/une écriture en échec dans l'enveloppe — elles écrivent un motif
+# dans `$_ARCH_DISPOSITION_REFUSAL_FILE` et rendent un jeton VIDE avec le code 0.
+# Les trois sites de lecture de `_iterate_groom_loop` ne distinguaient pas ce
+# vide d'un UNPARSED de l'architecte : ils payaient une relance, puis nommaient
+# `architect_unreadable` une cause qui est locale (classe mika#1772).
+#
+# Deux blocs ci-dessous, et il en faut deux :
+#   - le CANAL, mesuré sur les enveloppes elles-mêmes : le refus est par APPEL et
+#     non par processus, donc chaque enveloppe vide le fichier en tête ;
+#   - les TROIS SITES, mesurés sur le vrai `_iterate_groom_loop`, avec le
+#     contrôle négatif dans le même corps. Sans ce contrôle, « ne relance plus
+#     sur refus » et « ne relance plus du tout » se liraient pareil (AC-R3).
+# ===========================================================================
+
+echo ""
+echo "Test: le canal de refus est par appel, pas par processus (mika#2996)"
+echo "------------------------------------------------------------"
+
+# Le prédicat `_arch_disposition_refused` doit dire « CET appel a refusé », donc
+# un refus au tour n ne doit pas survivre au tour n+1. Mesuré directement sur
+# l'enveloppe : dans la boucle, un refus est terminal, donc AUCUN appel ne le
+# suit jamais — la remise à zéro n'y serait pas observable, et une assertion
+# qui ne peut pas rougir ne prouve rien.
+_m2996c_channel_probe() {
+    # $1 = code rendu au premier appel (passe `first`), $2 = au second (`second`).
+    #
+    # Le stub dispatche sur la PASSE et non sur un compteur : `mika` est invoqué
+    # dans un `$(...)`, donc un compteur posé par le stub mourrait avec la
+    # substitution et les deux appels liraient la même valeur.
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        M2996C_RC1="$1"
+        M2996C_RC2="$2"
+        mika() {
+            if [ "$3" = "first" ]; then return "$M2996C_RC1"; fi
+            return "$M2996C_RC2"
+        }
+        printf 'une réponse d architecte' | _parse_disposition >/dev/null 2>&1
+        if _arch_disposition_refused; then printf 'first=refused\n'; else printf 'first=clean\n'; fi
+        printf 'une réponse d architecte' | _parse_verdict >/dev/null 2>&1
+        if _arch_disposition_refused; then printf 'second=refused\n'; else printf 'second=clean\n'; fi
+    )
+}
+
+# Un refus, puis un UNPARSED : le second appel n'a PAS refusé, et c'est tout
+# l'objet de la remise à zéro en tête d'enveloppe.
+_m2996c_out=$(_m2996c_channel_probe 3 1) || _m2996c_out=""
+assert_contains "mika#2996: un code ≥2 arme le prédicat de refus" \
+    "first=refused" "$_m2996c_out"
+assert_contains "mika#2996: l'appel SUIVANT ne porte pas le refus du précédent (remise à zéro par appel)" \
+    "second=clean" "$_m2996c_out"
+
+# Symétrique : un UNPARSED n'arme rien, et un refus plus tard s'arme quand même.
+_m2996c_out=$(_m2996c_channel_probe 1 3) || _m2996c_out=""
+assert_contains "mika#2996: un UNPARSED (code 1) n'est pas un refus" \
+    "first=clean" "$_m2996c_out"
+assert_contains "mika#2996: _parse_verdict arme le prédicat sur son propre refus" \
+    "second=refused" "$_m2996c_out"
+
+echo ""
+echo "Test: un refus du lecteur arrête le groom aux trois sites, sans relance (mika#2996)"
+echo "------------------------------------------------------------"
+
+# $1 = site : first | second-ready | second-iterate
+# $2 = polarité : refuse (le lecteur rend 3) | unparsed (il rend 1)
+#
+# Imprime `arch_calls=`, le `RESULT` entre RESULT_BEGIN/RESULT_END, le motif
+# d'échec de boucle entre REASON_BEGIN/REASON_END, et le trail de verdicts entre
+# TRAIL_BEGIN/TRAIL_END.
+_groom_reader_refusal_probe_2996() {
+    local site="$1" polarity="$2" tmp wt plan
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    plan="$wt/docs/plans/2026-11-03-001-fix-2996-refus-lecteur-plan.md"
+    {
+        echo "# Plan rejouant le refus du lecteur de disposition (mika#2996)"
+        echo "**Ticket:** mika issue#2996"
+        for i in $(seq 1 40); do
+            echo "Ligne de corps $i — un refus local ne redemande rien à l'architecte."
+        done
+    } > "$plan"
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        export MIKA_ARCH_ASK_RETRY=0
+        RESULT=""
+        GROOM_LOOP_FAILURE_REASON=""
+        ARCH_CALLS="$tmp/arch-calls"
+        printf '0' > "$ARCH_CALLS"
+
+        # La passe sur laquelle le lecteur bute, et le jeton que la PREMIÈRE
+        # passe rend quand ce n'est pas elle qui bute — c'est lui qui amène la
+        # boucle jusqu'au site mesuré.
+        case "$site" in
+            first)          M2996R_AT="first";  M2996R_TOKEN1="" ;;
+            second-ready)   M2996R_AT="second"; M2996R_TOKEN1="READY" ;;
+            *)              M2996R_AT="second"; M2996R_TOKEN1="ITERATE" ;;
+        esac
+        # `refuse` → 3, membre de la famille `≥2` (« je n'ai pas pu regarder »).
+        # `unparsed` → 1, qui EST le chemin de relance de mika#1823/mika#2641.
+        M2996R_RC=3
+        [ "$polarity" = "refuse" ] || M2996R_RC=1
+
+        # Stub SÉLECTIF du lecteur, et sélectif par nécessité : un `return 3`
+        # inconditionnel ferait buter la première passe sur les trois sites, donc
+        # la boucle n'atteindrait jamais les deux sites de seconde passe.
+        # $1 = arch-disposition, $2 = --pass, $3 = first|second.
+        mika() {
+            if [ "$3" = "$M2996R_AT" ]; then
+                return "$M2996R_RC"
+            fi
+            printf '%s\n1\n' "$M2996R_TOKEN1"
+            return 0
+        }
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$ARCH_CALLS")
+            n=$((n + 1))
+            printf '%s' "$n" > "$ARCH_CALLS"
+            # Le contenu ne décide de rien ici — le stub du lecteur décide — mais
+            # il doit rester inerte pour les DEUX reconnaisseurs que la queue
+            # commune de `_escalate_groom` fait tourner dessus :
+            # `_second_pass_explicit_iterate` (qui prendrait le terminal
+            # `verdict`) et `_engine_escalation_line` (qui écraserait
+            # `GROOM_LOOP_FAILURE_REASON`, mika#2338).
+            case "$site:$n" in
+                second-ready:1)   body='Disposition: READY' ;;
+                second-iterate:1) body='F1: un constat de première passe.
+
+Disposition: ITERATE' ;;
+                *)                body="$M2641_UNREADABLE" ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-refus-2996"}}'
+        }
+        _write_canonical_callout() { return 0; }
+        _launch_revise_pilot() { return 0; }
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="2996" REPO="mika" BRANCH="probe-2996"
+        _iterate_groom_loop >/dev/null 2>&1 || true
+        # La sonde ne traverse pas `_deliver_callback`, qui est le seul appelant
+        # de l'annexe en production : elle l'appelle donc elle-même, au même
+        # point du fil (après le terminal, avant la lecture du `RESULT`).
+        _annex_arch_disposition_refusal || true
+
+        printf 'arch_calls=%s\n' "$(cat "$ARCH_CALLS")"
+        printf 'RESULT_BEGIN\n%s\nRESULT_END\n' "$RESULT"
+        printf 'REASON_BEGIN\n%s\nREASON_END\n' "${GROOM_LOOP_FAILURE_REASON:-}"
+        printf 'TRAIL_BEGIN\n'
+        cat -- "$wt/.claude/groom-verdict-trail.log" 2>/dev/null || true
+        printf 'TRAIL_END\n'
+    )
+    rm -rf "$tmp"
+}
+
+# L'ordre des polarités n'est pas libre : `refuse` D'ABORD. Le canal de refus est
+# un fichier porté par `$$`, que bash ne change PAS dans un sous-shell, donc les
+# six invocations se partagent le même chemin. Un refus qui fuirait vers la
+# polarité suivante y serait vu (le `rm -f` de chargement de la bibliothèque le
+# couvre déjà, et cet ordre refuse de s'en remettre à lui).
+for _m2996r_site in first second-ready second-iterate; do
+    case "$_m2996r_site" in
+        first) _m2996r_calls_refuse=1; _m2996r_calls_unparsed=2 ;;
+        *)     _m2996r_calls_refuse=2; _m2996r_calls_unparsed=3 ;;
+    esac
+    case "$_m2996r_site" in
+        first) _m2996r_stage="first-pass" ;;
+        second-ready) _m2996r_stage="second-pass-after-ready" ;;
+        *)     _m2996r_stage="second-pass-after-iterate" ;;
+    esac
+
+    # ── Polarité `refuse` : AC-R1, AC-R2, AC-R4 ──────────────────────────────
+    _m2996r_out=$(_groom_reader_refusal_probe_2996 "$_m2996r_site" refuse) || _m2996r_out=""
+    _m2996r_result=$(printf '%s\n' "$_m2996r_out" | sed -n '/^RESULT_BEGIN$/,/^RESULT_END$/p' | sed '1d;$d')
+    _m2996r_reason=$(printf '%s\n' "$_m2996r_out" | sed -n '/^REASON_BEGIN$/,/^REASON_END$/p' | sed '1d;$d')
+    _m2996r_trail=$(printf '%s\n' "$_m2996r_out" | sed -n '/^TRAIL_BEGIN$/,/^TRAIL_END$/p' | sed '1d;$d')
+
+    # AC-R1 — aucune relance : le compte d'appels architecte est celui du refus,
+    # pas celui du refus suivi d'un tour de remède de format.
+    assert_contains "mika#2996 ($_m2996r_site/refuse): aucune relance architecte sur un refus du lecteur" \
+        "arch_calls=$_m2996r_calls_refuse" "$_m2996r_out"
+    # AC-R2 — la cause nommée, avec son étape, sur la ligne ancrée.
+    assert_contains "mika#2996 ($_m2996r_site/refuse): RESULT porte la cause et l'étape" \
+        "Groom-halt-cause: disposition_reader_refused $_m2996r_stage" "$_m2996r_result"
+    assert_contains "mika#2996 ($_m2996r_site/refuse): RESULT porte l'annexe du motif" \
+        "REFUSED (arch-disposition, mika#2194) subcommand_error" "$_m2996r_result"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): RESULT n'accuse pas l'architecte" \
+        "architect_unreadable" "$_m2996r_result"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): le motif de boucle n'accuse pas l'architecte" \
+        "the architect never emitted" "$_m2996r_result
+$_m2996r_reason"
+    # AC-R4 — le trail : un jeton distinct, et pas de `-after-retry`.
+    assert_contains "mika#2996 ($_m2996r_site/refuse): le trail porte REFUSED-reader" \
+        "REFUSED-reader" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): le trail ne porte pas UNPARSED" \
+        "UNPARSED" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/refuse): aucune entrée -after-retry après un refus" \
+        "-after-retry" "$_m2996r_trail"
+
+    # ── Polarité `unparsed` : AC-R3, le contrôle négatif ─────────────────────
+    _m2996r_out=$(_groom_reader_refusal_probe_2996 "$_m2996r_site" unparsed) || _m2996r_out=""
+    _m2996r_result=$(printf '%s\n' "$_m2996r_out" | sed -n '/^RESULT_BEGIN$/,/^RESULT_END$/p' | sed '1d;$d')
+    _m2996r_reason=$(printf '%s\n' "$_m2996r_out" | sed -n '/^REASON_BEGIN$/,/^REASON_END$/p' | sed '1d;$d')
+    _m2996r_trail=$(printf '%s\n' "$_m2996r_out" | sed -n '/^TRAIL_BEGIN$/,/^TRAIL_END$/p' | sed '1d;$d')
+
+    assert_contains "mika#2996 ($_m2996r_site/unparsed): un UNPARSED réel relance toujours" \
+        "arch_calls=$_m2996r_calls_unparsed" "$_m2996r_out"
+    assert_contains "mika#2996 ($_m2996r_site/unparsed): le trail porte l'entrée -after-retry" \
+        "UNPARSED-after-retry" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/unparsed): aucun REFUSED-reader au trail" \
+        "REFUSED-reader" "$_m2996r_trail"
+    assert_not_contains "mika#2996 ($_m2996r_site/unparsed): aucune cause de refus dans RESULT" \
+        "disposition_reader_refused" "$_m2996r_result"
+    assert_not_contains "mika#2996 ($_m2996r_site/unparsed): aucune annexe de refus dans RESULT" \
+        "REFUSED (arch-disposition, mika#2194)" "$_m2996r_result"
+    # La cause d'un double UNPARSED reste celle de mika#2641 — sauf en première
+    # passe, dont le terminal (l. 11480) n'appelle pas `_escalate_groom` et ne
+    # pose donc aucune ligne de cause : son motif de boucle en tient lieu.
+    if [ "$_m2996r_site" = "first" ]; then
+        assert_contains "mika#2996 ($_m2996r_site/unparsed): le terminal de première passe est inchangé" \
+            "the architect never emitted a parsable 'Disposition:' line" "$_m2996r_reason"
+    else
+        assert_contains "mika#2996 ($_m2996r_site/unparsed): la cause architect_unreadable est inchangée" \
+            "Groom-halt-cause: architect_unreadable $_m2996r_stage" "$_m2996r_result"
+    fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mika#3030 — l'allowlist du worktree est construite par dispatch-lib, plus
+# copiée de l'allowlist de la session de l'opérateur.
+#
+# Le défaut fermé : `cp "$PLATFORM_DIR/.claude/settings.local.json"` rendait au
+# worktree les jokers de famille `Bash(gh pr:*)` / `Bash(gh issue:*)`. Une règle
+# allow des réglages court-circuite `can_use_tool`, donc la politique de
+# claude-pilot n'est JAMAIS interrogée pour la sous-commande couverte. mika#3024
+# a été ouvert par cette porte sans qu'aucune ligne de décision existe nulle
+# part. Rejoué hors ligne contre la politique installée, le geste rend `deny`.
+#
+# La sonde est FONCTIONNELLE : elle source dispatch-lib.sh, bâtit une fixture
+# qui porte ce que le ticket a mesuré, appelle `_seed_worktree_settings_allowlist`
+# et lit le fichier produit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "Test: mika#3030 — allowlist du worktree filtrée au seeding"
+
+# L'AC énonce une COUVERTURE (« aucune règle allow ne couvre une commande de
+# L »), pas une absence de sous-chaîne. Un `grep -v 'gh issue'` passerait sur
+# `Bash(gh issue *)` tout en manquant `Bash(gh:*)`. Ce matcher implémente la
+# sémantique de préfixe de Claude Code : `Bash(X)` → X ; X terminé par `:*` →
+# préfixe, donc le glob `X*` ; puis glob bash natif. `[[ ]]` ne fait pas de
+# word-splitting, donc un motif à espaces tient sans quoting.
+_t3030_covers() {
+    local entry=$1 cmd=$2 pat
+    case "$entry" in Bash\(*\)) pat=${entry#Bash(}; pat=${pat%)} ;; *) return 1 ;; esac
+    case "$pat" in *:\*) pat="${pat%:\*}*" ;; esac
+    # shellcheck disable=SC2053  # le glob est voulu : c'est le motif d'allowlist
+    [[ $cmd == $pat ]]
+}
+
+# Vrai si au moins une entrée de la liste (une par ligne, sur stdin) couvre $1.
+_t3030_any_covers() {
+    local cmd=$1 entry
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        if _t3030_covers "$entry" "$cmd"; then return 0; fi
+    done
+    return 1
+}
+
+# La liste L du ticket : ce qu'aucune règle allow du worktree ne doit couvrir.
+_T3030_FORBIDDEN=(
+    "gh issue create --title x"
+    "gh issue close 1"
+    "gh issue edit 1 --add-label ready"
+    "gh issue comment 1 --body x"
+    "gh pr merge 1"
+    "gh pr review 1 --approve"
+    "gh pr close 1"
+    "gh repo delete x"
+    "gh label create x"
+)
+
+# AC2 : les gestes du pipeline qui passaient par le joker copié restent permis.
+# `gh pr ready` n'y est PAS, et c'est délibéré — le contrat draft de mika
+# (#1613, #1682, #2624) interdit au pilote de rendre prête une PR ; voir le
+# contrôle négatif plus bas.
+_T3030_ALLOWED=(
+    "gh pr create --title x --body-file pr-body.md"
+    "gh pr view 1"
+    "gh pr edit 1 --add-label origin:loop"
+    "gh pr list --state open"
+    "gh pr diff 1"
+    "gh pr checks 1"
+    "gh issue view 3030"
+    "gh issue list --search x"
+)
+
+# Les entrées non-`gh` de l'allowlist de l'opérateur doivent SURVIVRE. Sans
+# cette famille, la famille « refus » passerait trivialement sur un filtre qui
+# jette tout — et on aurait livré un rétrécissement général en croyant livrer
+# un filtre.
+_T3030_PRESERVED=(
+    "Bash(cargo clippy:*)"
+    "Bash(ls:*)"
+    "Read(//home/x/**)"
+    "WebSearch"
+)
+
+# Écrit la fixture `platform/.claude/settings.local.json` sous $1.
+_t3030_write_fixture() {
+    local platform_dir=$1
+    mkdir -p "$platform_dir/.claude"
+    cat > "$platform_dir/.claude/settings.local.json" <<'T3030_FIXTURE'
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh issue *)",
+      "Bash(gh label *)",
+      "Bash(gh issue view:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(ls:*)",
+      "Read(//home/x/**)",
+      "WebSearch"
+    ]
+  }
+}
+T3030_FIXTURE
+}
+
+# Lance le seeding et imprime les entrées allow produites, une par ligne.
+# $3 = mode : "normal", "no-src" (source absente), "no-jq" (PATH sans jq).
+_t3030_seed_and_read() {
+    local base_dir=$1 mode=$2
+    local platform_dir="$base_dir/platform" worktree_dir="$base_dir/worktree"
+    mkdir -p "$worktree_dir/.claude"
+    [ "$mode" = "no-src" ] || _t3030_write_fixture "$platform_dir"
+    mkdir -p "$platform_dir/.claude"
+
+    (
+        # shellcheck disable=SC1091
+        source "$DISPATCH_LIB"
+        if [ "$mode" = "no-jq" ]; then
+            # Un PATH qui ne contient aucun jq : le repli doit s'armer.
+            PATH="$base_dir/empty-path"
+            mkdir -p "$PATH"
+            export PATH
+        fi
+        _seed_worktree_settings_allowlist "$platform_dir" "$worktree_dir" 2>/dev/null
+    )
+
+    local produced="$worktree_dir/.claude/settings.local.json"
+    [ -f "$produced" ] || { echo "__MISSING__"; return 0; }
+    # Lecture par jq quand il est là (le cas normal), sinon par un grep de
+    # forme — le repli écrit une entrée par ligne, entre guillemets.
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.permissions.allow[]?' "$produced" 2>/dev/null
+    else
+        sed -n 's/^ *"\(.*\)",\{0,1\}$/\1/p' "$produced"
+    fi
+}
+
+# ── Cas normal : jq présent, source présente ─────────────────────────────────
+_t3030_base=$(mktemp -d)
+_t3030_entries=$(_t3030_seed_and_read "$_t3030_base" normal)
+
+assert_not_contains "mika#3030: le seeding normal produit un fichier" \
+    "__MISSING__" "$_t3030_entries"
+
+# Famille 1 — refus (AC1). Aucune entrée produite ne couvre une commande de L.
+for _t3030_cmd in "${_T3030_FORBIDDEN[@]}"; do
+    if printf '%s\n' "$_t3030_entries" | _t3030_any_covers "$_t3030_cmd"; then
+        _t3030_verdict="COUVERTE"
+    else
+        _t3030_verdict="non couverte"
+    fi
+    assert_eq "mika#3030 AC1: le worktree ne couvre pas \`$_t3030_cmd\`" \
+        "non couverte" "$_t3030_verdict"
+done
+
+# Famille 2 — témoin positif (AC2). Un par geste du pipeline.
+for _t3030_cmd in "${_T3030_ALLOWED[@]}"; do
+    if printf '%s\n' "$_t3030_entries" | _t3030_any_covers "$_t3030_cmd"; then
+        _t3030_verdict="couverte"
+    else
+        _t3030_verdict="NON COUVERTE"
+    fi
+    assert_eq "mika#3030 AC2: le worktree couvre encore \`$_t3030_cmd\`" \
+        "couverte" "$_t3030_verdict"
+done
+
+# Famille 3 — contrôle négatif d'AC1 : une entrée de LECTURE reste présente.
+# Elle y est par RÉINJECTION (le filtre jette toutes les entrées `gh` avant
+# d'ajouter la liste close), pas par préservation. L'AC porte sur l'observable
+# — « reste présente dans le worktree » — et l'observable est identique. Noté
+# ici pour qu'une relecture n'y lise pas un contournement.
+assert_contains "mika#3030 AC1 (contrôle négatif): Bash(gh issue view:*) est dans le worktree" \
+    "Bash(gh issue view:*)" "$_t3030_entries"
+
+# Le contrat draft : aucune entrée ne rend prête une PR (#1613, #1682, #2624).
+# Le corps du ticket le dit explicitement — « Aucune entrée `gh pr ready` n'est
+# écrite ».
+if printf '%s\n' "$_t3030_entries" | _t3030_any_covers "gh pr ready 1"; then
+    _t3030_verdict="COUVERTE"
+else
+    _t3030_verdict="non couverte"
+fi
+assert_eq "mika#3030 AC2: aucune entrée ne couvre \`gh pr ready\` (contrat draft)" \
+    "non couverte" "$_t3030_verdict"
+
+# Famille 4 — contrôle positif du filtrage (R3). Les entrées non-`gh` de
+# l'allowlist de l'opérateur survivent : le vol n'est pas un rétrécissement
+# général.
+for _t3030_entry in "${_T3030_PRESERVED[@]}"; do
+    assert_contains "mika#3030 R3: l'entrée non-gh \`$_t3030_entry\` survit au filtre" \
+        "$_t3030_entry" "$_t3030_entries"
+done
+
+# Et aucun joker de famille `gh` ne subsiste.
+for _t3030_wild in "Bash(gh pr:*)" "Bash(gh issue:*)" "Bash(gh repo:*)" \
+                   "Bash(gh issue *)" "Bash(gh label *)"; do
+    assert_not_contains "mika#3030 AC1: le joker \`$_t3030_wild\` a disparu du worktree" \
+        "$_t3030_wild" "$_t3030_entries"
+done
+
+rm -rf "$_t3030_base"
+
+# ── Les deux cas de repli : fail-closed ──────────────────────────────────────
+# Chacun doit rendre un fichier qui porte la liste étroite, ne couvre aucune
+# commande de L, et ne porte AUCUNE entrée de la fixture — la preuve que le
+# repli n'a pas copié la source.
+for _t3030_mode in no-src no-jq; do
+    _t3030_base=$(mktemp -d)
+    _t3030_fb=$(_t3030_seed_and_read "$_t3030_base" "$_t3030_mode")
+
+    assert_not_contains "mika#3030 R5 ($_t3030_mode): le repli produit tout de même un fichier" \
+        "__MISSING__" "$_t3030_fb"
+    assert_contains "mika#3030 R5 ($_t3030_mode): le repli porte la liste étroite" \
+        "Bash(gh pr create:*)" "$_t3030_fb"
+
+    for _t3030_cmd in "${_T3030_FORBIDDEN[@]}"; do
+        if printf '%s\n' "$_t3030_fb" | _t3030_any_covers "$_t3030_cmd"; then
+            _t3030_verdict="COUVERTE"
+        else
+            _t3030_verdict="non couverte"
+        fi
+        assert_eq "mika#3030 R5 ($_t3030_mode): le repli ne couvre pas \`$_t3030_cmd\`" \
+            "non couverte" "$_t3030_verdict"
+    done
+
+    # La preuve du fail-closed : rien de la fixture n'a été recopié. Un repli
+    # naïf (`jq … || cp "$src" "$dst"`) reconstituerait le défaut, silencieusement,
+    # le jour où jq manque.
+    for _t3030_entry in "${_T3030_PRESERVED[@]}"; do
+        assert_not_contains "mika#3030 R5 ($_t3030_mode): le repli n'a pas copié \`$_t3030_entry\`" \
+            "$_t3030_entry" "$_t3030_fb"
+    done
+
+    rm -rf "$_t3030_base"
+done
+
+# ── Le matcher lui-même, sur ses trois formes réelles ────────────────────────
+# Un matcher faux rendrait toutes les assertions ci-dessus vertes pour la
+# mauvaise raison.
+_t3030_matcher_case() {
+    if _t3030_covers "$1" "$2"; then echo couvre; else echo "ne couvre pas"; fi
+}
+assert_eq "mika#3030 matcher: Bash(gh pr:*) couvre gh pr merge 1" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh pr:*)' 'gh pr merge 1')"
+assert_eq "mika#3030 matcher: Bash(gh issue *) couvre gh issue create --title x" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh issue *)' 'gh issue create --title x')"
+assert_eq "mika#3030 matcher: Bash(gh pr edit:*) couvre gh pr edit 1 --add-label origin:loop" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh pr edit:*)' 'gh pr edit 1 --add-label origin:loop')"
+assert_eq "mika#3030 matcher: Bash(gh pr edit:*) ne couvre PAS gh pr merge 1" \
+    "ne couvre pas" "$(_t3030_matcher_case 'Bash(gh pr edit:*)' 'gh pr merge 1')"
+assert_eq "mika#3030 matcher: Bash(gh:*) couvre gh issue create (le cas qu'un grep manque)" \
+    "couvre" "$(_t3030_matcher_case 'Bash(gh:*)' 'gh issue create --title x')"
+assert_eq "mika#3030 matcher: une entrée non-Bash ne couvre aucune commande" \
+    "ne couvre pas" "$(_t3030_matcher_case 'Read(//home/x/**)' 'gh issue create')"
+
+# ── AC4 — aucun `cp` d'un fichier de réglages vers le worktree ───────────────
+# La cible est le GESTE, pas la mention : les commentaires de scaffold nomment
+# `settings.local.json` sans `cp` devant, et le pathspec d'exclusion du rescue
+# non plus. Le `^[^#]*` écarte une ligne de commentaire ; le `[^;&|]*` borne la
+# lecture au segment du `cp`, de sorte qu'un `cp a b && echo settings.local.json`
+# ne compte pas.
+#
+# L'assertion est une ÉGALITÉ STRICTE à 0, jamais un `<= N`. Un seuil est une
+# exception sans date d'expiration : le registre d'exceptions de ce vol est vide
+# et doit le rester (Fire-Disposition, option (a)).
+_t3030_cp_count=$(grep -cE '^[^#]*\bcp\b[^;&|]*settings\.local\.json' "$DISPATCH_LIB" || true)
+assert_eq "mika#3030 AC4: aucun cp d'un settings.local.json dans dispatch-lib.sh" \
+    "0" "$_t3030_cp_count"
+
+# ── AC1, seconde porte — la source `project` tient par une ABSENCE ───────────
+# Le filtre ne tient AC1 que pour la source `local`. `.claude/settings.json` est
+# tracké par le dépôt et ne porte aujourd'hui que la clé `hooks` ; rien ne garde
+# cette absence. Un `permissions.allow` ajouté là rendrait `Bash(gh issue:*)` au
+# worktree par l'autre porte, avec le dépôt pour véhicule et le filtre
+# impuissant. Son propre `$comment` déclare déjà l'invariant — « noms de
+# fichiers distincts ET clés disjointes » ; ici on l'épingle du côté qui compte.
+assert_eq "mika#3030 AC1: le settings.json tracké (source project) ne porte aucune permission" \
+    "null" "$(jq -r '.permissions // "null"' "$REPO_ROOT/.claude/settings.json" 2>/dev/null)"
 
 # --- Summary ---
 

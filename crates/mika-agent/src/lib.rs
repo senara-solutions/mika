@@ -5,6 +5,8 @@ pub mod agent_loop;
 pub mod agent {
     pub use crate::agent_loop::*;
 }
+pub mod arch_disposition;
+pub mod arch_paraphrase;
 pub mod async_db;
 pub mod auth_boundary_ledger;
 pub mod auto_pull;
@@ -14,10 +16,18 @@ pub mod calibration;
 pub mod canonical_tokens;
 pub(crate) mod check_link;
 pub mod compaction;
+pub mod compaction_handsoff;
 pub mod config_keys;
+pub mod credit_hold;
 pub mod db;
 pub mod evidence;
+pub mod flight_source;
+pub mod flight_verdict_ledger;
+/// Le seul site `Command::new("gh")` de la suite `auto_pull` (mika#2713).
+/// Sous `#[cfg(test)]`, il ne spawne rien et refuse un vrai numéro d'issue.
+pub(crate) mod gh_process;
 pub(crate) mod github_graphql;
+pub mod groom_in_flight;
 pub mod grooming_marker;
 pub mod image_disposition;
 pub mod kg;
@@ -27,8 +37,10 @@ pub mod memory;
 pub mod merge_gate_rerun;
 pub mod messaging;
 pub mod milestone_manager;
+pub mod model_transmission;
 pub mod operational;
 pub mod panic_hook;
+mod parent_rehabilitation;
 pub mod perimeter;
 pub mod pilot_egress_stamp;
 pub mod pilot_launcher_health;
@@ -40,6 +52,9 @@ pub mod prompt;
 pub mod qa_build_callback;
 pub mod qa_head_supersession;
 pub mod qa_review_reconcile;
+pub mod qa_review_submission;
+pub(crate) mod qa_reviewed_head;
+pub mod read_receipt;
 pub mod ready_label;
 pub mod research;
 pub mod rewind;

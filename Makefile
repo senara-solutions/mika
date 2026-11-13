@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 BINARIES := mika mika-spirit mika-gateway
 
-.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-cause-token test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-release-debuginfo test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
+.PHONY: build build-dashboard deploy stop restart install install-permission-policy-plugin test-permission-policy-plugin test test-async-db-saturation test-dispatch-lib test-find-issue-plan measure-plan-header-coverage test-handler-crash-step test-measure-webhook-turn-cost test-measure-mika-subcommand-cost test-pr-origin test-rescue-signal test-rescue-closes-guard test-rescue-pipeline-verified test-rescue-tree-equals-main test-rescue-cause-token test-lean-tail-regression test-dispatch-symmetry test-pilot-egress-proxy test-sandbox-secret-argv test-pilot-phase2b-argv test-pilot-orientation-block test-demote-pipeline-failure test-github-token-not-in-sandbox test-sandbox-git-usable test-sandbox-gh-usable test-egress-sentinel-staging test-egress-sentinel-enforcement test-egress-push-bound test-egress-push-scope-staging test-egress-relay-socket-env test-shared-checkout-guard check-cta-primitives test-pilot-push-guard test-cwd-guard test-python-installer-guard test-issue-annotation-guard verify-no-secret-in-setenv verify-no-sigpipe-grep check-byte-slices check-substrate-leak check-image-tags-immutable check-pilot-instruction-paths check-dispatch-seats-declared check-pilot-turn-ceiling-labels check-root-files check-release-debuginfo check-release-tag check-install-major-gate check-suite-wiring test-verify-npm-publish verify-egress-no-log verify-egress-manifest verify-bundled-skills lint fmt check check-webhook-chain check-ngrok test-smoke-webhook-chain deploy-info clean help calibrate-mika-dev calibrate-mika-arch calibrate-mika-qa calibrate-mika-orchestrator
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -155,15 +155,22 @@ test: ## Run all tests
 	@bash scripts/test-check-pilot-push-sites.sh
 	@bash scripts/test-pr-origin-report.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
+	@bash skills/bundled/_shared/tests/test_pilot_phase2b_argv.sh
+	@bash skills/bundled/_shared/tests/test_demote_pipeline_failure.sh
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_gh_usable.sh
+	@bash skills/bundled/_shared/tests/test_egress_sentinel_staging.sh
+	@bash skills/bundled/_shared/tests/test_egress_sentinel_enforcement.sh
+	@bash skills/bundled/_shared/tests/test_egress_push_bound.sh
+	@bash skills/bundled/_shared/tests/test_egress_push_scope_staging.sh
 	@bash skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh
 	@bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 	@bash scripts/verify-egress-no-log.sh
 	@bash scripts/test-verify-egress-no-log.sh
+	@bash scripts/test-audit-egress-no-log.sh
 	@bash scripts/verify-egress-manifest.sh
 	@bash scripts/test-verify-egress-manifest.sh
 	@bash scripts/test-dispatch-symmetry.sh
@@ -177,8 +184,12 @@ test: ## Run all tests
 	@bash scripts/test-check-dispatch-seats-declared.sh
 	@bash scripts/check-pilot-turn-ceiling-labels.sh
 	@bash scripts/test-check-pilot-turn-ceiling-labels.sh
+	@bash scripts/check-root-files.sh
+	@bash scripts/test-check-root-files.sh
 	@bash scripts/check-issue-comment-patch-guard.sh
 	@bash scripts/test-annotate-issue-token-comment.sh
+	@bash scripts/check-pilot-instruction-paths.sh
+	@bash scripts/test-check-pilot-instruction-paths.sh
 	@python3 -B scripts/test-pilot-egress-proxy-status.py
 	@python3 -B scripts/test-pilot-egress-keepalive.py
 
@@ -188,6 +199,7 @@ test-async-db-saturation: ## Run async DB channel saturation regression test (mi
 test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it into CI)
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
 	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
+	@bash skills/bundled/_shared/tests/test_lean_tail_regression.sh
 
 test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
@@ -198,6 +210,12 @@ measure-plan-header-coverage: ## Report which plan headers the mika#2038 refutat
 test-measure-empty-turns: ## Pin the axis-B emptiness predicate and its four negative controls (mika#1910)
 	@bash scripts/test-measure-empty-turns.sh
 
+test-measure-webhook-turn-cost: ## Pin the webhook-turn register reader: the turn is a SUM, the release term, the crossing of the two taxonomies, the outcome joined by request_id — 4 positive + 16 negative controls (mika#2680, mika#2855)
+	@bash scripts/test-measure-webhook-turn-cost.sh
+
+test-measure-mika-subcommand-cost: ## Pin the S3 probe: both threshold polarities, the derived site count, the empty-population refusal — 6 controls, no real `mika` (mika#2194)
+	@bash scripts/test-measure-mika-subcommand-cost.sh
+
 test-rescue-signal: ## Run the rescue-into-open-PR signal suite (mika#2151)
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
 
@@ -207,12 +225,25 @@ test-rescue-closes-guard: ## Verify the rescue net only writes `Closes #N` when 
 test-rescue-pipeline-verified: ## Verify the `rescue-pipeline-verified` marker is measured, fail-closed, kill-switchable (mika#2354)
 	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
 
+# mika#3038 — ce target lance la suite SEULE. Sa porte de merge est l'étape
+# nommée du job `dispatch-lib-offline-suites` de ci.yml, pas ce target : un
+# target qu'aucun workflow ne nomme ne refuse rien (mika#2578).
+test-rescue-tree-equals-main: ## Verify no rescue draft opens on a head whose tree is already origin/main's (mika#3038)
+	@bash skills/bundled/_shared/tests/test_rescue_tree_equals_main.sh
+
 test-handler-crash-step: ## Verify a long-running handler names the step it crashed on, and arms its trap first (mika#2532)
 	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
 
 test-rescue-cause-token: ## Verify the rescue commit subject names its cause, derived from _halt_family (mika#2539)
 	@bash skills/bundled/_shared/tests/test_rescue_cause_token.sh
 	@bash skills/bundled/_shared/tests/test_rescue_commit_no_verify.sh
+
+# mika#2729 — ce target existe pour lancer la suite SEULE. Sa porte de merge,
+# elle, est la ligne ajoutée à `test-dispatch-lib` ci-dessus : ce que la suite
+# atteste vit dans `dispatch-lib.sh`, donc elle appartient à l'agrégat que le job
+# `Check` exécute déjà, et aucun nouveau step de `ci.yml` n'est dû.
+test-lean-tail-regression: ## Attest the lean-tail invocation detector — positive control, negative controls, mutation probes (mika#2729)
+	@bash skills/bundled/_shared/tests/test_lean_tail_regression.sh
 
 test-pilot-push-guard: ## Pin the PR-branch push guard and refuse unguarded push sites in skill handlers (mika#2520)
 	@bash skills/bundled/_shared/tests/test_pr_push_guard.sh
@@ -229,6 +260,15 @@ test-stamp-issue-seat: ## Verify dispatch-lib claims the issue with dispatch:loo
 test-sandbox-secret-argv: ## Verify no credential value reaches the pilot sandbox argv or trace (mika#2039 R8)
 	@bash skills/bundled/_shared/tests/test_sandbox_no_secret_in_argv.sh
 
+test-pilot-phase2b-argv: ## Verify the Phase 2b entrypoint passes the pilot argv as positional parameters (mika#2077)
+	@bash skills/bundled/_shared/tests/test_pilot_phase2b_argv.sh
+
+test-pilot-orientation-block: ## Verify the pilot is situated BEFORE it reads the ticket's host paths (mika#2108)
+	@bash skills/bundled/_shared/tests/test_pilot_orientation_block.sh
+
+test-demote-pipeline-failure: ## Verify a stale PIPELINE FAILURE block is demoted, never decapitated (mika#2077)
+	@bash skills/bundled/_shared/tests/test_demote_pipeline_failure.sh
+
 test-github-token-not-in-sandbox: ## Verify the GitHub token is host-reachable but sandbox-absent (mika#2056)
 	@bash skills/bundled/_shared/tests/test-pilot-github-token-not-in-sandbox.sh
 
@@ -237,6 +277,18 @@ test-sandbox-git-usable: ## Verify git works inside the pilot sandbox and contai
 
 test-sandbox-gh-usable: ## Verify gh leaves for the network inside the pilot sandbox, and stops on gh auth login without the placeholder (mika#2572)
 	@bash skills/bundled/_shared/tests/test_sandbox_gh_usable.sh
+
+test-egress-sentinel-staging: ## Verify the per-spawn egress sentinel is drawn, attested host-side, and that the argv value is the one the registry attests — operator switch and fail-open included (mika#2716)
+	@bash skills/bundled/_shared/tests/test_egress_sentinel_staging.sh
+
+test-egress-sentinel-enforcement: ## Verify the addon REQUIRES the egress sentinel on api.github.com — three refusal reasons, a DENY log that never discloses, TTL purge, github.com untouched, and the operator rollback honoured addon-side (mika#2724)
+	@bash skills/bundled/_shared/tests/test_egress_sentinel_enforcement.sh
+
+test-egress-push-bound: ## Verify the addon BOUNDS a git-receive-pack on github.com — seven refusal reasons, the declared perimeter's repository AND branch dimensions, the 4-byte auth probe and the chunked push still passing, the fetch untouched, and the dedicated rollback honoured (mika#2736, mika#2751, mika#2776)
+	@bash skills/bundled/_shared/tests/test_egress_push_bound.sh
+
+test-egress-push-scope-staging: ## Verify the launcher DECLARES the spawn's push perimeter host-side — repository AND branch coupled in one 0600 entry per spawn under a 0700 registry, the shape the addon reads, no reader of the switch, fail-open and call-time path included (mika#2751, mika#2776)
+	@bash skills/bundled/_shared/tests/test_egress_push_scope_staging.sh
 
 test-egress-relay-socket-env: ## Verify the egress relay socket is 0600, reachable from a bwrap pilot, and that the relay starts from a minimal environment — negative control included
 	@bash skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh
@@ -263,9 +315,10 @@ verify-no-secret-in-setenv: ## Verify no secret-shaped var reaches bwrap via --s
 	@bash scripts/verify-no-secret-in-setenv.sh
 	@bash scripts/test-verify-no-secret-in-setenv.sh
 
-verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour (mika#1810 E4 / mika#2054)
+verify-egress-no-log: ## Enforce no-log discipline on the egress substrate + pin the guard's negative behaviour + the runtime audit's declared event list (mika#1810 E4 / mika#2054 / mika#2788)
 	@bash scripts/verify-egress-no-log.sh
 	@bash scripts/test-verify-egress-no-log.sh
+	@bash scripts/test-audit-egress-no-log.sh
 
 verify-egress-manifest: ## Enforce manifest<->code lockstep on outbound sinks + pin the guard's four directions (mika#2408)
 	@bash scripts/verify-egress-manifest.sh --report
@@ -297,12 +350,30 @@ check-pilot-turn-ceiling-labels: ## Reject a PILOT_LABEL_TURN_CEILINGS key not d
 	@bash scripts/check-pilot-turn-ceiling-labels.sh
 	@bash scripts/test-check-pilot-turn-ceiling-labels.sh
 
+check-root-files: ## Reject a tracked file at the repo root that scripts/root-files-declared.txt does not declare + pin the guard's negative behaviour (mika#2760)
+	@bash scripts/check-root-files.sh
+	@bash scripts/test-check-root-files.sh
+
 check-release-debuginfo: ## Reject a [profile.release] that strips the line tables a wedged binary needs + pin the guard's negative behaviour (mika#1719)
 	@bash scripts/check-release-debuginfo.sh
 	@bash scripts/test-check-release-debuginfo.sh
 
+check-release-tag: ## Classify a release tag offline: vX.Y.Z-rc.N is a prerelease, never latest — install.sh installs latest (mika#2890)
+	@bash scripts/test-release-tag.sh
+
+check-install-major-gate: ## install.sh stops before a major change and names the migration guide, hors réseau (mika#2897)
+	@bash scripts/test-install-major-gate.sh
+
+check-suite-wiring: ## Reject a suite on disk that no workflow reaches and the registry does not declare + pin the guard's negative behaviour (mika#2761)
+	@bash scripts/check-suite-wiring.sh
+	@bash scripts/test-check-suite-wiring.sh
+
 test-verify-npm-publish: ## Exercise the post-publish verification hors réseau — AC1 (visible au 6e essai) et AC2 (jamais visible) (mika#2566)
 	@bash scripts/test-verify-npm-publish.sh
+
+check-pilot-instruction-paths: ## Reject host-workspace paths in the surface a pilot loads without asking + pin the guard's negative behaviour (mika#2108)
+	@bash scripts/check-pilot-instruction-paths.sh
+	@bash scripts/test-check-pilot-instruction-paths.sh
 
 verify-no-sigpipe-grep: ## Reject `printf|echo | grep -q` under pipefail (SIGPIPE trap, mika#2055)
 	@bash scripts/verify-no-sigpipe-grep.sh

@@ -36,6 +36,7 @@ fn make_identity(name: &str) -> Identity {
     Identity {
         name: name.to_string(),
         emoji: "M".to_string(),
+        enabled: None,
         reflection: None,
         heartbeat: None,
         kg: KgIdentityConfig::default(),
@@ -53,6 +54,7 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         identity,
         core_memory: &[],
         is_onboarding: false,
+        compaction_imminent: None,
         current_utc: Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap(),
         timezone: None,
         global_home_dir: None,
@@ -66,6 +68,7 @@ fn make_ctx<'a>(soul_content: &'a str, identity: &'a Identity) -> PromptContext<
         deployment: mika_common::home::Deployment::Unknown,
         persona_profile: mika_common::home::PersonaProfile::Operator,
         tenant_language: None,
+        pending_transmission: None,
     }
 }
 

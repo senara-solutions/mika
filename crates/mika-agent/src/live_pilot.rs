@@ -59,6 +59,26 @@
 //! the mika#2020 re-drive budget each round — three rounds abandon a perfectly
 //! healthy ticket to `operator-review`. These are not two errors of equal
 //! weight.
+//!
+//! # Three callers, and where the border runs (mika#2670)
+//!
+//! [`TaskPilot`] and [`resolve_task_pilot`] are `pub`, not `pub(crate)`, because
+//! the third caller lives in another crate: `mika-cli`'s `probe_pilot_liveness`,
+//! behind `mika tasks list` / `get` and the confirmation guard of
+//! `mika tasks cancel`. Until mika#2670 it redid the traversal on its own and
+//! **without the terminal filter**, so a terminal callback row still carrying a
+//! live pgid read "pilot alive" to the operator while the engine held it out of
+//! population — mika#2158's class again, on a display surface this time.
+//!
+//! The border it joins is the one the two in-crate callers already respect:
+//! **the traversal is shared, the classification stays at the caller.** A
+//! decision wants three fail-safe arms ([`LivePilotVerdict`], where `Unreadable`
+//! is never `Alive`); an operator wants informative outcomes, and distinguishes
+//! "dead pid" from "no pilot at all". Routing the CLI onto
+//! [`live_pilot_for_task`] would therefore have *lost* display, not gained
+//! uniformity — which is why this module exposes its traversal and not its
+//! verdict. The bound of the source scan that guards the composition is stated
+//! at [`resolve_task_pilot`].
 
 use tracing::warn;
 
@@ -186,7 +206,7 @@ pub async fn live_pilot_for_issue(db: &AsyncDatabase, issue_url: &str) -> LivePi
 /// identified. Those are two different questions with two different correct
 /// answers, and they stay at their two callers (see [`resolve_task_pilot`]).
 #[derive(Debug)]
-pub(crate) enum TaskPilot {
+pub enum TaskPilot {
     /// The named row is live and carries the pgid itself (the callback-row
     /// case). `start_time` is `None` when no usable `process_start_time` was
     /// read off it — the caller decides what an unidentifiable pgid means.
@@ -252,12 +272,26 @@ pub(crate) enum TaskPilot {
 ///    `Some(st)` only when the same instance is alive, a subset of what it
 ///    signals on `None`.
 ///
-/// # A source scan refuses a second composition
+/// # A source scan refuses a second composition — and where it stops
 ///
 /// `canonical_tokens::mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique`
 /// refuses any production file outside this module that composes a dispatch
-/// traversal, the terminal filter and [`is_same_process_alive`].
-pub(crate) async fn resolve_task_pilot(
+/// traversal, the terminal filter and [`is_same_process_alive`]. Its corpus is
+/// **not** `mika-agent` alone: `production_sources_to_test_module()` walks
+/// `crates` entirely, so `crates/mika-cli/src/commands/tasks.rs` was always
+/// inside it — a fact now pinned by
+/// `canonical_tokens::mika2670_le_corpus_du_scan_contient_la_cli`, because the
+/// sentence above becomes a lie in silence the day that walk narrows.
+///
+/// What let the CLI through was the **three-term conjunction**: it never called
+/// [`is_terminal_task_status`] — precisely because it had forgotten the filter
+/// (mika#2670). The scan is therefore exact rather than short-sighted, and a
+/// reader that *omits* the terminal filter is not named by it. Such a reader is
+/// named by review, and since mika#2670 it is also **prevented**: both handles
+/// of `find_dispatch_children_with_pid` are `pub(crate)`, so no site outside
+/// this crate can recompose the traversal at all. A scan says *you wrote that*;
+/// `pub(crate)` says *you cannot write it*.
+pub async fn resolve_task_pilot(
     db: &AsyncDatabase,
     task_id: &str,
     named: Option<&crate::db::Task>,

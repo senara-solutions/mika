@@ -347,6 +347,15 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Log full LLM request/response bodies at debug level (default: false)",
     },
+    // -- Fabrication-class P0 notification (mika#2867) --
+    ConfigKeyInfo {
+        key: "fabrication_p0_notify",
+        backend: ConfigBackend::File,
+        env_var: Some("MIKA_FABRICATION_P0_NOTIFY"),
+        secret: false,
+        description: "Notify the operator (P0) when a fabrication-class guard's \
+                      re-prompt budget is exhausted and the claim persists (default: false)",
+    },
     // -- Env backend (.env secrets) --
     ConfigKeyInfo {
         key: "openai_api_key",
@@ -561,6 +570,7 @@ pub fn get_effective_value(key: &str, settings: &Settings) -> Option<String> {
         "embedding_model" => Some(settings.embedding_model.clone()),
         "embedding_dimensions" => Some(settings.embedding_dimensions.to_string()),
         "dashboard_enabled" => Some(settings.dashboard_enabled.to_string()),
+        "fabrication_p0_notify" => Some(settings.fabrication_p0_notify.to_string()),
 
         // Per-provider: Anthropic
         "anthropic_model" => settings.anthropic_model.clone(),
@@ -1138,6 +1148,38 @@ pub struct Settings {
     #[serde(default)]
     pub surface_for_adoption: Option<String>,
 
+    /// Dedicated Telegram chat for `P0` operator notifications (mika#1381) —
+    /// « la boucle est morte », the class a human must act on.
+    ///
+    /// Env override: `MIKA_OPERATOR_ESCALATION_CHAT_ID`. The `MIKA_` prefix is
+    /// correct for the same reason as `surface_for_adoption` above: the value is
+    /// read by **mika-spirit** through the config-rs `MIKA_` cascade, whose
+    /// process env nothing clears.
+    ///
+    /// **A second surface rather than a flag**, because the problem it closes is
+    /// a mute: the operator mutes the chat carrying seventeen routine acks a day
+    /// and loses the breakage alarm with it. A "bypass-mute" bit cannot be
+    /// expressed on the Telegram side; a structurally distinct chat can, and the
+    /// operator keeps the mute.
+    ///
+    /// `None` is the nominal state — a single-channel deployment. A `P0` then
+    /// falls back to the normal chat with the `operator_escalation_chat_unset`
+    /// WARN, never dropped (D4). `Some(0)` is **refused as a route** for the
+    /// same reason: `chat_id == 0` is the documented "no reply channel" sentinel
+    /// that `GatewayMessageSender::send` short-circuits on (mika#650/#1090), so
+    /// honouring it here would swallow every P0 in silence.
+    ///
+    /// Since mika#2871 that same predicate is read at **boot**: with
+    /// [`Self::fabrication_p0_notify`] armed, a `None` or a `Some(0)` here
+    /// refuses startup rather than letting the fallback carry an operator P0 to
+    /// the end user's chat.
+    ///
+    /// `Option<i64>` and not `Option<u64>`: a Telegram group chat id is
+    /// negative. Only two of the sixteen `GatewayMessageSender::new` callsites
+    /// arm it — see `with_escalation_chat_id`.
+    #[serde(default)]
+    pub operator_escalation_chat_id: Option<i64>,
+
     /// First backoff step after a failed callback delivery, in seconds
     /// (mika#2179). Doubles per attempt up to
     /// [`Self::callback_delivery_backoff_max_secs`].
@@ -1159,6 +1201,17 @@ pub struct Settings {
     /// the pilot's return is real work nobody else will re-deliver).
     #[serde(default)]
     pub callback_delivery_backoff_max_secs: Option<u64>,
+
+    /// Intervalle de retenue après un 402 de crédit, en secondes (mika#2944).
+    ///
+    /// Env override: `MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS`.
+    ///
+    /// Default: [`DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS`] (900).
+    ///
+    /// `0` **désarme** la retenue et restaure l'échelle de mika#2179 pour le
+    /// 402 : interrupteur STOP déclaré, pas un plancher (doctrine mika#1833).
+    #[serde(default)]
+    pub callback_delivery_credit_hold_secs: Option<u64>,
 
     /// Per-call LLM HTTP plafond, in seconds (mika#2189 D1/D4).
     ///
@@ -1212,6 +1265,33 @@ pub struct Settings {
     /// lands (mika#1262). Default: false.
     #[serde(default)]
     pub operational_partner: bool,
+
+    /// Arm the `fabrication-detected` P0 notification (mika#2867). When a
+    /// fabrication-class guard has already spent its single re-prompt and the
+    /// claim persists, the engine always writes the `*_uncorrected` WARN; it
+    /// notifies the operator on the never-mute surface only when this is true.
+    ///
+    /// Ships **disarmed** on purpose (Fire-Disposition, mika#1574): the per-day
+    /// firing rate of the `assert_grounded` guard on real traffic is not yet
+    /// measured, and a P0 class that fires on every grounding re-prompt would
+    /// make `MIKA_OPERATOR_ESCALATION_CHAT_ID` mute in practice — the
+    /// "alarm-into-void" failure mika#1381 names. The WARN is the counting
+    /// instrument; arming is a separate decision, taken with the count in hand.
+    ///
+    /// Deliberately absent from `SETTABLE_CONFIG_KEYS` (like
+    /// `operational_partner`): it is an operator decision, not an agent one.
+    ///
+    /// **Arming requires a usable escalation chat, and that is now a machine
+    /// precondition (mika#2871 AC3).** With this `true` and
+    /// [`Self::operator_escalation_chat_id`] absent — or `Some(0)`, the
+    /// "no reply channel" sentinel — `mika-spirit` **refuses to start**, naming
+    /// the agent and the two exits
+    /// (`mika_agent::server::fabrication_p0_guard`). Without that refusal,
+    /// mika#1381's D4 fallback sends « the machine fabricated a claim » to the
+    /// normal chat, which on a tenant is the end user's own. Only the
+    /// documentation required the pair; the code requires it too now.
+    #[serde(default)]
+    pub fabrication_p0_notify: bool,
 
     /// Global permission-decision authority (mika#1733 AC3, AC8). Compile-time
     /// default is [`DecisionAuthority::Strict`]. Per-tenant / per-agent scopes
@@ -1515,6 +1595,19 @@ pub const DEFAULT_CALLBACK_DELIVERY_BACKOFF_MAX_SECS: u64 = 3600;
 /// setting meant to bound it. A backoff beyond thirty days has no meaning here
 /// anyway: the callback carries a pilot's return that someone is waiting on.
 pub const CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Intervalle de retenue par défaut après un 402 de crédit, en secondes
+/// (mika#2944). Quinze minutes.
+///
+/// Ce n'est pas un backoff : c'est le pas d'une **sonde**. Le 2026-10-28, les
+/// quatre reprises de la tâche 26b8d5c7 ont rejoué 60 tours de revue en
+/// soixante-cinq minutes, et la recharge est arrivée vers 08:51Z — un geste
+/// humain, dont le délai se compte en dizaines de minutes. Quinze minutes
+/// coûtent au pire **une** revue rejouée par intervalle au lieu d'une toutes
+/// les soixante secondes, et rendent la main au verdict dans le quart d'heure
+/// qui suit la recharge, ce que l'échelle de mika#2179 ne faisait qu'au bout
+/// d'une heure une fois quarantinée.
+pub const DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS: u64 = 900;
 
 /// Cost, in USD, above which a finished pilot dispatch is reported as an
 /// overrun (mika#2496).
@@ -1842,6 +1935,10 @@ impl Settings {
     /// résolveurs existent parce que la priorité dépend de la classe
     /// d'opération, pas de l'appelant. Toucher l'un sans lire l'autre est la
     /// façon dont cette règle se perdra.
+    ///
+    /// Troisième de la famille depuis mika#2963 :
+    /// [`Settings::resolve_ci_read_token`], App d'abord, pour les **lectures**
+    /// de CI.
     pub async fn resolve_github_token(
         &self,
         github_app: Option<&crate::github_app::GitHubApp>,
@@ -1900,6 +1997,11 @@ impl Settings {
     /// l'écriture qui est refusée — signalée par
     /// [`crate::label_write::LabelWriteToken::report_write_failure`] sous son
     /// propre nom, sans second essai au PAT qui échouerait de la même façon.
+    ///
+    /// Troisième de la famille depuis mika#2963 :
+    /// [`Settings::resolve_ci_read_token`], même cascade App-first pour les
+    /// **lectures** de CI, type rendu distinct — lire sa doc avant de vouloir
+    /// fondre les deux.
     pub async fn resolve_label_write_token(
         &self,
         github_app: Option<&crate::github_app::GitHubApp>,
@@ -1928,6 +2030,90 @@ impl Settings {
             return Some(LabelWriteToken::new(
                 pat.expose_secret().to_string(),
                 LabelWriteTokenSource::Pat,
+            ));
+        }
+        None
+    }
+
+    /// Résout le token des **lectures de CI** — App d'abord (mika#2963).
+    ///
+    /// App-first, pour la même raison que
+    /// [`Settings::resolve_label_write_token`] : lire les checks d'une tête est
+    /// une opération **non identitaire**. Aucune règle de la forge ne lit
+    /// l'auteur d'une lecture — personne ne sait, ni ne demande, qui a regardé.
+    /// Les opérations identitaires (approve, merge, review, comment) gardent
+    /// [`Settings::resolve_github_token`] (PAT-first) et ne passent pas par ici.
+    ///
+    /// # Pourquoi un troisième résolveur, et pas une factorisation
+    ///
+    /// La cascade est celle de `resolve_label_write_token` ; le **type rendu**
+    /// ne l'est pas. [`crate::label_write::LabelWriteToken`] n'a qu'une méthode
+    /// métier, `report_write_failure(scope, target, label, error)` — l'échec
+    /// d'une **écriture de label**, avec son numéro de cible et son nom de
+    /// label. Le réutiliser pour une lecture de checks le rendrait menteur sur
+    /// deux points : le `scope = "label_write"` de son WARN
+    /// `gh_app_token_exchange_failed`, et le vocabulaire de son rapport
+    /// d'échec. mika#2963 (AC4) veut compter les lectures CI par jeton,
+    /// mika#2228 veut compter les refus d'écriture de label ; les faire sortir
+    /// sous le même nom d'événement et le même `scope` rend les deux
+    /// populations inséparables — le défaut d'instrument que mika#2205 nomme.
+    ///
+    /// La tentation suivante est d'extraire la cascade commune et d'habiller
+    /// les trois résolveurs. `config.rs` ne le fait pas, et c'est délibéré :
+    /// `resolve_github_token` et `resolve_label_write_token` sont **déjà** deux
+    /// cascades écrites à la main, et la doc du second dit pourquoi il faut les
+    /// lire ensemble plutôt que les fondre. Factoriser reviendrait à toucher le
+    /// chemin `label_write` — en production depuis mika#2228, avec 34 refus
+    /// mesurés derrière lui — pour un gain d'une quinzaine de lignes, sur un
+    /// chemin que ce ticket n'a aucune raison de bouger.
+    ///
+    /// # La clé privée reste chez `github_app.rs` (AC1)
+    ///
+    /// Comme ses deux voisins, ce résolveur prend un
+    /// [`crate::github_app::GitHubApp`] **déjà construit** : il n'ajoute aucun
+    /// `from_settings`, aucun accès à `MIKA_GITHUB_APP_PRIVATE_KEY*`, et aucun
+    /// sink d'egress neuf — `installation_token()` est déjà déclaré dans
+    /// `docs/egress/egress-manifest.toml`, et son cache mémoire fait qu'une
+    /// lecture CI ne coûte pas un échange de jeton.
+    ///
+    /// # Échec de l'échange App
+    ///
+    /// On retombe sur le PAT, contrairement à `resolve_label_write_token` qui
+    /// s'y refuse. La différence est dans ce que coûte le second essai : une
+    /// écriture de label au PAT mesuré échouerait de la même façon en écrasant
+    /// la première erreur, alors qu'une **lecture** au PAT dégrade vers
+    /// exactement le régime d'avant ce ticket — échec sur `statusCheckRollup`,
+    /// gate fermé sur `GhCliFailure`. Un refus honnête, dit dans le log, jamais
+    /// du vert. Le WARN porte `scope = "ci_read"` pour que les deux populations
+    /// d'échec d'échange restent séparables.
+    pub async fn resolve_ci_read_token(
+        &self,
+        github_app: Option<&crate::github_app::GitHubApp>,
+    ) -> Option<crate::ci_read::CiReadToken> {
+        use crate::ci_read::{CiReadToken, CiReadTokenSource};
+
+        if let Some(app) = github_app {
+            match app.installation_token().await {
+                Ok(token) => {
+                    return Some(CiReadToken::new(token, CiReadTokenSource::App));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mika::github_auth",
+                        event = "gh_app_token_exchange_failed",
+                        error = %e,
+                        has_pat_fallback = self.github_token.is_some(),
+                        scope = "ci_read",
+                        "GitHub App token exchange failed for a CI read"
+                    );
+                }
+            }
+        }
+
+        if let Some(pat) = self.github_token.as_ref() {
+            return Some(CiReadToken::new(
+                pat.expose_secret().to_string(),
+                CiReadTokenSource::Pat,
             ));
         }
         None
@@ -2344,6 +2530,31 @@ impl Settings {
             )
     }
 
+    /// Intervalle de retenue effectif après un 402 de crédit (mika#2944).
+    ///
+    /// Trois tiers, et le premier est le seul qui ressemble aux accesseurs
+    /// mika#2179 voisins :
+    ///
+    /// * absent ⇒ [`DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS`] (900) ;
+    /// * `Some(0)` ⇒ **`0`**, et surtout pas `1`. C'est l'interrupteur STOP de
+    ///   la retenue, déclaré comme tel (doctrine mika#1833) : l'opérateur qui
+    ///   le pose veut retrouver l'échelle de mika#2179 sur le 402, et un clamp
+    ///   à `1` lui rendrait une retenue d'une seconde en prétendant l'avoir
+    ///   désarmée ;
+    /// * sinon, clampé dans `1..=`[`CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS`],
+    ///   pour la raison qui clampe déjà le backoff : la valeur atteint
+    ///   `chrono::Duration::seconds`, qui **panique** au-delà de
+    ///   `i64::MAX / 1000`, et la tâche mourrait dans la fonction même qui
+    ///   allait écrire le `next_fire_at`.
+    #[must_use]
+    pub fn effective_callback_delivery_credit_hold_secs(&self) -> u64 {
+        match self.callback_delivery_credit_hold_secs {
+            None => DEFAULT_CALLBACK_DELIVERY_CREDIT_HOLD_SECS,
+            Some(0) => 0,
+            Some(n) => n.clamp(1, CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS),
+        }
+    }
+
     /// Effective per-call LLM HTTP plafond, in seconds (mika#2189).
     ///
     /// Falls back to [`crate::llm::http_timeout_secs`] when unset, so the
@@ -2744,11 +2955,14 @@ impl Settings {
             pilot_cost_alert_usd: None,
             brief_size_alert_bytes: None,
             surface_for_adoption: None,
+            operator_escalation_chat_id: None,
             callback_delivery_backoff_base_secs: None,
             callback_delivery_backoff_max_secs: None,
+            callback_delivery_credit_hold_secs: None,
             kg_docs_root: None,
             kg_docs_roots: None,
             operational_partner: false,
+            fabrication_p0_notify: false,
             decision_authority: DecisionAuthority::Strict,
             permission_hold_timeout_secs: DEFAULT_PERMISSION_HOLD_TIMEOUT_SECS,
             webhook_queue_max_depth: None,
@@ -2888,12 +3102,20 @@ impl std::fmt::Debug for Settings {
             .field("kg_docs_root", &self.kg_docs_root)
             .field("kg_docs_roots", &self.kg_docs_roots)
             .field("operational_partner", &self.operational_partner)
+            .field("fabrication_p0_notify", &self.fabrication_p0_notify)
             .field("decision_authority", &self.decision_authority)
             .field(
                 "permission_hold_timeout_secs",
                 &self.permission_hold_timeout_secs,
             )
             .field("home_dir", &self.home_dir)
+            // In clear: a chat id is a routing destination, not a credential
+            // (mika#1381). Redacting it would hide the one value an operator
+            // debugging "my P0 went nowhere" needs to read.
+            .field(
+                "operator_escalation_chat_id",
+                &self.operator_escalation_chat_id,
+            )
             .finish()
     }
 }
@@ -2901,6 +3123,7 @@ impl std::fmt::Debug for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ci_read::CiReadTokenSource;
     use crate::label_write::LabelWriteTokenSource;
     use serial_test::serial;
 
@@ -3453,6 +3676,68 @@ mod tests {
         assert!(settings.github_token.is_none());
 
         assert!(settings.resolve_label_write_token(None).await.is_none());
+    }
+
+    // -- mika#2963 : lectures de CI, App d'abord (T3, AC1) --
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2963_ci_read_prefers_the_app_token_over_the_pat() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        // La configuration mesurée : PAT présent, authentifiant, incapable de
+        // lire `statusCheckRollup` (65 échecs sur mika-cloud, 11 sur
+        // mika-platform, 1 sur control-monitor, 2026-10-07 → 2026-10-29).
+        settings.github_token = Some("github_pat_test_value".to_string().into());
+
+        let app = crate::github_app::GitHubApp::new_with_test_token("ghs_app_installation").await;
+        let resolved = settings
+            .resolve_ci_read_token(Some(app.as_ref()))
+            .await
+            .expect("un token doit être résolu quand PAT et App sont là");
+
+        assert_eq!(resolved.token(), "ghs_app_installation");
+        assert_eq!(resolved.source(), CiReadTokenSource::App);
+
+        // Et le résolveur identitaire ne bouge pas (AC2, voie (i)) : la même
+        // configuration continue de rendre le PAT pour approve/merge/review.
+        let identity = settings.resolve_github_token(Some(app.as_ref())).await;
+        assert_eq!(identity.as_deref(), Some("github_pat_test_value"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2963_ci_read_falls_back_to_the_pat_when_no_app_is_configured() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+        settings.github_token = Some("github_pat_test_value".to_string().into());
+
+        // App absente : déploiement mono-identité, dépôt hors installation. Le
+        // repli dégrade vers le régime d'avant mika#2963 — lecture au PAT, et
+        // le log le dira (`source = "pat"`) plutôt que de le taire.
+        let resolved = settings
+            .resolve_ci_read_token(None)
+            .await
+            .expect("le PAT doit servir de repli quand l'App est absente");
+
+        assert_eq!(resolved.token(), "github_pat_test_value");
+        assert_eq!(resolved.source(), CiReadTokenSource::Pat);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn mika2963_ci_read_returns_none_when_nothing_is_configured() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert!(settings.github_token.is_none());
+
+        assert!(settings.resolve_ci_read_token(None).await.is_none());
     }
 
     #[test]
@@ -4305,6 +4590,68 @@ mod tests {
             // representable — this is the assertion the clamp exists for.
             let _ = chrono::Duration::seconds(
                 settings.effective_callback_delivery_backoff_max_secs() as i64,
+            );
+        }
+    }
+
+    // -- Retenue sur crédit épuisé (mika#2944) --
+
+    #[test]
+    #[serial]
+    fn callback_delivery_credit_hold_default_and_env_override() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert_eq!(settings.callback_delivery_credit_hold_secs, None);
+        assert_eq!(
+            settings.effective_callback_delivery_credit_hold_secs(),
+            900,
+            "quinze minutes : le pas d'une sonde, pas un backoff"
+        );
+
+        // Safety: test-only env var.
+        unsafe { std::env::set_var("MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS", "300") };
+        let settings = Settings::load(tmp.path()).unwrap();
+        assert_eq!(settings.effective_callback_delivery_credit_hold_secs(), 300);
+        unsafe { std::env::remove_var("MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS") };
+    }
+
+    /// `0` est un **interrupteur déclaré**, pas un plancher (doctrine mika#1833),
+    /// et les valeurs absurdes restent représentables pour `chrono`.
+    ///
+    /// Sans la première assertion, un clamp copié sur l'accesseur voisin rendrait
+    /// `1` : une retenue d'une seconde vendue comme un désarmement. Sans la
+    /// seconde, une valeur en millisecondes **paniquerait** dans la fonction même
+    /// qui allait écrire le `next_fire_at`.
+    #[test]
+    #[serial]
+    fn callback_delivery_credit_hold_zero_is_a_stop_switch_not_a_floor() {
+        clean_env();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::load(tmp.path()).unwrap();
+
+        settings.callback_delivery_credit_hold_secs = Some(0);
+        assert_eq!(
+            settings.effective_callback_delivery_credit_hold_secs(),
+            0,
+            "0 désarme la retenue et restaure l'échelle de mika#2179 — il ne vaut pas 1"
+        );
+
+        settings.callback_delivery_credit_hold_secs = Some(1);
+        assert_eq!(settings.effective_callback_delivery_credit_hold_secs(), 1);
+
+        // `i64::MAX as u64 + 1` est la valeur qui, sans clamp, **casse en
+        // négatif** à l'entrée de `chrono` ; `u64::MAX` est le pire cas.
+        for absurd in [(i64::MAX as u64) + 1, u64::MAX] {
+            settings.callback_delivery_credit_hold_secs = Some(absurd);
+            assert_eq!(
+                settings.effective_callback_delivery_credit_hold_secs(),
+                CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS
+            );
+            let _ = chrono::Duration::seconds(
+                settings.effective_callback_delivery_credit_hold_secs() as i64,
             );
         }
     }

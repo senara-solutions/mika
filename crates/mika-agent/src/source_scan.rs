@@ -137,6 +137,43 @@ pub(crate) fn strip_comment_lines(src: &str) -> String {
         .join("\n")
 }
 
+/// `needle` apparaît-il dans `line` à frontière de mot — à droite toujours,
+/// à gauche seulement si `left` ?
+///
+/// La frontière de droite est la pièce load-bearing, et le cas qui le prouve
+/// vit dans [`crate::parent_rehabilitation`], son premier appelant : la sonde de
+/// `parent_rehabilitation::decide` s'appelle `parent_rehabilitation_decided`,
+/// dont `decided` contient `decide`. Même classe que la frontière de gauche de
+/// mika#1833, qui sortait `per_budget` et `total_budget` de la population de
+/// `budget`.
+///
+/// **Pourquoi `left` est un paramètre et non les deux frontières en dur.** Les
+/// appelants ne cherchent pas la même forme d'aiguille. Un identifiant nu —
+/// `decide`, `budget`, la liaison du tick de mika#3047 — a besoin des deux
+/// frontières : sans celle de gauche, `per_budget` entre dans la population de
+/// `budget`. Un chemin qualifié (`parent_rehabilitation::decide`) n'en a pas
+/// l'usage, parce que ce qui le précède est toujours un `::` ou un début de
+/// ligne, donc jamais un caractère de mot ; le `false` de mika#3044 dit que
+/// cette frontière ne décide rien là, pas qu'on l'écarte. `false` est donc
+/// délibérément laxiste sur un **préfixe de mot** — une aiguille de la forme
+/// `faux_module::fonction` passerait — et c'est le test de ce fichier qui pose
+/// cette limite plutôt que de la laisser découvrir.
+///
+/// Extrait ici plutôt que recopié par garde : c'est la règle écrite de ce module
+/// (« un seul lecteur, pas une copie par garde »), et la classe que
+/// `grooming_marker` a dû graver une fois (mika#2158).
+pub(crate) fn occurs_at_boundary(line: &str, needle: &str, left: bool) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(needle).any(|(at, _)| {
+        let right_ok = !line[at + needle.len()..]
+            .chars()
+            .next()
+            .is_some_and(is_word);
+        let left_ok = !left || !line[..at].chars().next_back().is_some_and(is_word);
+        left_ok && right_ok
+    })
+}
+
 /// Découpe une source Rust en `(nom de fonction, corps)`, commentaires retirés.
 ///
 /// Les gardes structurelles de ce crate posent toutes la même question — *quelle
@@ -197,6 +234,81 @@ pub(crate) fn production_half(content: &str) -> &str {
         Some(i) => &content[..i],
         None => content,
     }
+}
+
+/// Tous les fichiers de production de `crates/mika-agent/src/`, en paires
+/// `(chemin relatif à `src/`, moitié production)`.
+///
+/// Le code de test est écarté deux fois, et les deux passes sont nécessaires :
+/// par le **chemin** ([`is_test_source_path`], la réparation mika#2321 — un
+/// module de test extrait ne porte aucun littéral `#[cfg(test)]`), puis par la
+/// **troncature** de [`production_half`] pour le `mod tests` inline du reste.
+///
+/// Le séparateur est normalisé en `/` : les assertions des gardes nomment des
+/// chemins, et un chemin qui dépend de la plateforme n'est pas un attendu.
+pub(crate) fn production_files() -> Vec<(String, String)> {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut paths = Vec::new();
+    walk(&root, &mut paths);
+    paths
+        .into_iter()
+        .filter(|p| !is_test_source_path(p))
+        .map(|p| {
+            let src = std::fs::read_to_string(&p).unwrap();
+            let prod = production_half(&src).to_string();
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, prod)
+        })
+        .collect()
+}
+
+/// Les fichiers de production qui passent `needle` à `log_audit_event` : la
+/// fenêtre lue est la ligne d'ouverture de l'appel et les quatre suivantes,
+/// parce qu'un appel d'audit est écrit sur cinq lignes par `rustfmt` et que le
+/// nom d'outil y est le deuxième argument.
+///
+/// **Le lecteur unique de ce prédicat.** Il vivait inline dans le `mod tests` de
+/// [`crate::qa_head_supersession`], où il tient les trois noms d'audit de
+/// mika#2671 ; mika#2917 l'a promu ici parce qu'une seconde garde pose la même
+/// question sur un quatrième nom. Promu plutôt que recopié : deux prédicats pour
+/// une question, dans deux fichiers, avec deux fenêtres à faire diverger, est la
+/// classe que `grooming_marker` a dû graver une fois (mika#2158 — une regex
+/// copiée dont le commentaire disait « Mirrors … » et qui a ensuite raté deux
+/// élargissements), et c'est la règle que ce module énonce pour lui-même.
+///
+/// `needle` est le **nom de la constante**, pas sa valeur : une garde qui
+/// cherchait le littéral ne verrait pas le site qui passe la constante, qui est
+/// précisément la forme qu'un écrivain correct emploie.
+pub(crate) fn audit_writers(needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rel, prod) in production_files() {
+        let lines: Vec<&str> = prod.lines().collect();
+        let writes = lines.iter().enumerate().any(|(i, l)| {
+            l.contains("log_audit_event(")
+                && lines[i..(i + 5).min(lines.len())]
+                    .iter()
+                    .any(|w| w.contains(needle))
+        });
+        if writes {
+            out.push(rel);
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(test)]
@@ -295,6 +407,62 @@ fn unrelated() {
             !other.contains("continuation"),
             "la continuation d'un bloc /* */ reste un commentaire : {other}"
         );
+    }
+
+    /// Les deux frontières de [`occurs_at_boundary`], chacune sur le cas réel
+    /// qui l'a rendue nécessaire (mika#3047 vol 2).
+    ///
+    /// Ce test est la raison pour laquelle le prédicat monte ici : il vivait
+    /// dans le `mod tests` de [`crate::parent_rehabilitation`], où un second
+    /// scan ne pouvait pas l'atteindre. Les deux cas ci-dessous ne sont pas
+    /// synthétiques — ce sont les deux faux positifs mesurés que les frontières
+    /// écartent.
+    #[test]
+    fn mika3047_les_deux_frontieres_du_predicat_de_token() {
+        // Frontière de droite — le cas de mika#3044 : la sonde du prédicat
+        // s'appelle `parent_rehabilitation_decided`, et `decided` contient
+        // `decide`.
+        assert!(!occurs_at_boundary(
+            "            event = \"parent_rehabilitation_decided\",",
+            "parent_rehabilitation::decide",
+            false
+        ));
+        assert!(occurs_at_boundary(
+            "    match crate::parent_rehabilitation::decide(db, &task).await {",
+            "parent_rehabilitation::decide",
+            false
+        ));
+
+        // Frontière de gauche — le cas de mika#1833 : `per_budget` et
+        // `total_budget` ne sont pas la population de `budget`.
+        assert!(!occurs_at_boundary("let per_budget = n;", "budget", true));
+        assert!(!occurs_at_boundary("let total_budget = n;", "budget", true));
+        assert!(occurs_at_boundary("let budget = n;", "budget", true));
+
+        // Un `::` n'est pas un caractère de mot, donc la frontière de gauche ne
+        // décide rien sur un chemin qualifié : les deux valeurs de `left`
+        // coïncident sur le site réel.
+        for left in [false, true] {
+            assert!(occurs_at_boundary(
+                "use crate::parent_rehabilitation::decide;",
+                "parent_rehabilitation::decide",
+                left
+            ));
+        }
+
+        // La limite de `left = false`, posée ici plutôt que laissée à
+        // découvrir : un **préfixe de mot** ne ferme pas la population. Aucune
+        // aiguille réelle n'en souffre aujourd'hui, et `true` la fermerait.
+        assert!(occurs_at_boundary(
+            "let d = faux_parent_rehabilitation::decide;",
+            "parent_rehabilitation::decide",
+            false
+        ));
+        assert!(!occurs_at_boundary(
+            "let d = faux_parent_rehabilitation::decide;",
+            "parent_rehabilitation::decide",
+            true
+        ));
     }
 
     #[test]

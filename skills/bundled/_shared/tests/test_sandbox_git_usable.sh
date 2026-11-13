@@ -21,7 +21,12 @@
 #   MUST WORK   rev-parse, status, log, add, commit, the remote resolving to
 #               https (not ssh — the sandbox has no key by design), and a
 #               committer identity (which lives only in the operator's
-#               ~/.gitconfig, blanked by --tmpfs /home).
+#               ~/.gitconfig, blanked by --tmpfs /home). And (mika#2108 vol 2)
+#               the README-SANDBOX the skeleton carries at the host root and at
+#               the sub-repo is readable and names the real working root.
+#
+#               Every launch carries that marker, so the MUST FAIL half below
+#               re-measures the containment on the argument set that adds it.
 #
 #   MUST FAIL   another worktree of the same repository, by path and through
 #               `git -C`; and deleting a branch head that is not this
@@ -158,6 +163,20 @@ stub_serving_egress_relay "$TMPROOT"
 _ensure_pilot_helper() { return 1; }
 _PILOT_SANDBOX_SECRET_ALLOWLIST=()
 
+# mika#2108 vol 2 — the two globals the README-SANDBOX marker is derived from.
+# They are born in `dispatch_claude_pilot`, which this suite does not run, so
+# without them `_pilot_sandbox_readme_args` takes its silent path and the
+# marker is simply absent: every assertion below would then measure the
+# PRE-marker argv and prove nothing about the arguments the marker adds. Set
+# here, before the first launch, they put the marker in EVERY sandbox this
+# suite starts — so the MUST FAIL half re-measures the mika#2141 containment
+# on the new argument set, and the MUST WORK half below proves that set was
+# actually in effect. FICTITIOUS paths under $TMPROOT, never the real host
+# root: the property is "the marker lands where the globals say", not its
+# spelling on one machine.
+PLATFORM_DIR="$TMPROOT/fake-host-root"
+SUB_REPO_DIR="$PLATFORM_DIR/fake-sub-repo"
+
 echo ""
 echo "MUST WORK — a real repository, inside the real sandbox"
 echo "------------------------------------------------------"
@@ -199,6 +218,32 @@ assert_eq "git add + git commit succeed inside the sandbox" "probe 2141" "$got_c
 # recoveries was silently substituting for.
 host_subject=$(git -C "$REPO_ROOT" log --oneline -1 --format=%s "$PROBE_BRANCH" 2>/dev/null)
 assert_eq "the commit is visible host-side on the branch head" "probe 2141" "$host_subject"
+
+echo ""
+echo "MUST WORK — the mount skeleton answers truthfully (mika#2108 vol 2)"
+echo "-------------------------------------------------------------------"
+# The two places where the skeleton used to answer FALSE — the host root, whose
+# first level lists what the host lists, and the sub-repo, which holds nothing
+# but `.git` — each carry a README-SANDBOX that names the real working root.
+# Without this half, the MUST FAIL half below cannot tell "contained, with the
+# marker" from "the marker never reached the namespace".
+#
+# Control first: neither path exists host-side. A README read inside is
+# therefore content `--ro-bind-data` materialised, not a host file leaking in.
+host_fake=$( [ -e "$PLATFORM_DIR" ] && echo present || echo absent )
+assert_eq "control: the fictitious host root does not exist host-side" "absent" "$host_fake"
+
+for readme_site in host-root sub-repo; do
+    case "$readme_site" in
+        host-root) readme_dest="$PLATFORM_DIR/README-SANDBOX" ;;
+        sub-repo)  readme_dest="$SUB_REPO_DIR/README-SANDBOX" ;;
+    esac
+    got_readme=$(_run_pilot_sandboxed /bin/sh -c "cat '$readme_dest' 2>/dev/null || echo unreadable" 2>/dev/null)
+    assert_contains "the $readme_site README is readable and names the real working root" \
+        "$WORKTREE_DIR" "$got_readme"
+    assert_contains "the $readme_site README declares the host workspace not mounted" \
+        "n'est PAS monté" "$got_readme"
+done
 
 echo ""
 echo "MUST FAIL — the containment AC2 exists to keep is still closed"

@@ -5,14 +5,33 @@
    pattern as `dashboard/src/index.css`. The six colour tokens this file used to
    declare were the rulebook's superseded "Override" row, which LC.1 (mika#1800)
    replaced in the shared theme without the change ever reaching this surface.
-   `theme.css` still exports `--color-bg`, `--color-bg-card`, `--color-accent`,
-   `--color-accent-light`, `--color-heading` and `--color-muted` as
-   backward-compat aliases onto the canonical values, so every `bg-accent` /
-   `text-muted` utility in this app keeps working and now resolves to canon.
+   Every `bg-accent` / `text-muted` utility in this app still resolves to canon
+   — but since mika#2913 the mechanism lives HERE, not in the lib, and that is
+   the thing to know when reading this file.
+
+   `theme.css` used to export `--color-bg`, `--color-bg-card`, `--color-accent`,
+   `--color-accent-light`, `--color-heading` and `--color-muted` as `var()`
+   aliases onto §2. That recoloured a whole unmigrated consumer on a minor bump
+   (mika-cloud#287), which Vincent called a regression, so the lib now freezes
+   those names at their 0.3.1 values. This landing is not an unmigrated
+   consumer — the rulebook is its law — so the block below takes canon back for
+   its 136 utilities, in `var()` form so it keeps tracking §2 when §2 moves
+   (and so `scripts/check-landing-tokens.sh` stays satisfied by construction).
+   Slaved by `packages/ui/src/theme.test.ts`: remove it and
+   `npm test -w packages/ui` fails.
+
    `--font-sans` / `--font-mono` were already identical to canon §3 and arrive
    with the import; `html { scroll-behavior: smooth }` does too.
 
    Only what is genuinely landing-specific stays below: the typing animation. */
+@theme {
+  --color-bg: var(--color-background);
+  --color-bg-card: var(--color-surface-container);
+  --color-accent: var(--color-primary);
+  --color-accent-light: var(--color-secondary);
+  --color-heading: var(--color-on-surface);
+  --color-muted: var(--color-on-surface-variant);
+}
 
 /* Typing cursor blink */
 @keyframes blink {

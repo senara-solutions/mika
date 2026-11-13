@@ -138,6 +138,7 @@ async fn ci_success_milestone_manager_pr_holds_for_operator() -> Result<()> {
         &db,
         Some("fake-token"),
         None,
+        None,
         SESSION_ID,
         "trace-porte1-ci",
     )
@@ -247,6 +248,7 @@ async fn mika2260_le_relecteur_est_transparent_a_levenement() -> Result<()> {
             // exactement ce qui distingue les deux états.
             None,
             None,
+            None,
             &session,
             "trace-2260-negatif",
         )
@@ -283,6 +285,7 @@ async fn mika2260_le_relecteur_est_transparent_a_levenement() -> Result<()> {
     let action = try_handle_ci_success(
         CHECK_SUITE_TEXT,
         &db,
+        None,
         None,
         None,
         session,

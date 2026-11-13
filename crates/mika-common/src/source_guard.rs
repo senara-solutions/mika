@@ -800,11 +800,18 @@ fn declarations_in_masked_regions(content: &str) -> Vec<ModuleDeclaration> {
     let lines: Vec<&str> = content.lines().collect();
     let clean = lines_starting_outside_a_literal(&lines);
     let masked = mask_test_regions(content);
-    let region: Vec<&str> = masked
-        .lines()
-        .enumerate()
-        .filter(|(i, line)| line.is_empty() && !lines[*i].is_empty() && clean[*i])
-        .map(|(i, _)| lines[i])
+    let masked_lines: Vec<&str> = masked.lines().collect();
+    let region: Vec<&str> = (0..lines.len())
+        .filter(|&i| {
+            // A masked last line becomes the empty tail of a `join("\n")`, which
+            // `str::lines` does not yield — so an **absent** entry here is a
+            // masked line, not an unmasked one (mika#3023). Indexing rather than
+            // zipping is what makes that distinguishable at all.
+            masked_lines.get(i).is_none_or(|line| line.is_empty())
+                && !lines[i].is_empty()
+                && clean[i]
+        })
+        .map(|i| lines[i])
         .collect();
     parse_declarations(&region)
 }
@@ -1404,6 +1411,32 @@ pub fn before() {}
         assert_eq!(decls[0].name, "mock");
         assert!(decls[0].chain.is_empty());
         assert!(decls[0].path_attribute.is_none());
+    }
+
+    /// A declaration masked on the file's **last** line is still read (mika#3023).
+    ///
+    /// `str::lines` yields no entry for the empty line a `join("\n")` leaves at
+    /// the end, so a region closing on the last line used to fall off the end of
+    /// the masked view and the declaration inside it was never resolved. The
+    /// shape is not exotic: `rustfmt` ends every file with exactly one newline,
+    /// so a parent whose `#[cfg(test)] mod tests;` is its final item — the
+    /// canonical placement, and the one `source_scan::production_half`'s anchor
+    /// expects — lands on it by construction. Measured on
+    /// `mika-agent/src/agent_loop/mod.rs`: KTD3 answered `false` for
+    /// `agent_loop/tests/mod.rs`, with an **empty** `unresolved()` list, so the
+    /// coherence guard of mika#2398 stayed green while ~9 800 lines of test code
+    /// were handed to every guard as production.
+    #[test]
+    fn mika3023_a_declaration_masked_on_the_last_line_is_still_read() {
+        let decls = declarations_in_masked_regions("fn f() {}\n\n#[cfg(test)]\nmod tests;\n");
+        assert_eq!(
+            decls.len(),
+            1,
+            "a `#[cfg(test)] mod tests;` closing the file is the canonical placement; \
+             reading it as absent silently reclassifies the whole module as production"
+        );
+        assert_eq!(decls[0].name, "tests");
+        assert!(decls[0].chain.is_empty());
     }
 
     #[test]

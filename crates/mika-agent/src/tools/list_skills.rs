@@ -5,7 +5,6 @@ use serde_json::Value;
 
 use super::{Tool, ToolContext, ToolOutput};
 use crate::bundled_skills::is_bundled_skill;
-use crate::skills::SkillRegistry;
 use crate::skills::marketplace::get_marketplace_entry;
 
 pub struct ListSkillsTool;
@@ -43,26 +42,22 @@ impl Tool for ListSkillsTool {
 
     async fn execute(&self, _input: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput> {
         let skills_dir = ctx.home_dir.join("skills");
-        let mut registry = SkillRegistry::from_dir(&skills_dir);
-
-        // Apply identity allowlist then DB overrides so the listing reflects effective values
+        // This listing's whole contract is "what the startup paths would load",
+        // and it used to hold a second copy of the sequence to stay in parity.
+        // It now goes through the single assembler (mika#2889): parity is no
+        // longer something this site maintains, it is the same code.
         let identity = crate::prompt::load_identity(ctx.home_dir);
-        if let Some(ref allowlist) = identity.skills.allowlist {
-            registry.apply_identity_allowlist(allowlist);
-        }
-        if let Ok(overrides) = ctx.db.get_skill_overrides(ctx.db.agent_id()).await {
-            registry.apply_overrides(&overrides);
-        }
-        // Phase 2 (mika#1798): testimony-grade ban — keep listing in parity with startup paths.
-        registry.apply_testimony_grade_ban();
-
-        // Run load-time crash-protection to promote broken-handler/tools.json skills to skipped,
-        // matching the startup paths (chat.rs, ask.rs, server/mod.rs).
-        registry.apply_load_safety_check();
-        // Runtime allowlist↔required_tools coherence guard (mika#1576) — keep the
-        // listing in parity with the startup paths (chat.rs, ask.rs, server/mod.rs).
-        registry.apply_required_tools_coherence_check(ctx.db.agent_id());
-        registry.log_summary();
+        let overrides = ctx
+            .db
+            .get_skill_overrides(ctx.db.agent_id())
+            .await
+            .unwrap_or_default();
+        let registry = crate::skills::assembly::assemble_agent_registry(
+            &skills_dir,
+            &identity,
+            &overrides,
+            ctx.db.agent_id(),
+        );
 
         let entries = registry.skills();
 

@@ -27,7 +27,14 @@
 //! - retirer l'appel `set_task_dispatcher_source` ⇒ la même rougit sur l'autre
 //!   moitié ;
 //! - rendre `EngineDispatchResult::Deferred` en `Dispatched` ⇒
-//!   `un_creneau_occupe_refuse_au_lieu_de_differer` rougit.
+//!   `un_creneau_occupe_refuse_au_lieu_de_differer` rougit ;
+//! - remettre le prédicat d'avant mika#2796 — `input.to_string().contains("2504")`
+//!   sur la chaîne **entière**, soit retirer le filtre d'exclusion de
+//!   `champs_portant_le_nombre` ⇒
+//!   `mika2796_un_task_id_portant_les_chiffres_du_numero_de_pr_ne_declenche_rien`
+//!   rougit, et **elle seule**. C'est le flake du run 39160328822, rendu
+//!   déterministe : un UUID v4 qui se termine par `…7f2504` suffisait à faire
+//!   rougir un `input` correct.
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, NewTask};
@@ -317,6 +324,63 @@ async fn run_nominal(db: &AsyncDatabase, skills: &SkillRegistry, context: &str) 
     .await
 }
 
+/// Les clés de l'`input` de dispatch dont la valeur est **frappée par le moteur**
+/// et ne dérive en rien de la requête de l'opérateur.
+///
+/// mika#2796 : exclues du contrôle négatif, parce qu'un UUID v4 porte ~20
+/// chiffres décimaux répartis en segments, et qu'une sous-chaîne décimale de 4
+/// chiffres donnée y tombe environ **une fois sur 4 400** (15 fenêtres
+/// utiles × 16⁻⁴ : les segments 3 et 4 commencent par `4` et `[89ab]`). Le CI requis de la PR
+/// mika#2787 (run 39160328822, 2026-10-18) a rougi sur
+/// `task_id = "fcc4cf43-9b62-4b0d-8281-06046a7f2504"` alors que l'`input` était
+/// correct — le prédicat d'alors lisait la chaîne entière.
+///
+/// L'exclusion ne dissimule aucune fuite : la valeur de `task_id` est vérifiée
+/// **exactement** par `le_nombre_qui_voyage_est_le_numero_d_issue`
+/// (`assert_eq!` contre le `task_id` rendu par l'outcome), donc le seul champ
+/// retiré du balayage est aussi le seul dont la valeur est pinnée au byte.
+const CLES_NON_DERIVEES_DE_LA_REQUETE: [&str; 1] = ["task_id"];
+
+/// Rend, sous la forme `clé=valeur`, les champs de l'`input` de dispatch dont la
+/// valeur porte `nombre` — hors [`CLES_NON_DERIVEES_DE_LA_REQUETE`]. Vide =
+/// aucune fuite.
+///
+/// # Trois propriétés, chacune porteuse
+///
+/// - **Le balayage porte sur les sous-arbres, pas sur les scalaires.** C'est le
+///   `to_string()` du sous-arbre qui est lu, donc un champ qui deviendrait un
+///   objet reste couvert sans qu'on y pense : c'est la lecture du « tout champ
+///   libre » de mika#2796.
+/// - **Le défaut est d'INCLURE.** La liste est une **exclusion**, pas une liste
+///   de champs à regarder : un cinquième champ ajouté au `json!` de production
+///   (`server/verdict_handler.rs`) entre dans le contrôle le jour où il est
+///   écrit. Une liste d'inclusion (`prompt` + `iteration_context`) aurait la
+///   forme que mika#2309 condamne — un contrôle qui cesse de couvrir ce qu'il
+///   devait couvrir, sans rougir.
+/// - **L'exclusion ne peut pas devenir muette en silence.** Chaque clé exclue
+///   doit être présente, sinon panique : un renommage en production ferait
+///   sinon re-balayer l'UUID, et le flake reviendrait sans que rien ne le dise.
+fn champs_portant_le_nombre(input: &serde_json::Value, nombre: &str) -> Vec<String> {
+    let obj = input
+        .as_object()
+        .expect("l'`input` de dispatch est un objet JSON");
+    for cle in CLES_NON_DERIVEES_DE_LA_REQUETE {
+        assert!(
+            obj.contains_key(cle),
+            "la clé exclue `{cle}` a disparu de l'`input` de dispatch : l'exclusion \
+             ne désigne plus rien, le balayage reviendrait sur un identifiant \
+             aléatoire et le flake de mika#2796 avec lui. Remède : retirer la clé \
+             de CLES_NON_DERIVEES_DE_LA_REQUETE si le champ a disparu, ou l'y \
+             renommer s'il a été renommé. Input vu : {input}"
+        );
+    }
+    obj.iter()
+        .filter(|(cle, _)| !CLES_NON_DERIVEES_DE_LA_REQUETE.contains(&cle.as_str()))
+        .filter(|(_, valeur)| valeur.to_string().contains(nombre))
+        .map(|(cle, valeur)| format!("{cle}={valeur}"))
+        .collect()
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // V5 — le nombre qui voyage est le numéro d'ISSUE (R2, AC2)
 // ───────────────────────────────────────────────────────────────────────────
@@ -327,9 +391,14 @@ async fn run_nominal(db: &AsyncDatabase, skills: &SkillRegistry, context: &str) 
 /// (`gh issue view "$ISSUE_NUM"`, puis `derive-branch-name --issue "$ISSUE_NUM"`).
 /// La PR est résolue **uniquement** pour vérifier les préconditions.
 ///
-/// Contrôle négatif porteur : le numéro de PR (`2504`) ne doit apparaître
-/// **nulle part** dans l'`input` de dispatch. Sans lui, l'assertion positive
-/// serait satisfaite par un `prompt` contenant les deux.
+/// Contrôle négatif porteur : le numéro de PR (`2504`) ne doit apparaître dans
+/// aucun champ **dérivé de la requête** de l'`input` de dispatch. Sans lui,
+/// l'assertion positive serait satisfaite par un `prompt` contenant les deux.
+///
+/// Le `task_id` est exclu du balayage (mika#2796) : son UUID est frappé par le
+/// moteur, ne dérive en rien de la requête, et sa valeur est vérifiée
+/// **exactement** plus bas. Une doc qui promettrait « nulle part » est ce qui
+/// fait qu'on « répare » l'assertion dans le mauvais sens à la lecture suivante.
 #[tokio::test]
 async fn le_nombre_qui_voyage_est_le_numero_d_issue() {
     let tmp = tempfile::tempdir().unwrap();
@@ -365,6 +434,15 @@ async fn le_nombre_qui_voyage_est_le_numero_d_issue() {
     );
     assert_eq!(input["skill"].as_str(), Some("dev-pilot"));
     assert_eq!(input["task_id"].as_str(), Some(task_id.as_str()));
+    // L'égalité ci-dessus compare deux sorties du même `create_task` : elle ne
+    // prouve pas que la valeur est frappée par le moteur. C'est la prémisse de
+    // l'exclusion de `CLES_NON_DERIVEES_DE_LA_REQUETE` (mika#2796), donc elle
+    // est vérifiée ici plutôt que supposée.
+    assert!(
+        uuid::Uuid::parse_str(&task_id).is_ok(),
+        "le `task_id` exclu du contrôle négatif doit être un UUID frappé par le \
+         moteur, pas une valeur dérivée de la requête : {task_id}"
+    );
     assert_eq!(
         input["iteration_context"].as_str(),
         Some("rebase puis corrige le lint SIGPIPE"),
@@ -372,13 +450,122 @@ async fn le_nombre_qui_voyage_est_le_numero_d_issue() {
          session (self-dev Rule 4)"
     );
 
-    // Contrôle négatif : aucune trace du numéro de PR.
-    let serialized = input.to_string();
+    // Contrôle négatif : aucun champ DÉRIVÉ DE LA REQUÊTE ne porte le numéro de
+    // PR. Le `task_id` est exclu (mika#2796) — son UUID n'a aucun rapport avec
+    // la requête, et sa valeur est vérifiée exactement deux assertions plus
+    // haut.
+    let porteurs = champs_portant_le_nombre(&input, "2504");
     assert!(
-        !serialized.contains("2504"),
-        "le numéro de PR ne doit apparaître nulle part dans l'input de \
-         dispatch — `dispatch-lib` le lirait comme un numéro d'issue : {serialized}"
+        porteurs.is_empty(),
+        "le numéro de PR ne doit apparaître dans aucun champ dérivé de la requête \
+         — `dispatch-lib` le lirait comme un numéro d'issue : {porteurs:?} \
+         (input complet : {input})"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// mika#2796 — le prédicat du contrôle négatif, mesuré
+// ───────────────────────────────────────────────────────────────────────────
+//
+// `champs_portant_le_nombre` est un **détecteur** : son chemin de succès est
+// « aucune violation trouvée ». Un détecteur dont nul ne mesure ni le silence ni
+// la capacité à rougir est une garde qui ne refuse rien. Les trois tests qui
+// suivent sont synchrones — ni base ni tokio : le sujet est une
+// `serde_json::Value`.
+
+/// **Le rouge-avant de mika#2796, figé.**
+///
+/// L'`input` exact du run 39160328822 (CI requis de la PR mika#2787,
+/// 2026-10-18), UUID `fcc4cf43-9b62-4b0d-8281-06046a7f2504` verbatim. Les quatre
+/// champs sont ceux que `server/verdict_handler.rs` compose, et l'`input` est
+/// **correct** : `prompt` porte le numéro d'issue, `iteration_context` le texte
+/// de l'opérateur. Seul le `task_id` se termine par `…7f2504`.
+///
+/// Sous le prédicat d'avant — `!input.to_string().contains("2504")` — ce test
+/// échoue. C'est le flake, rendu déterministe et nommé.
+#[test]
+fn mika2796_un_task_id_portant_les_chiffres_du_numero_de_pr_ne_declenche_rien() {
+    let input = serde_json::json!({
+        "skill": "dev-pilot",
+        "prompt": "mika#2503",
+        "task_id": "fcc4cf43-9b62-4b0d-8281-06046a7f2504",
+        "iteration_context": "rebase puis corrige le lint SIGPIPE",
+    });
+
+    assert_eq!(
+        champs_portant_le_nombre(&input, "2504"),
+        Vec::<String>::new(),
+        "un UUID qui porte par hasard les chiffres du numéro de PR n'est pas une \
+         fuite : la valeur du `task_id` est frappée par `create_task` et ne dérive \
+         en rien de la requête (mika#2796)"
+    );
+}
+
+/// **Le contrôle reste capable de rougir** — et il nomme le champ coupable.
+///
+/// Deux cas, tous deux sur la forme de production : le numéro de PR semé dans le
+/// champ libre `iteration_context`, puis dans `prompt` (la fuite réelle que
+/// mika#2506 existe pour refuser — `dispatch-lib` lirait `mika#2504` comme un
+/// numéro d'issue).
+///
+/// L'égalité porte sur la liste **entière**, pas sur sa non-vacuité : un prédicat
+/// qui rendrait tous les champs rougirait aussi « correctement » sans rien
+/// discriminer, et le message d'échec ne dirait plus lequel transporte le nombre.
+///
+/// Les deux `task_id` sont **neutres** — aucun ne porte `2504` — et c'est
+/// délibéré : le sujet de ce test est la capacité à rougir, pas l'exclusion.
+/// Un UUID pathologique ici lui ferait mesurer les deux, et le rouge-avant V2 du
+/// plan cesserait de discriminer (il rougirait ce test *et* celui du flake).
+/// La charge de l'exclusion appartient à
+/// `mika2796_un_task_id_portant_les_chiffres_du_numero_de_pr_ne_declenche_rien`,
+/// seul.
+#[test]
+fn mika2796_le_controle_rougit_quand_le_nombre_voyage_dans_un_champ_libre() {
+    let dans_le_champ_libre = serde_json::json!({
+        "skill": "dev-pilot",
+        "prompt": "mika#2503",
+        "task_id": "7b1e0a6d-4c88-4f1a-9ea7-30d55bc1ef80",
+        "iteration_context": "reprends la PR 2504 et corrige le lint",
+    });
+    assert_eq!(
+        champs_portant_le_nombre(&dans_le_champ_libre, "2504"),
+        vec!["iteration_context=\"reprends la PR 2504 et corrige le lint\"".to_string()],
+        "le champ libre est balayé, et le message nomme le champ — pas seulement \
+         le blob"
+    );
+
+    let dans_le_prompt = serde_json::json!({
+        "skill": "dev-pilot",
+        "prompt": "mika#2504",
+        "task_id": "fcc4cf43-9b62-4b0d-8281-06046a7f2503",
+        "iteration_context": "rebase puis corrige le lint SIGPIPE",
+    });
+    assert_eq!(
+        champs_portant_le_nombre(&dans_le_prompt, "2504"),
+        vec!["prompt=\"mika#2504\"".to_string()],
+        "la fuite que mika#2506 existe pour refuser doit être trouvée, et nommée \
+         `prompt=`"
+    );
+}
+
+/// **L'assertion auto-nettoyante.**
+///
+/// Si `task_id` est renommée ou retirée du `json!` de production, l'exclusion ne
+/// désigne plus rien : le balayage reviendrait sur l'UUID et le flake de
+/// mika#2796 avec lui, sans que rien ne le dise. Ce test fait rougir le
+/// renommage à la place — c'est ce qui empêche l'exception de devenir muette.
+#[test]
+#[should_panic(expected = "la clé exclue `task_id` a disparu")]
+fn mika2796_lexclusion_du_task_id_rougit_si_la_cle_disparait() {
+    let input = serde_json::json!({
+        "skill": "dev-pilot",
+        "prompt": "mika#2503",
+        // Renommée : exactement ce que ferait un refactor de production.
+        "dispatch_task_uuid": "fcc4cf43-9b62-4b0d-8281-06046a7f2504",
+        "iteration_context": "rebase puis corrige le lint SIGPIPE",
+    });
+
+    let _ = champs_portant_le_nombre(&input, "2504");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

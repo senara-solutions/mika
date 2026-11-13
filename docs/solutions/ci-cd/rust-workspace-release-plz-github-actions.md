@@ -29,7 +29,7 @@ superseded_by: release-please
 
 # Automated Release System for Rust Workspace with Cross-Platform Binaries
 
-> **Historical document.** This describes the release-plz setup (Stage 1, 2026-03-01 → 2026-04-03). The current release automation uses `googleapis/release-please-action` — see `release-please-config.json` at repo root. Retained for institutional memory per the chronic-drift compound doc.
+> **Historical document.** This describes the release-plz setup (Stage 1, 2026-03-01 → 2026-04-03). Its successor, release-please, was itself removed in mika#2890. Releases are now cut from an operator-pushed tag by `.github/workflows/release.yml` (see `release-automation-chronic-drift-2026-04-23.md` § Stage 6). Retained for institutional memory per the chronic-drift compound doc.
 
 ## Problem Statement
 

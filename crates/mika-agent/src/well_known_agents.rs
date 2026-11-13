@@ -321,6 +321,7 @@ allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
   \"qa-review-webhook-success\",\n\
+  \"qa-review-webhook-ready\",\n\
   \"skill-review\",\n\
   \"build-mika\",\n\
   \"deploy-mika\",\n\
@@ -377,6 +378,10 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
 /// - Cross-agent invocation: mika-arch is advisory; it does not initiate
 ///   activity in other agents' lanes (target-agent boundary leak)
 /// - Agent / team mutations: provisions/edits other agents and teams
+/// - Orphaned reads (mika#2593): a read whose entire write family is denied
+///   above — it prepares a decision this agent cannot make
+/// - Deferred-dispatch slot ledger (mika#2593): a write, in a lane this agent
+///   does not own
 ///
 /// Notably allowed:
 /// - `send_message`: writes to mika-arch's own session history. Constitutive
@@ -387,6 +392,49 @@ pub static MIKA_ARCH: WellKnownAgent = WellKnownAgent {
 ///   scoped to `agent_id = 'mika-arch'`). Constitutive of being an agent —
 ///   persistence, not platform side-effect. See
 ///   `docs/architecture/review-guide.md` § Orthogonality.
+///
+/// # The criterion the mika#2593 entries were cut by: C1 ∧ C2 ∧ C3
+///
+/// `tool_defs_bytes` is a toll, not a tail. Measured twice on
+/// `context_window_assembled` / `brief_size_overrun` (2026-10-15, 2026-10-16),
+/// mika-arch was served **21 175 bytes of tool definitions on every turn**,
+/// constant — ~41 % of the user message on the mika#2474 threshold population,
+/// 0.76 of it on the whole population. But restricting a tool surface changes
+/// *what the architect can do*: it is a **capacity** decision, not a size one,
+/// so the nine names mika#2593 added are the ones — and only the ones — where
+/// all three of these hold at once:
+///
+/// - **C1 — the entire write family is already out of reach.** Every tool that
+///   writes the table the read reads is either denied above or absent from the
+///   served builtin surface. Such a read informs no action this agent can take.
+///   This is the half that is *verified by code*, not merely asserted in prose:
+///   `mika2593_chaque_lecture_orpheline_a_sa_famille_decriture_hors_datteinte`.
+/// - **C2 — no served prompt names it.** The three mika-arch skill prompts name
+///   exactly four tools (`gh_read` ×17, `query_knowledge_graph` ×6, `store_fact`
+///   ×2, `update_core_memory` ×2); none of the nine appears once. A reproducible
+///   measurement, not a guard — an unnamed tool can still be reached through the
+///   base prompt's generic tool contract, which is why C2 alone never authorises
+///   a cut.
+/// - **C3 — neither constitutive nor self-knowledge nor grounding instrument.**
+///   Not `send_message` nor the agent-scoped memory writes (#811, *Notably
+///   allowed* above), not the self-knowledge family (#740), not the instruments
+///   the assert-grounded guard depends on (#1331).
+///
+/// **`list_agents` satisfies C1 and C2 and is kept anyway.** It prepares no
+/// action, but it carries topology knowledge — who else exists — which #740's
+/// self-knowledge contract may lean on outside any skill prompt. The criterion
+/// would have cut it; the criterion is not an automaton.
+///
+/// **Expected gain: 3.5–5.5 KB**, announced as a band because the plan's
+/// estimate transported a proportion of *source* weight and source↔JSON is not
+/// 1:1. Serializing the nine definitions at implementation time puts the figure
+/// at **4 252 bytes** (3 246 from `default_tools()` — of which
+/// `promote_deferred_callback` alone is 899 — plus 1 003 from the three team
+/// reads, plus separators), i.e. ~20 % of the 21 175 measured. That remains a
+/// *prediction*: the arbiter is `tool_defs_bytes` itself after deploy, read
+/// next to the `kept_count` / `kept_bytes` fields of
+/// `applied identity tool-visibility filter`, which are what tell a landed cut
+/// from a half-landed one.
 pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     // Skill mutations
     "create_skill",
@@ -418,6 +466,90 @@ pub const MIKA_ARCH_DISABLED_TOOLS: &[&str] = &[
     "update_team",
     "add_team_member",
     "remove_team_member",
+    // Orphaned reads (mika#2593) — a read whose entire write family is denied
+    // above informs no action this agent can take. Criterion C1, pinned by
+    // `mika2593_chaque_lecture_orpheline_a_sa_famille_decriture_hors_datteinte`.
+    "list_reminders",
+    "list_scheduled_tasks",
+    "list_tasks",
+    "get_task",
+    "check_task",
+    "list_teams",
+    "get_team_status",
+    "get_team_history",
+    // Deferred-dispatch slot ledger (mika#2593) — a WRITE, in the lane this
+    // agent does not own. Same category as `a2a_call` / `delegate_task` /
+    // `run_team` above; its absence from #811's list was a gap, not a decision.
+    "promote_deferred_callback",
+];
+
+/// The builtin tools mika-arch is **allowed** to see (mika#2748).
+///
+/// # Why an allowlist replaces the denylist as the decision record
+///
+/// [`MIKA_ARCH_DISABLED_TOOLS`] is a real cut, but a *re-erodable* one: it is
+/// obtained by **adding** names, so the next `register(...)` in `default_tools()`
+/// hands the architect a definition nobody decided it should have. mika#2593's
+/// attestation guard made that growth loud, not impossible — an implementer who
+/// read the guard's message and added the name to the roster had satisfied the
+/// guard without deciding anything.
+///
+/// Under an allowlist the default changes sign: a new builtin reaches mika-arch
+/// only if someone writes its name **here**. This constant *is* the decision
+/// register — grep-visible, one name per line, read in a diff — and that is what
+/// replaced the guard rather than a test that recomputes
+/// `allowlist == registry − denylist` (which would put the denylist back as the
+/// source of truth, re-erodable by the same door).
+///
+/// # Where the nineteen come from
+///
+/// Eighteen are everything `default_tools()` still served mika-arch after
+/// mika#2593, transcribed from the roster that guard attested. The nineteenth is
+/// **`list_agents`**, the sole survivor of the fourteen tools of
+/// `management_tools_if_needed()` — thirteen are denied, and this one is kept on
+/// purpose (topology self-knowledge, mika#740; reopening it is mika#2593 § 8 (c),
+/// a question about #740 rather than about size). It is named here, in the
+/// doc-comment, rather than split into a second constant: one more site of truth
+/// for one element would be paid at every reading.
+///
+/// Nineteen is exactly the `kept_count` the filter logs, and that is not a
+/// coincidence to be relied on — it is the invariant this vol preserved, so
+/// `tool_defs_bytes` is expected **strictly unchanged** after the switch.
+///
+/// # Hard bound — builtins only
+///
+/// The filter runs before skill and MCP tools are appended, so this list does
+/// not govern them. `gh_read` — mika-arch's most-used tool — is served without
+/// appearing here. Writing it here would be an **inert entry that reads as an
+/// authorisation**, and assertion A of
+/// `mika2748_lallowlist_de_mika_arch_est_le_roster` refuses any name that is not
+/// a declared builtin precisely so that cannot happen quietly.
+pub const MIKA_ARCH_ALLOWED_TOOLS: &[&str] = &[
+    // Memory and facts (#811 constitutive — the agent must be able to learn)
+    "update_core_memory",
+    "store_fact",
+    "search_memory",
+    "update_fact",
+    // Communication (#811 constitutive — without it the agent cannot answer)
+    "send_message",
+    // Self-knowledge (#740)
+    "list_skills",
+    "get_config",
+    "get_active_llm",
+    "read_agent_file",
+    "list_agent_files",
+    "list_agents",
+    // Grounding reads (#1331)
+    "query_timeline",
+    "get_session_messages",
+    "list_audit_events",
+    "search_tool_history",
+    // Review work
+    "resolve_issue_order",
+    "query_knowledge_graph",
+    // Content-serve ledger (mika#1867)
+    "record_served_content",
+    "check_already_served",
 ];
 
 /// mika-arch's static skill allowlist. Held as a `pub const` (rather than only
@@ -461,8 +593,16 @@ fn build_mika_arch_identity(settings: &Settings) -> Result<String, String> {
         roots_block.push_str(&format!("  \"{s}\",\n"));
     }
 
+    // Both shapes, in the same section (mika#2748). The allowlist is what
+    // decides; the denylist subtracts on top and keeps mika#2593's reasoning
+    // readable. `mika2748_lallowlist_de_mika_arch_est_le_roster` asserts their
+    // intersection is empty, so neither overrides the other in practice.
     let mut tools_block = String::from("disabled = [\n");
     for tool in MIKA_ARCH_DISABLED_TOOLS {
+        tools_block.push_str(&format!("  \"{tool}\",\n"));
+    }
+    tools_block.push_str("]\nallowed = [\n");
+    for tool in MIKA_ARCH_ALLOWED_TOOLS {
         tools_block.push_str(&format!("  \"{tool}\",\n"));
     }
     tools_block.push(']');
@@ -571,6 +711,15 @@ pub const CODE_OWNED_IDENTITY_SECTIONS: &[&str] = &[
     "skills.allow_authoring",
     "skills.nudge_enabled",
     "tools.disabled",
+    // mika#2748, and code-owned for exactly the reason its `context.history`
+    // sibling below spells out: `write_default_if_missing` never rewrites an
+    // existing `identity.toml`, so without this entry mika-arch — provisioned
+    // long before this vol — would never see the allowlist and would keep
+    // running under the denylist alone, with a green test suite over the top.
+    // That is the inert-declaration class of mika#1833 (`[kg]`) / mika#2330
+    // (`[context.history]`), and probe P4 of the plan reads the disk to confirm
+    // it did not happen.
+    "tools.allowed",
     "context.summary",
     // mika#2295. Listed here for the same reason as its `context.summary`
     // sibling: the window bounds are a property of the role, not an operator
@@ -1675,6 +1824,138 @@ mod tests {
         }
     }
 
+    /// AC4 de mika#2889 — l'ensemble des skills chargées à l'initialisation est
+    /// **inchangé** par le passage des six sites à l'assembleur unique.
+    ///
+    /// Le ticket demande une garantie de non-régression, et c'est la seule des
+    /// quatre que les trois autres critères ne couvrent pas : AC1 et AC2 disent
+    /// qu'une skill fautive est désormais écartée aux rechargements à chaud, AC3
+    /// dit qu'il n'existe qu'un assembleur — aucun des trois ne dirait qu'une
+    /// skill **légitime** a cessé d'être chargée au démarrage. Le témoin est la
+    /// séquence manuelle que `server/mod.rs` portait avant ce changement, rejouée
+    /// ici à la main : l'égalité des deux ensembles est ce qui atteste que
+    /// l'extraction n'a rien déplacé.
+    ///
+    /// L'identité passe par [`crate::prompt::load_identity`] sur un `identity.toml`
+    /// écrit pour l'occasion, et non par un littéral : `Identity` ne dérive pas
+    /// `Default`, et c'est le lecteur que les six sites utilisent réellement.
+    ///
+    /// **Angle mort nommé.** Sur une bibliothèque saine — mesuré : les trois
+    /// allowlists écartent zéro skill — retirer `apply_load_safety_check` ou
+    /// `apply_required_tools_coherence_check` de l'assembleur laisse ce test vert :
+    /// les deux côtés chargeraient le même ensemble et n'écarteraient toujours
+    /// rien. C'est AC1 et AC2 qui couvrent cette classe, en **posant** une skill
+    /// que chaque contrôle écarte ; ce test-ci répond à l'autre question, celle
+    /// qu'aucun des deux ne pose — l'extraction a-t-elle coûté une skill légitime.
+    #[test]
+    fn mika2889_lensemble_des_skills_a_linitialisation_est_inchange() {
+        use crate::bundled_skills::seed_bundled_skills;
+        use crate::skills::SkillRegistry;
+        use crate::skills::assembly::assemble_agent_registry;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir");
+        seed_bundled_skills(&skills_dir);
+
+        let noms = |r: &SkillRegistry| -> Vec<String> {
+            let mut v: Vec<String> = r
+                .skills()
+                .iter()
+                .map(|e| e.manifest.skill.name.clone())
+                .collect();
+            v.sort();
+            v
+        };
+
+        for (agent, allowlist) in well_known_skill_allowlists() {
+            let home = tmp.path().join(format!("home-{agent}"));
+            fs::create_dir_all(&home).expect("agent home");
+            let quoted: Vec<String> = allowlist.iter().map(|s| format!("\"{s}\"")).collect();
+            fs::write(
+                home.join("identity.toml"),
+                format!(
+                    "name = \"{agent}\"\nemoji = \"✦\"\n\n[skills]\nallowlist = [{}]\n",
+                    quoted.join(", ")
+                ),
+            )
+            .expect("identity.toml");
+            let identity = crate::prompt::load_identity(&home);
+            assert_eq!(
+                identity.skills.allowlist.as_deref(),
+                Some(allowlist.as_slice()),
+                "l'identité écrite pour '{agent}' n'a pas été relue telle quelle — \
+                 le témoin et l'assembleur ne verraient pas la même allowlist"
+            );
+
+            // Le témoin : les sept étapes dans l'ordre de l'init serveur, à la main.
+            let mut temoin = SkillRegistry::from_dir(&skills_dir);
+            temoin.apply_identity_allowlist(&allowlist);
+            temoin.apply_overrides(&[]);
+            temoin.apply_testimony_grade_ban();
+            temoin.apply_load_safety_check();
+            temoin.apply_required_tools_coherence_check(agent);
+
+            let obtenu = assemble_agent_registry(&skills_dir, &identity, &[], agent);
+
+            // Sans ce plancher, deux ensembles vides satisfont l'égalité qui suit
+            // et le test reste vert en ne mesurant rien.
+            assert!(
+                !noms(&obtenu).is_empty(),
+                "'{agent}' ne charge aucune skill — l'égalité qui suit ne mesurerait rien"
+            );
+
+            // Ni l'un ni l'autre des deux contrôles n'écarte quoi que ce soit de la
+            // bibliothèque livrée — mesuré le 2026-10-23 : les trois allowlists
+            // rendent `skipped == []`. L'égalité ci-dessous ne le dirait pas : si
+            // les deux côtés écartaient la même skill, elle resterait verte.
+            //
+            // Les préfixes sont ceux que le code écrit réellement —
+            // `apply_load_safety_check` écrit `validation: …` et
+            // `apply_required_tools_coherence_check` écrit `coherence: …`. Le plan
+            // de mika#2889 annonçait `load:`, qui n'existe nulle part ; une
+            // assertion sur ce préfixe aurait été verte en ne filtrant rien.
+            let ecartes_par_les_controles: Vec<&str> = obtenu
+                .skipped()
+                .iter()
+                .filter(|s| {
+                    s.reason.starts_with("validation:") || s.reason.starts_with("coherence:")
+                })
+                .map(|s| s.name.as_str())
+                .collect();
+            assert!(
+                ecartes_par_les_controles.is_empty(),
+                "les deux contrôles de l'init écartent des skills de '{agent}' : {ecartes_par_les_controles:?}"
+            );
+
+            assert_eq!(
+                noms(&obtenu),
+                noms(&temoin),
+                "l'assembleur de mika#2889 ne charge pas le même ensemble que la \
+                 séquence de l'init serveur, pour '{agent}'"
+            );
+
+            // Et la population écartée est la même, raison par raison : un ensemble
+            // chargé identique obtenu en écartant pour d'autres motifs serait une
+            // régression que l'égalité ci-dessus ne verrait pas.
+            let skips = |r: &SkillRegistry| -> Vec<(String, String)> {
+                let mut v: Vec<(String, String)> = r
+                    .skipped()
+                    .iter()
+                    .map(|s| (s.name.clone(), s.reason.clone()))
+                    .collect();
+                v.sort();
+                v
+            };
+            assert_eq!(
+                skips(&obtenu),
+                skips(&temoin),
+                "les skills écartées diffèrent entre l'assembleur et le témoin, \
+                 pour '{agent}'"
+            );
+        }
+    }
+
     #[test]
     fn test_find_well_known_agent_not_found() {
         assert!(find_well_known_agent("mika").is_none());
@@ -1739,17 +2020,30 @@ mod tests {
         assert!(err.contains("relative path"));
     }
 
+    /// # Why this reads the parsed list instead of grepping the document
+    ///
+    /// Until mika#2748 the `[tools]` section held one list, so a substring
+    /// search over the whole document was a faithful proxy for "absent from the
+    /// denylist". With `allowed` beside `disabled` the proxy lies in **both**
+    /// directions: `update_core_memory` is now a name the document carries, and
+    /// a name moved from `allowed` into `disabled` would keep every `contains`
+    /// below green. The assertions are therefore on the named list, which is
+    /// what they always meant.
     #[test]
     fn test_mika_arch_identity_has_tools_disabled_block() {
         let toml = build_mika_arch_identity(&test_settings_with_kg_roots()).unwrap();
         assert!(toml.contains("[tools]"));
-        assert!(toml.contains("\"pr_merge_with_gate\""));
-        assert!(toml.contains("\"a2a_call\""));
+        let identity: crate::prompt::Identity =
+            toml::from_str(&toml).expect("rendered identity should parse");
+        let disabled = &identity.tools.disabled;
+
+        assert!(disabled.iter().any(|t| t == "pr_merge_with_gate"));
+        assert!(disabled.iter().any(|t| t == "a2a_call"));
         // Memory writes are NOT denied — agent-scoped self-state, not platform side-effect.
         // See review-guide.md § Orthogonality (commit 2bba6223).
-        assert!(!toml.contains("\"update_core_memory\""));
+        assert!(!disabled.iter().any(|t| t == "update_core_memory"));
         // send_message must NOT be in the disabled list (constitutive of being an agent)
-        assert!(!toml.contains("\"send_message\""));
+        assert!(!disabled.iter().any(|t| t == "send_message"));
     }
 
     #[test]
@@ -2073,19 +2367,337 @@ mod tests {
         );
     }
 
+    /// Memory writes mutate the agent's own self-state (5 core memory
+    /// blocks + 4 facts categories, scoped to agent_id='mika-arch'). They
+    /// are constitutive of being an agent, not platform side-effects.
+    /// See mika/docs/architecture/review-guide.md § Orthogonality.
+    ///
+    /// Held as a const — rather than inline in the single test that used to own
+    /// it — because mika#2593's criterion C3 is a second reader of the same
+    /// three names, and a criterion checked against a copy of a list is checked
+    /// against nothing. #811 remains the owner: this list is not widened,
+    /// narrowed or rewritten by any later ticket.
+    const MIKA_ARCH_AGENT_SELF_STATE_TOOLS: &[&str] =
+        &["update_core_memory", "store_fact", "update_fact"];
+
     #[test]
     fn test_mika_arch_disabled_tools_excludes_agent_self_state() {
-        // Memory writes mutate the agent's own self-state (5 core memory blocks
-        // + 4 facts categories, scoped to agent_id='mika-arch'). They are
-        // constitutive of being an agent, not platform side-effects.
-        // See mika/docs/architecture/review-guide.md § Orthogonality.
-        let agent_self_state_tools = ["update_core_memory", "store_fact", "update_fact"];
-        for tool in &agent_self_state_tools {
+        for tool in MIKA_ARCH_AGENT_SELF_STATE_TOOLS {
             assert!(
                 !MIKA_ARCH_DISABLED_TOOLS.contains(tool),
                 "{tool} must remain visible to mika-arch (agent self-state, not platform side-effect)"
             );
         }
+    }
+
+    /// The rest of criterion C3 (mika#2593), beyond #811's constitutive three.
+    ///
+    /// `send_message` is constitutive on the same grounds as the memory writes
+    /// (#811); the self-knowledge family is mika#740's; the four grounding
+    /// instruments are what the assert-grounded EndTurn guard reads (#1331).
+    /// Named here so a future widening of [`MIKA_ARCH_ORPHANED_READS`] into any
+    /// of them reddens instead of shipping — a tool can satisfy C1 and C2 and
+    /// still be one the architect must keep.
+    const MIKA_ARCH_C3_PROTECTED: &[&str] = &[
+        // Constitutive (#811), alongside MIKA_ARCH_AGENT_SELF_STATE_TOOLS
+        "send_message",
+        // Self-knowledge (#740)
+        "get_config",
+        "get_active_llm",
+        "list_skills",
+        "read_agent_file",
+        "list_agent_files",
+        // Grounding instruments the assert-grounded guard depends on (#1331)
+        "query_timeline",
+        "get_session_messages",
+        "list_audit_events",
+        "search_tool_history",
+    ];
+
+    /// The eight orphaned reads of mika#2593, each with the write family that
+    /// makes it orphaned: `(read, the tools that write the table it reads)`.
+    ///
+    /// `promote_deferred_callback` is deliberately **absent**: it is a write,
+    /// denied under the cross-agent-invocation rationale, not a read whose
+    /// family went out of reach. Putting it here would make the table claim
+    /// something about it that is not the reason it was cut.
+    const MIKA_ARCH_ORPHANED_READS: &[(&str, &[&str])] = &[
+        (
+            "list_reminders",
+            &["create_reminder", "cancel_reminder"] as &[&str],
+        ),
+        (
+            "list_scheduled_tasks",
+            &[
+                "create_reminder",
+                "cancel_reminder",
+                "create_scheduled_task",
+            ],
+        ),
+        (
+            "list_tasks",
+            &[
+                "create_task",
+                "update_task_status",
+                "complete_task",
+                "cancel_task",
+            ],
+        ),
+        (
+            "get_task",
+            &[
+                "create_task",
+                "update_task_status",
+                "complete_task",
+                "cancel_task",
+            ],
+        ),
+        (
+            "check_task",
+            &[
+                "create_task",
+                "update_task_status",
+                "complete_task",
+                "cancel_task",
+            ],
+        ),
+        (
+            "list_teams",
+            &[
+                "create_team",
+                "delete_team",
+                "update_team",
+                "add_team_member",
+                "remove_team_member",
+                "run_team",
+            ],
+        ),
+        (
+            "get_team_status",
+            &[
+                "create_team",
+                "delete_team",
+                "update_team",
+                "add_team_member",
+                "remove_team_member",
+                "run_team",
+            ],
+        ),
+        (
+            "get_team_history",
+            &[
+                "create_team",
+                "delete_team",
+                "update_team",
+                "add_team_member",
+                "remove_team_member",
+                "run_team",
+            ],
+        ),
+    ];
+
+    /// Rows of [`MIKA_ARCH_ORPHANED_READS`] exempted from the criterion, each
+    /// with the reason — `(read, why)`.
+    ///
+    /// **Shipped empty, and it is meant to stay that way.** A detector born
+    /// with exceptions is a detector that was never armed (mika#2158). An entry
+    /// here is an admission that one of the nine cuts does not meet the
+    /// criterion the const's doc-comment claims for all nine; the honest
+    /// response is to take that name back out of `MIKA_ARCH_DISABLED_TOOLS`,
+    /// not to write a line here. The emptiness is asserted, so the list cleans
+    /// itself up rather than rotting.
+    const MIKA2593_CRITERION_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// mika#2593 C1 + C3 — a read is cut only when it prepares no decision this
+    /// agent can make, and is not itself a tool the architect must keep.
+    ///
+    /// The class this catches that no behavioural test can: a future ticket
+    /// widening the cut to a read whose writes are **still served**. Such a
+    /// read is not orphaned — it informs an action the architect can still
+    /// take — and removing it is destructive, which is exactly what mika#2593
+    /// promised not to be. Nothing about the served tool array would look
+    /// wrong; the suite would stay green and the capability would be gone.
+    ///
+    /// "Out of reach" is read against the whole declared builtin surface
+    /// ([`crate::tools::BUILTIN_TOOL_NAMES`] ∪ the registry built by
+    /// `default_tools()`), not against `default_tools()` alone: a write living
+    /// in `management_tools_if_needed` is served to mika-arch too, so counting
+    /// it absent would let the guard pass on a family that is still reachable.
+    #[test]
+    fn mika2593_chaque_lecture_orpheline_a_sa_famille_decriture_hors_datteinte() {
+        assert!(
+            MIKA2593_CRITERION_EXCEPTIONS.is_empty(),
+            "MIKA2593_CRITERION_EXCEPTIONS is not empty: {MIKA2593_CRITERION_EXCEPTIONS:?}. \
+             An exception means one of mika#2593's cuts does not meet the criterion its \
+             doc-comment claims for all of them — remove that name from \
+             MIKA_ARCH_DISABLED_TOOLS instead of exempting it here."
+        );
+
+        let registry = crate::tools::default_tools();
+        let declared: std::collections::HashSet<String> = crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|n| (*n).to_string())
+            .chain(registry.definitions().iter().map(|d| d.name.clone()))
+            .collect();
+
+        for (read, write_family) in MIKA_ARCH_ORPHANED_READS {
+            if MIKA2593_CRITERION_EXCEPTIONS.iter().any(|(n, _)| n == read) {
+                continue;
+            }
+
+            // C1a — the read itself is actually denied. Without this the two
+            // checks below could pass on a name nobody ever cut.
+            assert!(
+                MIKA_ARCH_DISABLED_TOOLS.contains(read),
+                "{read} is listed in MIKA_ARCH_ORPHANED_READS but is not in \
+                 MIKA_ARCH_DISABLED_TOOLS. Either deny it, or drop its row from the table."
+            );
+
+            // C1b — the whole write family is out of reach.
+            for write in *write_family {
+                let denied = MIKA_ARCH_DISABLED_TOOLS.contains(write);
+                let unserved = !declared.contains(*write);
+                assert!(
+                    denied || unserved,
+                    "{read} is cut as an orphaned read, but {write} — which writes the table \
+                     it reads — is still served to mika-arch. The read is therefore NOT \
+                     orphaned: it informs an action the architect can still take, and cutting \
+                     it is destructive. Either deny {write} in MIKA_ARCH_DISABLED_TOOLS \
+                     (well_known_agents.rs) too, or take {read} back out of the denylist."
+                );
+            }
+
+            // C3 — the read is not one the architect must keep regardless.
+            assert!(
+                !MIKA_ARCH_AGENT_SELF_STATE_TOOLS.contains(read)
+                    && !MIKA_ARCH_C3_PROTECTED.contains(read),
+                "{read} is cut as an orphaned read, but it belongs to a family mika-arch keeps \
+                 by decision (#811 constitutive / #740 self-knowledge / #1331 grounding). C1 and \
+                 C2 do not authorise cutting it — remove it from MIKA_ARCH_DISABLED_TOOLS."
+            );
+        }
+    }
+
+    /// Named exceptions to [`mika2748_lallowlist_de_mika_arch_est_le_roster`] —
+    /// `(tool name, follow-up ticket and reason)`.
+    ///
+    /// **Empty at birth, and asserted empty.** All three assertions below were
+    /// verified at zero violations on the state mika#2593 merged, so a detector
+    /// born with exceptions would be a detector that was never armed
+    /// (mika#2158). This door exists so the next *legitimate* violation gets a
+    /// grep-visible entry instead of a weakened predicate — and the emptiness
+    /// assertion is what makes the list clean itself up rather than rot.
+    const MIKA2748_ALLOWLIST_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// mika#2748 — [`MIKA_ARCH_ALLOWED_TOOLS`] **is** the roster.
+    ///
+    /// # What replaced what
+    ///
+    /// This guard took over from `mika2593_le_tableau_servi_a_mika_arch_est_un_roster_atteste`
+    /// (`tools/mod.rs`), which asserted that the builtins surviving
+    /// [`MIKA_ARCH_DISABLED_TOOLS`] matched a hand-kept roster. That guard
+    /// detected "a tool is served to mika-arch without anyone having decided
+    /// it" — a fact that under an allowlist **cannot occur** rather than merely
+    /// going undetected: a new `register(...)` does not reach the architect
+    /// until its name is written in the constant. A guard watching an
+    /// unreachable state is not a safety net, it is an equality to recompute.
+    ///
+    /// **And the equality is deliberately not reintroduced here.** Asserting
+    /// `allowlist == registry − denylist` would put the denylist back as the
+    /// source of truth and the allowlist back as its derived copy — re-erodable
+    /// through the very door this vol closed. That equality was checked **once**,
+    /// at implementation, by the post-deploy probes (`tool_defs_bytes` strictly
+    /// unchanged); it is not reaffirmed on every `cargo test`.
+    ///
+    /// # The failure mode this guard exists for
+    ///
+    /// The switch creates a class the denylist did not have, and **the sign of
+    /// the error inverts**: a typo in a *denylist* silently **keeps** a tool
+    /// (visible degradation, one tool too many), whereas a typo in an
+    /// *allowlist* silently **removes** one — mika-arch loses a constitutive
+    /// tool and nothing says so. Assertions A and B are the oracle that turns
+    /// that silence into red.
+    ///
+    /// Three assertions, none redundant with another:
+    ///
+    /// - **A — anti-typo.** Every name is a declared builtin
+    ///   ([`crate::tools::BUILTIN_TOOL_NAMES`], itself parity-tested against the
+    ///   registry). This also refuses a skill or MCP tool written here, which
+    ///   would be an inert entry *reading* as an authorisation (the hard bound).
+    /// - **B — the constitutive tools are *present*.** This is the sense
+    ///   inversion mika#2748 asked for, and the reason
+    ///   [`MIKA_ARCH_AGENT_SELF_STATE_TOOLS`] (#811) and
+    ///   [`MIKA_ARCH_C3_PROTECTED`] survive untouched: their contents do not
+    ///   change, only the direction of membership — *absent from the denylist*
+    ///   becomes *present in the allowlist*. Both existing guards stay green; B
+    ///   is their counterpart on the other shape.
+    /// - **C — no decision written twice.** A name on both lists is not a
+    ///   contradiction for the predicate to arbitrate in silence (the denylist
+    ///   would win), it is a decision recorded in two places.
+    #[test]
+    fn mika2748_lallowlist_de_mika_arch_est_le_roster() {
+        assert!(
+            MIKA2748_ALLOWLIST_EXCEPTIONS.is_empty(),
+            "MIKA2748_ALLOWLIST_EXCEPTIONS is not empty: {MIKA2748_ALLOWLIST_EXCEPTIONS:?}. \
+             The list is empty at birth; an entry added since must be removed as soon as its \
+             follow-up ticket closes, and this assertion is what remembers to ask."
+        );
+
+        let exempt = |name: &str| {
+            MIKA2748_ALLOWLIST_EXCEPTIONS
+                .iter()
+                .any(|(n, _)| *n == name)
+        };
+
+        // A — anti-typo: every allowed name is a declared builtin.
+        let not_builtins: Vec<&str> = MIKA_ARCH_ALLOWED_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !exempt(name) && !crate::tools::BUILTIN_TOOL_NAMES.contains(name))
+            .collect();
+        assert!(
+            not_builtins.is_empty(),
+            "mika#2748 A — these names are in MIKA_ARCH_ALLOWED_TOOLS but are not declared \
+             builtins: {not_builtins:?}.\n\
+             → A misspelt entry does not add a tool, it REMOVES one: the allowlist admits \
+             nothing by that name and mika-arch silently loses it. Fix the spelling against \
+             crate::tools::BUILTIN_TOOL_NAMES.\n\
+             → If the name is a skill or MCP tool, remove it: the filter runs before those are \
+             appended, so the entry is inert and only READS as an authorisation."
+        );
+
+        // B — the constitutive families are present, not merely undenied.
+        let missing: Vec<&str> = MIKA_ARCH_AGENT_SELF_STATE_TOOLS
+            .iter()
+            .chain(MIKA_ARCH_C3_PROTECTED.iter())
+            .copied()
+            .filter(|name| !exempt(name) && !MIKA_ARCH_ALLOWED_TOOLS.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "mika#2748 B — these tools mika-arch keeps by decision are absent from \
+             MIKA_ARCH_ALLOWED_TOOLS: {missing:?}.\n\
+             → Under an allowlist, keeping a tool means WRITING its name, not leaving it out of \
+             the denylist. Each of these is constitutive (#811), self-knowledge (#740) or a \
+             grounding instrument the assert-grounded EndTurn guard reads (#1331); losing one is \
+             a capability gone with a green suite over the top.\n\
+             → Add the name to MIKA_ARCH_ALLOWED_TOOLS (well_known_agents.rs)."
+        );
+
+        // C — no name is written on both sides.
+        let both: Vec<&str> = MIKA_ARCH_ALLOWED_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| MIKA_ARCH_DISABLED_TOOLS.contains(name))
+            .collect();
+        assert!(
+            both.is_empty(),
+            "mika#2748 C — these names are in BOTH MIKA_ARCH_ALLOWED_TOOLS and \
+             MIKA_ARCH_DISABLED_TOOLS: {both:?}.\n\
+             → The predicate would resolve it (the denylist subtracts on top, so the tool is \
+             hidden), which is exactly the problem: a decision recorded in two places, arbitrated \
+             in silence. Decide once and delete the other entry."
+        );
     }
 
     /// Skills that front a write-capable tool (i.e., one in any well-known
@@ -2470,6 +3082,12 @@ mod tests {
             "qa-review",
             "qa-review-build-callback",
             "qa-review-webhook-success",
+            // mika#2212 — handler for `pull_request.ready_for_review`. Missing
+            // it from the identity allowlist above produces a skill that
+            // exists, seeds into the canonical library, and is NEVER linked
+            // under `{global_home}/agents/mika-qa/skills/`: invisible, with no
+            // failure. That silence is the class this ticket was filed for.
+            "qa-review-webhook-ready",
         ];
         for skill in &qa_only {
             assert!(
@@ -2670,8 +3288,8 @@ mod tests {
             .expect("mika-qa must have allowlist");
         assert_eq!(
             allowlist.len(),
-            18,
-            "mika-qa allowlist should have 18 skills"
+            19,
+            "mika-qa allowlist should have 19 skills (+qa-review-webhook-ready, mika#2212)"
         );
     }
 
@@ -3124,50 +3742,41 @@ mod tests {
         }
     }
 
-    /// mika#2309 § Fire-Disposition surface 3 — **contrôle positif
-    /// auto-nettoyant** sur une divergence vivante, mesurée le 2026-09-18.
+    /// mika#2759 — le plancher d'envoi **couvre** l'enveloppe per-agent que ce
+    /// fichier déclare pour mika-arch.
     ///
-    /// # Le fait
+    /// # Ce qu'il remplace
     ///
-    /// `mika_a2a::client::resolve_timeout_secs` ne lit que
-    /// `MIKA_AGENT_TOTAL_TIMEOUT_SECS` dans l'env **du process** ; il ne lit
-    /// jamais le `config.toml` **per-agent**. Or `MIKA_ARCH_CONFIG` pose
-    /// `agent_total_timeout_secs = 900` (mika#2189). Sur un appel vers
-    /// mika-arch, le client résout donc son défaut (600 s) face à une enveloppe
-    /// de 900 s : le plancher `client >= total` de mika#2297 **n'est pas tenu**,
-    /// et le client abandonne une génération que le moteur a encore le droit de
-    /// finir — exactement le sinistre du 11/09 qui a motivé le passage de 300 à
-    /// 600.
+    /// Jusqu'ici ce site portait `mika2309_client_default_is_below_the_arch_envelope`,
+    /// un **contrôle positif auto-nettoyant** qui affirmait l'écart au lieu de le
+    /// taire : le défaut client (600 s) était strictement *sous* l'enveloppe
+    /// per-agent de mika-arch (900 s, mika#2189), donc le plancher
+    /// `client >= total` de mika#2297 n'était pas tenu et le client abandonnait
+    /// une génération que le moteur avait encore le droit de finir — le sinistre
+    /// du 11/09. Son propre message disait quoi faire le jour où il rougirait :
+    /// « la divergence est résolue et il doit être RETIRÉ avec son ticket de
+    /// suivi, pas ajusté ». mika#2759 **est** ce ticket de suivi, et ceci est ce
+    /// retrait (discipline mika#1574 : une exception part avec sa cause).
     ///
-    /// # Pourquoi un test qui *constate* au lieu de corriger
+    /// # Ce qu'il affirme à la place
     ///
-    /// Corriger revient à apprendre au client a2a à lire la cascade per-agent,
-    /// c'est-à-dire un changement de **comportement runtime** que mika#2309
-    /// s'interdit en tête (« substrat borné »). Et la forme même est la
-    /// question : le client ne connaît pas l'agent visé au moment où il résout
-    /// son budget. La doctrine (`docs/solutions/best-practices/fire-disposition-doctrine.md`)
-    /// nomme ce cas — la résolution de la violation préexistante *est* la
-    /// question de périmètre — et n'autorise pas à surfacer puis passer à autre
-    /// chose : d'où ce contrôle.
+    /// La même paire de valeurs réelles, avec l'assertion retournée dans le sens
+    /// que la correction rend vrai : l'enveloppe lue dans `MIKA_ARCH_CONFIG`,
+    /// passée au **noyau pur** du résolveur comme candidat `total`, ressort
+    /// couverte. C'est exactement ce que `budget_floor` obtient de l'attestation
+    /// de spirit puis passe à `resolve_send_timeout_with_floor` au moment de
+    /// l'envoi : l'enveloppe per-agent n'est plus une valeur que le client ignore,
+    /// c'est un troisième candidat au `max`.
     ///
-    /// # Ce qu'il fait rougir, et c'est le point
+    /// Il rougit si quelqu'un lève l'enveloppe de mika-arch **et** casse la
+    /// résolution par `max` — c'est-à-dire si le plancher redevient un plafond.
+    /// Le `max` étant total, aucune valeur d'enveloppe ne peut le faire rougir
+    /// seule : c'est la propriété, pas le chiffre, qui est épinglée ici.
     ///
-    /// Il lit les **deux valeurs réelles** et affirme l'écart. Il rougit donc le
-    /// jour où l'écart disparaît — valeurs alignées, ou client apprenant à lire
-    /// le per-agent — ce qui force à retirer l'exception au lieu de la laisser
-    /// survivre à sa cause.
-    ///
-    /// # Ticket de suivi
-    ///
-    /// La divergence est remontée dans son propre ticket (portée de lecture du
-    /// plancher mika#2297 face aux cascades per-agent de mika#2189) ; son corps
-    /// intégral est reproduit dans la description de la PR qui livre mika#2309,
-    /// et son numéro s'inscrit ici à son ouverture. **Ce qui est interdit à qui
-    /// lit ce test** : aligner `DEFAULT_TIMEOUT` sur 900, ou faire lire le
-    /// `config.toml` per-agent au client, de sa propre autorité. Les deux
-    /// changent un budget de production.
+    /// Il passe par le noyau pur `resolve_timeout_secs`, donc il ne touche pas à
+    /// l'environnement du process et n'a pas besoin de `#[serial]`.
     #[test]
-    fn mika2309_client_default_is_below_the_arch_envelope() {
+    fn mika2759_le_plancher_couvre_lenveloppe_de_mika_arch() {
         let config: toml::Value =
             toml::from_str(MIKA_ARCH_CONFIG).expect("MIKA_ARCH_CONFIG should be valid TOML");
         let arch_envelope = config["agent_total_timeout_secs"]
@@ -3175,15 +3784,17 @@ mod tests {
             .expect("mika-arch declares agent_total_timeout_secs")
             as u64;
 
-        let client_default = mika_a2a::client::DEFAULT_TIMEOUT.as_secs();
+        let resolved = mika_a2a::client::resolve_timeout_secs(None, Some(arch_envelope));
 
         assert!(
-            client_default < arch_envelope,
-            "mika#2309 surface 3 : l'écart mesuré entre le défaut client a2a \
-             ({client_default}s) et l'enveloppe per-agent de mika-arch \
-             ({arch_envelope}s) a disparu. Ce test est un contrôle positif \
-             auto-nettoyant : s'il rougit, la divergence est résolue et il doit \
-             être RETIRÉ avec son ticket de suivi, pas ajusté."
+            resolved >= arch_envelope,
+            "mika#2759 : le budget d'envoi résolu ({resolved}s) est sous \
+             l'enveloppe per-agent de mika-arch ({arch_envelope}s). Le plancher \
+             `client >= total` de mika#2297 n'est plus tenu pour un agent dont \
+             l'enveloppe est per-agent (mika#2189) : le client abandonnerait une \
+             génération que le moteur a encore le droit de finir. Le remède est \
+             dans `resolve_timeout_secs`, qui doit résoudre par `max` — PAS ici, \
+             et surtout pas en baissant l'enveloppe."
         );
     }
 
@@ -3215,6 +3826,19 @@ mod tests {
                 .contains(&"pr_merge_with_gate".to_string())
         );
         assert!(identity.tools.disabled.contains(&"a2a_call".to_string()));
+        // mika#2748 — fidelity of the emission, not preservation of a value:
+        // `build_mika_arch_identity` writes both lists into one `[tools]` block,
+        // and a block that parses with `allowed` absent is the whole regression
+        // (the agent would silently run the denylist alone). Whether the names
+        // are the right ones is `mika2748_lallowlist_de_mika_arch_est_le_roster`.
+        assert_eq!(
+            identity
+                .tools
+                .allowed
+                .expect("rendered mika-arch identity must carry [tools].allowed")
+                .len(),
+            MIKA_ARCH_ALLOWED_TOOLS.len()
+        );
     }
 
     #[test]
@@ -3590,6 +4214,19 @@ mod tests {
         assert_eq!(allowlist.len(), 3);
     }
 
+    /// Reconciliation of an already-provisioned mika-arch, which is the only
+    /// path by which mika#2748's allowlist reaches an agent whose
+    /// `identity.toml` predates it.
+    ///
+    /// The pre-seeded document below carries `[tools]\ndisabled = []` and no
+    /// `allowed` — the shape every mika-arch on disk had before this ticket.
+    /// `write_default_if_missing` never rewrites an existing file, so without
+    /// `"tools.allowed"` in `CODE_OWNED_IDENTITY_SECTIONS` the declaration
+    /// would be inert for exactly the agents that already exist (class
+    /// mika#1833 / mika#2330): green tests, and a fleet still running the
+    /// denylist. The `tools.allowed` assertion is that class's test, and it
+    /// costs eight lines here instead of a file because this scenario already
+    /// existed for `[context.summary]`.
     #[test]
     fn test_reconcile_adds_mika_arch_missing_context_summary() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3619,6 +4256,21 @@ mod tests {
         assert!(
             !identity.context.summary.inject,
             "reconciler must set [context.summary].inject = false (mika#1009 leak protection)"
+        );
+        let allowed = identity.tools.allowed.unwrap_or_else(|| {
+            panic!(
+                "mika#2748 — reconciliation must add [tools].allowed to an agent provisioned \
+                 before the allowlist existed; absent means \"tools.allowed\" left \
+                 CODE_OWNED_IDENTITY_SECTIONS and the declaration is inert (class mika#1833)"
+            )
+        });
+        assert_eq!(
+            allowed,
+            MIKA_ARCH_ALLOWED_TOOLS
+                .iter()
+                .map(|t| (*t).to_string())
+                .collect::<Vec<_>>(),
+            "mika#2748 — reconciled [tools].allowed must be the roster, in order"
         );
     }
 
@@ -3841,6 +4493,202 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- La réserve de mika#1580 est épinglée par valeur (mika#2888) --
+
+    /// **Livrée vide, et le détecteur plus bas assert qu'elle l'est.**
+    ///
+    /// Il n'y a rien à excuser à la livraison : les quatre spécifications de
+    /// [`WELL_KNOWN_AGENTS`] déclarent déjà `allow_authoring = false` — mika-dev
+    /// et mika-qa dans leurs constantes statiques, mika-arch dans le `format!`
+    /// de `build_mika_arch_identity` (voie `Computed`), mika-test dans la sienne.
+    /// Le détecteur est donc armé et vert au merge, sans aucune dérogation.
+    ///
+    /// **Quand ce détecteur tire, on ne l'excepte pas.** Une entrée ici serait une
+    /// ouverture de l'écriture de skills décidée hors de mika#1580, ce qui est
+    /// exactement ce que cette réserve interdit. Les deux seules issues légitimes
+    /// sont : rendre la valeur à `false`, ou modifier ce détecteur dans la PR de
+    /// mika#1580 en y citant la décision de Vincent (doctrine mika#2201 — un site
+    /// qu'on ne veut pas armer est un site à supprimer, pas à excepter).
+    ///
+    /// Ce n'est donc **pas un filtre** : le détecteur ne la consulte pas pour
+    /// blanchir un agent, il assert qu'elle est vide. Une entrée ajoutée fait
+    /// rougir le détecteur lui-même, pas seulement la revue — et l'exception ne
+    /// peut pas devenir stale, puisqu'il n'y en a aucune.
+    const ALLOW_AUTHORING_PIN_EXCEPTIONS: &[&str] = &[];
+
+    /// Retourne `None` quand la spécification épingle bien la réserve de
+    /// mika#1580, et `Some(<message nommant l'agent et ce qui cloche>)` sinon.
+    ///
+    /// Deux formes de violation, et une seule porte : la clé **absente** et la clé
+    /// à **`true`** sont toutes deux des manquements à la réserve. L'absence compte
+    /// parce que `skills.allow_authoring` est code-owned
+    /// ([`CODE_OWNED_IDENTITY_SECTIONS`]) : une spécification qui n'émet rien laisse
+    /// le réconciliateur sans valeur à imposer, et la valeur effective retombe sur
+    /// le défaut de `SkillsIdentityConfig::authoring_enabled()` — `false`
+    /// aujourd'hui, mais un défaut n'est pas une réserve, et il se change à un
+    /// autre endroit du code.
+    ///
+    /// Prend le TOML **rendu** en `&str` plutôt qu'un `&WellKnownAgent` : c'est ce
+    /// qui rend le prédicat exerçable sur un fixture, et donc ce qui arme les
+    /// recettes de rouge-avant AC2 et AC3 au-delà du jour de la PR.
+    fn allow_authoring_pin_violation(agent_name: &str, rendered_toml: &str) -> Option<String> {
+        let value: toml::Value = match toml::from_str(rendered_toml) {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(format!(
+                    "l'identité rendue de l'agent bien connu '{agent_name}' n'est pas \
+                     du TOML valide, donc la réserve de mika#1580 n'y est pas \
+                     lisible : {e}"
+                ));
+            }
+        };
+
+        match get_path(&value, "skills.allow_authoring") {
+            Some(v) if v.as_bool() == Some(false) => None,
+            Some(v) => Some(format!(
+                "l'agent bien connu '{agent_name}' déclare \
+                 skills.allow_authoring = {v} — la réserve de mika#1580 exige \
+                 `false`. La clé étant code-owned (CODE_OWNED_IDENTITY_SECTIONS), \
+                 cette valeur se propage à l'agent sur disque au démarrage suivant."
+            )),
+            None => Some(format!(
+                "l'agent bien connu '{agent_name}' n'émet pas \
+                 skills.allow_authoring — la clé est code-owned \
+                 (CODE_OWNED_IDENTITY_SECTIONS), donc une spécification muette laisse \
+                 le réconciliateur sans valeur à imposer et la valeur effective \
+                 retombe sur le défaut de SkillsIdentityConfig::authoring_enabled(). \
+                 Un défaut n'est pas la réserve de mika#1580 : déclare \
+                 `allow_authoring = false` explicitement."
+            )),
+        }
+    }
+
+    /// AC1 de mika#2888 — chaque spécification bien connue épingle
+    /// `skills.allow_authoring = false`, et un échec nomme l'agent fautif.
+    ///
+    /// Énumère [`WELL_KNOWN_AGENTS`] et marche le chemin avec [`get_path`] : c'est,
+    /// terme pour terme, la source et le marcheur du réconciliateur
+    /// (`reconcile_well_known_identity`). Un cinquième agent bien connu est donc
+    /// couvert sans édition de ce test, et mika-arch est couvert par sa voie
+    /// `Computed` — la valeur testée est celle que l'agent reçoit vraiment, pas
+    /// celle qu'un littéral laisse croire.
+    ///
+    /// **Rouge-avant joué à la main pendant l'implémentation** (plan mika#2888,
+    /// étapes 5–6), les deux fois avec retour en arrière et vert retrouvé :
+    /// - `MIKA_DEV_IDENTITY` passée à `allow_authoring = true` → rouge, message
+    ///   nommant `mika-dev` et citant la valeur `true`.
+    /// - ligne retirée du `format!` de `build_mika_arch_identity` → rouge, message
+    ///   nommant `mika-arch` sur la branche « clé absente ». C'est la recette qui
+    ///   atteste que la voie non-littérale est bien couverte — aucun scan textuel
+    ///   du source ne l'aurait vue.
+    #[test]
+    fn mika2888_les_agents_bien_connus_epinglent_allow_authoring_false() {
+        assert!(
+            ALLOW_AUTHORING_PIN_EXCEPTIONS.is_empty(),
+            "ALLOW_AUTHORING_PIN_EXCEPTIONS est livrée vide et doit le rester : une \
+             entrée serait une ouverture de l'écriture de skills décidée hors de \
+             mika#1580. Lis son doc-comment — les deux seules issues sont de rendre \
+             la valeur à `false`, ou de modifier ce détecteur dans la PR de mika#1580 \
+             en citant la décision de Vincent. Entrées trouvées : {ALLOW_AUTHORING_PIN_EXCEPTIONS:?}"
+        );
+
+        let settings = test_settings_with_kg_roots();
+        let mut violations = Vec::new();
+
+        for spec in WELL_KNOWN_AGENTS {
+            // Pas de `Err(_) => continue` ici, contrairement aux deux détecteurs
+            // voisins : `render_identity_content` ne rend `Err` que sur la voie
+            // `Computed` de mika-arch quand `kg_docs_roots` est absent, et
+            // `test_settings_with_kg_roots()` le peuple. Un `Err` sous ces
+            // settings-là est un défaut, et `continue` le transformerait en
+            // couverture silencieusement perdue — mika-arch sauté, test vert,
+            // réserve non épinglée chez l'agent qui lit le plus de code.
+            let content = render_identity_content(spec, &settings).unwrap_or_else(|e| {
+                panic!(
+                    "le RENDU de l'identité a échoué pour l'agent bien connu '{}' — ce \
+                     n'est PAS une violation de la réserve de mika#1580, c'est un agent \
+                     que ce détecteur ne couvre pas encore. Complète \
+                     test_settings_with_kg_roots() avec le setting manquant. Cause : {e}",
+                    spec.name
+                )
+            });
+
+            if let Some(violation) = allow_authoring_pin_violation(spec.name, &content) {
+                violations.push(violation);
+            }
+        }
+
+        // Collecte complète avant l'assertion : un seul run doit nommer les quatre
+        // fautifs s'il y en a quatre, pas seulement le premier.
+        assert!(
+            violations.is_empty(),
+            "la réserve de mika#1580 n'est plus épinglée par {} spécification(s) \
+             bien connue(s) :\n  - {}",
+            violations.len(),
+            violations.join("\n  - ")
+        );
+    }
+
+    /// Contrôle positif du prédicat — sans lui, un helper qui rendrait `Some`
+    /// inconditionnellement passerait les deux tests de fixture ci-dessous.
+    #[test]
+    fn mika2888_la_valeur_conforme_nest_pas_une_violation() {
+        assert_eq!(
+            allow_authoring_pin_violation(
+                "agent-fictif-conforme",
+                "[skills]\nallow_authoring = false\n"
+            ),
+            None,
+            "`allow_authoring = false` EST la réserve de mika#1580 — le prédicat ne \
+             doit rien signaler"
+        );
+    }
+
+    /// AC2 de mika#2888, armé — une spécification qui déclare `true` est une
+    /// violation, et le message nomme l'agent.
+    #[test]
+    fn mika2888_une_valeur_a_true_est_une_violation_qui_nomme_lagent() {
+        let violation =
+            allow_authoring_pin_violation("agent-fictif-ac2", "[skills]\nallow_authoring = true\n")
+                .expect(
+                    "`allow_authoring = true` doit être une violation de la réserve de \
+                     mika#1580",
+                );
+
+        // AC1 n'est pas « le test échoue », c'est « il nomme le fautif » : seule une
+        // assertion sur le texte du message le vérifie.
+        assert!(
+            violation.contains("agent-fictif-ac2"),
+            "le message de violation doit nommer l'agent fautif — obtenu : {violation}"
+        );
+        assert!(
+            violation.contains("allow_authoring"),
+            "le message doit nommer la clé en cause — obtenu : {violation}"
+        );
+    }
+
+    /// AC3 de mika#2888, armé — une spécification bien connue qui n'émet pas la
+    /// clé est elle aussi une violation, et le message nomme l'agent.
+    #[test]
+    fn mika2888_une_cle_absente_est_une_violation_qui_nomme_lagent() {
+        let violation =
+            allow_authoring_pin_violation("agent-fictif-ac3", "[skills]\nnudge_enabled = false\n")
+                .expect(
+                    "une spécification sans skills.allow_authoring laisse le \
+                     réconciliateur sans valeur à imposer — c'est une violation, pas \
+                     une abstention",
+                );
+
+        assert!(
+            violation.contains("agent-fictif-ac3"),
+            "le message de violation doit nommer l'agent fautif — obtenu : {violation}"
+        );
+        assert!(
+            violation.contains("allow_authoring"),
+            "le message doit nommer la clé manquante — obtenu : {violation}"
+        );
     }
 
     // -- Config reconciliation tests (mika#1633) --

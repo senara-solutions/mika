@@ -79,6 +79,26 @@ make_page_with_button() {
     echo "$dir"
 }
 
+# Twin of make_page_with_button, one directory over: the body lands in the
+# PRODUCER package instead of a consumer surface (mika#1799 D1). $2 names the
+# file, so the same content can be dropped as `Probe.tsx` or `Probe.test.tsx`
+# and the perimeter's test-file filter measured by the difference.
+#
+# The migrated <Button> on `dashboard/src` is not decoration: without it, the
+# filtered case (N8b) would have an empty CTA population and its green would be
+# the anti-vacuity exit 3 rather than a clean scan — the two states this harness
+# exists to keep apart.
+make_ui_component() {
+    local dir name
+    name="${2:-Probe.tsx}"
+    dir="$(mktemp -d)"
+    mkdir -p "$dir/packages/ui/src/components" "$dir/dashboard/src/pages"
+    printf '%s\n' "$1" > "$dir/packages/ui/src/components/$name"
+    printf '%s\n' '        <Button onClick={() => {}}>Search</Button>' \
+        > "$dir/dashboard/src/pages/Migrated.tsx"
+    echo "$dir"
+}
+
 make_allowlist() {
     local f
     f="$(mktemp)"
@@ -89,8 +109,27 @@ make_allowlist() {
 # ── 1. The real, migrated tree is clean, and the count is not zero (V6). This is
 #      what makes every red case below mean something: a lint that starts red
 #      proves nothing when you see it red.
+#      The count, decomposed and measured 2026-10-19 — pinned because understood,
+#      which is the difference between a harness and a clipboard:
+#
+#        10  the founding population across `dashboard/src` + `site/src`
+#       + 3  `ErrorState.tsx`, the three actions migrated by mika#1799 D4
+#       + 1  `SecretField.tsx:111`
+#       ────
+#         14
+#
+#      `packages/ui/src` holds 15 non-test `<Button` occurrences by raw grep and
+#      contributes only 4. TEN are in comments — 4 in `Button.tsx`'s JSDoc, both
+#      of `Spinner.tsx`, 2 of `SecretField.tsx` (one JSDoc, one JSX comment), and
+#      one each in `AuthCard.tsx` and `Stepper.tsx`; comments are not code
+#      (section 8 below pins that). The ELEVENTH is `Record<ButtonSize` at
+#      `Button.tsx:85`, a type, which the identifier boundary rejects. So a
+#      primitive documenting its own call sites does not inflate this number. The other 53 raw occurrences live in `Button.test.tsx` (26),
+#      `Button.type-assertions.tsx` (25), `Spinner.test.tsx` and
+#      `SecretField.test.tsx`: those are what the perimeter filter removes, and
+#      what would otherwise move this assertion on every test added to <Button>.
 assert_exit "$REPO_ROOT" 0 "real tree is clean (V6)"
-assert_says "$REPO_ROOT" "10 CTA element(s)" "V6: all ten CTAs are still found, via <Button>"
+assert_says "$REPO_ROOT" "14 CTA element(s)" "V6: all fourteen CTAs are still found, via <Button>"
 assert_says "$REPO_ROOT" "0 hand-rolled" "V6: none of them is hand-rolled"
 
 # ── 2. N1 — the base case. A solid fill on a <button>, all on one line.
@@ -167,6 +206,129 @@ rm -rf "$d"
 #       shape exclusions these would each read as a fill.
 d="$(make_page_with_button '      <button className="bg-clip-text bg-gradient-to-r bg-cover bg-no-repeat bg-center bg-blend-multiply">x</button>')"
 assert_exit "$d" 0 "non-colour background-* utilities are not fills"
+rm -rf "$d"
+
+# ── 5e. N5 (mika#1799 D2) — a gradient WITH STOPS is the most CTA fill there is.
+#       `bg-gradient-to-r` alone paints nothing, which is why 5d above is green
+#       and why the exclusion was written. Accompanied by a `from-*` stop it
+#       paints §2's signature texture — the one the rulebook prescribes for a
+#       primary — and the founding state said so itself: "Ten CTAs … none of them
+#       a gradient". The case did not exist, so it fell into the neighbouring
+#       bucket, and `ErrorState.tsx:46` lived there for three weeks.
+#
+#       The reported token is the STOP, not the word `bg-gradient-to-r`: the stop
+#       is what names the colour that stopped tracking §2, and it is the string a
+#       reader will search the file for.
+d="$(make_page_with_button '      <button onClick={retry} className="px-4 py-1.5 rounded-lg bg-gradient-to-r from-accent to-accent-light text-white">Retry</button>')"
+assert_exit "$d" 1 "N5: a gradient with colour stops is a CTA fill"
+assert_says "$d" "from-accent" "N5: the failure names the stop, not the gradient utility"
+rm -rf "$d"
+
+# ── 5e'. N5b — Tailwind v4 renames `bg-gradient-to-*` to `bg-linear-*`. Both
+#        spellings coexist in the wild, so the rule carries both; pinning one
+#        would make the guard green on the day the package upgrades.
+d="$(make_page_with_button '      <button className="px-4 py-2 bg-linear-to-br from-[#7c6af7] to-accent">Promote</button>')"
+assert_exit "$d" 1 "N5b: the v4 bg-linear-* spelling is caught too"
+assert_says "$d" "from-[#7c6af7]" "N5b: the stop is reported even as an arbitrary hex"
+rm -rf "$d"
+
+# ── 5f. N6 (mika#1799 D3) — a STATE ROLE is not an action. `<LiveRefreshToggle>`
+#       is a canonical primitive of this very package, and its switch track
+#       paints `bg-accent` to say WHICH STATE IT IS IN, not to call to action.
+#       "Solid fill on a <button>" cannot tell the two apart, because the
+#       distinction is not in the fill — it is in the role.
+#
+#       Closed by the predicate and never by the allowlist, for the reason this
+#       guard's own header gives: "un faux positif ici coûte une PR bloquée et se
+#       règle en mettant le lint en sourdine, ce qui est le mode de défaillance à
+#       fermer en premier."
+d="$(make_page_with_button '      <button role="switch" aria-checked={isLive} className="relative w-9 h-5 rounded-full bg-accent">
+        <span className="absolute top-0.5 w-4 h-4 rounded-full bg-white" />
+      </button>')"
+assert_exit "$d" 0 "N6: a role=\"switch\" track is state, not a CTA"
+rm -rf "$d"
+
+# ── 5f'. N6b — ...and the exclusion is a CLOSED list of selected-state roles.
+#        `role="button"` and `role="link"` are CTAs that gave themselves an
+#        explicit role; the scan must keep seeing them. Without this case, D3
+#        would be indistinguishable from "any tag carrying a role is exempt",
+#        which is the form that would quietly let the next CTA through.
+d="$(make_page_with_button '      <button role="button" className="px-4 py-2 rounded-lg bg-accent text-white">Promote</button>')"
+assert_exit "$d" 1 "N6b: role=\"button\" is not a state role"
+rm -rf "$d"
+
+# ── 5f''. N6c — the role must be a quoted LITERAL. A real CTA whose class list
+#         merely compares a role (`role === "tab"`) or whose title mentions one
+#         must stay in the population: otherwise exclusion 4 is an escape hatch
+#         anyone can open by accident.
+d="$(make_page_with_button '      <button className={cn("px-4 bg-accent", role === "tab" && "ring")}>Go</button>
+      <button title="role=tab" className="px-4 bg-accent">Go</button>')"
+assert_exit "$d" 1 "N6c: a role comparison or a prose mention does not exempt a CTA"
+assert_says "$d" "Found 2 hand-rolled" "N6c: both tags stay in the population"
+rm -rf "$d"
+
+# ── 5g. N7 — the gradient rule's natural false positive is TEXT in a gradient
+#       (`bg-clip-text text-transparent` + stops), which is banal on a landing.
+#       Measured at zero occurrences across the three surfaces before the rule
+#       was written — but a scan whose restraint nobody has watched is
+#       indistinguishable from a scan that fires on every `from-`, and the second
+#       form would be muted within the week.
+d="$(make_page_with_button '      <h1 className="bg-clip-text text-transparent bg-gradient-to-r from-accent to-accent-light">Mika</h1>
+      <button className="bg-clip-text px-2">x</button>')"
+assert_exit "$d" 0 "N7: gradient text on a non-interactive tag, and bg-clip-text alone, stay green"
+rm -rf "$d"
+
+# ── 5h. N8 (mika#1799 D1) — the perimeter reaches the PRODUCER package. LC.2
+#       armed this scan on the two consuming surfaces and not on the package that
+#       defines `<Button>` — the one place the primitive can contradict itself
+#       without anything saying so, and the place it did.
+d="$(make_ui_component '      <button onClick={go} className="px-3 py-2 rounded-lg bg-accent text-white">Search</button>')"
+assert_exit "$d" 1 "N8: a hand-rolled CTA inside packages/ui is rejected"
+assert_says "$d" "packages/ui/src/components/Probe.tsx" "N8: the failure names the producer path"
+rm -rf "$d"
+
+# ── 5h'. N8b — ...and stops at its test fixtures. A fixture is not a rendered
+#        surface, and without the filter the anti-vacuity count below swings by 53
+#        call sites (`Button.test.tsx` alone holds 26) and moves on every test
+#        added to `<Button>`. A harness that goes red on healthy work is a harness
+#        somebody disarms.
+d="$(make_ui_component '      <button onClick={go} className="px-3 py-2 rounded-lg bg-accent text-white">Search</button>' 'Probe.test.tsx')"
+assert_exit "$d" 0 "N8b: a test fixture inside packages/ui is outside the perimeter"
+rm -rf "$d"
+
+# ── 5i. N9 — exclusions 1 and 2 stay dominant over the new gradient case. A
+#       variant-prefixed stop and a translucent stop are the same grammar they
+#       always were; the gradient rule must not reach past them.
+d="$(make_page_with_button '      <button className="px-4 py-2 bg-gradient-to-r hover:from-accent hover:to-accent-light">x</button>')"
+assert_exit "$d" 0 "N9: a variant-prefixed gradient stop is not a fill (exclusion 2)"
+rm -rf "$d"
+
+d="$(make_page_with_button '      <button className="px-4 py-2 bg-gradient-to-r from-accent/40 to-accent-light/40">x</button>')"
+assert_exit "$d" 0 "N9: a translucent gradient stop is not a fill (exclusion 1)"
+rm -rf "$d"
+
+# ── 5j. N7b — gradient TEXT on the very tags the scan evaluates. N7 puts it on
+#       an <h1>, which the scan never looks at; the realistic case is a landing
+#       link whose label is clipped to the gradient. `bg-clip-text` paints the
+#       glyphs, not a fill, so it stays exclusion 3 whatever its stops say.
+d="$(make_page_with_button '      <a href="/x" className="bg-clip-text text-transparent bg-gradient-to-r from-accent to-accent-light">Docs</a>
+      <button className="bg-clip-text text-transparent bg-linear-to-br from-accent to-accent-light">x</button>')"
+assert_exit "$d" 0 "N7b: gradient text on an <a> or a <button> is not a fill"
+rm -rf "$d"
+
+# ── 5k. N9b — exclusion 3 stays dominant over the stop, as it does over the
+#        solid fill: a stop that names no colour or a surface tier paints no CTA
+#        (a fade-out sheen on a ghost button is the realistic shape).
+d="$(make_page_with_button '      <button className="bg-gradient-to-r from-transparent via-white/10 to-transparent">x</button>
+      <button className="bg-gradient-to-b from-surface-container to-bg">y</button>')"
+assert_exit "$d" 0 "N9b: from-transparent and surface-tier stops are not fills (exclusion 3)"
+rm -rf "$d"
+
+# ── 5l. N5c — a stop POSITION is not a colour stop. `from-10%` must not be the
+#        token reported; the colour stop after it is.
+d="$(make_page_with_button '      <button className="bg-gradient-to-r from-10% from-accent to-accent-light">Go</button>')"
+assert_exit "$d" 1 "N5c: a gradient with a positioned stop is still a fill"
+assert_says "$d" "painting from-accent" "N5c: the colour stop is reported, not the position"
 rm -rf "$d"
 
 # ── 6. The rule is SHAPE, not a denylist of the ten measured classes. This is the

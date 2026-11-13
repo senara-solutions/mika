@@ -3,13 +3,76 @@
 Moved verbatim out of `crates/mika-agent/CLAUDE.md` on 2026-10-13. That file is loaded whole into a pilot's prompt as soon as the pilot reads anything under `crates/mika-agent/`; at 594 KB it no longer fit, and `crates/mika-common/tests/claude_md_size.rs` now caps every `CLAUDE.md` in the repository. Headings keep their original level.
 
 
-Max 20 tool steps (all modes: conversation, callback, reminder, team), a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()` for builtins, and by the owning skill's `timeout_secs` for skill tools — see § Per-Tool Skill Budget). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
+Max 20 tool steps (all modes: conversation, callback, reminder, team) — **30 for mika-qa since mika#2926, see § Le plafond de pas est résolu par agent below** — a per-agent turn envelope **defaulting** to 5 minutes (settable since mika#2189 — see § Timeout Budgets), 30s default per-tool timeout (overridable via `Tool::timeout_secs()` for builtins, and by the owning skill's `timeout_secs` for skill tools — see § Per-Tool Skill Budget). `LoopMode::Silent { max_steps }` carries per-trigger step limits via `SilentTrigger::max_steps()`. Step-awareness nudge injected at step `max_steps - 2` for all modes to encourage wrapping up. Silent mode nudge text is tailored for `send_message` notification.
 
 **Deadline enforcement (#848, #939, mika#2189):** the turn budget is enforced via an `Instant`-based deadline checked at five points: (1) top of each `run_loop` step iteration, (2) end of prelude work in each inner function before entering `run_loop`, (3) before `attempt_continuation_turn` entry — skip when `now + CONTINUATION_TIMEOUT_SECS > deadline`, (4) inside `attempt_continuation_turn` itself, where the inner timeout is clamped to `min(60s, deadline - now)`, (5) inside the LLM transport retry loop — `send_message_with_deadline()` aborts the retry chain when the remaining budget falls under a threshold **derived from the effective per-call plafond** (`0.75 × plafond + 0.25 × plafond`, which is the historical 90 + 30 = 120s at the default plafond), preventing doomed retries from consuming the deadline (#939). **The outer agent deadline still never drops a future mid-flight** — that is the mika#848 contract and it is unchanged: the `llm_calls` row is always persisted (success or transport-timeout), and worst-case turn duration remains `envelope + plafond`, i.e. `300s + 120s = 420s` at the shipped defaults. What changed with **mika#2342** is that the provider's `reqwest` timeout is no longer the **sole** cancellation mechanism: `run_loop`'s call is wrapped in a `tokio::time::timeout` sized on `LlmProvider::worst_case_failure_secs() + LLM_WATCHDOG_MARGIN_SECS` (60 s) — see § LLM-call watchdog below. Sized on the *worst case* rather than on the remaining deadline, that net does not contradict the mika#848 reasoning: on a rail that bounds its own calls it can only fire once the rail's mechanism has already failed, i.e. on a call that is already lost. Note the Anthropic rail (`crates/mika-common/src/claude.rs`) still hard-codes its own `120s` literal instead of reading the plafond — a real inconsistency mika#2189 names and leaves to its own ticket; mika#2342 makes it a *declared* value (`AnthropicProvider::worst_case_failure_secs`) so the net is not sized on a budget that rail does not honour. `LoopResult` is a three-variant enum (`Done`/`MaxStepsExceeded`/`DeadlineExceeded`) without `#[non_exhaustive]` — the compiler's match-exhaustiveness check enforces that all three outer handlers (conversation, silent, team) handle every variant. CI lint guard `scripts/check-loop-select.sh` rejects `tokio::select!` inside `run_loop`'s body (would shadow the iteration-top deadline check).
 
 On max-steps exceeded: continuation turn (tools disabled, deadline-clamped timeout, ceiling 60s) forces a text summary via shared `attempt_continuation_turn()` helper (used by Conversation, Team, and Silent modes); the helper persists an `llm_calls` row in all outcomes (success/error/timeout) so the continuation is never the silent-drop variant of the in-flight-cancel bug at smaller scale. If continuation fails or is skipped (deadline too close), structured fallback shows last 5 tool names with status. Silent mode continuation sends the summary via `message_sender` if available, prefixed with "[Background task exceeded tool step limit]".
 
 **Test-only entry points (`run_*_with_deadline`):** publicly visible by naming convention, used only by `EvalHarness` to inject short deadlines for the deadline-during-LLM-call eval scenarios. Production callers should always use `run_agent`/`run_silent_agent`/`run_team_agent`. `AgentParams` carries no deadline knob.
+
+### Le plafond de pas est résolu par agent, et c'est celui-là qu'on annonce (mika#2926)
+
+**Un site unique de résolution.** En tête de `run_loop` :
+
+```rust
+let max_steps =
+    crate::planning::policy::max_tool_steps_for_agent(db.agent_id(), mode.max_steps());
+for step in 0..max_steps { … }
+```
+
+`mode.max_steps()` fournit le **défaut** — `MAX_TOOL_STEPS`,
+`MAX_CALLBACK_TOOL_STEPS` ou `MAX_TEAM_TOOL_STEPS` selon le `LoopMode`, parce que
+c'est le mode qui sait lequel des trois s'applique — et la fonction ne le
+remplace que pour `mika-qa`, à qui elle rend `MAX_TOOL_STEPS_MIKA_QA = 30`. Les
+trois modes passent par ce site et rien en aval ne recalcule un plafond : **c'est
+ce qui tient AC3 structurellement** plutôt que par relecture. La résolution est
+sensible à la casse (`"Mika-QA"` reçoit le défaut) ; les deux propriétés sont
+affirmées agent par agent dans `planning::policy`'s `mod tests`
+(`mika2926_le_plafond_par_agent_ne_touche_que_mika_qa`,
+`mika2926_la_resolution_est_sensible_a_la_casse`).
+
+**Pourquoi 30, et pas 25 ni 40.** Mesuré sur les 13 tours de mika-qa coupés au
+plafond entre le 2026-10-23 et le 2026-10-26 (série `max_steps_tool_census`,
+mika#2877) : `run_shell` consommait de 9 à 28 pas, et le `total_calls` maximum
+observé était 31. 30 couvre 12 des 13 tours ; le treizième est accepté comme
+coupé, parce qu'un plafond dimensionné sur le pire cas observé n'est plus un
+plafond. La borne d'exploration posée dans les deux prompts de revue est l'autre
+moitié du correctif — le relèvement seul **déplace** l'épuisement, la mesure le
+disait avant le geste.
+
+**Le plafond SERVI est transporté, jamais recalculé (R1b).**
+`LoopResult::MaxStepsExceeded` porte un champ `max_steps: usize`, rempli depuis
+le local déjà résolu. Trois consommateurs en aval le lisent là, et chacun
+annonçait auparavant un nombre qui pouvait divergir :
+
+| consommateur | ce qu'il lisait avant | pourquoi c'était faux |
+|---|---|---|
+| WARN `"silent agent exceeded max tool steps"` | `params.trigger.max_steps()` | le déclencheur **déclare** 20 pour un `Callback` ; c'est le plafond du déclencheur, pas celui que la boucle a servi |
+| `persist_deadline_fallback` (bras conversationnel) | la constante `MAX_TOOL_STEPS` | un quatrième site annonçant un plafond, non nommé par le ticket, trouvé en vol — c'est le site que le tour `synchronize` 4f94fbc8 de mika#2920 a traversé |
+| `max_steps_tool_census` | le local (déjà correct) | inchangé — il est émis **dans** le corps de boucle |
+
+L'invariant à retenir : **un nombre de pas annoncé hors de `run_loop` se lit sur
+la variante, jamais sur une constante ni sur le déclencheur.** Le bras `Team`
+détruisait déjà la variante avec `..` et n'a rien demandé.
+
+**Et le prompt est le quatrième annonceur.** `qa-review/system_prompt.md` dit
+*« You have a maximum of N tool steps per turn. »* ; N vivait dans un fichier que
+rien ne joignait au moteur, et valait **14** pendant que le moteur servait 20.
+L'égalité est désormais une assertion :
+`tests/qa_review_executes_repo_guards.rs § mika2926_le_plafond_annonce_par_le_prompt_est_celui_du_moteur`
+extrait N du prompt et le compare à ce que `max_tool_steps_for_agent` résout — la
+fonction, jamais un littéral recopié. Les deux nombres doivent donc bouger dans
+le même commit.
+
+**Attestation de bout en bout** : `tests/eval/test_qa_step_budget_2926.rs`, trois
+tours sur le **même** corpus rejoué (la session `callback-0f07c520`, 23
+`run_shell` puis la revue) — mika-qa pose son verdict sans census, un autre agent
+épuise à 20 sur la même séquence (le contrôle négatif, qui est l'information
+disant que le changement est bien par agent), et le WARN de coupure annonce 30 et
+non 20. Le troisième passe par `run_silent_agent` monté à la main, parce que
+`EvalHarness::run` appelle `run_agent` et que `callback_turn(true)` ne pose qu'un
+drapeau sur `AgentParams`.
 
 ### Timeout Budgets (mika#2189)
 
@@ -274,7 +337,7 @@ serialization, connection acquisition). `request_bytes` rides on the **start** o
 the attempt because that is the only way to know the size of a request that never
 comes back: `llm_calls.request_bytes` is written after the call returns.
 
-**Structural guard.** `agent_loop::tests::mika2342_every_llm_call_is_wrapped_in_a_timeout`
+**Structural guard.** `mika2342_every_llm_call_is_wrapped_in_a_timeout`
 — a source scan, because removing the net breaks no assertion: the loop keeps
 working and every existing test stays green, only the call goes unbounded and
 silent again. Inventory closed at two call sites, **no allowlist** (an allowlist
@@ -407,6 +470,8 @@ Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guar
 6b. **Callback milestone advance guard (#991):** Inline guard (not in `INTENT_GUARDS` const array) that enforces queue advancement on milestone/project-context callback turns. Triggers on `[callback:` + `[milestone-parent: <id>]` markers in the user message (the marker is injected by `run_silent_agent` after a DB lookup of the parent task type). Satisfied by EITHER Path A: `run_claude_pilot` call (advance to next child), OR Path B: `update_task_status` targeting the parent task ID with status `blocked`/`completed` (halt or finish). Inline because the satisfied predicate needs the parent_task_id from the user message. Composes with `callback_terminal_action` (entry e) — a milestone-context callback must satisfy BOTH guards. Also has an empty-text exit mirror guard. Companion `SilentTrigger::PostCallbackAdvance` fires a second advance turn if the first callback turn did not advance; auto-blocks the milestone if the second turn also fails. **Webhook companion guard (#1218, paired with #991):** Sibling inline guard for `pull_request.closed(merged:true)` webhook turns. Triggers on the `[milestone-parent: <id>]` marker prepended by `server::milestone_context_handler` when the PR-closed event correlates to a task with a `milestone`/`project` parent. Satisfaction has three valid paths: Path A (`run_claude_pilot` or `run_claude_pilot_groom` — advance), Path B (`update_task_status` on parent with `blocked`/`completed` — halt), Path C (`deploy_mika` + `send_message` — deploy-hook ack per self-dev-webhook-qa step 5.5.b). Mutually exclusive triggers with #991: the callback prefix `[callback:` and the webhook prefix `[GitHub] PR closed:` cannot both appear on a single user message. The marker parser `extract_milestone_parent_id` and the constant `MILESTONE_PARENT_MARKER` are shared with #991.
 6c. **Asserted-unavailability guard (#862, #894):** Inline guard (not in `INTENT_GUARDS` const array) that detects when assistant text claims a tool is unavailable ("X is not callable", "X not callable", "I don't have access to X", "X is skill-scoped", "X skill-scoped", "cannot call X", "X is structurally not callable") while X is in the agent's turn-start enabled-tool set and no call to X was attempted in the turn. Five regex patterns with named `(?P<tool>...)` capture groups, normalized to lowercase for case-insensitive registry lookup. P2 and P4 use optional copula `(?:is )?` to catch elided-copula forms; P2 and P3 use optional adverb `(?:\w+ly )?` to catch adverb-interposed forms (e.g., "structurally", "currently"). Two-layer false-positive filter: snake-case capture constraint + enabled-set lookup. Inline rather than in the registry because it checks *assistant* text (not user input) and needs the `enabled_tool_names` snapshot + dynamic `format!` correction message. Uses `intent_guard_retries` with label `"asserted_unavailability"` for single-retry semantics. Not skipped by `skip_remaining_guards` (#1178) — a successful PR review does not grant license to fabricate tool unavailability claims. `enabled_tool_names: HashSet<String>` is a turn-start snapshot of the LLM tool array (after identity denylist + skill overrides + MCP), threaded to `run_loop` from all three call sites (conversation, silent, team). Structural counterpart to Rule 2 of `docs/solutions/best-practices/required-tools-gate-evasion-patterns-2026-04-28.md`.
 6d. **Assert-grounded guard (#1331):** Inline guard that detects affirmative state claims about referenced resources (issue/PR/task #N) without a grounding tool call (`run_gh`, `check_task`, `gh_read`) in the turn. Four regex patterns detect claim shapes (first-person verification claims, passive state assertions, handler/callback completion claims). Two-layer false-positive filter: narrow claim-verb + resource-type noun pairs, plus resource-ref extraction requirement (no ref → no fire). Satisfaction predicate checks `all_tool_summaries` for any attempt (success or failure) to a grounding tool with matching resource reference. Single retry via `intent_guard_retries` with label `"assert_grounded"`. Mirror of `asserted_unavailability` (negative → affirmative claims). Not skipped by `skip_remaining_guards` (#1178) — a successful PR review does not ground affirmative claims about unrelated resources.
+
+**Second violation in the same turn (mika#2867):** the budget is spent, the EndTurn is accepted, and a `guard.assert_grounded_uncorrected` WARN is emitted at the point where the recidive is observed, as in the rest of the `_uncorrected` family. This is also the first emission site of mika#1381's `fabrication-detected` P0 class, and it ships **disarmed** behind `fabrication_p0_notify` / `MIKA_FABRICATION_P0_NOTIFY` (default `false`, resolved with `is_some_and` at the three `run_loop` entry points). When the gate is open, the notification is **not** sent from the branch. Guards downstream of it (6e, 6f, #1313, #864, #901, #2037) can still refuse the close, and the response that recidivated would then never go out. The notification is held in `pending_fabrication_p0` and sent through `send_with_severity(…, P0)` only once the EndTurn is accepted, just before the #953 correction telemetry, and only if the accepted text still carries an ungrounded claim. The `intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)` term of the branch predicate is redundant on every reachable path, because 6d sits directly above with the same conjuncts and `continue`s. It is kept as defense in depth. Transport-level coverage, including the gate-closed control and the downstream-guard case: `tests/eval/test_fabrication_detected_p0_2867.rs`. Operator surfaces, probes and the arming condition: `docs/operator/environment-variables.md` § *La récidive d'ancrage se nomme*.
 6f. **Unacknowledged send-failure guard (mika#2136):** Refuses an EndTurn that closes over a `send_message` the engine watched fail and nothing repaired. Founding incident, 2026-09-01 on Al's Telegram: a 12 000-character document refused for length, answered with « Le voici en entier 👆 »; then a split whose part 1/4 died at the transport, with the agent moving on to « Partie 2/4 » without a word. **The model had been told, both times, with the exact figures in the `tool_result`** — which is what makes this the hardest of the three same-day tickets and what rules out a prompt line as the remedy (`feedback_prompt_enforcement_empirically_confirmed_at_loop_substrate`: nine recurrences under prompt enforcement against zero when the fact is posed by code).
 
 **The information already existed; what was missing was a type and a reader.** `dispatch.rs` has always pushed `{name: "send_message", success: false}` into `all_tool_summaries`, and eleven guards read that vector at close — but `grep -c "send_message" crates/mika-agent/src/evidence/guards.rs` returned **0**. So this ticket does not create a fact, it qualifies one and reads it.
@@ -434,6 +499,217 @@ Single retry via `intent_guard_retries`; **not** skipped by `skip_remaining_guar
 7. **Persistence evaluation guard (#648):** `detect_informational_input()` checks user input for informational signals (FYI, diagnostic, correction, status update) and `detect_persistable_output()` checks assistant text for verdict-shaped patterns (root cause, confirmed, validated, lesson learned). If no persistence write tool (`store_fact`, `update_fact`, `update_core_memory`) was called and either detection matches, nudges the model once to consider calling `store_fact`. Conversation mode only. Nudge, not rejection — the model can decline. `PERSISTENCE_WRITE_TOOLS` constant defines the write-tool set.
 8. **Required-suffix-line guard (#864):** Manifest-driven guard for skill-declared output contracts. Skills opt in via `[output] required_suffix_lines = ["Verdict: GROOMED", "Verdict: ESCALATE"]` in `skill.toml`. `collect_required_suffix_lines()` unions lines from `Keyword` and `AlwaysOn` matched skills (not `Dependency`). The guard scans the assistant's last 3 non-empty lines (after `trim()`) for an exact match to any entry; missing match rejects EndTurn once with a corrective re-prompt naming the accept-set. Standalone retry flag `required_suffix_line_retry_done`. Position: after persistence-eval — other guards' rejections take precedence. Silent mode passes empty `required_suffix_lines` (no enforcement). Currently opted-in: `mika-arch-second-review` (GROOMED/ESCALATE) and `mika-arch-groom-ticket` (READY/ITERATE/ESCALATE). Structural counterpart for the verdict-ghosting failure mode in mika#788.
 9. **Required-finding-list guard (#901):** Manifest-driven guard for skill-declared F-list emission contracts. Skills opt in via `[output] required_finding_list_prefixes = ["F1:", "F2:", ..., "F10:"]` in `skill.toml`. `collect_required_finding_list_prefixes()` unions prefixes from `Keyword` and `AlwaysOn` matched skills (not `Dependency`). The guard fires only on terminal dispositions (ITERATE/ESCALATE/Verdict: ESCALATE) — `is_terminal_disposition()` checks the last 3 non-empty lines against both the skill's `required_suffix_lines` and a `TERMINAL_DISPOSITIONS` constant. Scan range: message start up to (exclusive of) the first line matching any `required_suffix_lines` entry. At least one line in the scan range must start with a declared prefix (via `starts_with`, no regex). Missing match rejects EndTurn once. Standalone retry flag `required_finding_list_retry_done`. Position: immediately after #864 suffix-line guard. Silent mode passes empty `required_finding_list_prefixes` (no enforcement). Currently opted-in: `mika-arch-groom-ticket` and `mika-arch-second-review`. Structural counterpart for the conditional-disclosure-evasion failure class (N=8 incidents, mika#901).
+
+### Review-anchor guard — measuring the corrective re-prompt (mika#2794)
+
+The review-anchor guard (mika#2037, label `REVIEW_ANCHOR_GUARD_LABEL`) refuses a
+non-terminal disposition — `Disposition: READY`, `Verdict: GROOMED` — whose body carries no
+attestation: anchor lines quoting the reviewed brief verbatim at disjoint regions. The
+predicate lives in `agent_loop::review_anchor`, whose module doc-comment carries the design;
+the refusal is fail-closed and, since mika#2338, fail-visible (the disposition becomes an
+`ESCALATE` of its own family, preceded by an engine finding line).
+
+**Since mika#2794 the corrective re-prompt names the anchor that failed.** The verdict carries
+`per_anchor: Vec<AnchorOutcome>` — label, excerpt, refusal — and
+`review_anchor::format_anchor_diagnosis` turns it into the paragraph the model reads: the accepted
+anchors by name (so the correction is local rather than a rewrite of all three), the refused
+ones with the start of what they said, and — gated on `QuoteNotInBrief` — the usual cause,
+stated as a likelihood: a quote absent from the brief generally comes from a document read with
+a tool, not from the brief message of the turn. **Nothing in the decision reads `per_anchor`**:
+the counters and the miss reason still decide alone, so the guard's refusal path is unchanged.
+
+**Whether the model obeys is a bet, and these two journal lines are the instrument that judges
+it.** The ticket's acceptance measure is *the number of withholds after a re-prompt over the
+number of re-prompts*, and the two existing lines already are exactly that ratio — one per
+re-prompt, one per withhold:
+
+| line | level | cardinality |
+|---|---|---|
+| `event = "guard.review_anchor"` | WARN | one per corrective re-prompt (**denominator**) |
+| `event = "guard.review_anchor_withheld"` | ERROR | one per withhold after the re-prompt (**numerator**) |
+
+Both gained the same two fields: **`refused_labels`** and **`accepted_labels`**, labels joined
+by `,` because a `tracing` field carries one scalar. That is what makes the measurement readable
+*per anchor class* — the ticket's thesis is "it is always the first one", and only this field
+confirms or refutes it in production.
+
+Three reading rules:
+
+- **Empty is an empty string, never an absent field.** The **absence** of either field means a
+  binary older than this change (class mika#2340), never "no anchor was refused" (mika#2331).
+- **No third probe.** A new line would be a second producer of the same number; the cardinality
+  of the two existing ones *is* the ratio (mika#2205).
+- **The instrument is not live before `make deploy`** — the journal is written by the binary
+  being served, not by the checkout.
+
+Protocol, read on `$MIKA_SPIRIT_LOG_FILE` (`/var/log/mika/server.log`):
+
+```sh
+jq -r 'select(.event == "guard.review_anchor" or .event == "guard.review_anchor_withheld")
+       | [.timestamp, .event, .refused_labels, .accepted_labels, .miss_reason] | @tsv' \
+  < /var/log/mika/server.log
+```
+
+**The "before" measurement is already acquired** — the offline replay of the matcher over the
+real briefs and responses of three mika-arch grooming sessions, window 2026-10-18: **3 withholds
+on 3 re-prompts, a ratio of 1.0**, and the refused anchor was the first one in 2 of the 3
+sessions (`49ffa230`, `a7f1ccad`; `f167ff53` went 3 valid of 1 then of 0). Session `a7f1ccad`
+returned the same faulty anchor three times under a re-prompt that named the class and not the
+line.
+
+The **decision** in the light of the "after" measurement — keep, reinforce, or move to
+deterministic attribution (searching the refused excerpt in the turn's `tool_result` blocks, so
+the sentence can say *"your A1 quotes the output of `gh_read`"* instead of supposing it) — is an
+operator gesture over a deployment window. mika#2794 does not take it and opens no ticket for
+it: a ticket opened on an unmeasured hypothesis is precisely what mika#2786 declined to do for
+this lead.
+
+**That gesture was taken, on a measurement, by mika#3003** — see *the re-prompt names the tool
+that produced the quote* below. The hypothesis stopped being unmeasured on 2026-10-31 (trace
+`f2a64bd7`): the three anchors were absent from a brief byte-identical to the committed plan and
+present word for word in the ticket body the architect had read with `gh_read issue_view`.
+
+### Review-anchor guard — the UNPARSED retries carry the plan (mika#2996)
+
+The guard only arms when the turn's brief reaches `review_anchor_min_brief_chars` (2000 on
+both groom skills). The two UNPARSED retries of `_iterate_groom_loop` — mika#1823 on the
+first pass, mika#2641 on the second — used to send a ~380-character corrective prompt and
+then **accept the disposition returned on that turn**. That turn was below the threshold, so
+an advancing disposition owed no evidence there. Measured on 2026-10-31, trace `15ea28bd`: a
+review of *another* plan, ending in `Disposition: READY`, advanced the chain as
+`READY-after-retry`.
+
+Since mika#2996 the retry message carries the plan, verbatim, between two marker lines
+(`review_anchor::RETRY_PLAN_BEGIN` / `RETRY_PLAN_END`, written literally by
+`_append_retry_plan_envelope` in `dispatch-lib.sh`). `review_anchor::anchor_reference`
+reduces such a brief to the plan before the length check and the quote matching, so:
+
+- the guard arms on the retry exactly as on the turn it repairs;
+- anchors are checked against the **plan only**: three quotes of the corrective instruction
+  around it attest nothing;
+- the false positive the threshold was guarding against (demanding proof from a brief that
+  cannot contain it) is gone, because the brief contains the plan.
+
+A brief with no envelope, or with only one of the two markers, is used whole — a malformed
+envelope keeps the guard armed rather than disarming it on an empty region. A plan that has
+become unreadable makes the retry prompt fail to build, and the loop stops instead of
+retrying without the plan.
+
+**Post-deploy probe (AC4 of mika#2996).** A guard that passes on the first try emits no line,
+so the journal alone cannot tell "evaluated and satisfied" from "never armed". The probe is
+on the messages instead. For every `READY-after-retry` or `GROOMED-after-retry` entry of a
+`.claude/groom-verdict-trail.log`, read the retry turn's user message and the reply in
+`~/.mika/data/mika.db` (session from the trail's third field). The user message must carry
+both marker lines and a plan region of at least 2000 characters, which proves the guard
+armed. The reply must carry three anchors that quote that plan region at disjoint places,
+which proves it was satisfied. Check this by replaying `verify_review_anchors` against
+`anchor_reference(user_message)`. The count of entries that fail either half is reported on
+mika#2996, and the target is 0. The instrument is not live before `make deploy`:
+`dispatch-lib.sh` is seeded from the binary, not read from the checkout.
+
+### Review-anchor guard — the re-prompt names the tool that produced the quote (mika#3003)
+
+mika#2794's re-prompt phrases the origin **in the conditional** — *"a quote that is absent from
+the brief usually comes from a document you read with a tool"* — because the engine did not know.
+Since mika#3003 it knows, and the sentence goes to the indicative **only when a verbatim search
+established it**.
+
+**The turn's read ledger.** `review_anchor::ToolReadLedger` is a turn-scoped `Vec<(tool_name,
+normalized_text)>`, created in `run_loop` before the step loop and threaded into
+`process_tool_calls`. Its **single feed site** is in `tool_execution/dispatch.rs`, just before the
+`tool_results.push` that carries a real tool output: `record_tool_read(name, &output.content)`.
+The two other `tool_results.push` of that function carry text the *engine* wrote (boundary
+removal #771, evidence refusal mika#2934), not a document a tool returned, and must never feed
+the ledger — a source scan holds that (`mika3003_le_registre_de_lecture_a_un_seul_ecrivain`,
+allowlist shipped **empty**, with its good-faith positive control; the predicate consults
+`crate::source_scan::is_test_source_path` rather than truncating at `#[cfg(test)]`). An output in
+**error** is recorded like any other: the architect quoted what it was shown, whatever the tool
+thought of it.
+
+**Why the text is normalized at the write.** `find_brief_quote_range` requires its haystack to be
+in the matcher's canonical form (`normalize_for_anchor_match` — strips `*` and backticks, folds
+typographic apostrophes, collapses whitespace, idempotent). Normalizing at the write makes the
+ledger and the matcher symmetric by construction, instead of hoping every reader remembers.
+
+**The ceiling, and `Unknown`.** `TOOL_READ_LEDGER_CHARS = 200_000` bounds the whole ledger, not
+each entry. The **raw** text is clipped first and normalized after, in **characters** (never bytes
+— `scripts/check-byte-slices.sh`), and a clip sets `truncated`. The consequence is the rule that
+matters: when an excerpt is found in no entry and the ledger was truncated, the attribution is
+`AnchorAttribution::Unknown`, never `AbsentFromReads` — *"I did not find it"* and *"it is not
+there"* are two populations, and asserting the second from the first is how an instrument lies
+(class mika#2205). `Unknown` keeps the conditional sentence.
+
+**What is searched, and with what window.** Not `outcome.excerpt` as-is: the excerpt is the first
+72 characters of the anchor line *after* its `A1:` prefix, so it carries the model's own quotation
+mark and the start of its prose, and no document contains that string. The search uses the
+matcher's own `find_brief_quote_range` over the normalized excerpt (trailing `…` removed), at a
+window clamped to `[ATTRIBUTION_MIN_QUOTE_CHARS = 40, ANCHOR_EXCERPT_CHARS = 72]` —
+`min_quote_chars.clamp(40, 72)`. The floor is deliberate: a 12-character window would attribute
+on a common phrase. Only a `QuoteNotInBrief` refusal is attributed at all; every other refusal
+reason returns `None` and changes no wording.
+
+**The re-prompt.** `review_anchor::format_anchor_diagnosis` takes the attributions indexed **in parallel with
+`per_anchor`** (not "in refused order" — the pairing is positional, and a test pins that), and
+emits one indicative line per attributed anchor: *"A1 quotes, word for word, what the `<tool>`
+tool returned during this turn — not the brief. This is measured, not guessed: the engine searched
+the text that tool returned and found that line in it."* The mika#2794 conditional paragraph
+survives **byte for byte** for any `QuoteNotInBrief` anchor the ledger did not attribute. The two
+moods cohabit on a mixed turn. **Nothing in the decision reads the attributions**: the guard's
+refusal path is unchanged, exactly as mika#2794 left it.
+
+**AC3's denominator did not exist, so it was built.** mika#2794's ratio is *withholds over
+re-prompts*; mika#3003 AC3 asks for *withholds over non-terminal **passes***, and no line counted
+passes. A third line now does:
+
+| line | level | cardinality |
+|---|---|---|
+| `event = "guard.review_anchor_armed"` | INFO (`target: "mika::otel"`) | **one per guard evaluation**, on every armed branch including the healthy one |
+
+It is emitted by `review_anchor::ArmedPassage::emit`, which also accumulates what the line
+reports across the guard's two branches. It carries `anchors_found`, `anchors_valid`,
+`brief_chars`, `withheld: bool` and `attributed_sources`. Three reading rules:
+
+- **One line per PASS, not per turn.** A turn that re-prompts emits two: the re-prompt's
+  (`withheld: false`) and the following pass's. Counting turns would under-state the denominator
+  by a factor that depends on the re-prompt rate.
+- **`anchors_found` / `anchors_valid` are ABSENT on the `Satisfied` branch, not zero.** That
+  branch counts nothing (`AnchorVerdict::Satisfied` carries no counter), and a `0` would lie about
+  a reply with three valid anchors (motif mika#2331). They are emitted as `Option<usize>` for
+  that reason — `tracing` renders `None` as an absent field.
+- **This is not the probe mika#2794 refused.** That one wanted to replay the verbatim search over
+  every document of the turn to *guess* an origin. This line only counts what the guard already
+  decided.
+
+Both pre-existing lines gained **one** field, the same on both: **`attributed_sources`** — tool
+names joined by `,`, order-preserving and deduplicated, and an **empty string** when nothing was
+attributed. Empty is an empty string, never an absent field: the **absence** of the field means a
+binary older than this change (class mika#2340), never "nothing was attributed" (mika#2331).
+
+Protocol, read on `$MIKA_SPIRIT_LOG_FILE` (`/var/log/mika/server.log`):
+
+```sh
+jq -r 'select(.event | startswith("guard.review_anchor"))
+       | [.timestamp, .event, .anchors_valid, .attributed_sources, .miss_reason] | @tsv' \
+  < /var/log/mika/server.log
+```
+
+**The "before" denominator is unobtainable from the log, and is reconstructed offline.** The
+numerator is already acquired from `server.log` (12 withholds over 2026-10-17 → 2026-10-31: 2 on
+17/10, 5 on 18/10, 2 on 20/10, 1 on 29/10, 2 on 31/10). The denominator is not there — no line
+counted passes before this change. It is rebuilt from `llm_calls.response_text` (the column added
+in schema v31) in `~/.mika/data/mika.db`: a non-terminal pass is a response carrying a
+non-terminal `Disposition:` / `Verdict:` line, on a brief of at least
+`review_anchor_min_brief_chars`. The two halves of the ratio therefore come from two instruments
+for the "before" window and from one for the "after" window — which is itself a reading rule, not
+a defect to hide.
+
+**The 14+14-day read is an operator gesture on a deploy window, not a CI assertion.** The
+instrument is not live before `make deploy`: the journal is written by the binary being served,
+not by the checkout. No script ships for it — the written protocol above is AC3's deliverable.
+
+**Named risk (AC3's whole point).** This is a model-behaviour defect, and a more precise re-prompt
+does not guarantee obedience (doctrine mika#1190). The measurement is what will say whether it
+moved.
 
 ### Deterministic Context Injection
 

@@ -31,11 +31,14 @@ use super::cadence::{
     DeliveryError, DeliveryFailureKind, ManagerConfig, classify_delivery_auth,
     run_manager_cycle_with_auth,
 };
+use super::evaluator::FlightSource;
+use super::groom_trigger::{GroomInFlightSource, GroomSender};
 use super::liveness::{LivenessEmitter, LivenessSink};
 use super::reader::{GhCommandError, GhRunner, ProcessGhRunner};
 use super::reporter::{AuthBoundaryNote, AuthBoundaryTracker};
 use super::types::MilestoneRef;
 use crate::auth_boundary_ledger::AuthBoundaryLedger;
+use crate::flight_verdict_ledger::FlightVerdictLedger;
 use mika_common::auth_boundary::AuthBoundaryError;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
@@ -120,6 +123,54 @@ pub const DEFAULT_SILENCE_THRESHOLD_DAYS: u32 = 3;
 /// poll costs one `gh` invocation and a digest comparison — cheap.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 300;
 
+/// Rend `None` — et le dit en ERROR — quand l'URL confiée à une variable de
+/// **rapport** vise un endpoint de **battement** (mika#2697).
+///
+/// Le défaut fondateur : `MIKA_MANAGER_DELIVERY_URL` visait
+/// `…/agents/mika-manager/heartbeat`, qui enregistre un tick, répond 201 pour
+/// n'importe quel nom d'entité et **ne conserve pas le corps**. Le POST
+/// réussissait, donc le cycle journalisait `manager_cycle_delivered route=http`,
+/// et le 2xx fermait aussi la porte du repli : trois semaines de rapports
+/// lisibles nulle part (dernier fichier du sink : 2026-09-27 06:08Z).
+///
+/// La garde **efface** la valeur plutôt que d'ouvrir une troisième route. C'est
+/// ce qui garde `cadence::url_is_routable` seul lecteur du prédicat de routage
+/// (mika#2267) : en aval, « URL effacée » et « URL absente » sont le *même* mot,
+/// donc `manager_delivery_resolved` annonce `delivery_url_set=false
+/// route_normal=offline_sink` sans qu'aucune ligne n'ait à le recalculer. Et la
+/// route obtenue est le sink **nominal**, pas `…_FALLBACK` : rien n'est tombé en
+/// panne, une variable était mal remplie.
+///
+/// La ligne ERROR nomme la variable fautive **et** la correcte — un opérateur
+/// qui lit « mauvaise URL » sans savoir où la mettre n'a pas de geste. Elle ne
+/// porte aucune URL ni aucun chemin : discipline du module (un journal porte des
+/// booléens et des noms), vérifiée par le balayage tous-champs de
+/// `tests/manager_delivery_observability_2267.rs`.
+///
+/// `pub` pour son test de contrat, pas pour des appelants — même raison
+/// qu'`emit_delivery_resolved` : la ligne ERROR est une surface opérateur, et le
+/// seul moyen honnête de l'épingler est d'appeler le site d'émission réel.
+pub fn reject_heartbeat_endpoint(url: Option<String>, env_var: &str) -> Option<String> {
+    let url = url?;
+    if !super::cadence::url_is_heartbeat_endpoint(&url) {
+        return Some(url);
+    }
+    error!(
+        target: "mika::milestone_manager",
+        event = "manager_report_url_rejected_heartbeat_endpoint",
+        env_var = env_var,
+        use_instead = ENV_LIVENESS_URL,
+        matched_segment = super::cadence::HEARTBEAT_PATH_SEGMENT,
+        route = super::cadence::ROUTE_OFFLINE_SINK,
+        "{env_var} vise un endpoint de battement : cet endpoint ne conserve pas \
+         le corps du rapport, donc le POST réussirait sans que rien ne soit \
+         lisible. L'URL est ignorée et le rapport part dans le sink disque. \
+         Déplacez-la vers {ENV_LIVENESS_URL}, qui est le canal de vivacité, \
+         puis redémarrez."
+    );
+    None
+}
+
 /// Assemble a `ManagerConfig` from the current process env, or return
 /// `Ok(None)` when the feature-gate env var is unset.
 ///
@@ -160,9 +211,16 @@ pub async fn manager_config_from_env(
     let poll_secs_effective = poll_secs.max(1).min(heartbeat_secs.max(1));
 
     // Optional string env vars — treat empty string as unset per convention.
-    let delivery_url = read_string_env(ENV_DELIVERY_URL);
+    // mika#2697 — les deux variables de RAPPORT passent par la garde : une URL
+    // de battement n'est pas une route de rapport, et sur les deux canaux
+    // l'erreur a la même forme et le même coût (un 201 qui jette le corps).
+    // `ENV_LIVENESS_URL` ne passe PAS par là : c'est la variable dont
+    // l'endpoint de battement est la cible légitime.
+    let delivery_url =
+        reject_heartbeat_endpoint(read_string_env(ENV_DELIVERY_URL), ENV_DELIVERY_URL);
     let delivery_token = read_string_env(ENV_DELIVERY_TOKEN);
-    let escalation_url = read_string_env(ENV_ESCALATION_URL);
+    let escalation_url =
+        reject_heartbeat_endpoint(read_string_env(ENV_ESCALATION_URL), ENV_ESCALATION_URL);
     let health_url = read_string_env(ENV_HEALTH_URL);
     // mika#1990 D4 — trois paliers de la forme maison : absente ou vide ⇒ canal
     // désarmé (zéro POST, zéro erreur) ; posée ⇒ canal armé. Aucune valeur
@@ -244,12 +302,54 @@ pub async fn manager_config_from_env(
 /// one every 6 hours. Injected exactly as `token_resolver` was, and for the same
 /// reason: production passes `HttpLivenessSink`, tests inject an in-memory sink.
 /// The beat is best-effort — it can neither fail a cycle nor stop the loop.
+///
+/// **mika#2698 — `flight_source`.** D'où viennent les vols terminés que le
+/// cycle évalue. Injectée comme les trois précédentes, et `None` est un état
+/// nominal : sans source, l'assessment ne porte aucun verdict, le rapport n'a
+/// pas la section, et le cycle est exactement celui d'avant mika#2698. La
+/// source n'a **aucune** autorité d'écriture — elle lit `tasks`, c'est tout.
+///
+/// **mika#2922 — `verdict_ledger`.** Où chaque verdict de l'évaluateur est
+/// inscrit. Injectée comme `auth_ledger`, et pour la même raison : un registre
+/// est une destination, pas une décision. `None` est un état nominal — le cycle
+/// est alors exactement celui d'avant mika#2922. Le registre n'a **aucune**
+/// autorité : il écrit dans `audit_events` et ne touche ni la forge, ni le
+/// rapport, ni le verdict qu'il inscrit.
+///
+/// **mika#2958 vol 2b — `groom_sender`.** Par quoi part le geste de groom de la
+/// relève. `None` est l'état nominal : le cycle le dit `reason = "no_sender"` et
+/// ne tente rien. Elle n'est **pas** construite ici comme l'est le `gh_runner`
+/// du vol 2 de mika#2698 : le rail demande le jeton interne, que ni ce site ni
+/// `ManagerConfig` ne tiennent — il se résout par
+/// [`super::resolve_groom_rail`] au site qui le tient, et traverse jusqu'ici.
+/// `Arc` plutôt que la propriété nue, parce que le contexte de cycle est rebâti
+/// à chaque tour et que l'émetteur, lui, vit aussi longtemps que la tâche.
+///
+/// **mika#2958 vol 2d — `groom_in_flight`.** Par quoi le cycle voit qu'un groom
+/// est **déjà en vol**, pour ne pas le relancer (AC2). Même raison que
+/// `groom_sender` de ne pas la construire ici : la lecture tient un handle de
+/// base, que ni ce site ni `ManagerConfig` ne portent — elle se construit au
+/// site qui le tient (`server/mod.rs`) et traverse jusqu'ici. `None` est un état
+/// nominal, et il se dit `no_in_flight_source` : un motif à lui, distinct de
+/// « la base voit un groom », parce que deux causes sous un nom commun ne se
+/// soustraient plus (mika#2205) — et c'est l'axe même où AC2 se lit. La source
+/// n'a **aucune** autorité d'écriture : elle lit `tasks`, c'est tout.
+// `groom_sender` est la huitième injection et franchit le seuil de clippy. Elles
+// ne se regroupent pas en structure sans perdre ce qui les tient : chacune est
+// une dépendance que la production construit et que les tests remplacent une à
+// une, et un agrégat obligerait chaque test à nommer les sept autres pour en
+// changer une. L'idiome du dépôt pour ce cas est l'exemption nommée.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_manager_cycle_task(
     mut cfg: ManagerConfig,
     cancel: CancellationToken,
     token_resolver: Arc<dyn TokenResolver>,
     auth_ledger: Option<Arc<dyn AuthBoundaryLedger>>,
     liveness_sink: Arc<dyn LivenessSink>,
+    flight_source: Option<Arc<dyn FlightSource>>,
+    verdict_ledger: Option<Arc<dyn FlightVerdictLedger>>,
+    groom_sender: Option<Arc<dyn GroomSender>>,
+    groom_in_flight: Option<Arc<dyn GroomInFlightSource>>,
 ) -> Option<JoinHandle<()>> {
     // mika#1968 AC6 (change 6b) — diagnostic PID log emitted BEFORE the guard
     // check so operators can distinguish "two mika-spirit processes" (two
@@ -409,7 +509,16 @@ pub fn spawn_manager_cycle_task(
             // `installation_token()`, we simply never asked for it again.
             refresh_cycle_token(&mut cfg, token_resolver.as_ref()).await;
 
-            match run_manager_cycle_with_auth(&cfg, auth_ledger.as_ref(), &pending_auth_notes).await
+            match run_manager_cycle_with_auth(
+                &cfg,
+                auth_ledger.as_ref(),
+                &pending_auth_notes,
+                flight_source.as_ref(),
+                verdict_ledger.as_ref(),
+                groom_sender.as_deref(),
+                groom_in_flight.as_ref(),
+            )
+            .await
             {
                 Ok(outcome) => {
                     // A successful cycle proves auth works — close any open
@@ -1834,14 +1943,20 @@ mod tests {
             due_on: None,
             last_activity_at: Some("2026-08-22T00:00:00Z".into()),
             sub_issues: vec![SubIssue {
+                missing_grooming_signals: None,
                 number: 100,
                 title: "T".into(),
                 state: IssueState::Open,
                 priority_rank: None,
                 plan_present: true,
+                plan_reading: None,
+                dormancy: None,
                 branch_present: true,
                 pr_number: Some(200),
                 pr_state: Some("open".into()),
+                pr_url: None,
+                pr_link_source: None,
+                merged_prs: None,
                 ci_state: CiState::Success,
                 blockers: vec![],
                 updated_at: "2026-08-22T00:00:00Z".into(),
@@ -1858,6 +1973,11 @@ mod tests {
                 subject: "#99".into(),
             }],
             executor_healthy: None,
+            ready_pool: vec![],
+            outside_candidates: vec![],
+            outside_read_truncated: None,
+            plan_sizes: Default::default(),
+            milestone_read_audit: None,
         }
     }
 
@@ -1960,6 +2080,10 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
+            None,
+            None,
+            None,
         )
         .expect("first spawn returns Some(handle)");
 
@@ -2425,6 +2549,10 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
+            None,
+            None,
+            None,
         );
         assert!(first.is_some(), "first spawn must return Some(handle)");
 
@@ -2436,6 +2564,10 @@ mod tests {
             static_resolver(None),
             None,
             noop_liveness_sink(),
+            None,
+            None,
+            None,
+            None,
         );
         assert!(
             second.is_none(),
@@ -2599,6 +2731,10 @@ mod tests {
             Arc::new(resolver),
             None,
             noop_liveness_sink(),
+            None,
+            None,
+            None,
+            None,
         )
         .expect("spawn returns Some(handle)");
 
@@ -3367,5 +3503,113 @@ mod tests {
             classify_cycle_error_text("gh: the probe timed out after 15s"),
             AuthClass::Timeout
         );
+    }
+
+    // ---- mika#2697 — une URL de battement ne devient pas une route de rapport ----
+
+    /// Les trois cas que le ticket demande de tester **sans réseau**, dans un
+    /// seul test parce que c'est leur comparaison qui dit la règle : l'URL
+    /// heartbeat doit donner *exactement* la route de l'URL absente.
+    ///
+    /// Le test passe par `manager_config_from_env` (le vrai site de lecture de
+    /// l'environnement) puis par `cadence::route_name_for` (le vrai décideur de
+    /// route), donc il épingle la chaîne complète et non le prédicat seul : une
+    /// garde correcte jamais appelée laisserait les tests de `cadence` verts.
+    #[tokio::test]
+    #[serial]
+    async fn mika2697_une_url_de_battement_route_vers_le_sink_comme_une_url_absente() {
+        let heartbeat = "https://cm.example.com/api/v1/agents/mika-manager/heartbeat";
+        let ingestion = "https://cm.example.com/api/v1/messages/dispatch";
+
+        // Cas 1 — URL de battement ⇒ effacée, donc route sink.
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        set_env(ENV_DELIVERY_URL, heartbeat);
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(
+            cfg.delivery_url, None,
+            "la garde EFFACE la valeur : en aval, « refusée » et « absente » \
+             doivent être le même mot (mika#2267, lecteur unique)"
+        );
+        assert_eq!(
+            crate::milestone_manager::cadence::route_name_for(cfg.delivery_url.as_deref()),
+            crate::milestone_manager::cadence::ROUTE_OFFLINE_SINK,
+            "le sink NOMINAL, pas le repli : rien n'est tombé en panne, \
+             une variable était mal remplie"
+        );
+
+        // Cas 2 — URL d'ingestion ⇒ intacte, donc route http.
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        set_env(ENV_DELIVERY_URL, ingestion);
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(
+            cfg.delivery_url.as_deref(),
+            Some(ingestion),
+            "la garde ne juge qu'un endpoint de battement : tout le reste passe"
+        );
+        assert_eq!(
+            crate::milestone_manager::cadence::route_name_for(cfg.delivery_url.as_deref()),
+            crate::milestone_manager::cadence::ROUTE_HTTP
+        );
+
+        // Cas 3 — URL absente ⇒ le témoin de la route sink, celui auquel le
+        // cas 1 doit être identique.
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(cfg.delivery_url, None);
+        assert_eq!(
+            crate::milestone_manager::cadence::route_name_for(cfg.delivery_url.as_deref()),
+            crate::milestone_manager::cadence::ROUTE_OFFLINE_SINK
+        );
+
+        clear_manager_env();
+    }
+
+    /// `MIKA_MANAGER_ESCALATION_URL` est l'autre canal de rapport, et l'erreur
+    /// y a la même forme et le même coût : un 201 qui jette le corps. La garde
+    /// couvre donc les deux variables — et pas `MIKA_MANAGER_LIVENESS_URL`,
+    /// dont l'endpoint de battement est la cible **légitime** : ce dernier point
+    /// est l'assertion qui empêche de « généraliser » la garde à tout le module.
+    #[tokio::test]
+    #[serial]
+    async fn mika2697_la_garde_couvre_lescalade_et_epargne_le_canal_de_vivacite() {
+        let heartbeat = "https://cm.example.com/api/v1/agents/mika-manager/heartbeat";
+
+        clear_manager_env();
+        set_env(ENV_TARGET_MILESTONE, "senara-solutions/mika#42");
+        set_env(ENV_ESCALATION_URL, heartbeat);
+        set_env(ENV_LIVENESS_URL, heartbeat);
+
+        let cfg = manager_config_from_env(&test_settings(), None)
+            .await
+            .expect("valid")
+            .expect("Some");
+        assert_eq!(
+            cfg.escalation_url, None,
+            "l'escalade est un rapport : même garde, même effacement"
+        );
+        assert_eq!(
+            cfg.liveness_url.as_deref(),
+            Some(heartbeat),
+            "le canal de vivacité garde son URL : c'est LA variable que le \
+             ticket demande de faire viser le battement"
+        );
+
+        clear_manager_env();
+        // SAFETY: tests are serialized via `#[serial_test::serial]`.
+        // `clear_manager_env` ne touche pas LIVENESS (il appartient à
+        // `liveness.rs`) — on le retire ici pour ne pas fuir sur le test suivant.
+        unsafe { env::remove_var(ENV_LIVENESS_URL) };
     }
 }

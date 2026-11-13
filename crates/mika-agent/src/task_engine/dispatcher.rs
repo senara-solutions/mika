@@ -97,6 +97,139 @@ pub fn is_routable_trigger(trigger: &str) -> bool {
     ROUTABLE_TRIGGERS.contains(&trigger)
 }
 
+/// Un tir récurrent a été refusé au dernier point de passage parce que l'agent
+/// porte `enabled = false` à la racine de son `identity.toml` (mika#2456, vol 2).
+///
+/// **En régime attendu, cet événement n'est jamais émis** — la porte à
+/// l'enregistrement (mika#2456 vol 1) a déjà retiré les lignes. Son zéro est
+/// donc l'assertion que la porte amont tient, comme pour le filet du dispatcher
+/// de mika#2337. Il se lève pour les deux populations que la porte ne voit pas :
+/// les lignes nées **avant** son déploiement, et les bascules d'`enabled` **en
+/// cours d'exécution**.
+pub(crate) const RECURRING_FIRE_REFUSED_EVENT: &str = "recurring_fire_refused_agent_disabled";
+
+/// `audit_events.tool_name` de la surface d'audit du filet (mika#2843, vol 3).
+///
+/// **SOLE WRITER :** [`TaskDispatcher::refuse_recurring_fire_if_agent_disabled`],
+/// sur sa branche de refus et nulle part ailleurs. Le refus à
+/// l'**enregistrement** (vol 1, `ensure_recurring_task_with_policy`) n'écrit
+/// délibérément **aucune** ligne d'audit : il est borné par la cadence des
+/// redémarrages là où le tir ne l'est pas, et sa ligne de journal suffit.
+///
+/// C'est cette propriété d'écrivain unique qui rend la requête opérateur
+/// lisible :
+///
+/// ```sql
+/// SELECT target_key, after_value, count(*)
+/// FROM audit_events
+/// WHERE tool_name = 'agent_recurring_gate'
+/// GROUP BY 1, 2;
+/// ```
+///
+/// Son résultat est **exactement** la population des lignes qui échappent à la
+/// porte, et non un mélange de deux mécanismes. Tenu par
+/// `mika2456_the_gate_audit_name_has_exactly_one_writer`
+/// (`canonical_tokens.rs`), dont l'allowlist est livrée vide.
+pub(crate) const RECURRING_GATE_AUDIT_TOOL_NAME: &str = "agent_recurring_gate";
+
+/// La session sous laquelle la ligne d'audit du filet se lit (mika#2843, C1).
+///
+/// **Un sentinel fixe, pas un identifiant par tâche.** Un `session_id` qui
+/// porterait l'id de tâche rendrait `get_audit_events(session_id)` inutilisable :
+/// il n'existerait plus de session sous laquelle lire la **population**. Le
+/// précédent est `auth_boundary`, documenté dans `crates/mika-agent/CLAUDE.md`
+/// § *Audit Log* en ces termes — *« `session_id` : `auth-boundary` — a boundary
+/// failure belongs to no conversation »*. Un refus de porte n'appartient à
+/// aucune conversation non plus.
+///
+/// L'id de tâche reste porté par `reasoning` (`task_id=<n>`), où il est une
+/// **donnée** et non une clé de regroupement.
+///
+/// Noter la graphie : ce littéral est en **tirets**, le `tool_name` ci-dessus en
+/// tirets **bas**. Deux littéraux distincts, et le scan SOLE WRITER compare de
+/// façon **exacte** — c'est ce qui lui permet de naître avec une allowlist vide.
+pub(crate) const RECURRING_GATE_AUDIT_SESSION_ID: &str = "agent-recurring-gate";
+
+/// Quelle fraîcheur un refus `(agent_id, label)` déjà annoncé peut perdre avant
+/// d'être réécrit (mika#2843).
+///
+/// Sans fenêtre, une récurrente à la minute écrirait ≈ 1 440 lignes
+/// `audit_events` **par jour** pour un seul agent désactivé : un état stable se
+/// lirait comme du trafic, et « régime attendu : zéro ligne » deviendrait
+/// illisible. Avec elle, le zéro se lit à la bonne granularité — zéro
+/// **population**, une ligne par ligne fautive et par jour, et non une par
+/// cadence.
+const RECURRING_GATE_AUDIT_REFRESH: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Plafond de la table de déduplication. La population réelle est
+/// (agents × labels), une poignée au plus : l'atteindre signifie que quelque
+/// chose engendre des clés distinctes sans borne. Vider coûte une ligne
+/// redondante par refus vivant — bon marché et honnête ; l'alternative est une
+/// table qui croît pour la vie du processus.
+const RECURRING_GATE_AUDIT_SEEN_CAP: usize = 10_000;
+
+/// Quand chaque `(agent_id, label)` a été annoncé pour la dernière fois **par ce
+/// processus**.
+///
+/// Transcription de `auto_pull.rs::EXCLUSION_AUDIT_SEEN` (mika#2131), avec ses
+/// trois propriétés que la transcription seule perdrait :
+///
+/// - **L'état est en mémoire, donc perdu au redémarrage — par conception.** Le
+///   premier refus après un restart réécrit une ligne, et c'est voulu : un
+///   restart est une information, et un processus neuf re-photographie l'état
+///   qu'il trouve. Un état persisté ferait porter à la base le souvenir d'un
+///   processus mort.
+/// - **Consulter n'est pas marquer.** [`recurring_gate_audit_is_due`] et
+///   [`mark_recurring_gate_audited`] sont deux gestes séparés, et c'est la
+///   propriété que `mika2456_consulting_does_not_mark` tient. Elle existe pour
+///   qu'un échec transitoire de `log_audit_event` ne coûte qu'un réessai à la
+///   cadence suivante, jamais la ligne de cette row pour la vie du processus.
+/// - **Fail-open sur mutex empoisonné.** Reprendre l'état par
+///   `into_inner()` est un **choix** : le seul état porté est « déjà écrit », et
+///   *un audit qui ne peut pas se dédupliquer écrit plutôt que de refuser le
+///   refus*.
+static RECURRING_GATE_AUDIT_SEEN: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String), std::time::Instant>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// `true` quand ce `(agent_id, label)` n'est pas enregistré, ou l'a été il y a
+/// plus de [`RECURRING_GATE_AUDIT_REFRESH`].
+///
+/// **Ne marque rien.** Le `now` est un **paramètre** et non un
+/// `Instant::now()` interne : c'est ce qui rend la fenêtre de 24 h testable sans
+/// attendre 24 h (`mika2456_v4c_the_refusal_is_deduplicated_on_a_24h_window`).
+fn recurring_gate_audit_is_due(key: &(String, String), now: std::time::Instant) -> bool {
+    let seen = RECURRING_GATE_AUDIT_SEEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match seen.get(key) {
+        Some(&written_at) => now.duration_since(written_at) >= RECURRING_GATE_AUDIT_REFRESH,
+        None => true,
+    }
+}
+
+/// Enregistre que le WARN et la ligne d'audit de `key` ont été écrits à `now`.
+///
+/// **L'appelant marque après que l'écriture a atterri**, jamais avant : marquer
+/// avant, c'est perdre silencieusement la ligne et taire le refus 24 h. La forme
+/// qui le porte est le `Ok(()) => mark…` du site d'appel, et une inversion de
+/// ces deux lignes ne ferait rougir rien d'autre que cette phrase.
+fn mark_recurring_gate_audited(key: (String, String), now: std::time::Instant) {
+    let mut seen = RECURRING_GATE_AUDIT_SEEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.len() >= RECURRING_GATE_AUDIT_SEEN_CAP {
+        warn!(
+            cap = RECURRING_GATE_AUDIT_SEEN_CAP,
+            "agent_recurring_gate: la table de déduplication a atteint son \
+             plafond ; vidage"
+        );
+        seen.clear();
+    }
+    seen.insert(key, now);
+}
+
 /// Qui refuse, et qu'est-ce qu'il sait router (mika#2446 R-1).
 ///
 /// Les cinq champs qu'une ligne de mort par trigger inconnu doit porter pour
@@ -120,8 +253,17 @@ pub struct BinaryAttribution {
     /// Quel processus a refusé.
     pub process_id: u32,
     /// `mika-spirit` ou `mika` — sépare le démon d'un `mika chat` qui tire les
-    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet, et
-    /// `cli_mode` ne court-circuite jamais le dispatch `run_skill`).
+    /// mêmes lignes récurrentes de la même base (son `TaskEngine` est complet).
+    ///
+    /// **Depuis mika#2351, ce champ ne vaut plus `mika` sur cette ligne.** Le
+    /// moteur `cli_mode` teste la routabilité **avant** `claim_and_fire_task`
+    /// (`engine.rs::is_not_routable_here`) : un trigger qu'il ne sait pas router
+    /// n'est pas réclamé, donc il ne meurt pas là et n'émet pas cette ligne. Un
+    /// `process_name: "mika"` ici atteste désormais un binaire **antérieur** à ce
+    /// correctif — ce qui en fait, pour cette classe, une lecture plus forte
+    /// qu'avant et non plus faible. La phrase précédente (« `cli_mode` ne
+    /// court-circuite jamais le dispatch `run_skill` ») décrivait l'arbre
+    /// d'avant ; elle est fausse aujourd'hui.
     pub process_name: String,
     /// L'inventaire **de ce binaire**, à comparer au trigger refusé.
     pub routable_triggers: String,
@@ -579,6 +721,111 @@ pub struct TaskDispatcher {
         std::sync::Mutex<Option<crate::config_keys::ResolvedProactiveBudget>>,
 }
 
+/// Ce qu'une relecture du consentement `ready` a produit (mika#2995, tranche
+/// du 2026-11-03 ; élargi par mika#3050).
+///
+/// Huit issues, huit noms. Les deux premières dispatchent, les six autres
+/// non — et parmi celles-là, trois écrivent un terminal. L'enum existe pour
+/// que cette asymétrie soit lisible au site de décision plutôt que répartie
+/// dans des `bool` imbriqués, exactement comme `BuildCallbackHead` le fait pour
+/// mika#2671.
+///
+/// # Deux prédicats, et pourquoi leurs refus ne se fondent pas
+///
+/// La garde consulte deux lecteurs : le **parc** de la timeline (qui a retiré
+/// `ready`, et quand) puis, seulement sur son verdict de non-park, l'**état** du
+/// ticket à la forge (ouvert ? portant `ready` ?). Chacun porte ses propres
+/// variantes de refus, et aucune n'est partagée : un retrait humain est
+/// simultanément un park *et* un `ready` absent, donc fondre les deux ferait
+/// tomber le compte de mika#2995 à zéro sans qu'aucune régression ait eu lieu —
+/// deux populations sous un nom ne se soustraient pas (mika#2205). L'ordre
+/// décide sous quelle raison la population est comptée, et il est fixé :
+/// **le parc d'abord** (mika#3050 D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WithdrawnConsentVerdict {
+    /// AC-T3 — parente absente, ou label hors du préfixe `ready-label:`
+    /// (groom, revue, dispatch manuel). **Aucune lecture réseau n'a eu lieu.**
+    NotAReadyLabelParent,
+    /// Dernier événement `labeled`, ou `unlabeled` d'une identité machine
+    /// (AC-T2 : le `remove` puis `add` de la Phase 2 d'`auto_pull`).
+    ConsentHeld,
+    /// Dernier événement `unlabeled` d'un acteur non machine : un humain a
+    /// retiré le consentement et ne l'a pas remis.
+    ConsentWithdrawn {
+        parked_by: Option<String>,
+        parked_at: String,
+    },
+    /// D4 — la relecture n'a pas abouti. `cause` est fermée à quatre valeurs
+    /// (`api`, `parse`, `truncated`, `identities`) pour que « la lecture échoue
+    /// en boucle » et « aucun wrapper n'est passé par la garde » ne rendent pas
+    /// zéro tous les deux (classe mika#2205).
+    TimelineUnreadable { cause: &'static str, detail: String },
+    /// D4 — aucun jeton GitHub résolu. Variante distincte de la précédente :
+    /// un jeton absent est une panne de configuration, une timeline illisible
+    /// est une panne d'API, et les deux remédiations n'ont rien en commun.
+    NoToken,
+    /// mika#3050 — le parc rend « non parqué », mais le ticket ne porte plus
+    /// `ready`. La forme de `0529ed9b`/#3044 : depuis mika#3022 une identité
+    /// **machine** retire `ready` à chaque merge de la boucle, donc le prédicat
+    /// de parc rend `Ok(None)` et le tour partait. Terminal, sous
+    /// `READY_ABSENT_AT_REARM_REASON`.
+    ReadyAbsentAtPromotion,
+    /// mika#3050 — le parc rend « non parqué », mais le ticket est fermé. L'état
+    /// est le seul des deux prédicats qui puisse le dire : la timeline de
+    /// `ready` ne porte pas `state`. Terminal, sous
+    /// `ISSUE_CLOSED_AT_REARM_REASON`.
+    IssueClosedAtPromotion,
+    /// mika#3050 — la relecture d'**état** n'a pas abouti. Report, **jamais**
+    /// terminal : c'est l'asymétrie D4 du module (`ready_label.rs:69`)
+    /// transposée mot pour mot. Un faux négatif coûte un tick de latence ; un
+    /// faux positif terminal tuerait une parente consentante sur une panne
+    /// d'API. Variante distincte de [`Self::TimelineUnreadable`], parce qu'une
+    /// panne du lecteur d'état et une panne du lecteur de timeline ne se
+    /// remédient pas au même endroit.
+    StateUnreadable { detail: String },
+}
+
+impl WithdrawnConsentVerdict {
+    /// Le nom du verdict dans la ligne de recensement `promotion_consent_checked`.
+    ///
+    /// Exhaustif et sans bras `_` : une neuvième variante ne doit pas pouvoir
+    /// hériter en silence du nom d'une huitième, qui est exactement comment un
+    /// recensement se met à compter deux populations sous un libellé
+    /// (mika#2205). Même contrat que l'`as_str()` de
+    /// [`crate::ready_label::RearmConsentCensus`], et les noms des trois
+    /// verdicts d'état disent **`_at_promotion`** plutôt que de reprendre les
+    /// motifs d'audit `*_at_rearm` : ces derniers sont des constantes dont le
+    /// site de définition est unique (D3 de `ready_label.rs`), et les recopier
+    /// ici en littéral en ouvrirait un second.
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAReadyLabelParent => "not_a_ready_label_parent",
+            Self::ConsentHeld => "consent_held",
+            Self::ConsentWithdrawn { .. } => "consent_withdrawn",
+            Self::TimelineUnreadable { .. } => "timeline_unreadable",
+            Self::NoToken => "no_token",
+            Self::ReadyAbsentAtPromotion => "ready_absent_at_promotion",
+            Self::IssueClosedAtPromotion => "issue_closed_at_promotion",
+            Self::StateUnreadable { .. } => "state_unreadable",
+        }
+    }
+}
+
+/// La parente `ready-label:` d'un wrapper différé, et l'issue dont elle porte
+/// le travail (mika#2995).
+///
+/// Les coordonnées viennent du **label** de la parente, pas de son
+/// `reference_url` : le label porte `owner/repo#N` en entier, là où le parseur
+/// d'URL rend le dépôt nu. `agent_id` est transporté parce que la ligne d'audit
+/// en a besoin pour sa session système, et le relire serait une seconde lecture
+/// pour une donnée déjà en main.
+struct ReadyLabelParent {
+    id: String,
+    agent_id: String,
+    repo: String,
+    issue: u64,
+}
+
 impl TaskDispatcher {
     /// Write `execution_trace_id` back to a task after a silent agent run completes.
     /// Best-effort: logs a warning on failure but does not propagate the error.
@@ -696,6 +943,108 @@ impl TaskDispatcher {
         Ok(())
     }
 
+    /// Le filet au tir de la porte récurrente niveau-agent (mika#2456, vol 2) :
+    /// ce tir est-il refusé parce que l'agent porte `enabled = false` à la
+    /// racine de son `identity.toml` ?
+    ///
+    /// **Pourquoi un filet en plus de la porte.** La porte à l'enregistrement
+    /// est un invariant sur l'historique des écritures : elle tient pour toute
+    /// ligne née après son déploiement, sur un `enabled` lu à ce moment-là. Le
+    /// filet est un invariant sur l'**état courant**, et il couvre les deux
+    /// populations que la porte ne peut pas voir — les lignes plus vieilles
+    /// qu'elle, et un `enabled` basculé depuis. En régime attendu il ne lève
+    /// rien, et ce zéro est l'assertion que la porte amont tient.
+    ///
+    /// **Ne mute rien.** Pas d'annulation de la ligne, pas de réécriture de
+    /// statut : la décision du filet est lisible dans son journal et dans ce
+    /// qui *n'a pas* eu lieu. Un filet qui corrigerait la base effacerait la
+    /// preuve de son propre déclenchement (mika#2156), et la remise en marche
+    /// d'un agent réactivé demanderait alors un ré-armement explicite plutôt
+    /// qu'un simple tick.
+    ///
+    /// **Seules les récurrentes.** La garde sur `trigger_type` est
+    /// inconditionnelle : un rappel (`time`), un callback ou une tâche manuelle
+    /// d'un agent désactivé passent, parce que `enabled = false` à la racine
+    /// nomme les **récurrentes** et pas l'agent entier. Ce qui le prouve est le
+    /// contrôle négatif de la branche (b) de V5.
+    ///
+    /// # Deux surfaces, **un** prédicat (mika#2843, R-9 du plan amont)
+    ///
+    /// Le WARN et la ligne [`RECURRING_GATE_AUDIT_TOOL_NAME`] partent sous le
+    /// même `if recurring_gate_audit_is_due(…)`, et leur `agent_id` sort de la
+    /// même source (`self.db.agent_id()`). C'est ce qui rend le journal et la
+    /// table **soustractibles** : un WARN et une ligne d'audit qui nommeraient
+    /// des agents différents ne seraient pas comparables, et le
+    /// `GROUP BY target_key` de la requête opérateur compterait une population
+    /// que le journal ne sait pas désigner.
+    ///
+    /// # Changement de contrat du WARN, à dire fort (mika#2843, C3)
+    ///
+    /// Le WARN était **inconditionnel** jusqu'au vol 3. Il est désormais
+    /// dédupliqué sur la même fenêtre de 24 h que la ligne d'audit, donc :
+    ///
+    /// > **l'absence de `recurring_fire_refused_agent_disabled` dans les logs
+    /// > signifie « déjà annoncé dans les 24 h », et non « aucun refus ».**
+    ///
+    /// L'alternative — garder le WARN inconditionnel — est refusée : elle
+    /// rendrait ≈ 1 440 lignes de journal par jour et par agent désactivé, et
+    /// ferait du journal et de la table deux populations non soustractibles
+    /// (classe mika#2205). La phrase ci-dessus vit aussi dans
+    /// `crates/mika-agent/CLAUDE.md` § *Audit Log*, où un opérateur la lit.
+    async fn refuse_recurring_fire_if_agent_disabled(&self, task: &Task) -> bool {
+        if task.trigger_type != super::types::trigger_type::RECURRING {
+            return false;
+        }
+        if super::agent_recurring_tasks_enabled(&self.home_dir, self.db.agent_id()).await {
+            return false;
+        }
+        // C2 — une seule source d'`agent_id` pour la clé de déduplication, pour
+        // le `target_key` et pour le WARN.
+        let agent_id = self.db.agent_id().to_string();
+        let key = (agent_id.clone(), task.label.clone());
+        let now = std::time::Instant::now();
+        if recurring_gate_audit_is_due(&key, now) {
+            warn!(
+                target: "mika::otel",
+                event = RECURRING_FIRE_REFUSED_EVENT,
+                agent_id = %agent_id,
+                label = %task.label,
+                trigger_type = %task.trigger_type,
+                "mika#2456: agent carries `enabled = false` — recurring fire refused \
+                 at the last gate before an LLM turn. The row is left as it is: this \
+                 agent will fire again the tick after `enabled` goes back to true"
+            );
+            match self
+                .db
+                .log_audit_event(
+                    RECURRING_GATE_AUDIT_SESSION_ID,
+                    RECURRING_GATE_AUDIT_TOOL_NAME,
+                    &format!("{agent_id}@{}", task.label),
+                    None,
+                    Some("refused_agent_disabled"),
+                    Some(&format!("task_id={}", task.id)),
+                    None,
+                )
+                .await
+            {
+                // On marque **après** que l'écriture a atterri. Marquer avant,
+                // c'est perdre silencieusement la ligne et taire le refus 24 h.
+                Ok(()) => mark_recurring_gate_audited(key, now),
+                Err(e) => warn!(
+                    target: "mika::otel",
+                    task_id = %task.id,
+                    error = %e,
+                    "mika#2843: échec d'écriture de la ligne d'audit \
+                     agent_recurring_gate — le refus reste un refus"
+                ),
+            }
+        }
+        // Rendu **hors** du `match` : une écriture d'audit en échec ne change
+        // pas le verdict du filet. Même forme que le *fire-and-forget* d'
+        // `AuthBoundaryLedger`, et même raison — un audit ne décide rien.
+        true
+    }
+
     /// Run a background silent agent for proactive tasks.
     ///
     /// Supports two modes via `action_config`:
@@ -706,6 +1055,18 @@ impl TaskDispatcher {
         task: &Task,
         config: &serde_json::Value,
     ) -> Result<(), DispatchError> {
+        // mika#2456 (vol 2) — le filet, avant toute route : c'est le dernier
+        // point de passage commun aux deux branches ci-dessous, et donc le
+        // dernier avant qu'un tour de LLM ne soit consommé.
+        //
+        // `Ok(())` et non `Err` : un refus de porte n'est pas un tir raté. Les
+        // variantes de `DispatchError` disent « ce tir aurait dû aboutir » et
+        // alimentent les comptes d'incident ; ici rien ne tire *parce que c'est
+        // le réglage demandé*.
+        if self.refuse_recurring_fire_if_agent_disabled(task).await {
+            return Ok(());
+        }
+
         // Check for arbitrary skill_name first
         if let Some(skill_name) = config["skill_name"].as_str() {
             return self.dispatch_skill_by_name(task, skill_name, config).await;
@@ -1075,6 +1436,458 @@ impl TaskDispatcher {
         }
     }
 
+    /// Les coordonnées d'une relecture de consentement : la parente d'un
+    /// wrapper différé **quand elle vient du feeder `ready-label`**, et l'issue
+    /// dont elle porte le travail.
+    ///
+    /// `None` est le cas d'AC-T3 — parente absente, ou label hors préfixe
+    /// (groom, revue, dispatch manuel). La parente est rendue entière parce que
+    /// la ligne d'audit a besoin de son `agent_id` : l'obtenir plus tard serait
+    /// une seconde lecture pour une donnée déjà en main.
+    async fn ready_label_parent_for_recheck(&self, task: &Task) -> Option<ReadyLabelParent> {
+        let parent_id = task.parent_task_id.as_deref()?;
+        let parent = match self.db.get_task_unscoped(parent_id).await {
+            Ok(Some(p)) => p,
+            Ok(None) => return None,
+            Err(e) => {
+                // Une base qui ne rend pas la parente ne prouve pas qu'elle
+                // n'est pas `ready-label`. Mais le dispatch qui suivrait lit la
+                // même base et échouerait pour la même raison, donc on nomme le
+                // fait au lieu de le taire, et on ne le transforme pas en refus.
+                warn!(
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "mika#2995: parente illisible — relecture de consentement sautée"
+                );
+                return None;
+            }
+        };
+        let (repo, issue) = crate::ready_label::parse_ready_label_task_label(&parent.label)?;
+        Some(ReadyLabelParent {
+            id: parent.id,
+            agent_id: parent.agent_id,
+            repo,
+            issue,
+        })
+    }
+
+    /// Un wrapper différé dont la parente `ready-label:` a perdu son
+    /// consentement ne paie **ni tour LLM ni dispatch** (mika#2995, tranche du
+    /// 2026-11-03).
+    ///
+    /// # Le défaut que ceci ferme
+    ///
+    /// Le consentement est lu à l'**entrée** de la file — le webhook
+    /// `labeled ready` crée la tâche parente — et n'était **jamais relu à la
+    /// sortie**, au moment où le wrapper différé promu part en tour. Le
+    /// 2026-11-01 sur #3002 : `unlabeled ready` humain à 14:08:43Z, tour
+    /// mika-dev parti à 14:46:01Z. 37 minutes, et rien ne l'a relu. Le tour a
+    /// fermé le ticket, qu'un siège a dû rouvrir à la main à 15:32:14Z.
+    ///
+    /// # Le joint, et pourquoi `machine` passe par paramètre
+    ///
+    /// `machine_identities` mémoïse dans un `OnceLock` **à l'échelle du
+    /// processus** : un test qui l'alimenterait figerait les identités pour tous
+    /// les autres tests du binaire. Le `OnceLock` reste donc hors du périmètre
+    /// testé — exactement comme `is_parked` l'est déjà pour `auto_pull`.
+    ///
+    /// # L'ordre, et ce qu'il atteste
+    ///
+    /// Le discriminant de parente est le **premier** geste, et il est gratuit :
+    /// une parente hors préfixe rend `false` sans qu'un seul appel au fetcher
+    /// soit payé. C'est ce qu'AC-T3 épingle en comptant les appels, et c'est la
+    /// seule forme d'« octet pour octet » qu'un test puisse attester ici.
+    ///
+    /// # Deux prédicats, et pourquoi le parc passe d'abord (mika#3050 D1)
+    ///
+    /// Le prédicat de parc rend « non parqué » sur un `unlabeled` **machine** —
+    /// à dessein, c'est sa propriété D2, celle qui tolère le `remove`→`add` de
+    /// la Phase 2 d'`auto_pull`. Mais depuis mika#3022 c'est une identité
+    /// machine qui retire `ready` à chaque merge de la boucle, donc une parente
+    /// en attente au moment d'un merge `Refs` est dans cette forme **par
+    /// construction** : le parc la laisse passer, et le tour part sur un ticket
+    /// qui ne consent plus (`0529ed9b`/#3044).
+    ///
+    /// L'état du ticket est donc consulté — mais **seulement sur le `Ok(None)`
+    /// du parc**. Un retrait humain rend le ticket simultanément parqué *et*
+    /// sans `ready` : si l'état passait d'abord, chaque park humain basculerait
+    /// vers la raison de mika#3050 et le compte de mika#2995 tomberait à zéro
+    /// sans qu'aucune régression ait eu lieu — deux populations sous un nom ne
+    /// se soustraient pas (mika#2205). L'ordre décide sous quelle raison la
+    /// population est comptée, et il est fixé ici.
+    ///
+    /// # Le prédicat d'état est appelé, pas redérivé (mika#3050 D2)
+    ///
+    /// « `ready` est posé » se dériverait de la timeline déjà lue — le dernier
+    /// événement de la série est un `labeled` — pour zéro appel réseau de plus.
+    /// C'est précisément ce qu'il ne faut pas faire : ce serait un **second
+    /// lecteur** de « ouvert et portant `ready` », avec une seconde
+    /// implémentation, contre la doctrine du lecteur unique (mika#2158,
+    /// mika#2205, mika#3049). Et la timeline de `ready` ne porte pas `state` :
+    /// le parc seul ne peut pas rendre la moitié « ouvert » qu'AC1 exige.
+    ///
+    /// Le `token` est ici par le même raisonnement que `machine` : le joint est
+    /// auto-suffisant, et le double de `run_gh` compilé sous le `cfg` de test
+    /// canne l'état sans qu'un seam de plus soit introduit.
+    ///
+    /// L'attribut de compilation conditionnelle n'est **pas** écrit en toutes
+    /// lettres ici, et ce n'est pas un détail de style :
+    /// `canonical_tokens::tests::production_sources` coupe chaque fichier à sa
+    /// **première** occurrence de ce littéral, doc-comments compris. Un fichier
+    /// qui le nomme avant son vrai module de test voit toute sa production
+    /// disparaître du scan, et les trois gardes d'écrivain unique qui exigent ce
+    /// fichier (`pilot_cost_overrun` mika#2496, `groom_pilot_autofire_stopped`
+    /// mika#2498, le recensement de dispatch mika#2506) rougissent sur leur
+    /// anti-vacuité — « ce scan vise un nom mort ». Mesuré sur `cf1bcee93`,
+    /// dont le doc-comment le nommait.
+    async fn skip_deferred_dispatch_on_withdrawn_consent_with(
+        &self,
+        task: &Task,
+        fetcher: &dyn crate::ready_label::TimelinePageFetcher,
+        machine: &crate::ready_label::MachineIdentities,
+        token: &str,
+    ) -> bool {
+        use crate::ready_label::{TimelineReadError, park_verdict_for_issue_with};
+
+        let parent = self.ready_label_parent_for_recheck(task).await;
+        let verdict = match &parent {
+            None => WithdrawnConsentVerdict::NotAReadyLabelParent,
+            // D3 — un jeu d'identités machine vide rend le prédicat
+            // inutilisable : **tout** retrait se lirait comme un park, y compris
+            // le `remove` puis `add` de la Phase 2 d'`auto_pull`. Le module
+            // refuse d'agir plutôt que de décider sur un prédicat aveugle, et
+            // ici « refuser d'agir » veut dire ne rien lancer et ne rien écrire.
+            Some(_) if machine.is_empty() => WithdrawnConsentVerdict::TimelineUnreadable {
+                cause: "identities",
+                detail: "machine identities unresolved (fail-closed)".to_string(),
+            },
+            Some(p) => {
+                match park_verdict_for_issue_with(fetcher, &p.repo, p.issue, machine).await {
+                    // Le parc ne voit pas de retrait humain. C'est là, et
+                    // seulement là, que l'état du ticket est consulté.
+                    Ok(None) => Self::state_verdict_at_promotion(token, p).await,
+                    Ok(Some((parked_by, parked_at))) => WithdrawnConsentVerdict::ConsentWithdrawn {
+                        parked_by,
+                        parked_at,
+                    },
+                    Err(e) => WithdrawnConsentVerdict::TimelineUnreadable {
+                        cause: match &e {
+                            TimelineReadError::Api(_) => "api",
+                            TimelineReadError::Parse(_) => "parse",
+                            TimelineReadError::Truncated { .. } => "truncated",
+                        },
+                        detail: e.to_string(),
+                    },
+                }
+            }
+        };
+
+        self.apply_withdrawn_consent_verdict(task, parent.as_ref(), verdict)
+            .await
+    }
+
+    /// Le second prédicat : le ticket est-il encore ouvert, et porte-t-il encore
+    /// `ready` ? (mika#3050 D2)
+    ///
+    /// Trois états et un quatrième que le type ne porte pas : la relecture en
+    /// erreur, qui est le `Err` du `Result`. Elle devient
+    /// [`WithdrawnConsentVerdict::StateUnreadable`] — un **report**, jamais un
+    /// terminal. Une panne de forge n'est pas un état du ticket, et l'écrire
+    /// comme tel ferait classer une indisponibilité en retrait de consentement,
+    /// donc poserait un terminal sur une parente parfaitement consentante
+    /// (mika#2131, mika#2331 : une absence n'est pas un zéro). Le prédicat est
+    /// déjà fail-closed champ par champ ; cette fonction est ce qui rend ce
+    /// fail-closed conséquent au site de promotion.
+    async fn state_verdict_at_promotion(
+        token: &str,
+        parent: &ReadyLabelParent,
+    ) -> WithdrawnConsentVerdict {
+        use crate::ready_label::{RearmConsent, reread_issue_consent_via_gh};
+
+        match reread_issue_consent_via_gh(token, &parent.repo, parent.issue).await {
+            Ok(RearmConsent::Held) => WithdrawnConsentVerdict::ConsentHeld,
+            Ok(RearmConsent::ReadyAbsent) => WithdrawnConsentVerdict::ReadyAbsentAtPromotion,
+            Ok(RearmConsent::Closed) => WithdrawnConsentVerdict::IssueClosedAtPromotion,
+            Err(detail) => WithdrawnConsentVerdict::StateUnreadable { detail },
+        }
+    }
+
+    /// Le site de production de [`Self::skip_deferred_dispatch_on_withdrawn_consent_with`].
+    ///
+    /// Le jeton vient de `resolve_github_token`, le convertisseur canonique de
+    /// l'ADR-008 — et **pas** de `resolve_periodic_scan_token`, dont le
+    /// paramètre `scan: PeriodicScan` est un enum fermé aux scans périodiques :
+    /// cette garde n'en est pas un, et y ajouter une variante donnerait au mot
+    /// « scan » deux populations sous un nom (classe mika#2205).
+    async fn skip_deferred_dispatch_on_withdrawn_consent(&self, task: &Task) -> bool {
+        // AC-T3 en premier, et gratuitement : une parente hors préfixe sort ici,
+        // sans jeton résolu et sans un seul appel réseau.
+        let Some(parent) = self.ready_label_parent_for_recheck(task).await else {
+            return false;
+        };
+
+        let Some(token) = self
+            .settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await
+        else {
+            return self
+                .apply_withdrawn_consent_verdict(
+                    task,
+                    Some(&parent),
+                    WithdrawnConsentVerdict::NoToken,
+                )
+                .await;
+        };
+
+        let machine = crate::ready_label::machine_identities(&token).await;
+        let fetcher = crate::ready_label::GhTimelineFetcher::new(&token);
+        // La parente est relue une fois dans le joint. C'est un SELECT par clé
+        // primaire, sur la population la plus étroite du dispatcher, et c'est le
+        // prix d'un joint auto-suffisant : un joint qui dépendrait d'un
+        // pré-calcul de son appelant n'attesterait plus l'ordre qu'AC-T3 exige.
+        self.skip_deferred_dispatch_on_withdrawn_consent_with(task, &fetcher, machine, &token)
+            .await
+    }
+
+    /// Applique le verdict : `true` quand le dispatch est refusé.
+    ///
+    /// Six des huit issues ne dispatchent pas, et **trois seulement écrivent un
+    /// terminal**. L'asymétrie est la décision du § 6 du plan : une lecture qui
+    /// échoue ne doit ni lancer un tour (ce serait le défaut mesuré, rouvert)
+    /// ni graver un terminal (ce serait l'autre faux positif). Un faux négatif
+    /// coûte un tick de 10 minutes ; un faux positif coûte ~600 k tokens Opus
+    /// et casse un STOP opérateur.
+    ///
+    /// # L'écrivain unique du recensement (mika#3050 § 3)
+    ///
+    /// Cette fonction est **le seul site** qui émet `promotion_consent_checked`,
+    /// et elle l'émet **avant** le `match`, donc inconditionnellement : les huit
+    /// branches passent par cette ligne, branche saine comprise. C'est ce qui
+    /// donne au recensement son dénominateur — un compte d'anomalies seules n'en
+    /// a pas (mika#1833, mika#1926). C'est aussi le seul point du dispatcher que
+    /// **toutes** les branches traversent : le joint y aboutit sur ses sept
+    /// verdicts, et le site de production y entre directement pour son huitième
+    /// (`NoToken`, qui naît avant le joint).
+    ///
+    /// Le nom est neuf plutôt qu'emprunté à `rearm_consent_checked` (vol 2,
+    /// `executor.rs`) : cette enveloppe-là rend un `RearmOutcome` là où la garde
+    /// rend un `bool`, et un second émetteur rendrait le compte du vol 2
+    /// illisible. Deux populations, deux instruments — la même raison qui
+    /// interdit de partager le motif de refus interdit de partager le nom de la
+    /// sonde.
+    async fn apply_withdrawn_consent_verdict(
+        &self,
+        task: &Task,
+        parent: Option<&ReadyLabelParent>,
+        verdict: WithdrawnConsentVerdict,
+    ) -> bool {
+        use crate::ready_label::{
+            ISSUE_CLOSED_AT_REARM_REASON, READY_ABSENT_AT_REARM_REASON,
+            READY_CONSENT_WITHDRAWN_REASON,
+        };
+
+        // Les sept verdicts qui ne sont pas `NotAReadyLabelParent` portent une
+        // parente par construction de l'appelant — même idiome que le
+        // `events.last().expect("is_parked is false on an empty set")` du
+        // prédicat qu'ils consomment.
+        let expect_parent =
+            || parent.expect("seul NotAReadyLabelParent peut naître sans parente `ready-label:`");
+
+        info!(
+            target: "mika::otel",
+            event = "promotion_consent_checked",
+            agent_id = %self.db.agent_id(),
+            task_id = %task.id,
+            verdict = verdict.as_str(),
+            // `Option` et non une valeur de repli : sur `NotAReadyLabelParent`
+            // les trois champs doivent être **absents** du log, pas vides. `""`
+            // et `0` ont la forme d'une réponse sans en être une, et un `jq` qui
+            // les agrège ne s'en aperçoit pas (mika#2331).
+            parent_task_id = parent.map(|p| p.id.as_str()),
+            repo = parent.map(|p| p.repo.as_str()),
+            issue = parent.map(|p| p.issue),
+        );
+
+        match verdict {
+            WithdrawnConsentVerdict::NotAReadyLabelParent
+            | WithdrawnConsentVerdict::ConsentHeld => false,
+
+            WithdrawnConsentVerdict::ConsentWithdrawn {
+                parked_by,
+                parked_at,
+            } => {
+                let parent = expect_parent();
+                info!(
+                    event = "deferred_dispatch_refused_consent_withdrawn",
+                    agent_id = %self.db.agent_id(),
+                    task_id = %task.id,
+                    parent_task_id = %parent.id,
+                    repo = %parent.repo,
+                    issue = parent.issue,
+                    parked_by = parked_by.as_deref().unwrap_or("<unknown>"),
+                    parked_at = %parked_at,
+                    "mika#2995: `ready` a été retiré par un acteur non machine — aucun tour \
+                     LLM, aucun dispatch. Reposez `ready` à la main pour relancer le ticket."
+                );
+                self.write_promotion_consent_terminal(task, parent, READY_CONSENT_WITHDRAWN_REASON)
+                    .await;
+                true
+            }
+
+            // Les deux refus d'état n'ont **pas** de ligne de diagnostic à eux :
+            // le recensement émis ci-dessus porte déjà leur verdict, leurs
+            // coordonnées et leur parente, et la ligne d'audit en base porte la
+            // raison qu'AC1 nomme. Un troisième nom d'événement ici serait un
+            // nom de la famille de la relecture de consentement, donc une
+            // quatrième entrée au détecteur D3 — pour une information déjà
+            // portée deux fois.
+            WithdrawnConsentVerdict::ReadyAbsentAtPromotion => {
+                self.write_promotion_consent_terminal(
+                    task,
+                    expect_parent(),
+                    READY_ABSENT_AT_REARM_REASON,
+                )
+                .await;
+                true
+            }
+
+            WithdrawnConsentVerdict::IssueClosedAtPromotion => {
+                self.write_promotion_consent_terminal(
+                    task,
+                    expect_parent(),
+                    ISSUE_CLOSED_AT_REARM_REASON,
+                )
+                .await;
+                true
+            }
+
+            WithdrawnConsentVerdict::TimelineUnreadable { cause, detail } => {
+                Self::defer_consent_recheck(task, expect_parent(), cause, &detail);
+                true
+            }
+            WithdrawnConsentVerdict::StateUnreadable { detail } => {
+                Self::defer_consent_recheck(task, expect_parent(), "state", &detail);
+                true
+            }
+            WithdrawnConsentVerdict::NoToken => {
+                Self::defer_consent_recheck(
+                    task,
+                    expect_parent(),
+                    "no_token",
+                    "aucun jeton GitHub résolu (resolve_github_token)",
+                );
+                true
+            }
+        }
+    }
+
+    /// Le terminal des trois refus de la garde : wrapper en no-op, parente
+    /// `failed`, une ligne d'audit qui nomme la raison.
+    ///
+    /// Extrait du bras `ConsentWithdrawn` par mika#3050 plutôt que recopié deux
+    /// fois : les trois refus ne diffèrent que par leur **raison**, et c'est
+    /// exactement la forme qu'une copie rate au premier élargissement
+    /// (mika#2158). La raison reste le paramètre, jamais une valeur par défaut :
+    /// c'est elle qui garde les trois populations soustractables (mika#2205).
+    async fn write_promotion_consent_terminal(
+        &self,
+        task: &Task,
+        parent: &ReadyLabelParent,
+        reason: &str,
+    ) {
+        use crate::ready_label::READY_CONSENT_RECHECK_TOOL_NAME;
+
+        // Le wrapper d'abord : il est `completed` (il vient d'être promu), donc
+        // l'UPDATE gardé de `mark_deferred_wrapper_noop` s'applique. `expired`
+        // est le mot de mika#2169 pour « le tour a eu lieu et n'a rien
+        // dispatché » — ici il n'a même pas eu lieu, ce qui est strictement
+        // moins, et aucun sixième statut n'est inventé pour la nuance.
+        self.record_wrapper_noop(&task.id, reason).await;
+
+        // Puis la parente. **Le terminal n'est pas un verrou sur le ticket, il
+        // est la condition pour que le prochain « oui » humain soit pris** :
+        // `idx_tasks_manual_active_ref_url` exclut les statuts terminaux, donc
+        // une parente laissée `pending` garderait le créneau de l'issue occupé
+        // et un `labeled ready` reposé ensuite échouerait à créer sa tâche.
+        match self.db.update_task_failed(&parent.id, reason).await {
+            Ok(true) => {
+                let trace_id = mika_common::trace::generate_trace_id();
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &format!("system-{}", parent.agent_id),
+                        // Le nom de l'outil est celui de la **promotion**, pour
+                        // les trois raisons : `REARM_CONSENT_RECHECK_TOOL_NAME`
+                        // nomme un ré-armement refusé 45 min plus tard, et c'est
+                        // une autre population (mika#2205).
+                        READY_CONSENT_RECHECK_TOOL_NAME,
+                        &parent.id,
+                        Some("pending"),
+                        Some("failed"),
+                        Some(reason),
+                        Some(&trace_id),
+                    )
+                    .await
+                {
+                    warn!(
+                        parent_task_id = %parent.id,
+                        error = %e,
+                        "mika#2995: ligne d'audit de relecture de consentement non écrite"
+                    );
+                }
+            }
+            Ok(false) => {
+                debug!(
+                    parent_task_id = %parent.id,
+                    "mika#2995: parente déjà terminale — terminal de relecture sauté"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    parent_task_id = %parent.id,
+                    error = %e,
+                    "mika#2995: terminal de la parente non écrit"
+                );
+            }
+        }
+    }
+
+    /// La sonde du report D4 — une ligne par report, distincte du refus.
+    ///
+    /// Sans elle, « la lecture échoue en boucle » et « aucun wrapper
+    /// `ready-label` n'est passé par la garde » rendraient zéro tous les deux
+    /// (classe mika#2205). Son **absence** veut dire un binaire antérieur à
+    /// cette tranche, pas un régime nominal (classe mika#2340) : l'instrument
+    /// n'est pas vivant avant `make deploy`.
+    ///
+    /// Le report est borné sans rien de neuf : le wrapper reste `completed` non
+    /// délivré, donc la boucle de délivrance le reprend au tick suivant et
+    /// **relit** la timeline ; au-delà de
+    /// `PROMOTED_WRAPPER_LIVENESS_DEFAULT_SECS` (45 min) le faucheur d'orphelines
+    /// prend la main, et son propre budget `MAX_STUCK_REARMS = 2` finit en
+    /// terminal. La sortie du report est donc toujours un terminal, jamais un
+    /// tour.
+    fn defer_consent_recheck(
+        task: &Task,
+        parent: &ReadyLabelParent,
+        cause: &'static str,
+        detail: &str,
+    ) {
+        info!(
+            event = "deferred_dispatch_consent_recheck_deferred",
+            task_id = %task.id,
+            parent_task_id = %parent.id,
+            repo = %parent.repo,
+            issue = parent.issue,
+            cause = cause,
+            detail = detail,
+            "mika#2995: consentement non relisible — aucun dispatch et aucun terminal, le \
+             tick suivant relira"
+        );
+    }
+
     pub(crate) async fn dispatch_resume_agent(&self, task: &Task) -> Result<(), DispatchError> {
         let is_callback = task.trigger_type == "callback";
 
@@ -1148,6 +1961,26 @@ impl TaskDispatcher {
         // pas de tour LLM. Placé AVANT le verrou : un tour qu'on ne lance pas
         // n'a ni à attendre le verrou ni à compter un report `AgentBusy`.
         if is_callback && self.skip_superseded_build_callback(task).await {
+            return Ok(());
+        }
+
+        // mika#2944 — une ligne retenue pour crédit épuisé paie une sonde d'un
+        // message, jamais une revue complète. Même raison d'être avant le
+        // verrou, et **après** la garde ci-dessus parce que l'ordre est
+        // porteur : la supersession est un test de base gratuit, la retenue
+        // coûte un appel LLM.
+        if is_callback && self.hold_callback_on_exhausted_credit(task).await {
+            return Ok(());
+        }
+
+        // mika#2995 — un wrapper différé dont la parente `ready-label:` a perdu
+        // son consentement humain ne paie ni tour LLM ni dispatch. Même rang que
+        // les deux gardes ci-dessus, et **après** elles : son discriminant est
+        // gratuit mais sa lecture de timeline est un appel réseau, donc elle
+        // passe en dernier des trois. Gatée sur `is_deferred_dispatch` et non sur
+        // `is_callback` : la population est celle des wrappers différés, et un
+        // callback de build n'a aucune parente à relire.
+        if is_deferred_dispatch && self.skip_deferred_dispatch_on_withdrawn_consent(task).await {
             return Ok(());
         }
 
@@ -1258,6 +2091,15 @@ impl TaskDispatcher {
             // and zeroing the auto-pull re-drive budget on every tick. Resolve
             // it here, at the moment the refusal arrives.
             try_resolve_parent_on_dispatch_refusal(&self.db, task).await;
+            // mika#2976 AC5 : le frère du précédent pour la HALTE de dispatch.
+            // `dispatch-lib` s'arrête sur `STATUS=REBASE_CONFLICT` ou
+            // `STATUS=BRANCH_HAS_UNMERGED_WORK` sans rien toucher ; mesuré le
+            // 2026-10-30, la parente de groom 19c11b09 est restée `in_progress`
+            // alors que son seul enfant était livré et qu'aucun processus ne
+            // tournait — une parente zombie, qui a demandé un `cancel` à la
+            // main. Ce lecteur la rend terminale à l'instant où la halte arrive,
+            // sans dépendre du prompt ni de `make deploy`.
+            try_terminate_parent_on_dispatch_halt(&self.db, task).await;
             // mika#1289 / mika#1614: structural counterpart to the prompt-level
             // groom-success handler in self-dev-callback (PR #1291). When a groom
             // callback delivers with `Outcome: PLAN_GROOMED`, the engine spawns the
@@ -2085,6 +2927,12 @@ impl TaskDispatcher {
             &label_auth,
             &trace_id,
             &session_id,
+            // Le rail de notification opérateur (mika#2866) : un bail du démon
+            // part en P0 sous la classe `recovery-runbook`. C'est le même
+            // `message_sender` que le rail du calage de dispatch, construit
+            // avec `with_escalation_chat_id` par `server/mod.rs` — donc il
+            // atteint déjà la surface jamais muette, rien à câbler ici.
+            self.message_sender.as_ref(),
         )
         .await;
 
@@ -2807,7 +3655,40 @@ impl TaskDispatcher {
         // far end of a long outage.
         let max_attempts = self.settings.effective_callback_delivery_max_attempts();
         let max_backoff = self.settings.effective_callback_delivery_backoff_max_secs();
-        let backoff_secs = if counter_written {
+
+        // mika#2944 — un 402 de crédit **remplace** le calcul du backoff par un
+        // intervalle de retenue. Un backoff borne la *fréquence* d'un réessai ;
+        // il ne peut rien contre un réessai dont on sait qu'il ne peut pas
+        // aboutir. La ligne garde tout le reste : son compteur, sa classe de
+        // fil `http_402`, son événement `callback_delivery_failed`, son
+        // résultat de build, et sa quarantaine le jour où elle la franchit.
+        //
+        // La retenue ne dépend **pas** de `counter_written`, et c'est une
+        // différence de nature, non un oubli : l'intervalle est constant, donc
+        // il n'y a rien à escalader depuis un nombre non fiable. Le compteur
+        // illisible dégrade l'échelle de mika#2179, pas celle-ci.
+        //
+        // `0` est l'interrupteur STOP déclaré du ticket (voir
+        // `effective_callback_delivery_credit_hold_secs`) : la retenue est
+        // désarmée et le 402 retrouve l'échelle de mika#2179.
+        let credit_hold_secs = if mika_common::llm::error::is_credit_exhausted_anyhow(err) {
+            self.settings.effective_callback_delivery_credit_hold_secs()
+        } else {
+            0
+        };
+
+        let backoff_secs = if credit_hold_secs > 0 {
+            self.stamp_credit_hold(
+                task,
+                session_id,
+                trace_id,
+                &class,
+                credit_hold_secs,
+                attempts,
+            )
+            .await;
+            credit_hold_secs
+        } else if counter_written {
             delivery_backoff_secs(
                 self.settings
                     .effective_callback_delivery_backoff_base_secs(),
@@ -2883,6 +3764,227 @@ impl TaskDispatcher {
                 attempts,
                 "callback delivery quarantined — retrying at the backoff ceiling, result preserved"
             );
+        }
+    }
+
+    /// mika#2944 — Poser (ou reposer) la marque de retenue sur crédit épuisé.
+    ///
+    /// N'écrit **pas** le `next_fire_at` : les deux appelants ont chacun leur
+    /// propre site de timer — `record_callback_delivery_failure` en a déjà un et
+    /// un seul (le `next_fire_at` de mika#2179, dont la valeur devient
+    /// l'intervalle de retenue), et [`Self::hold_callback_on_exhausted_credit`]
+    /// doit écrire le sien parce qu'aucun autre chemin ne le fera. Un helper qui
+    /// écrirait le timer poserait deux `next_fire_at` sur le chemin de l'échec,
+    /// dont le second effacerait le premier sans trace.
+    ///
+    /// `probes` est incrémenté ici parce que c'est ici que la facture de la
+    /// retenue se lit : une sonde payée par intervalle, et le compte dit combien.
+    async fn stamp_credit_hold(
+        &self,
+        task: &Task,
+        session_id: &str,
+        trace_id: &str,
+        class: &str,
+        hold_secs: u64,
+        attempts: u32,
+    ) {
+        use crate::credit_hold::{
+            CREDIT_HELD_EVENT, DELIVERY_CREDIT_HELD_AT_KEY, DELIVERY_CREDIT_PROBES_KEY,
+        };
+
+        let probes = self
+            .db
+            .get_task_metadata_field(&task.id, DELIVERY_CREDIT_PROBES_KEY)
+            .await
+            .unwrap_or_default()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+
+        self.set_delivery_metadata(
+            &task.id,
+            DELIVERY_CREDIT_HELD_AT_KEY,
+            &crate::timestamp::now(),
+        )
+        .await;
+        self.set_delivery_metadata(&task.id, DELIVERY_CREDIT_PROBES_KEY, &probes.to_string())
+            .await;
+
+        let reasoning = format!(
+            "hold_secs={hold_secs} probes={probes} attempts={attempts} label:{}",
+            task.label
+        );
+        if let Err(e) = self
+            .db
+            .log_audit_event(
+                session_id,
+                CREDIT_HELD_EVENT,
+                &format!("task:{}", task.id),
+                None,
+                Some(class),
+                Some(&reasoning),
+                Some(trace_id),
+            )
+            .await
+        {
+            warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_credit_held audit event");
+        }
+
+        warn!(
+            event = CREDIT_HELD_EVENT,
+            task_id = %task.id,
+            label = %task.label,
+            error_class = %class,
+            hold_secs,
+            probes,
+            attempts,
+            "crédit du fournisseur épuisé — la ligne est retenue au lieu de rejouer \
+             la revue (résultat préservé, reprise à la prochaine sonde)"
+        );
+    }
+
+    /// mika#2944 — Une ligne retenue pour crédit épuisé ne rejoue pas sa revue :
+    /// elle paie une sonde d'un message, et c'est tout.
+    ///
+    /// Rend `true` quand le tour ne doit pas tourner. Appelée **avant le
+    /// verrou**, juste après la garde mika#2671, pour la même raison : un tour
+    /// qu'on ne lance pas n'a ni à attendre le verrou ni à compter un report
+    /// `AgentBusy`. Et **après** elle, parce que l'ordre est porteur — la
+    /// supersession est un test de base gratuit, la retenue coûte un appel LLM.
+    ///
+    /// # Les trois sorties, et pourquoi la troisième est fermée
+    ///
+    /// * la sonde **passe** ⇒ le crédit est revenu : on pose la marque de
+    ///   relâchement, on l'annonce, et on rend `false` — la revue reprend dans
+    ///   le tour qui suit immédiatement, sans geste à la main (AC2) ;
+    /// * la sonde rend un **402** ⇒ le crédit manque toujours : re-retenue,
+    ///   `true`. C'est le cas nominal d'une retenue, et il coûte un message
+    ///   par intervalle au lieu d'une revue complète ;
+    /// * la sonde rend **autre chose** (429, 5xx, transport) ⇒ re-retenue sous
+    ///   WARN, `true`. **Fail-closed assumé** : on ne sait pas si le crédit est
+    ///   revenu, et la seule façon de le savoir coûterait précisément ce que ce
+    ///   ticket existe pour ne plus payer. Un quart d'heure de retard sur un
+    ///   verdict est moins cher qu'une revue de 28 tours rejouée dans le vide.
+    ///   L'événement porte la classe de l'erreur, donc une retenue qui dure
+    ///   parce que le fournisseur est en panne se distingue d'une retenue qui
+    ///   dure parce que le solde est à zéro.
+    ///
+    /// # Ce que la sonde ne prouve pas
+    ///
+    /// Qu'elle passe ne garantit pas que la revue aboutira : le pré-vol porte
+    /// sur l'enveloppe de la requête, et une revue de 28 tours en consomme
+    /// plusieurs. C'est une **indication**, et le résidu assumé est au pire une
+    /// revue rejouée par intervalle de retenue — contre une toutes les soixante
+    /// secondes avant ce ticket.
+    async fn hold_callback_on_exhausted_credit(&self, task: &Task) -> bool {
+        use crate::credit_hold::{
+            CREDIT_PROBE_INCONCLUSIVE_EVENT, CREDIT_RESTORED_EVENT, DELIVERY_CREDIT_HELD_AT_KEY,
+            DELIVERY_CREDIT_PROBES_KEY, DELIVERY_CREDIT_RELEASED_AT_KEY,
+        };
+
+        if !crate::credit_hold::is_held(task.metadata.as_deref()) {
+            return false;
+        }
+
+        let hold_secs = self.settings.effective_callback_delivery_credit_hold_secs();
+        if hold_secs == 0 {
+            // Interrupteur STOP déclaré (doctrine mika#1833) : l'opérateur a
+            // désarmé la retenue, la ligne repart sur l'échelle de mika#2179.
+            // Aucune marque n'est retirée — `async_db` n'a pas de suppression —
+            // donc le désarmement est réversible sans toucher aux données.
+            return false;
+        }
+
+        let session_id = format!("credit-probe-{}", uuid::Uuid::new_v4());
+        let trace_id = mika_common::trace::generate_trace_id();
+        let probe = crate::credit_hold::probe_request(self.llm.as_ref());
+
+        match self.llm.send_message(&probe).await {
+            Ok(_) => {
+                let held_secs = task
+                    .metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|v| {
+                        v.get(DELIVERY_CREDIT_HELD_AT_KEY)
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string)
+                    })
+                    .and_then(|ts| crate::timestamp::parse(&ts).ok())
+                    .map(|held| chrono::Utc::now().signed_duration_since(held).num_seconds())
+                    .unwrap_or(-1);
+                let probes = crate::qa_build_callback::metadata_counter(
+                    task.metadata.as_deref(),
+                    DELIVERY_CREDIT_PROBES_KEY,
+                );
+
+                self.set_delivery_metadata(
+                    &task.id,
+                    DELIVERY_CREDIT_RELEASED_AT_KEY,
+                    &crate::timestamp::now(),
+                )
+                .await;
+
+                if let Err(e) = self
+                    .db
+                    .log_audit_event(
+                        &session_id,
+                        CREDIT_RESTORED_EVENT,
+                        &format!("task:{}", task.id),
+                        None,
+                        Some(&held_secs.to_string()),
+                        Some(&format!("held_secs={held_secs} probes={probes}")),
+                        Some(&trace_id),
+                    )
+                    .await
+                {
+                    warn!(error = %e, task_id = %task.id, "failed to write callback_delivery_credit_restored audit event");
+                }
+
+                info!(
+                    event = CREDIT_RESTORED_EVENT,
+                    task_id = %task.id,
+                    label = %task.label,
+                    held_secs,
+                    probes,
+                    "crédit revenu — la revue reprend dans ce tour, sans geste à la main"
+                );
+                false
+            }
+            Err(e) => {
+                let class = e.error_class();
+                let conclusive = mika_common::llm::error::is_credit_exhausted(&e);
+                if !conclusive {
+                    warn!(
+                        event = CREDIT_PROBE_INCONCLUSIVE_EVENT,
+                        task_id = %task.id,
+                        label = %task.label,
+                        error_class = %class,
+                        error = %e,
+                        "la sonde de crédit n'a pas conclu — retenue maintenue (fail-closed : \
+                         la seule façon de savoir coûterait la revue que ce ticket évite)"
+                    );
+                }
+                self.stamp_credit_hold(
+                    task,
+                    &session_id,
+                    &trace_id,
+                    class.as_ref(),
+                    hold_secs,
+                    crate::qa_build_callback::metadata_counter(
+                        task.metadata.as_deref(),
+                        DELIVERY_ATTEMPTS_KEY,
+                    ) as u32,
+                )
+                .await;
+
+                let fire_at =
+                    crate::timestamp::now_plus(chrono::Duration::seconds(hold_secs as i64));
+                if let Err(e) = self.db.update_task_next_fire_at(&task.id, &fire_at).await {
+                    warn!(error = %e, task_id = %task.id, "failed to write callback credit hold");
+                }
+                true
+            }
         }
     }
 
@@ -3144,6 +4246,16 @@ impl TaskDispatcher {
             return;
         }
 
+        // mika#3050 D7 — ici la « passe » est un seul lanceur consommé, donc la
+        // résolution est à son site d'appel ; elle vit après la garde L2a
+        // ci-dessus, pour qu'une parente déjà terminale ne la paie pas. Même
+        // porte que le site frère de mika#2995 : `resolve_github_token`, et non
+        // `resolve_periodic_scan_token`.
+        let github_token = self
+            .settings
+            .resolve_github_token(self.github_app.as_deref())
+            .await;
+
         let outcome = crate::skills::executor::rearm_deferred_callback(
             &self.db,
             parent_id,
@@ -3156,6 +4268,7 @@ impl TaskDispatcher {
             // the second shape would count itself as live for the whole
             // liveness window.
             Some(task.id.as_str()),
+            github_token.as_deref(),
         )
         .await;
 
@@ -3217,6 +4330,36 @@ impl TaskDispatcher {
                     ),
                 )
                 .await;
+            }
+            // mika#3050 AC1 — le ticket ne consent plus. Le terminal de la
+            // parente et la ligne d'audit sont **déjà** écrits par la garde
+            // (D6) ; ce qui reste au site d'appel est le registre du lanceur
+            // consommé, que lui seul connaît. Sans lui, ce lanceur reste
+            // `completed` et `count_promoted_undelivered_wrappers` (L2b) le lit
+            // comme « promu, jamais pris » — l'indicateur de famine tirerait
+            // sur un refus sain, exactement l'argument du bras
+            // `AlreadyRepresented` ci-dessus.
+            //
+            // `debug!` et non `info!` : la ligne de surface est celle de la
+            // garde, et la dupliquer au niveau INFO ferait deux populations
+            // sous un même compte (mika#2205), alors que la cible d'AC4 est un
+            // compte.
+            RearmOutcome::ConsentWithdrawn { reason } => {
+                self.record_wrapper_noop(
+                    &task.id,
+                    &format!(
+                        "noop: aucun dispatch produit (cause={cause}) — \
+                         consentement du ticket retiré ({reason})"
+                    ),
+                )
+                .await;
+                debug!(
+                    task_id = %task.id,
+                    parent_task_id = %parent_id,
+                    cause,
+                    reason,
+                    "mika#3050 : ré-armement refusé — le ticket ne consent plus"
+                );
             }
             RearmOutcome::Unrepairable => {
                 let reason = format!(
@@ -4103,6 +5246,154 @@ async fn try_resolve_parent_on_dispatch_refusal(db: &AsyncDatabase, task: &Task)
     }
 }
 
+/// Le statut de **halte de dispatch** porté par un résultat de callback, quand
+/// le résultat en est un (mika#2976 AC5).
+///
+/// # Une table CLOSE, lue sur la PREMIÈRE LIGNE
+///
+/// `dispatch-lib.sh` pose ces deux bannières lui-même, comme première ligne du
+/// `RESULT` qu'il délivre : `_branch_reuse_gate` pour
+/// `STATUS=BRANCH_HAS_UNMERGED_WORK` (mika#2976 vol 1) et la porte de rebase
+/// pour `STATUS=REBASE_CONFLICT` (mika#1727, mika#2968 deux fois). Le prédicat
+/// est donc l'égalité de la première ligne, après `trim_end`, avec l'une de
+/// **deux** valeurs nommées.
+///
+/// Les deux bornes du prédicat sont load-bearing, et chacune ferme une
+/// mauvaise lecture :
+///
+/// * **Pas `contains`.** Un `RESULT` de refus qui *cite* la bannière pour
+///   expliquer qu'il n'y a rien à reprendre serait compté comme la halte
+///   elle-même — la classe mika#2590, où une sous-chaîne a fait passer la note
+///   d'un refus pour la preuve qu'elle décrivait.
+/// * **Pas un préfixe `STATUS=` nu.** La famille `STATUS=` porte aussi
+///   `CANCELLED_BY_OPERATOR` et `CANCELLED_BY_SIGNAL`, qui ont leur propre
+///   discriminateur et leur propre issue. Les avaler ici confondrait un geste
+///   opérateur avec une branche inreprenable, et rendrait les deux populations
+///   non soustractibles (mika#2205).
+///
+/// Les deux jetons sont déclarés classe B dans `scripts/canonical-tokens.tsv`,
+/// avec ce site : une bannière reformulée côté shell ferait retomber la parente
+/// en zombie, en silence.
+fn parse_dispatch_halt_status(result: &str) -> Option<&'static str> {
+    match result.lines().next()?.trim_end() {
+        "STATUS=REBASE_CONFLICT" => Some("REBASE_CONFLICT"),
+        "STATUS=BRANCH_HAS_UNMERGED_WORK" => Some("BRANCH_HAS_UNMERGED_WORK"),
+        _ => None,
+    }
+}
+
+/// Une halte de dispatch rend la parente terminale (mika#2976 AC5).
+///
+/// # Le défaut que ceci ferme
+///
+/// Le 2026-10-30, le groom de mika#2968 s'est arrêté en `REBASE_CONFLICT` : la
+/// branche du vol précédent, dont la PR venait d'être mergée en squash, a été
+/// reprise puis rebasée contre son propre squash. `dispatch-lib` a fait ce
+/// qu'il devait — s'arrêter sans rien toucher — et a livré l'enfant
+/// `1f838a67`. Mais la parente de groom `19c11b09` est restée `in_progress`
+/// alors que son seul enfant était livré et qu'aucun processus ne tournait. Une
+/// parente zombie bloque la relance du ticket : le nettoyage a demandé un
+/// `mika tasks … cancel` à la main, sur le mot de l'opérateur.
+///
+/// # Pourquoi `failed` et non `completed`
+///
+/// C'est l'inverse du frère `try_resolve_parent_on_dispatch_refusal`. Un refus
+/// `auto_skipped` est un **résultat correct** — le ticket EST groomé — donc il
+/// se résout en `completed`. Une halte, elle, est un vol qui n'a produit ni
+/// plan ni PR : la marquer `completed` dirait que le ticket est traité et le
+/// retirerait du compte des vraies pannes.
+///
+/// # Pourquoi `update_task_failed`
+///
+/// La **même primitive que le faucheur** : un UPDATE gardé sur l'état terminal,
+/// donc inoffensif en course avec lui ou avec un geste opérateur. `Ok(false)`
+/// veut dire « quelqu'un d'autre l'a déjà rendue terminale » et ne mérite qu'un
+/// `debug!`.
+///
+/// # Pourquoi un motif distinct
+///
+/// `dispatch_halt_<statut>` ne recouvre ni `callback_no_pr_*` ni
+/// `phantom_aged_out` : deux populations sous un même nom cessent d'être
+/// soustractibles, et c'est exactement ce que mika#2205 ferme. Le statut est
+/// reporté verbatim, donc `REBASE_CONFLICT` et `BRANCH_HAS_UNMERGED_WORK`
+/// restent séparables l'un de l'autre aussi.
+///
+/// Best-effort, fire-and-forget — même forme que les helpers frères.
+async fn try_terminate_parent_on_dispatch_halt(db: &AsyncDatabase, task: &Task) {
+    let Some(parent_id) = task.parent_task_id.clone() else {
+        return;
+    };
+
+    let Some(result) = task.result.as_deref().filter(|r| !r.is_empty()) else {
+        return;
+    };
+    let Some(halt_status) = parse_dispatch_halt_status(result) else {
+        return;
+    };
+
+    // Portée identique aux frères : une tâche de suivi self_dev encore en vol.
+    // Pas de filtre sur `dispatch_class` — la halte tombe sur un groom comme sur
+    // un implement, et un second prédicat plus faible pour le même fait est ce
+    // que mika#2158 ferme.
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t))
+            if t.trigger_type == "manual"
+                && t.status == "in_progress"
+                && t.source.as_deref() == Some("self_dev") =>
+        {
+            t
+        }
+        _ => return,
+    };
+
+    let motif = format!("dispatch_halt_{halt_status}");
+    match db.update_task_failed(&parent_id, &motif).await {
+        Ok(true) => {
+            let system_session = format!("system-{}", parent.agent_id);
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &system_session,
+                    "dispatch_halt_resolver",
+                    &parent_id,
+                    Some("in_progress"),
+                    Some("failed"),
+                    Some(&motif),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent_id,
+                    error = %e,
+                    "engine: failed to write dispatch-halt-resolver audit event"
+                );
+            }
+            info!(
+                event = "dispatch_halt_parent_terminated",
+                parent_task_id = %parent_id,
+                callback_task_id = %task.id,
+                halt_status = %halt_status,
+                "engine: dispatch halt made its parent terminal (mika#2976)"
+            );
+        }
+        Ok(false) => {
+            debug!(
+                parent_task_id = %parent_id,
+                halt_status = %halt_status,
+                "engine: parent no longer in_progress, skipping dispatch-halt termination"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to terminate parent task on dispatch halt"
+            );
+        }
+    }
+}
+
 /// Returns `true` if the task is a team-child callback (per-delegation
 /// `resume_agent` created by the team engine). Both `team_run_id` and
 /// `parent_task_id` are set together at child-creation time in
@@ -4140,24 +5431,33 @@ const GROOM_PILOT_DISPATCHED_VALUE: &str = "implement_dispatched";
 const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
 
 /// mika#1289 — When a dev-groom callback delivers with `Outcome: PLAN_GROOMED`
-/// in its result text, re-add the `ready` label on the GitHub issue so the
-/// ready-label webhook handler dispatches dev-pilot. This is the structural
-/// counterpart to the LLM-mediated prompt-level path in `self-dev-callback`
-/// (mika#996 / PR #1291) which has a documented drift rate: the LLM
-/// sometimes sets `update_task_status(completed)` but skips the
-/// `gh issue edit --add-label ready` step, leaving the queue wedged.
+/// in its result text, dispatch dev-pilot. This is the structural counterpart
+/// to the LLM-mediated prompt-level path in `self-dev-callback` (mika#996 /
+/// PR #1291), which had a documented drift rate: the LLM sometimes set
+/// `update_task_status(completed)` and skipped its own step, leaving the queue
+/// wedged.
 ///
-/// Engine-side dispatch is fire-and-forget: failure to re-add the label is
-/// logged at WARN and does not affect the callback delivery. The prompt-
-/// level handler remains as defense-in-depth (idempotent — re-adding an
-/// already-present label is a no-op on GitHub).
+/// **This function is the ONLY auto-fire after a groom success since mika#2995.**
+/// The prompt-level path was not defense-in-depth, it was a self-consent
+/// surface: its step prescribed `gh issue edit --add-label ready`, i.e. the
+/// engine posting the operator's consent label to itself (mika#841 / mika#2772),
+/// and since mika#1614 moved dispatch here it had nothing left to achieve
+/// anyway. It was removed; the agent is now told the promotion belongs to the
+/// operator. Do not reinstate a label write on this path — a scan in
+/// `canonical_tokens.rs` refuses it in any bundled prompt.
+///
+/// Engine-side dispatch is fire-and-forget.
 ///
 /// Trigger conditions (all must hold):
 ///   - `task.dispatch_class == Some("groom")` — groom-class callbacks only
-///   - `task.result` contains the literal `"Outcome: PLAN_GROOMED"` —
-///     the structural success marker emitted by `_write_canonical_callout`'s
-///     parent `_iterate_groom_loop` (does not depend on body-marker write
-///     having succeeded; the callback-result text is canonical for this signal)
+///   - `task.result` carries `"Outcome: PLAN_GROOMED"` **at the head of a
+///     line** — the structural success marker emitted by
+///     `_write_canonical_callout`'s parent `_iterate_groom_loop` (does not
+///     depend on body-marker write having succeeded; the callback-result text
+///     is canonical for this signal). Not "contains the literal": mika#2590
+///     anchored the reading, and since mika#2981 the line carries a
+///     ` — <plan>` suffix naming the plan that groom validated, so a reader
+///     that required an end anchor would refuse every real proof.
 ///   - parent task has a parseable `reference_url` of shape
 ///     `https://github.com/<owner>/<repo>/issues/<n>`
 ///
@@ -4174,8 +5474,11 @@ const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
 /// spawn — observed on mika#1609, 2026-06-28).
 ///
 /// Fire-and-forget: on ANY precondition failure (tool not in registry, readiness
-/// rejection, handler missing) the function logs a WARN and returns. The
-/// prompt-level path in `self-dev-callback` remains as defense-in-depth.
+/// rejection, handler missing) the function logs a WARN and returns. **Nothing
+/// catches that failure downstream since mika#2995** — the prompt-level path
+/// that used to be named here as defense-in-depth is gone (see above), so a
+/// precondition failure leaves the ticket promoted and undispatched, which is
+/// an operator-visible state and not an agent's business to repair.
 ///
 /// Audit event written under [`GROOM_PILOT_DISPATCHER_TOOL`] with
 /// `after_value=`[`GROOM_PILOT_DISPATCHED_VALUE`] for traceability — and, since
@@ -4865,7 +6168,11 @@ fn parse_repo_issue_from_url(url: &str) -> Option<(String, u64)> {
 ///
 /// Fields default to `"unknown"` in the handler when not available;
 /// this parser skips `"unknown"` values to avoid polluting metadata.
-fn extract_callback_fields(result: &str) -> serde_json::Value {
+///
+/// `pub(crate)` for mika#2981: the provenance gate reads the `PR:` line through
+/// this parser to date the last PR a flight opened, so the gate and the
+/// parent-completer share one reader of that line.
+pub(crate) fn extract_callback_fields(result: &str) -> serde_json::Value {
     static RE_SESSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Session:\s*(\S+)").unwrap());
     static RE_TURNS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Turns:\s*(\d+)").unwrap());
     static RE_COST: LazyLock<Regex> =
@@ -4923,9 +6230,15 @@ fn extract_callback_fields(result: &str) -> serde_json::Value {
 ///
 /// Mirror of `RE_PR_URL` above: `(?m)^NO_PR:` is line-anchored so a free-text
 /// mention never matches, and the reason is constrained to the lowercase-token
-/// charset the three `dispatch-lib.sh` emission sites produce (`no_pr_on_branch`,
+/// charset the `dispatch-lib.sh` emission sites produce (`no_pr_on_branch`,
 /// `gh_query_failed`, `branch_unset`, `repo_unset`, `rescue_pr_create_failed` —
-/// KTD2). Returns `None` when no `NO_PR:` line is present, which is the AC-G2
+/// KTD2 — plus the two refusals the rescue can pronounce: `rescue_scratch_only`,
+/// mika#2503, and `rescue_adds_nothing_to_main`, mika#3038). This list is the
+/// only enumeration an operator reads to know what the loop can answer, so a
+/// reason the parser accepts but nothing here names is a reason nobody can look
+/// up: `rescue_scratch_only` was such a reason until mika#3038 added its
+/// neighbour and found it missing.
+/// Returns `None` when no `NO_PR:` line is present, which is the AC-G2
 /// contract: a callback carrying neither `PR:` nor `NO_PR:` (a producer that
 /// predates U1) leaves the generic `callback_delivered_without_pr_url` motif
 /// intact. The reaper (`engine::reap_orphaned_parent_tasks`) calls this to
@@ -5318,6 +6631,341 @@ mod tests {
             worktree_reap_stop_armed: AtomicBool::new(false),
             proactive_budget_reported: std::sync::Mutex::new(None),
         }
+    }
+
+    // ---- mika#2456 (vol 2) — le filet au tir -------------------------------
+    //
+    // Le témoin du refus est **la valeur de retour du filet**, assertée
+    // directement. Pas un tir observé, pas une ligne d'audit : le filet ne mute
+    // rien, et faire porter la preuve par un effet de bord qu'il n'a pas le
+    // droit d'avoir obligerait à lui en donner un.
+
+    /// Un foyer d'agent dont l'`identity.toml` porte exactement `body`.
+    fn agent_home(body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("foyer d'agent temporaire");
+        std::fs::write(dir.path().join("identity.toml"), body).expect("écrire identity.toml");
+        dir
+    }
+
+    /// La graine de V4 et de V5, à un octet près. Les deux foyers sortent de la
+    /// **même** fonction pour que l'écart mesuré soit celui de la clé et non
+    /// celui de deux montages qui auraient divergé.
+    fn home_with_enabled(enabled: bool) -> tempfile::TempDir {
+        agent_home(&format!(
+            "name = \"mika\"\nemoji = \"🧪\"\nenabled = {enabled}\n"
+        ))
+    }
+
+    /// Une ligne posée en base puis relue : les ~35 champs de [`Task`] ne se
+    /// construisent pas à la main (même geste que `curator_task`).
+    ///
+    /// `trigger_type` est un paramètre parce que c'est le **seul** champ qui
+    /// sépare V4 de la branche (b) de V5 — la graine est commune, et la
+    /// différence mesurée est celle du champ.
+    async fn seeded_task(db: &AsyncDatabase, label: &str, trigger_type: &str) -> crate::db::Task {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: label.to_string(),
+                trigger_type: trigger_type.to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: Some(crate::timestamp::now()),
+                timeout_at: None,
+                action_type: "run_skill".to_string(),
+                action_config: format!(r#"{{"trigger":"{label}"}}"#),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .expect("poser la ligne de la sonde");
+        db.get_task(&id).await.unwrap().expect("task must exist")
+    }
+
+    /// **V4** — une récurrente d'un agent dont la racine porte `enabled = false`
+    /// est refusée au tir. C'est la population que la porte à l'enregistrement
+    /// ne voit pas : la ligne est déjà là.
+    #[tokio::test]
+    async fn mika2456_le_filet_refuse_une_recurrente_dun_agent_desactive() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 — `enabled = false` à la racine doit refuser le tir \
+             d'une récurrente, quelle que soit la date de naissance de la ligne"
+        );
+    }
+
+    /// **V5 (a)** — contrôle négatif sur la clé : même graine, `enabled = true`,
+    /// et le filet laisse passer. Sans lui, V4 passerait aussi sur un filet qui
+    /// refuse tout.
+    #[tokio::test]
+    async fn mika2456_le_filet_laisse_passer_une_recurrente_dun_agent_active() {
+        let home = home_with_enabled(true);
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            !dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "un agent activé tire ses récurrentes normalement — sinon le filet \
+             ne mesure pas `enabled` mais sa propre présence"
+        );
+    }
+
+    /// **V5 (b)** — contrôle négatif sur le `trigger_type` : même `enabled =
+    /// false`, mais un rappel (`time`) passe. `enabled = false` à la racine
+    /// nomme les récurrentes, pas l'agent entier — et c'est très exactement le
+    /// défaut que le `if false &&` de la wip produisait.
+    #[tokio::test]
+    async fn mika2456_le_filet_ne_touche_pas_un_rappel_dun_agent_desactive() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::TIME,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            !dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 R-3 — un `trigger_type` non récurrent n'est pas du \
+             ressort de cette porte, même sur un agent désactivé"
+        );
+    }
+
+    /// **V6** — le filet n'usurpe pas la décision d'une porte de section.
+    /// Racine `enabled = true` **et** `[heartbeat] enabled = false` : le filet
+    /// rend `false`, et c'est `heartbeat_enabled_for_agent` qui éteint le
+    /// heartbeat. Les deux clés coexistent ; confondre leurs portées ferait de
+    /// chaque `[section] enabled = false` un agent éteint.
+    #[tokio::test]
+    async fn mika2456_le_filet_laisse_la_porte_de_section_decider() {
+        let home = agent_home(
+            "name = \"mika\"\nemoji = \"🧪\"\nenabled = true\n\n[heartbeat]\nenabled = false\n",
+        );
+        let db = test_db();
+        let task = seeded_task(
+            &db,
+            "heartbeat",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher =
+            test_dispatcher_with_homes(db, home.path().to_path_buf(), no_stop_home().to_path_buf());
+
+        assert!(
+            !dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "le filet lit la clé racine seule — `[heartbeat] enabled = false` \
+             n'est pas son affaire"
+        );
+        assert!(
+            !crate::task_engine::heartbeat_enabled_for_agent(home.path()).await,
+            "…et la porte de section, elle, dit bien non : sans cette seconde \
+             assertion, un `[heartbeat]` ignoré de bout en bout rendrait la \
+             première verte"
+        );
+    }
+
+    // ---- mika#2843 (vol 3) — la surface d'audit du filet -------------------
+    //
+    // **Chaque sonde de cette section prend un `label` UNIQUE, et ce n'est pas
+    // une coquetterie.** `RECURRING_GATE_AUDIT_SEEN` est un `static` partagé par
+    // tout le binaire de test : depuis le vol 3, le V4 du vol 2
+    // (`mika2456_le_filet_refuse_une_recurrente_dun_agent_desactive`, agent
+    // `"mika"`, label `"heartbeat"`) écrit lui aussi une ligne, sous la clé
+    // `("mika", "heartbeat")`. Deux sondes qui partageraient une clé se
+    // dédupliqueraient l'une l'autre et liraient `0` ou `1` **selon l'ordre
+    // d'exécution**. « Simplifier » vers un label partagé réintroduit ce flake
+    // sans rien faire rougir sur le coup.
+
+    /// **V4-bis** — le refus écrit **sa ligne d'audit**. Le vol 2 ne tenait V4
+    /// que par le booléen rendu et par le WARN ; c'est cette sonde qui rend la
+    /// requête opérateur du § *Audit Log* non vide.
+    ///
+    /// Modèle : les sondes de ligne d'audit de mika#2496 — appeler la fonction,
+    /// puis lire `count_audit_events_by_tool_name` et `get_audit_events`.
+    /// **Aucun `TaskEngine`** : le filet est une fonction, et le harnais inline
+    /// du vol 2 suffit.
+    #[tokio::test]
+    async fn mika2456_v4bis_le_refus_ecrit_sa_ligne_daudit() {
+        let home = home_with_enabled(false);
+        let db = test_db();
+        // Label unique — cf. le commentaire de section ci-dessus.
+        let task = seeded_task(
+            &db,
+            "v4bis-gate-audit",
+            crate::task_engine::types::trigger_type::RECURRING,
+        )
+        .await;
+        let dispatcher = test_dispatcher_with_homes(
+            db.clone(),
+            home.path().to_path_buf(),
+            no_stop_home().to_path_buf(),
+        );
+
+        // Le contrat du vol 2 reste tenu : le verdict est toujours le booléen.
+        assert!(
+            dispatcher
+                .refuse_recurring_fire_if_agent_disabled(&task)
+                .await,
+            "mika#2456 — le filet doit toujours refuser ; la ligne d'audit \
+             s'ajoute à ce contrat, elle ne le remplace pas"
+        );
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(RECURRING_GATE_AUDIT_TOOL_NAME)
+                .await
+                .unwrap(),
+            1,
+            "mika#2843 — un refus doit écrire exactement une ligne sous \
+             `tool_name = 'agent_recurring_gate'` : c'est la population que le \
+             `GROUP BY` de la requête opérateur compte"
+        );
+
+        let events = db
+            .get_audit_events(RECURRING_GATE_AUDIT_SESSION_ID)
+            .await
+            .unwrap();
+        // La session est un sentinel fixe (C1) : c'est sous elle que la
+        // population se lit, et un `session_id` par tâche l'aurait rendue
+        // introuvable.
+        assert_eq!(
+            events.len(),
+            1,
+            "la ligne doit être lisible sous le sentinel de session, pas sous \
+             une session par tâche"
+        );
+        let row = &events[0];
+        assert_eq!(row.tool_name, RECURRING_GATE_AUDIT_TOOL_NAME);
+        assert_eq!(
+            row.target_key, "mika@v4bis-gate-audit",
+            "`target_key` = `<agent_id>@<label>`, et son `agent_id` vient de \
+             `self.db.agent_id()` — la même source que le WARN (C2, R-9)"
+        );
+        assert_eq!(row.after_value.as_deref(), Some("refused_agent_disabled"));
+        assert_eq!(
+            row.before_value, None,
+            "le filet ne mute rien (mika#2156) : il n'y a aucun état antérieur \
+             à nommer"
+        );
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(
+            reasoning.contains(&format!("task_id={}", task.id)),
+            "l'id de tâche est une DONNÉE portée par `reasoning`, pas une clé \
+             de regroupement (C1) ; lu : {reasoning}"
+        );
+    }
+
+    /// **V4c** — la fenêtre de déduplication, aux trois instants qui la
+    /// définissent.
+    ///
+    /// Le troisième cas est porteur : sans lui, la sonde ne distingue pas
+    /// « dédupliqué » de « écrit une seule fois puis plus jamais » — deux
+    /// comportements dont seul le premier borne le bruit **sans perdre le
+    /// signal**. Une déduplication sans horizon rendrait la dernière ligne
+    /// indatable.
+    ///
+    /// L'`Instant` est un **paramètre** des deux fonctions, et non un
+    /// `Instant::now()` interne : c'est la seule raison pour laquelle une
+    /// fenêtre de 24 h se teste sans attendre 24 h.
+    ///
+    /// **Le cap de 10 000 n'est délibérément pas testé en remplissant la
+    /// table.** `seen.clear()` est un effet de bord sur un `static` partagé : une
+    /// sonde qui le déclencherait viderait la table de déduplication des tests
+    /// parallèles et les rendrait flaky. Le cap est tenu par sa **lecture** — la
+    /// constante, le `>=`, le WARN qui nomme `cap` — et ce refus est écrit ici
+    /// pour qu'il ne se relise pas comme un oubli.
+    #[test]
+    fn mika2456_v4c_the_refusal_is_deduplicated_on_a_24h_window() {
+        // Clé unique — cf. le commentaire de section ci-dessus.
+        let key = (
+            "mika2843-v4c-agent".to_string(),
+            "v4c-dedup-window".to_string(),
+        );
+        let t0 = std::time::Instant::now();
+
+        assert!(
+            recurring_gate_audit_is_due(&key, t0),
+            "une clé jamais vue est due"
+        );
+        mark_recurring_gate_audited(key.clone(), t0);
+
+        let t1 = t0 + std::time::Duration::from_secs(23 * 60 * 60);
+        assert!(
+            !recurring_gate_audit_is_due(&key, t1),
+            "mika#2843 — un second refus dans la fenêtre ne doit RIEN écrire : \
+             sinon une récurrente à la minute écrirait ≈ 1 440 lignes par jour \
+             pour un seul agent désactivé, et « régime attendu : zéro ligne » \
+             deviendrait illisible"
+        );
+
+        let t2 = t0 + RECURRING_GATE_AUDIT_REFRESH + std::time::Duration::from_secs(1);
+        assert!(
+            recurring_gate_audit_is_due(&key, t2),
+            "au-delà de la fenêtre la ligne doit revenir : une déduplication \
+             sans horizon rendrait la dernière ligne indatable — une ligne dont \
+             la date suggère l'actualité en portant un fait périmé est pire que \
+             pas de ligne"
+        );
+    }
+
+    /// Consulter n'est pas marquer, et les deux gestes sont séparés pour ça.
+    ///
+    /// L'appelant marque **après** que `log_audit_event` a atterri. Si consulter
+    /// marquait, un échec transitoire d'écriture coûterait la ligne de cette row
+    /// **pour la vie du processus** — c'est-à-dire exactement le silence que
+    /// cette surface existe pour supprimer.
+    #[test]
+    fn mika2456_consulting_does_not_mark() {
+        // Clé unique — cf. le commentaire de section ci-dessus.
+        let key = (
+            "mika2843-consult-agent".to_string(),
+            "v4c-consult-only".to_string(),
+        );
+        let now = std::time::Instant::now();
+        assert!(recurring_gate_audit_is_due(&key, now));
+        assert!(
+            recurring_gate_audit_is_due(&key, now),
+            "une consultation ne pose aucune marque"
+        );
     }
 
     // ---- mika#2329 — STOP global à chaud -----------------------------------
@@ -5990,13 +7638,20 @@ mod tests {
 
     #[test]
     fn test_parse_no_pr_reason_known_reasons() {
-        // All five reasons U1 emits across the three dispatch-lib sites.
+        // Every reason dispatch-lib can emit: the five of U1 across its three
+        // sites, then the two refusals the end-of-flight rescue pronounces —
+        // `rescue_scratch_only` (mika#2503) and `rescue_adds_nothing_to_main`
+        // (mika#3038). The two refusals matter more to this table than the five,
+        // not less: U1's reasons report a failure to look, theirs report a
+        // deliberate decision not to open, and the reaper routes on the token.
         for reason in [
             "no_pr_on_branch",
             "gh_query_failed",
             "branch_unset",
             "repo_unset",
             "rescue_pr_create_failed",
+            "rescue_scratch_only",
+            "rescue_adds_nothing_to_main",
         ] {
             let result = format!("Outcome: PIPELINE_INCOMPLETE\nNO_PR: {reason}");
             assert_eq!(parse_no_pr_reason(&result).as_deref(), Some(reason));
@@ -7679,6 +9334,281 @@ mod tests {
         );
     }
 
+    // -- try_terminate_parent_on_dispatch_halt tests (mika#2976 AC5) --
+
+    /// Le `RESULT` verbatim de la tâche de pilote de groom `1f838a67`
+    /// (mika#2968, 2026-10-30), tronqué de ses champs de diagnostic longs.
+    ///
+    /// Verbatim et non paraphrasé : la bannière est posée par `dispatch-lib.sh`
+    /// comme PREMIÈRE ligne, et c'est cette position que le lecteur lit.
+    const REBASE_CONFLICT_RESULT: &str = "STATUS=REBASE_CONFLICT\n\
+         Branch fix/2968/manager-l-valuateur-recommande-merge is 7 commits behind origin/main.\n\
+         Rebase failure mode: conflict\n\
+         Conflicted files:\n\
+         docs/plans/2026-10-29-005-fix-2968-manager-l-valuateur-recommande-merge-plan.md\n\
+         Resolve manually before re-dispatching mika#2968.\n\
+         NO_PR: no_pr_on_branch";
+
+    /// Le `RESULT` verbatim du premier relevé de la sonde d'AC4 (mika#2958,
+    /// 2026-10-31) : la halte neuve que le vol 1 a posée.
+    const UNMERGED_WORK_RESULT: &str = "STATUS=BRANCH_HAS_UNMERGED_WORK\n\
+         Branch feat/2958/manager-phase-2-c-vol-2-le-manager carries 3 commit(s) absent from \
+         origin/main by patch-id, while its PRs are all terminal (#2975 MERGED).\n\
+         Nothing was reset, nothing was removed, nothing was stashed.";
+
+    /// Les transitions écrites sous `dispatch_halt_resolver` pour cette
+    /// parente, sous la forme `<avant>→<après> (<motif>)`. L'absence
+    /// d'événement est une information : c'est ce qui sépare « la garde n'a pas
+    /// tiré » de « la transition a eu lieu sans trace ».
+    async fn dispatch_halt_audit_values(db: &AsyncDatabase, parent_id: &str) -> Vec<String> {
+        db.get_audit_events("system-mika")
+            .await
+            .expect("la lecture des audit_events ne doit pas échouer")
+            .into_iter()
+            .filter(|e| e.tool_name == "dispatch_halt_resolver" && e.target_key == parent_id)
+            .map(|e| {
+                format!(
+                    "{}→{} ({})",
+                    e.before_value.as_deref().unwrap_or("?"),
+                    e.after_value.as_deref().unwrap_or("?"),
+                    e.reasoning.as_deref().unwrap_or("?"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_dispatch_halt_status_is_a_closed_table() {
+        assert_eq!(
+            parse_dispatch_halt_status(REBASE_CONFLICT_RESULT),
+            Some("REBASE_CONFLICT")
+        );
+        assert_eq!(
+            parse_dispatch_halt_status(UNMERGED_WORK_RESULT),
+            Some("BRANCH_HAS_UNMERGED_WORK")
+        );
+        // Une ligne terminée par un retour chariot reste la même bannière :
+        // `trim_end` est dans le prédicat, pas dans l'espoir.
+        assert_eq!(
+            parse_dispatch_halt_status("STATUS=REBASE_CONFLICT \r\nsuite"),
+            Some("REBASE_CONFLICT")
+        );
+        // La famille `STATUS=` n'est PAS la table : ces deux-là ont leur propre
+        // discriminateur et leur propre issue (mika#2205).
+        assert_eq!(
+            parse_dispatch_halt_status("STATUS=CANCELLED_BY_OPERATOR\nkilled by operator"),
+            None
+        );
+        assert_eq!(
+            parse_dispatch_halt_status("STATUS=PIPELINE_INCOMPLETE"),
+            None
+        );
+        // Ni `contains`, ni préfixe nu : la bannière citée hors première ligne
+        // n'est pas la halte.
+        assert_eq!(
+            parse_dispatch_halt_status("Log path: /tmp/x.log\nSTATUS=REBASE_CONFLICT"),
+            None
+        );
+        assert_eq!(parse_dispatch_halt_status(""), None);
+        assert_eq!(
+            parse_dispatch_halt_status("claude-pilot completed (status: done)."),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebase_conflict_halt_makes_the_parent_terminal() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, REBASE_CONFLICT_RESULT).await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "une halte de dispatch ne laisse pas sa parente `in_progress` après que son \
+             dernier enfant est livré — c'est la parente zombie 19c11b09 du 2026-10-30"
+        );
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("dispatch_halt_REBASE_CONFLICT"),
+            "le motif nomme la halte et son statut, distinct de `callback_no_pr_*` et de \
+             `phantom_aged_out` (mika#2205)"
+        );
+        assert_eq!(
+            dispatch_halt_audit_values(&db, &parent_id).await,
+            vec!["in_progress→failed (dispatch_halt_REBASE_CONFLICT)".to_string()],
+            "la transition laisse une trace nommée, sinon son absence sous un fantôme ne dit rien"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unmerged_work_halt_makes_the_parent_terminal_under_its_own_motive() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, UNMERGED_WORK_RESULT).await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(parent.status, "failed");
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("dispatch_halt_BRANCH_HAS_UNMERGED_WORK"),
+            "les deux haltes restent soustractibles l'une de l'autre, pas seulement du reste"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cancel_banner_is_not_a_dispatch_halt() {
+        let db = test_db();
+        let (parent_id, callback_id) = create_refusal_callback_pair(
+            &db,
+            "STATUS=CANCELLED_BY_OPERATOR\nkilled by operator request",
+        )
+        .await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "la table est CLOSE : un préfixe `STATUS=` nu avalerait le geste opérateur et \
+             confondrait deux populations"
+        );
+        assert!(dispatch_halt_audit_values(&db, &parent_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_halt_does_not_reopen_a_terminal_parent() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, REBASE_CONFLICT_RESULT).await;
+        db.update_task_completed(&parent_id, Some("delivered earlier"))
+            .await
+            .unwrap();
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "completed",
+            "l'UPDATE est gardé sur l'état terminal : inoffensif en course avec le faucheur \
+             ou avec un geste opérateur"
+        );
+        assert!(
+            dispatch_halt_audit_values(&db, &parent_id).await.is_empty(),
+            "pas de transition, pas d'événement — `Ok(false)` ne mérite qu'un `debug!`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_banner_off_the_first_line_is_not_a_halt() {
+        let db = test_db();
+        let (parent_id, callback_id) = create_refusal_callback_pair(
+            &db,
+            "Log path: /home/mika/.mika/logs/pilot-1f838a67.log\nSTATUS=REBASE_CONFLICT\n\
+             Branch fix/2968/x is 7 commits behind origin/main.",
+        )
+        .await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "in_progress",
+            "la position fait partie de la lecture : `dispatch-lib` pose la bannière en \
+             première ligne, et un `RESULT` qui la cite ailleurs n'est pas la halte"
+        );
+        assert!(dispatch_halt_audit_values(&db, &parent_id).await.is_empty());
+    }
+
+    // -- mika#2976 AC5 : la POSITION du discriminateur dans le prompt --
+
+    /// Le prompt **embarqué**, pas celui de l'arbre : `include_str!` fige les
+    /// octets au build, exactement comme `build.rs` les fige dans
+    /// `BUNDLED_SKILL_MANIFESTS`. Une édition de l'arbre est invisible aux deux
+    /// jusqu'au prochain `make deploy` (motif mika#2340). Même idiome que
+    /// `qa_reviewed_head::tests` § *conformité des prompts*.
+    const PROMPT_SELF_DEV_CALLBACK: &str =
+        include_str!("../../../../skills/bundled/self-dev-callback/system_prompt.md");
+
+    /// L'en-tête que le discriminateur de halte doit PRÉCÉDER.
+    ///
+    /// C'est là que vit le handler générique qui a mesurément lancé le
+    /// `git rebase` du 2026-10-30 : sa section « Diagnose and recover from
+    /// failure » porte « **Attempt recovery (max 1).** ». Un discriminateur
+    /// placé **sous** cet en-tête est silencieusement désarmé — il est correct,
+    /// il est lisible, et il n'est jamais atteint.
+    const GENERIC_FAILURE_HEADING: &str = "Pipeline result classification";
+
+    /// Les bannières de halte dont la position n'est PAS exigée.
+    ///
+    /// **Livrée vide, et le test frère l'assert.** Quand ce scan tire, la
+    /// résolution est de REMONTER le discriminateur au-dessus de
+    /// [`GENERIC_FAILURE_HEADING`], jamais d'ajouter une entrée ici : une
+    /// allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction (mika#2323).
+    const ORDER_SCAN_ALLOWLIST: &[&str] = &[];
+
+    #[test]
+    fn mika2976_le_discriminateur_de_halte_precede_le_handler_generique() {
+        let heading = PROMPT_SELF_DEV_CALLBACK
+            .find(GENERIC_FAILURE_HEADING)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`{GENERIC_FAILURE_HEADING}` est absent du prompt — l'ancre du scan a été \
+                     renommée, et un scan sans ancre ne mesure rien"
+                )
+            });
+
+        let mut offenders = Vec::new();
+        for banner in ["STATUS=REBASE_CONFLICT", "STATUS=BRANCH_HAS_UNMERGED_WORK"] {
+            if ORDER_SCAN_ALLOWLIST.contains(&banner) {
+                continue;
+            }
+            match PROMPT_SELF_DEV_CALLBACK.find(banner) {
+                None => offenders.push(format!(
+                    "{banner} est absent du prompt — le tour de callback retombe sur le handler \
+                     « On failure » générique, qui a lancé un `git rebase` dans un worktree le \
+                     2026-10-30"
+                )),
+                Some(at) if at > heading => offenders.push(format!(
+                    "{banner} apparaît APRÈS `{GENERIC_FAILURE_HEADING}` (octet {at} > {heading}) \
+                     — le discriminateur est désarmé en silence"
+                )),
+                Some(_) => {}
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "la POSITION du discriminateur de halte est le correctif, pas son texte :\n  {}\n\n\
+             RÉSOLUTION : remonter la section « Dispatch-halt discriminator » au-dessus de \
+             `**{GENERIC_FAILURE_HEADING}` dans \
+             skills/bundled/self-dev-callback/system_prompt.md (mika#2976 AC5).",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn mika2976_lallowlist_du_scan_dordre_est_livree_vide() {
+        assert!(
+            ORDER_SCAN_ALLOWLIST.is_empty(),
+            "l'allowlist du scan d'ordre porte {:?}. Une entrée ici exempte une bannière de \
+             l'exigence de POSITION, c'est-à-dire la réouvre au défaut de mika#2976 AC5. \
+             Elle n'est admissible qu'avec un ticket de suivi NOMMÉ et une date de retrait \
+             écrits en commentaire au-dessus de la ligne ; sinon, remonter le discriminateur.",
+            ORDER_SCAN_ALLOWLIST
+        );
+    }
+
     // -- try_complete_parent_on_callback_success tests (mika#1162) --
 
     /// Helper: create a self_dev parent in `in_progress` with an `implement`
@@ -8149,6 +10079,10 @@ mod tests {
     }
 
     const TEST_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/1614";
+
+    /// Le plan que le callout du corps nomme, et que la preuve liée porte
+    /// depuis mika#2981 — déjà normalisé (relatif au dépôt, sous `docs/plans/`).
+    const TEST_GROOM_PLAN: &str = "docs/plans/2026-10-30-001-fix-1614-plan.md";
 
     #[tokio::test]
     async fn test_auto_fire_skips_non_groom_class() {
@@ -8865,7 +10799,17 @@ mod tests {
     #[tokio::test]
     async fn test_groom_gate_survives_implement_flip() {
         let db = test_db();
-        let (parent_id, _cb) = create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
+        // Preuve **liée** au plan courant (mika#2981) : le verdict attendu
+        // reste `Converged` au mot, donc ce test continue de ne parler que du
+        // flip. Le corps passe par le helper à `result` libre plutôt que par le
+        // booléen de son frère : celui-ci sert douze tests qui n'ont rien
+        // demandé au suffixe.
+        let (parent_id, _cb) = create_groom_callback_pair_with_result(
+            &db,
+            &format!("claude-pilot completed (status: done).\nOutcome: PLAN_GROOMED — {TEST_GROOM_PLAN}\nSession: sess-2981"),
+            Some(TEST_ISSUE_URL),
+        )
+        .await;
 
         // The mika#1614 / mika#996 task-reuse flip — the parent is now
         // implement-class and still `in_progress`.
@@ -8875,7 +10819,7 @@ mod tests {
         assert_eq!(dispatch_class_of(&db, &parent_id).await, "implement");
 
         let verified = db
-            .has_completed_groom_for_issue(TEST_ISSUE_URL)
+            .has_completed_groom_for_issue(TEST_ISSUE_URL, Some(TEST_GROOM_PLAN))
             .await
             .expect("gate query must not error");
         assert_eq!(
@@ -8899,7 +10843,7 @@ mod tests {
             .unwrap();
 
         let verified = db
-            .has_completed_groom_for_issue(TEST_ISSUE_URL)
+            .has_completed_groom_for_issue(TEST_ISSUE_URL, Some(TEST_GROOM_PLAN))
             .await
             .expect("gate query must not error");
         assert_eq!(
@@ -9749,6 +11693,1055 @@ mod tests {
 
             assert!(mock.calls_made() >= 1);
             assert_eq!(superseded_rows(&db).await, 0);
+        }
+    }
+
+    /// mika#2995, tranche du 2026-11-03 — un `ready-label` dont le
+    /// consentement a été retiré par un humain ne paie ni tour ni dispatch.
+    ///
+    /// Les cinq cas tirent sur le **joint**
+    /// `skip_deferred_dispatch_on_withdrawn_consent_with`, qui est la moitié
+    /// décidable de la garde : son retour `true`/`false` est exactement ce que
+    /// `dispatch_resume_agent` consomme. Le sixième, celui d'AC-T3, passe par
+    /// `dispatch` entier et compte les appels LLM — c'est le seul cas où le
+    /// site de production est atteignable sans réseau, parce que le
+    /// discriminant de parente sort avant toute résolution de jeton, et c'est
+    /// précisément la propriété qu'AC-T3 demande d'attester.
+    mod mika2995 {
+        use super::*;
+        use crate::ready_label::timeline_fixtures::{labeled_json, unlabeled_json};
+        use crate::ready_label::{
+            MachineIdentities, READY_CONSENT_RECHECK_TOOL_NAME, READY_CONSENT_WITHDRAWN_REASON,
+            READY_LABEL_TASK_PREFIX, TimelinePageFetcher,
+        };
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const REPO: &str = "senara-solutions/mika";
+        /// Au-dessus du plancher de fixture (mika#2713), et non le `3002` réel
+        /// du cas mesuré : dès que la garde relit l'**état** du ticket
+        /// (mika#3050), toute branche qui atteint `ConsentHeld` franchit le
+        /// double `run_gh`, et celui-ci panique sur un numéro sous le plancher
+        /// — il n'y a pas d'allowlist. Un panic masquerait la lecture du
+        /// défaut, d'où la renumérotation **avant** la composition.
+        const ISSUE: u64 = 990_002;
+        const HUMAN: &str = "samidarko";
+        const MACHINE: &str = "mika-platform-dev";
+        const POSE: &str = "2026-11-01T14:00:00Z";
+        const RETRAIT: &str = "2026-11-01T14:08:43Z";
+        const REPOSE: &str = "2026-11-01T14:09:12Z";
+
+        /// Un numéro de fixture par cas de mika#3050.
+        ///
+        /// Les tables de charges cannées de `gh_process` sont **globales au
+        /// processus** : deux tests qui décrivent deux réponses de la forge pour
+        /// un même numéro se marcheraient dessus sous `cargo test` parallèle.
+        /// Chaque variante prend donc son propre numéro — c'est la doctrine du
+        /// vol 2 (`rearm_fixture_with_issue`), et c'est aussi ce qui rend
+        /// `recorded_calls()` filtrable par test, dont T7 a besoin.
+        ///
+        /// Les deux tests de mika#2995 qui atteignent `ConsentHeld` gardent
+        /// [`ISSUE`] : ils cannent la **même** charge `Held`, donc aucun
+        /// entrelacement ne les distingue.
+        ///
+        /// La bande est `3_080..=3_088`, et le choix n'est pas libre : le vol 2 a
+        /// pris `3_050..=3_055` et `3_060..=3_067` dans
+        /// `skills::executor::tests` (`:12908`, `:13253`). Un numéro commun aux
+        /// deux modules partagerait la table de charges **et** le journal
+        /// d'appels, donc un test de l'autre module décrirait la forge pour
+        /// celui-ci — c'est exactement ce que « un numéro par cas » interdit, et
+        /// T7 asserte une **égalité** de compte d'appels sur son numéro.
+        const ISSUE_T1_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_080;
+        const ISSUE_T2_CLOSED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_081;
+        const ISSUE_T3_UNREADABLE: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_082;
+        const ISSUE_T4_HELD: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_083;
+        const ISSUE_T5_PARK_FIRST: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_084;
+        const ISSUE_T6_REMOVE_ADD: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_085;
+        const ISSUE_T7_OTHER_CLASS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_086;
+        const ISSUE_T8_CENSUS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_087;
+        const ISSUE_T8_CENSUS_OTHER_CLASS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3_088;
+
+        /// Le jeton que les tests passent au joint.
+        ///
+        /// Le double `#[cfg(test)] run_gh` ne le lit pas — il n'y a pas de
+        /// forge à l'autre bout. Il est là parce que le joint le **transporte**
+        /// plutôt que de le résoudre : un dispatcher de test n'a pas de jeton,
+        /// donc un joint qui appellerait `resolve_github_token` lui-même
+        /// rendrait `NoToken` sur chacun des huit cas, et T4 — le contrôle
+        /// positif, celui qui dit que le tour part encore — ne pourrait jamais
+        /// être vert. Le site de production, lui, l'a déjà résolu avant
+        /// d'entrer : la résolution reste à **un** site.
+        const FIXTURE_TOKEN: &str = "fake-token";
+
+        /// L'état d'un ticket qui consent encore : ouvert, et portant `ready`.
+        ///
+        /// C'est la charge des quatre premiers cas du tableau de mesure du
+        /// ticket — la forme saine — et celle que les deux tests de mika#2995
+        /// qui atteignent `ConsentHeld` doivent canner depuis mika#3050, sans
+        /// quoi le double `gh` leur rendrait une sortie vide et le verdict
+        /// basculerait en `StateUnreadable`.
+        const ETAT_HELD: &str = r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#;
+
+        /// Fabrique la réponse d'état que le double `gh` rendra pour ce ticket.
+        ///
+        /// Le motif d'`argv` est `issue view`, celui du vol 2 : le prédicat
+        /// d'état appelle `gh issue view <n> --repo … --json state,labels`, et
+        /// le motif laisse les autres appels du même sujet lire leur propre
+        /// charge (mika#3047).
+        fn canner_etat(issue: u64, payload: &str) {
+            crate::gh_process::assert_fixture_issue(issue);
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(issue),
+                "issue view",
+                payload,
+            );
+        }
+
+        /// Les appels `gh` que le double a vus **sur ce numéro de fixture**.
+        ///
+        /// Le journal est global au processus, donc un compte absolu ne dirait
+        /// rien : T7 lit un *avant* et un *après* sur son propre numéro, et
+        /// c'est leur égalité qui atteste « aucune lecture d'état ». Le filtre
+        /// par sujet est ce qui rend cette lecture possible sous `cargo test`
+        /// parallèle — et ce qui justifie un numéro par cas.
+        fn appels_gh(issue: u64) -> Vec<String> {
+            crate::gh_process::recorded_calls()
+                .into_iter()
+                .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(issue))
+                .map(|c| c.args)
+                .collect()
+        }
+
+        /// Un fournisseur de pages qui **compte** ses appels, et peut échouer.
+        ///
+        /// Le compteur est la pièce d'AC-T3 : « octet pour octet » n'est pas
+        /// observable, mais « aucun appel réseau n'a eu lieu » l'est.
+        struct CountingFetcher {
+            page: String,
+            calls: AtomicUsize,
+            fail: bool,
+        }
+
+        impl CountingFetcher {
+            fn with(events: &[String]) -> Self {
+                Self {
+                    page: format!("[{}]", events.join(",")),
+                    calls: AtomicUsize::new(0),
+                    fail: false,
+                }
+            }
+
+            fn failing() -> Self {
+                Self {
+                    page: String::new(),
+                    calls: AtomicUsize::new(0),
+                    fail: true,
+                }
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::Relaxed)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl TimelinePageFetcher for CountingFetcher {
+            async fn fetch(&self, _repo: &str, _issue: u64, page: u32) -> Result<String, String> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.fail {
+                    return Err("gh api: 502 Bad Gateway".to_string());
+                }
+                if page == 1 {
+                    Ok(self.page.clone())
+                } else {
+                    Ok("[]".to_string())
+                }
+            }
+        }
+
+        /// Le jeu d'identités machine du moteur, tel que `machine_identities`
+        /// le rendrait en production.
+        fn machine() -> MachineIdentities {
+            MachineIdentities::from_logins([MACHINE])
+        }
+
+        /// La timeline du 2026-11-01 sur #3002 : pose humaine, puis retrait
+        /// humain qui n'a pas été remis.
+        fn retrait_humain() -> Vec<String> {
+            vec![labeled_json(HUMAN, POSE), unlabeled_json(HUMAN, RETRAIT)]
+        }
+
+        /// Une parente et son wrapper différé promu. La parente porte `label`,
+        /// ce qui est le seul discriminant que la garde lit.
+        async fn seed_pair(db: &AsyncDatabase, parent_label: &str) -> (String, String) {
+            seed_pair_sur(db, parent_label, ISSUE).await
+        }
+
+        /// [`seed_pair`] sur un numéro de ticket choisi (mika#3050).
+        ///
+        /// Le numéro va dans le `reference_url` **et** dans le label que
+        /// l'appelant compose : c'est le label que la garde lit pour ses
+        /// coordonnées, et un `reference_url` qui nommerait un autre ticket
+        /// serait une fixture qui se contredit.
+        async fn seed_pair_sur(
+            db: &AsyncDatabase,
+            parent_label: &str,
+            issue: u64,
+        ) -> (String, String) {
+            let parent = db
+                .create_task(NewTask {
+                    agent_id: "mika".to_string(),
+                    team_run_id: None,
+                    parent_task_id: None,
+                    depth: 0,
+                    label: parent_label.to_string(),
+                    trigger_type: "manual".to_string(),
+                    cron_expr: None,
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: None,
+                    timeout_at: None,
+                    action_type: "resume_agent".to_string(),
+                    action_config: "{}".to_string(),
+                    input_context: None,
+                    created_by_session: Some("ready-label-session".to_string()),
+                    created_trace_id: None,
+                    reference_url: Some(format!("https://github.com/{REPO}/issues/{issue}")),
+                    source: None,
+                    metadata: None,
+                    r#type: None,
+                    dispatch_class: None,
+                })
+                .await
+                .unwrap();
+            let wrapper = db
+                .create_task(NewTask {
+                    agent_id: "mika".to_string(),
+                    team_run_id: None,
+                    parent_task_id: Some(parent.clone()),
+                    depth: 1,
+                    label: crate::agent::DEFERRED_DISPATCH_LABEL.to_string(),
+                    trigger_type: "callback".to_string(),
+                    cron_expr: None,
+                    event_source: None,
+                    event_offset_secs: None,
+                    condition_expr: None,
+                    next_fire_at: None,
+                    timeout_at: None,
+                    action_type: "resume_agent".to_string(),
+                    action_config: "{}".to_string(),
+                    input_context: None,
+                    created_by_session: Some("ready-label-session".to_string()),
+                    created_trace_id: None,
+                    reference_url: None,
+                    source: None,
+                    metadata: None,
+                    r#type: None,
+                    dispatch_class: None,
+                })
+                .await
+                .unwrap();
+            // Promu : c'est l'état dans lequel la boucle de délivrance le prend,
+            // et le seul que l'UPDATE gardé du terminal accepte.
+            db.update_task_completed(&wrapper, Some("promoted"))
+                .await
+                .unwrap();
+            (parent, wrapper)
+        }
+
+        fn ready_label_parent() -> String {
+            ready_label_parent_sur(ISSUE)
+        }
+
+        fn ready_label_parent_sur(issue: u64) -> String {
+            format!("{READY_LABEL_TASK_PREFIX} {REPO}#{issue}")
+        }
+
+        async fn task(db: &AsyncDatabase, id: &str) -> Task {
+            db.get_task_unscoped(id).await.unwrap().unwrap()
+        }
+
+        async fn audit_lines(db: &AsyncDatabase) -> i64 {
+            db.count_audit_events_by_tool_name(READY_CONSENT_RECHECK_TOOL_NAME)
+                .await
+                .unwrap()
+        }
+
+        /// Les **raisons** portées par les lignes d'audit de la relecture.
+        ///
+        /// Le compte seul ne suffit plus depuis mika#3050 : trois refus écrivent
+        /// désormais une ligne sous le même `tool_name`, et c'est la raison qui
+        /// les distingue. Un test qui n'assertait que le compte lirait un refus
+        /// de parc comme un refus d'état — exactement la fusion de populations
+        /// que mika#2205 interdit, et que T5 est là pour épingler.
+        ///
+        /// La session est celle que la garde écrit, `system-<agent>` ; l'`agent_id`
+        /// de la ligne vient de la poignée.
+        async fn audit_reasons(db: &AsyncDatabase) -> Vec<String> {
+            db.get_audit_events(&format!("system-{}", db.agent_id()))
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.tool_name == READY_CONSENT_RECHECK_TOOL_NAME)
+                .filter_map(|e| e.reasoning)
+                .collect()
+        }
+
+        // ── la capture du recensement de promotion (mika#3050, T8) ──────────
+        //
+        // La capture est locale à ce mod, et ce n'est pas une duplication par
+        // négligence : `test_utils` n'expose que
+        // `install_capturing_subscriber` — le site unique permis par mika#2646
+        // — et **aucune** couche capteuse de champs. Le vol 2 a écrit la sienne
+        // au mod `mika3050_recensement` de `skills::executor::tests` (`:13262`),
+        // sur un autre nom d'événement ; mutualiser les deux demanderait un
+        // helper partagé dans `test_utils`, qui est un geste de portée
+        // différente de celle de ce vol.
+        //
+        // `#[serial_test::serial]` est la **moitié porteuse** de la doctrine
+        // mika#2646, et elle couvre les *poisonneurs* autant que les capturants :
+        // un callsite `tracing` ne s'enregistre qu'à sa première atteinte, et
+        // son `Interest` est alors décidé par le défaut du thread qui
+        // l'enregistre — un voisin qui y arrive d'abord sans abonné l'éteint
+        // globalement. La population des poisonneurs de
+        // `promotion_consent_checked` est exactement l'ensemble des tests qui
+        // traversent `apply_withdrawn_consent_verdict` : les sept de mika#2995
+        // et T1 à T7. Tous sont annotés.
+
+        /// Le nom de l'événement, tel que l'enveloppe l'écrit et tel que le
+        /// scan d'écrivain unique (D3) le cherche.
+        const CENSUS_EVENT: &str = "promotion_consent_checked";
+
+        type CapturedEvents =
+            std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+        struct CapturingLayer(CapturedEvents);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut std::collections::HashMap<String, String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut fields = std::collections::HashMap::new();
+                event.record(&mut V(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        fn capture_events() -> (tracing::subscriber::DefaultGuard, CapturedEvents) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+            let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            (guard, events)
+        }
+
+        /// Les lignes de recensement, dans l'ordre d'émission, filtrées sur leur
+        /// champ `event` — jamais sur le niveau ni sur le message, qu'une ligne
+        /// de diagnostic voisine pourrait partager.
+        fn census_lines(events: &CapturedEvents) -> Vec<std::collections::HashMap<String, String>> {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some(CENSUS_EVENT))
+                .cloned()
+                .collect()
+        }
+
+        /// Le triplet qu'AC4 lit. Les coordonnées rendent `None` quand le champ
+        /// est **absent** de la ligne, ce qui est la propriété testée :
+        /// `tracing` n'enregistre rien pour un `Option::None`, donc l'absence
+        /// est observable et ne se confond pas avec `""` ni `0` (mika#2331).
+        fn triplet(
+            line: &std::collections::HashMap<String, String>,
+        ) -> (&str, Option<&str>, Option<&str>) {
+            (
+                line.get("verdict")
+                    .map(String::as_str)
+                    .unwrap_or("<absent>"),
+                line.get("repo").map(String::as_str),
+                line.get("issue").map(String::as_str),
+            )
+        }
+
+        /// AC-T1 — l'épisode mesuré. Retrait humain en dernier : la garde
+        /// refuse, le wrapper reçoit son terminal sous le motif nommé, la
+        /// parente aussi, et la ligne d'audit est posée.
+        // `#[serial_test::serial]` : poisonneur du callsite
+        // `promotion_consent_checked` (doctrine mika#2646, voir l'enveloppe de
+        // capture ci-dessus). Il le traverse sans le capturer.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_un_ready_label_dont_le_consentement_est_retire_ne_lance_aucun_tour() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(refused, "un consentement retiré refuse le dispatch");
+            let w = task(&db, &wrapper).await;
+            assert_eq!(w.status, "expired", "le wrapper reçoit son terminal");
+            assert_eq!(w.result.as_deref(), Some(READY_CONSENT_WITHDRAWN_REASON));
+            let p = task(&db, &parent).await;
+            assert_eq!(
+                p.status, "failed",
+                "la parente aussi — son créneau d'issue \
+                 doit se libérer pour le prochain oui humain"
+            );
+            assert_eq!(p.result.as_deref(), Some(READY_CONSENT_WITHDRAWN_REASON));
+            assert_eq!(audit_lines(&db).await, 1);
+        }
+
+        /// AC-T1 contrôle négatif — **la même fixture**, plus un `labeled`
+        /// humain en dernier. La garde laisse passer, et n'écrit rien.
+        ///
+        /// Depuis mika#3050 ce cas franchit le second prédicat : le parc rend
+        /// `Ok(None)`, donc l'état est relu. Il canne la forme saine — c'est la
+        /// fixture du contrôle négatif, pas un détail de plomberie : sans elle
+        /// le test resterait « vert » sur un `StateUnreadable`, qui refuse
+        /// aussi le tour, et n'attesterait plus rien.
+        #[tokio::test]
+        #[serial_test::serial] // poisonneur de `promotion_consent_checked` (mika#2646)
+        async fn mika2995_la_meme_fixture_avec_un_labeled_en_dernier_lance_le_tour() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            canner_etat(ISSUE, ETAT_HELD);
+            let mut events = retrait_humain();
+            events.push(labeled_json(HUMAN, REPOSE));
+            let fetcher = CountingFetcher::with(&events);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(!refused, "un consentement reposé laisse partir le tour");
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// AC-T2 — le `remove` puis `add` machine de la Phase 2 d'`auto_pull`
+        /// n'est pas un retrait. La propriété est celle d'`is_parked` ; ce cas
+        /// la montre au site neuf, où une lecture naïve du dernier `unlabeled`
+        /// aurait arrêté le feeder sur son propre geste.
+        #[tokio::test]
+        #[serial_test::serial] // poisonneur de `promotion_consent_checked` (mika#2646)
+        async fn mika2995_un_remove_puis_add_machine_nest_pas_un_retrait() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            // mika#3050 — même raison que ci-dessus : le parc laisse passer,
+            // donc l'état est relu, et c'est la forme saine qu'il faut canner.
+            canner_etat(ISSUE, ETAT_HELD);
+            let fetcher = CountingFetcher::with(&[
+                labeled_json(HUMAN, POSE),
+                unlabeled_json(MACHINE, RETRAIT),
+                labeled_json(MACHINE, REPOSE),
+            ]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(!refused, "la re-pose machine n'est pas un retrait humain");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// AC-T3, moitié joint — une parente hors préfixe ne coûte **aucun
+        /// appel** au fournisseur de timeline. C'est la forme observable de
+        /// « comportement inchangé » : le discriminant de parente passe avant
+        /// toute lecture.
+        #[tokio::test]
+        #[serial_test::serial] // poisonneur de `promotion_consent_checked` (mika#2646)
+        async fn mika2995_une_parente_de_groom_ne_paie_aucune_lecture() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, "long_running:run_claude_pilot_groom").await;
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(!refused, "une parente de groom n'est pas touchée");
+            assert_eq!(
+                fetcher.calls(),
+                0,
+                "aucune lecture de timeline sur une parente hors préfixe"
+            );
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+        }
+
+        /// AC-T3, moitié bout en bout — le même wrapper, par `dispatch`
+        /// entier : le tour part. Ce cas tient parce que la garde sort **avant**
+        /// de résoudre le jeton ; s'il devait le résoudre d'abord, un
+        /// dispatcher de test sans jeton reporterait ce tour et ce test serait
+        /// rouge. C'est l'ordre lui-même qui est épinglé ici.
+        // `#[serial_test::serial]` : ce test traverse `rearm_consumed_deferred_wrapper`,
+        // donc le callsite de `rearm_consent_checked` (mika#3050 D3), qu'il ne capture
+        // pas. Un poisonneur non annoté éteint l'`Interest` du callsite pour tout le
+        // processus et rend la capture muette ailleurs (doctrine mika#2646, au
+        // sous-module `mika3050_recensement` de `skills::executor::tests`).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_une_parente_de_groom_est_inchangee_de_bout_en_bout() {
+            let db = test_db();
+            let mock = Arc::new(
+                MockLlmProvider::builder()
+                    .responses((0..8).map(|_| text_response("Dispatched.")).collect())
+                    .build(),
+            );
+            let mut dispatcher = test_dispatcher(db.clone());
+            dispatcher.llm = mock.clone();
+            let (_parent, wrapper) = seed_pair(&db, "long_running:run_claude_pilot_groom").await;
+
+            dispatcher.dispatch(&wrapper).await.unwrap();
+
+            assert!(
+                mock.calls_made() >= 1,
+                "le tour du wrapper différé doit tourner"
+            );
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// D4 — une timeline illisible ne lance pas le tour et **n'écrit aucun
+        /// terminal**. Les deux moitiés comptent : refuser le tour ferme le
+        /// défaut mesuré, ne pas graver de terminal évite l'autre faux positif.
+        /// Le report est borné par le faucheur d'orphelines, pas par un
+        /// compteur neuf.
+        #[tokio::test]
+        #[serial_test::serial] // poisonneur de `promotion_consent_checked` (mika#2646)
+        async fn mika2995_une_timeline_illisible_reporte_sans_terminal() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::failing();
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(refused, "une lecture qui échoue ne lance pas le tour");
+            assert_eq!(fetcher.calls(), 1, "la lecture a bien été tentée");
+            assert_eq!(
+                task(&db, &wrapper).await.status,
+                "completed",
+                "le wrapper reste promu non délivré — le tick suivant relira"
+            );
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        /// D3 — un jeu d'identités machine vide rend le prédicat aveugle :
+        /// **tout** retrait se lirait comme un park, y compris la re-pose
+        /// d'`auto_pull`. Le module refuse d'agir, donc ici : pas de tour, pas
+        /// de terminal, et pas même une lecture.
+        #[tokio::test]
+        #[serial_test::serial] // poisonneur de `promotion_consent_checked` (mika#2646)
+        async fn mika2995_des_identites_machine_vides_reportent_sans_lire() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair(&db, &ready_label_parent()).await;
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &MachineIdentities::from_logins(Vec::<String>::new()),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(refused, "un prédicat aveugle n'autorise pas le tour");
+            assert_eq!(
+                fetcher.calls(),
+                0,
+                "D3 est tranché avant la lecture, pas après"
+            );
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_lines(&db).await, 0);
+        }
+
+        // ── mika#3050 — l'autre moitié d'AC1, au site de promotion ──────────
+        //
+        // Le prédicat de parc ci-dessus rend « non parqué » sur un `unlabeled`
+        // **machine**. Depuis mika#3022 c'est une identité machine qui retire
+        // `ready` à chaque merge de la boucle, donc un lanceur promu sur un
+        // ticket sans `ready` franchissait la garde et payait son tour. Les huit
+        // cas qui suivent tirent sur le **même joint** que ceux de mika#2995 —
+        // le vol n'en introduit aucun autre — et cannent l'état du ticket par le
+        // double `run_gh` de `gh_process.rs`.
+
+        /// **T1 — `ready` retiré par la machine : aucun tour, et un terminal.**
+        ///
+        /// La forme exacte de `0529ed9b`/#3044 : pose humaine, puis retrait
+        /// **machine** (le `merged_pr_ready_label_cleaned` de mika#3022, une
+        /// seconde avant la création de la parente). Le parc rend « non
+        /// parqué » — c'est juste, aucun humain n'a rien retiré — et c'est
+        /// l'état du ticket qui refuse, sous sa propre raison.
+        ///
+        /// **C'est le test du défaut** : sur `e0691c76f` il est rouge, parce que
+        /// rien ne relit l'état.
+        #[tokio::test]
+        #[serial_test::serial] // poisonneur de `promotion_consent_checked` (mika#2646)
+        async fn mika3050_un_ready_retire_par_la_machine_refuse_la_promotion() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T1_READY_ABSENT),
+                ISSUE_T1_READY_ABSENT,
+            )
+            .await;
+            canner_etat(ISSUE_T1_READY_ABSENT, r#"{"state":"OPEN","labels":[]}"#);
+            let fetcher = CountingFetcher::with(&[
+                labeled_json(HUMAN, POSE),
+                unlabeled_json(MACHINE, RETRAIT),
+            ]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(
+                refused,
+                "un ticket sans `ready` à l'instant de la promotion ne lance aucun tour"
+            );
+            let w = task(&db, &wrapper).await;
+            assert_eq!(w.status, "expired", "le wrapper reçoit son terminal");
+            assert_eq!(
+                w.result.as_deref(),
+                Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON)
+            );
+            let p = task(&db, &parent).await;
+            assert_eq!(
+                p.status, "failed",
+                "la parente aussi — son créneau d'issue doit se libérer pour le \
+                 prochain oui humain"
+            );
+            assert_eq!(
+                p.result.as_deref(),
+                Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON),
+                "la raison est lisible sur la tâche, pas seulement dans un log"
+            );
+            assert_eq!(
+                audit_reasons(&db).await,
+                vec![crate::ready_label::READY_ABSENT_AT_REARM_REASON.to_string()],
+                "une ligne d'audit, et elle nomme la raison qu'AC1 exige"
+            );
+        }
+
+        /// **T2 — ticket fermé : aucun tour, et un terminal.**
+        ///
+        /// L'autre moitié d'AC1. Le ticket porte encore `ready` — un ticket
+        /// fermé garde ses labels — donc seul le champ `state` refuse, et il
+        /// refuse sous **sa** raison : fusionner les deux rendrait le compte
+        /// d'AC4 insoustractable (mika#2205).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_un_ticket_ferme_refuse_la_promotion() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T2_CLOSED),
+                ISSUE_T2_CLOSED,
+            )
+            .await;
+            canner_etat(
+                ISSUE_T2_CLOSED,
+                r#"{"state":"CLOSED","labels":[{"name":"ready"}]}"#,
+            );
+            let fetcher = CountingFetcher::with(&[labeled_json(HUMAN, POSE)]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(refused, "un ticket fermé ne lance aucun tour");
+            let w = task(&db, &wrapper).await;
+            assert_eq!(w.status, "expired");
+            assert_eq!(
+                w.result.as_deref(),
+                Some(crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON)
+            );
+            let p = task(&db, &parent).await;
+            assert_eq!(p.status, "failed");
+            assert_eq!(
+                p.result.as_deref(),
+                Some(crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON)
+            );
+            assert_eq!(
+                audit_reasons(&db).await,
+                vec![crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON.to_string()],
+                "`ready` est encore posé : c'est la fermeture, et elle seule, \
+                 que la ligne d'audit doit nommer"
+            );
+        }
+
+        /// **T3 — la relecture d'état échoue : report, et aucun terminal.**
+        ///
+        /// Les deux moitiés comptent, et l'asymétrie est la décision du plan :
+        /// refuser le tour ferme le défaut mesuré ; ne **pas** graver de
+        /// terminal évite l'autre faux positif. Une panne de forge n'est pas un
+        /// état du ticket, et une parente parfaitement consentante ne doit pas
+        /// mourir d'un 502 — le report est borné par le faucheur d'orphelines,
+        /// qui relira au tick suivant.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_une_relecture_detat_en_erreur_reporte_sans_terminal() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T3_UNREADABLE),
+                ISSUE_T3_UNREADABLE,
+            )
+            .await;
+            canner_etat(ISSUE_T3_UNREADABLE, "<html>502 Bad Gateway</html>");
+            let fetcher = CountingFetcher::with(&[labeled_json(HUMAN, POSE)]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(refused, "une relecture qui échoue ne lance pas le tour");
+            assert_eq!(
+                task(&db, &wrapper).await.status,
+                "completed",
+                "le wrapper reste promu non délivré — le tick suivant relira"
+            );
+            assert_eq!(
+                task(&db, &parent).await.status,
+                "pending",
+                "la parente reste en file : un 502 n'est pas un retrait de consentement"
+            );
+            assert_eq!(
+                audit_reasons(&db).await,
+                Vec::<String>::new(),
+                "aucun terminal, donc aucune ligne d'audit"
+            );
+        }
+
+        /// **T4 — le contrôle positif, et sans lui rien n'est attesté.**
+        ///
+        /// La forme des quatre premiers cas du tableau de mesure : timeline non
+        /// parquée, ticket ouvert et portant `ready`. Le tour part. C'est ce
+        /// cas qui sépare « la garde lit l'état » de « la garde refuse tout »,
+        /// et c'est aussi lui qui exige que le joint **transporte** le jeton :
+        /// un joint qui le résoudrait lui-même rendrait `NoToken` ici.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_un_ticket_ouvert_portant_ready_laisse_partir_le_tour() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) =
+                seed_pair_sur(&db, &ready_label_parent_sur(ISSUE_T4_HELD), ISSUE_T4_HELD).await;
+            canner_etat(ISSUE_T4_HELD, ETAT_HELD);
+            let fetcher = CountingFetcher::with(&[labeled_json(HUMAN, POSE)]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(!refused, "un consentement intact laisse partir le tour");
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_reasons(&db).await, Vec::<String>::new());
+        }
+
+        /// **T5 — le parc passe d'abord, et c'est la propriété (D1).**
+        ///
+        /// Un retrait **humain** rend le ticket simultanément parqué *et* sans
+        /// `ready` : les deux prédicats refusent, et un seul doit nommer la
+        /// raison. Si l'état passait en premier, chaque park humain basculerait
+        /// vers `ready_absent_at_rearm` et le compte de mika#2995 tomberait à
+        /// zéro sans qu'aucune régression ait eu lieu — deux populations sous un
+        /// nom ne se soustraient pas (mika#2205). C'est le test qui garde les
+        /// deux comptes lisibles l'un sans l'autre.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_parc_garde_la_preseance_sur_letat() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T5_PARK_FIRST),
+                ISSUE_T5_PARK_FIRST,
+            )
+            .await;
+            // L'état dit la même chose que le parc : `ready` n'est plus là.
+            // C'est la fixture du cas réel, et c'est ce qui rend le test
+            // discriminant — les deux raisons sont atteignables.
+            canner_etat(ISSUE_T5_PARK_FIRST, r#"{"state":"OPEN","labels":[]}"#);
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(refused);
+            assert_eq!(
+                task(&db, &parent).await.result.as_deref(),
+                Some(READY_CONSENT_WITHDRAWN_REASON),
+                "un retrait humain reste un retrait de consentement, jamais un \
+                 `ready` simplement absent"
+            );
+            assert_eq!(
+                audit_reasons(&db).await,
+                vec![READY_CONSENT_WITHDRAWN_REASON.to_string()],
+                "une seule ligne, et elle porte la raison du parc"
+            );
+        }
+
+        /// **T6 — la fenêtre `remove`→`add` d'`auto_pull`, au site neuf (D3).**
+        ///
+        /// La forme d'AC-T2 de mika#2995, mais vue par les deux prédicats : le
+        /// parc tolère la re-pose machine (c'est sa propriété), et l'état la
+        /// confirme — `ready` est bien là *maintenant*. Le tour part. Sans
+        /// l'état, cette fenêtre resterait tranchée par la seule timeline ;
+        /// avec lui, c'est l'instant de la promotion qui décide.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_un_remove_puis_add_machine_laisse_partir_le_tour() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T6_REMOVE_ADD),
+                ISSUE_T6_REMOVE_ADD,
+            )
+            .await;
+            canner_etat(ISSUE_T6_REMOVE_ADD, ETAT_HELD);
+            let fetcher = CountingFetcher::with(&[
+                labeled_json(HUMAN, POSE),
+                unlabeled_json(MACHINE, RETRAIT),
+                labeled_json(MACHINE, REPOSE),
+            ]);
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(
+                !refused,
+                "la re-pose machine n'est pas un retrait, et l'état le confirme"
+            );
+            assert_eq!(task(&db, &parent).await.status, "pending");
+            assert_eq!(audit_reasons(&db).await, Vec::<String>::new());
+        }
+
+        /// **T7 — une autre classe ne paie aucune lecture (AC3).**
+        ///
+        /// « Comportement inchangé » n'est pas observable octet pour octet ;
+        /// « aucune lecture n'a été payée » l'est, et le vol en ajoute une
+        /// seconde à compter. Le discriminant de parente passe donc avant les
+        /// **deux** prédicats : zéro appel au fournisseur de timeline, et zéro
+        /// appel enregistré à la couture `gh` sur le numéro de ce test.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_une_autre_classe_ne_paie_ni_timeline_ni_etat() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (parent, wrapper) = seed_pair_sur(
+                &db,
+                "long_running:run_claude_pilot_groom",
+                ISSUE_T7_OTHER_CLASS,
+            )
+            .await;
+            // Posée exprès : si la garde lisait l'état malgré la classe, elle
+            // trouverait de quoi répondre, et le test échouerait sur le compte
+            // plutôt que sur un panic de plancher.
+            canner_etat(ISSUE_T7_OTHER_CLASS, ETAT_HELD);
+            let avant = appels_gh(ISSUE_T7_OTHER_CLASS);
+            let fetcher = CountingFetcher::with(&retrait_humain());
+
+            let refused = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &wrapper).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+
+            assert!(!refused, "une parente de groom n'est pas touchée");
+            assert_eq!(fetcher.calls(), 0, "aucune lecture de timeline");
+            assert_eq!(
+                appels_gh(ISSUE_T7_OTHER_CLASS),
+                avant,
+                "aucune lecture d'état non plus : le discriminant de parente \
+                 passe avant les deux prédicats"
+            );
+            assert_eq!(task(&db, &wrapper).await.status, "completed");
+            assert_eq!(task(&db, &parent).await.status, "pending");
+        }
+
+        /// **T8 — le recensement émet sur toutes les branches, coordonnées
+        /// comprises.**
+        ///
+        /// Un recensement qui ne compterait que les refus n'aurait pas de
+        /// dénominateur : « zéro promotion refusée » et « aucune promotion
+        /// n'a eu lieu » rendraient les mêmes octets (mika#1833, mika#1926), et
+        /// la cible d'AC4 *est* un compte. La ligne est donc émise avant le
+        /// `match`, sur les huit verdicts, branche saine comprise.
+        ///
+        /// Deux passages dans un seul test, parce que c'est leur **différence**
+        /// qui est la propriété : la branche saine porte `repo` et `issue`, la
+        /// branche hors classe les a **absents** — pas `""`, pas `0` (motif
+        /// mika#2331). La garde hors classe n'a lu aucune coordonnée, donc elle
+        /// ne peut pas en déclarer.
+        ///
+        /// L'autre moitié de T8 — « ce nom n'a qu'un site de définition » — est
+        /// portée par les entrées de `CONSENT_RECHECK_NAMES` dans
+        /// `ready_label.rs`, que le détecteur D3 lit : un test comportemental ne
+        /// peut pas voir un second site émetteur.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_de_promotion_emet_sur_toutes_les_branches() {
+            let db = test_db();
+            let dispatcher = test_dispatcher(db.clone());
+            let (_p_sain, w_sain) = seed_pair_sur(
+                &db,
+                &ready_label_parent_sur(ISSUE_T8_CENSUS),
+                ISSUE_T8_CENSUS,
+            )
+            .await;
+            canner_etat(ISSUE_T8_CENSUS, ETAT_HELD);
+            let (_p_autre, w_autre) = seed_pair_sur(
+                &db,
+                "long_running:run_claude_pilot_groom",
+                ISSUE_T8_CENSUS_OTHER_CLASS,
+            )
+            .await;
+            let fetcher = CountingFetcher::with(&[labeled_json(HUMAN, POSE)]);
+            let (_guard, events) = capture_events();
+
+            let refused_sain = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &w_sain).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+            assert!(
+                !refused_sain,
+                "la branche recensée est bien la branche saine"
+            );
+
+            let lignes = census_lines(&events);
+            assert_eq!(lignes.len(), 1, "un passage, une ligne : {lignes:?}");
+            assert_eq!(
+                triplet(&lignes[0]),
+                (
+                    "consent_held",
+                    Some(REPO),
+                    Some(ISSUE_T8_CENSUS.to_string().as_str())
+                ),
+                "le dénominateur d'AC4 porte son verdict et ses coordonnées : {lignes:?}"
+            );
+
+            let refused_autre = dispatcher
+                .skip_deferred_dispatch_on_withdrawn_consent_with(
+                    &task(&db, &w_autre).await,
+                    &fetcher,
+                    &machine(),
+                    FIXTURE_TOKEN,
+                )
+                .await;
+            assert!(!refused_autre);
+
+            let lignes = census_lines(&events);
+            assert_eq!(lignes.len(), 2, "la seconde branche est recensée aussi");
+            assert_eq!(
+                triplet(&lignes[1]),
+                ("not_a_ready_label_parent", None, None),
+                "hors classe, la garde n'a lu aucune coordonnée : elle ne peut \
+                 donc pas en déclarer, et un `\"\"` dirait le contraire"
+            );
         }
     }
 }

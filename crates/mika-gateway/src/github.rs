@@ -14,6 +14,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use hmac::{Hmac, KeyInit, Mac};
+use mika_common::github_event_format::{
+    CHECK_SUITE_HEAD_LINE_PREFIX, CHECK_SUITE_PRS_LINE_PREFIX, CHECK_SUITE_PRS_NONE,
+};
 use rand::RngExt;
 use secrecy::ExposeSecret;
 use sha2::Sha256;
@@ -99,6 +102,29 @@ pub struct GitHubInstallation {
 pub struct CheckSuite {
     pub conclusion: Option<String>,
     pub head_branch: Option<String>,
+    /// La tête de la suite (mika#2917). Jetée jusqu'à ce vol, ce qui rendait
+    /// le texte transmis incapable de nommer de quelle tête l'événement parle.
+    pub head_sha: Option<String>,
+    /// Les PR que la forge associe à cette suite (mika#2917).
+    ///
+    /// `#[serde(default)]` : un payload dépourvu du tableau se désérialise, il
+    /// ne fait pas échouer la livraison. Mesuré vide sur mika#2681, ce qui est
+    /// un état nominal de la forge et non une anomalie.
+    #[serde(default)]
+    pub pull_requests: Vec<CheckSuitePullRequest>,
+}
+
+/// Une entrée de `check_suite.pull_requests[]` (mika#2917).
+///
+/// **Tout est `Option`, délibérément.** Une entrée dont `number` manquerait
+/// ferait échouer la désérialisation de l'événement **entier** si le champ
+/// était requis — donc une livraison perdue pour un champ que ce vol ne fait
+/// que transmettre. Le producteur saute l'entrée qu'il ne sait pas nommer ;
+/// c'est le fail-safe de la bonne direction (le tour a lieu).
+#[derive(Debug, serde::Deserialize)]
+pub struct CheckSuitePullRequest {
+    pub number: Option<u64>,
+    pub head: Option<GitHubRef>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -124,6 +150,15 @@ pub struct GitHubPullRequest {
 pub struct GitHubRef {
     #[serde(rename = "ref")]
     pub ref_name: Option<String>,
+    /// La tête que ce `ref` désigne (mika#2917). Présente sur tous les objets
+    /// `head` de la forge (`pull_request.head`, `check_suite.pull_requests[].head`)
+    /// et jusqu'ici non désérialisée.
+    ///
+    /// **Un seul type de `ref`, et pas un second.** La forme de l'objet est la
+    /// même partout chez GitHub ; en écrire une copie pour le seul besoin de
+    /// `check_suite` serait la classe de divergence programmée que ce dépôt
+    /// refuse ailleurs (mika#2158).
+    pub sha: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -257,12 +292,23 @@ const QA_REVIEWER_LOGIN: &str = mika_common::forge_identity::REVIEWER_FORGE_LOGI
 /// Adding a repo here is a code change + deploy — intentionally not env-tunable
 /// (security-adjacent: changes on release cadence, not ops cadence).
 ///
+/// **Un dépôt renommé porte ici son nom courant, sans alias** (mika#2666).
+/// Cette liste est *autorisante* : une entrée **ouvre** une route. GitHub met le
+/// nom courant dans `repository.full_name`, donc garder l'ancien n'ouvre rien
+/// d'utile et ne laisse qu'une entrée morte dans une liste adjacente à la
+/// sécurité. La règle est **inverse** pour une liste *restrictive* comme
+/// `mika_common::forge_identity::MPC_GATE_REQUIRED_REPOS`, qui exige une trace
+/// avant merge : là, l'ancien nom reste en alias, parce qu'un appelant qui
+/// l'écrit encore atteint la même PR par redirection GitHub et ne doit pas
+/// trouver la porte ouverte. Les deux listes divergent donc à dessein — voir
+/// `docs/solutions/security-issues/repo-name-keyed-guard-goes-inert-on-rename-keep-the-alias-2026-10-05.md`.
+///
 /// See: mika#1382 (cross-repo ready-label dispatch).
 const INTERNAL_REPOS: &[&str] = &[
     "senara-solutions/mika",
     "senara-solutions/mika-cloud",
     "senara-solutions/mika-skills",
-    "senara-solutions/claude-pilot-py",
+    "senara-solutions/claude-pilot",
     "senara-solutions/mika-platform",
     "senara-solutions/wizzard",
 ];
@@ -378,6 +424,36 @@ fn truncate_body(text: &str, max_chars: usize) -> String {
         let truncated: String = text.chars().take(max_chars).collect();
         format!("{truncated}\n\n[truncated]")
     }
+}
+
+/// Rend la valeur de la ligne [`CHECK_SUITE_PRS_LINE_PREFIX`] : les PR que la
+/// suite **nomme**, sous la forme `{n}@{sha}` séparés par un espace (mika#2917).
+///
+/// Une entrée dont le numéro ou le `head.sha` manque est **sautée** : une PR
+/// sans tête n'est pas une PR nommée, et la transmettre à moitié donnerait au
+/// consommateur un numéro sans la tête qu'il compare.
+///
+/// Rend [`CHECK_SUITE_PRS_NONE`] quand rien n'est nommable — tableau vide (état
+/// nominal de la forge, mesuré sur mika#2681) comme tableau dont toutes les
+/// entrées ont été sautées. **Jamais une valeur vide** : « ne nomme aucune
+/// tête » est une forme de la grammaire, et elle a un nom.
+fn format_check_suite_prs(pull_requests: &[CheckSuitePullRequest]) -> String {
+    let named: Vec<String> = pull_requests
+        .iter()
+        .filter_map(|pr| {
+            let number = pr.number?;
+            let sha = pr.head.as_ref()?.sha.as_deref()?;
+            if sha.is_empty() {
+                return None;
+            }
+            Some(format!("{number}@{sha}"))
+        })
+        .collect();
+
+    if named.is_empty() {
+        return CHECK_SUITE_PRS_NONE.to_string();
+    }
+    named.join(" ")
 }
 
 /// Format a GitHub webhook event into a markdown summary suitable for the agent's context.
@@ -539,8 +615,27 @@ pub fn format_event_text(event_type: &str, event: &GitHubWebhookEvent) -> String
             let branch = cs
                 .and_then(|c| c.head_branch.as_deref())
                 .unwrap_or("unknown");
+            // `unknown` sur le modèle exact de `conclusion` et `branch` : le
+            // gateway n'invente pas une tête, et le consommateur traite
+            // `unknown` comme une tête non nommée.
+            let head = cs.and_then(|c| c.head_sha.as_deref()).unwrap_or("unknown");
+            // Pas de `unwrap_or_default()` ici : une valeur VIDE n'est pas une
+            // forme de la grammaire, et `CHECK_SUITE_PRS_NONE` dit exactement
+            // ce qu'un `check_suite` absent dit du payload — il ne nomme
+            // aucune tête.
+            let prs = cs.map_or_else(
+                || CHECK_SUITE_PRS_NONE.to_string(),
+                |c| format_check_suite_prs(&c.pull_requests),
+            );
 
-            format!("[GitHub] Check suite {conclusion} on {repo_name} (branch: {branch})")
+            // Les deux lignes nouvelles sont des lignes 2 et 3, JAMAIS la
+            // ligne 1 : les quatre lecteurs du moteur ne lisent que la
+            // première et la terminent sur son `)` (mika#2917 R3).
+            format!(
+                "[GitHub] Check suite {conclusion} on {repo_name} (branch: {branch})\n\
+                 {CHECK_SUITE_HEAD_LINE_PREFIX}{head}\n\
+                 {CHECK_SUITE_PRS_LINE_PREFIX}{prs}"
+            )
         }
         _ => {
             format!("[GitHub] {event_type}.{action} on {repo_name}")
@@ -1821,6 +1916,195 @@ mod tests {
         );
     }
 
+    /// Input domain of the routing↔handlers coherence sweep below: the `action`
+    /// values GitHub documents for the `pull_request` event.
+    ///
+    /// This list is the sweep's **input**, never its answer — `route_event` is
+    /// what decides which of these reach mika-qa. Adding an entry can only
+    /// widen what the guard checks; it can never make the guard pass.
+    const PULL_REQUEST_ACTIONS_FOR_COHERENCE_SWEEP: &[&str] = &[
+        "assigned",
+        "auto_merge_disabled",
+        "auto_merge_enabled",
+        "closed",
+        "converted_to_draft",
+        "demilestoned",
+        "dequeued",
+        "edited",
+        "enqueued",
+        "labeled",
+        "locked",
+        "milestoned",
+        "opened",
+        "ready_for_review",
+        "reopened",
+        "review_request_removed",
+        "review_requested",
+        "synchronize",
+        "unassigned",
+        "unlabeled",
+        "unlocked",
+    ];
+
+    /// `skills/bundled/`, resolved from this crate's manifest dir.
+    ///
+    /// The directory is versioned; `include_str!`/`build.rs` are only
+    /// consumers of it. Reading it from disk is what lets this guard see both
+    /// `route_event` and the agent-side contract without `mika-gateway` taking
+    /// a dependency on `mika-agent` (mika#2212 D-C). Same pattern as
+    /// `crates/mika-agent/tests/bundled_skills_load.rs`.
+    fn bundled_skills_dir() -> std::path::PathBuf {
+        // CARGO_MANIFEST_DIR = .../mika/crates/mika-gateway
+        // skills/bundled/    = .../mika/skills/bundled
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("skills")
+            .join("bundled")
+    }
+
+    /// Routing ↔ handlers coherence: every `pull_request` action `route_event`
+    /// sends to mika-qa must be covered on the agent side (mika#2212).
+    ///
+    /// **The founding defect this guard exists for.** mika#1822 added
+    /// `ready_for_review` to the routing table above — correctly, and for
+    /// exactly the class this ticket reports — but changed nothing on the agent
+    /// side: `qa-review/system_prompt.md` kept enumerating its triggers as
+    /// `opened` / `synchronize` / `review_requested`, and no dedicated handler
+    /// covered the new action. The event was routed, the queue did not coalesce
+    /// it, the agent received it — and no skill claimed it. **Nothing failed.**
+    /// Two PRs (#2202, #2210) and three triggerings produced zero fresh
+    /// `mika-platform-qa` verdict, and the only way to see it was to measure
+    /// the posted reviews by hand.
+    ///
+    /// Coverage is a **disjunction of two terms**, both read from disk:
+    ///
+    /// - **T1** — a `skills/bundled/qa-review*/skill.toml` declares the action
+    ///   in `[triggers] keywords`. Read by TOML **parse**, never by substring
+    ///   search: a comment mentioning the action would satisfy a raw substring,
+    ///   and that false green is precisely what this guard exists to exclude.
+    /// - **T2** — `skills/bundled/qa-review/system_prompt.md` contains the
+    ///   literal `pull_request.<action>`. This term exists because `qa-review`
+    ///   is `always_on = true`: `opened`, `synchronize` and `review_requested`
+    ///   are covered by no manifest keyword and have no need to be — their real
+    ///   contract is that enumeration. A literal-substring test on an exact
+    ///   form is mechanical, not prose analysis.
+    ///
+    /// When this fires, the remediation is to add the missing term — **never**
+    /// to remove the action from `route_event` to quiet the test.
+    #[test]
+    fn mika2212_every_pull_request_action_routed_to_qa_is_covered_by_a_handler() {
+        let skills_dir = bundled_skills_dir();
+        assert!(
+            skills_dir.is_dir(),
+            "bundled-skills directory not found at {} — repo layout changed?",
+            skills_dir.display()
+        );
+
+        // --- T1: keywords declared by the qa-review skill family ---
+        let mut family_dirs: Vec<String> = Vec::new();
+        let mut family_keywords: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(&skills_dir).expect("failed to read skills/bundled/") {
+            let path = entry.expect("failed to read dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            // The qa-review family: the base skill and its handler siblings.
+            if dir_name != "qa-review" && !dir_name.starts_with("qa-review-") {
+                continue;
+            }
+            family_dirs.push(dir_name.clone());
+
+            let manifest_path = path.join("skill.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let toml_str = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+            let manifest: toml::Value = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
+            let keywords = manifest
+                .get("triggers")
+                .and_then(|t| t.get("keywords"))
+                .and_then(|k| k.as_array());
+            for kw in keywords.into_iter().flatten() {
+                if let Some(s) = kw.as_str() {
+                    family_keywords.push((dir_name.clone(), s.to_lowercase()));
+                }
+            }
+        }
+        assert!(
+            !family_dirs.is_empty(),
+            "no qa-review-family skill directory found under {} — repo layout changed?",
+            skills_dir.display()
+        );
+
+        // --- T2: the trigger enumeration qa-review declares in its own prompt ---
+        let qa_prompt_path = skills_dir.join("qa-review").join("system_prompt.md");
+        let qa_prompt = std::fs::read_to_string(&qa_prompt_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read {} — repo layout changed? ({e})",
+                qa_prompt_path.display()
+            )
+        });
+
+        let mut routed: Vec<&str> = Vec::new();
+        let mut uncovered: Vec<String> = Vec::new();
+        for action in PULL_REQUEST_ACTIONS_FOR_COHERENCE_SWEEP {
+            if route_event("pull_request", Some(action), None) != Some("mika-qa") {
+                continue;
+            }
+            routed.push(action);
+
+            let action_lower = action.to_lowercase();
+            let t1 = family_keywords.iter().any(|(_, kw)| *kw == action_lower);
+            let t2 = qa_prompt.contains(&format!("pull_request.{action}"));
+            if !t1 && !t2 {
+                uncovered.push(format!(
+                    "  - pull_request.{action}\n      \
+                     T1 missing: no skills/bundled/qa-review*/skill.toml declares \
+                     \"{action}\" in [triggers].keywords\n      \
+                     T2 missing: skills/bundled/qa-review/system_prompt.md does not \
+                     contain the literal \"pull_request.{action}\""
+                ));
+            }
+        }
+
+        // Anti-vacuity: a sweep that measured nothing must not read as a pass.
+        assert!(
+            !routed.is_empty(),
+            "route_event sent no pull_request action to mika-qa — this sweep measured \
+             NOTHING. Either the candidate-action list above went stale, or the routing \
+             table changed; a green here would be meaningless."
+        );
+
+        assert!(
+            uncovered.is_empty(),
+            "\nRouting ↔ handlers incoherence (mika#2212, class mika#1822): {} of {} \
+             pull_request action(s) routed to mika-qa are claimed by no handler and by \
+             no trigger enumeration.\n\n{}\n\n\
+             The gateway delivers these events; nothing on the agent side acts on them, \
+             and nothing fails — the only symptom is a verdict that never comes.\n\n\
+             Remediation: add the missing term — a dedicated handler skill declaring the \
+             action in [triggers].keywords (T1, the structural route — engine keyword \
+             matching, see crates/mika-agent/src/skills/matcher.rs), or the \
+             `pull_request.<action>` enumeration in qa-review/system_prompt.md (T2, valid \
+             only because that skill is always_on).\n\
+             NEVER remove the action from route_event to quiet this test: that restores \
+             the mika#1822 gap it was added to close.\n\n\
+             qa-review family scanned: {:?}\n",
+            uncovered.len(),
+            routed.len(),
+            uncovered.join("\n"),
+            family_dirs,
+        );
+    }
+
     #[test]
     fn test_route_event_pr_review_is_author_independent() {
         // mika#1729 (R3/AC3): the mika-qa review trigger is gateway routing, NOT
@@ -2055,7 +2339,7 @@ mod tests {
         assert!(is_internal_repo("senara-solutions/mika"));
         assert!(is_internal_repo("senara-solutions/mika-cloud"));
         assert!(is_internal_repo("senara-solutions/mika-skills"));
-        assert!(is_internal_repo("senara-solutions/claude-pilot-py"));
+        assert!(is_internal_repo("senara-solutions/claude-pilot"));
         assert!(is_internal_repo("senara-solutions/mika-platform"));
         assert!(is_internal_repo("senara-solutions/wizzard"));
     }
@@ -2066,6 +2350,18 @@ mod tests {
         assert!(!is_internal_repo("other-org/mika"));
         assert!(!is_internal_repo(""));
         assert!(!is_internal_repo("mika"));
+        // mika#2666 — l'ancien nom du dépôt renommé n'est PAS un alias ici.
+        // `INTERNAL_REPOS` est une liste *autorisante* : une entrée ouvre une
+        // route sans ligne `github_repos`. GitHub n'envoie que le nom courant,
+        // donc l'alias n'ouvrirait rien qui soit utile — il ne laisserait
+        // qu'une entrée morte dans une liste adjacente à la sécurité. La règle
+        // inverse vaut pour `MPC_GATE_REQUIRED_REPOS`, qui est *restrictive* et
+        // garde les deux noms (`mika_common::forge_identity`).
+        assert!(
+            !is_internal_repo("senara-solutions/claude-pilot-py"),
+            "liste autorisante : l'ancien nom n'ouvre pas de route (mika#2666, D1). \
+             Ne pas le rajouter « par symétrie » avec MPC_GATE_REQUIRED_REPOS, qui est restrictive."
+        );
     }
 
     // -- Message text formatting tests --
@@ -2118,6 +2414,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/bug".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2160,6 +2457,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/review-routing".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2215,6 +2513,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/review-routing".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2275,6 +2574,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("fix/review-routing".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2319,6 +2619,8 @@ mod tests {
             check_suite: Some(CheckSuite {
                 conclusion: Some("failure".to_string()),
                 head_branch: Some("main".to_string()),
+                head_sha: None,
+                pull_requests: Vec::new(),
             }),
             issue: None,
             pull_request: None,
@@ -2354,6 +2656,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("feat/new".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),
@@ -2530,6 +2833,535 @@ mod tests {
         );
     }
 
+    /// An event with every optional field cleared — mika#2680's fixtures fill
+    /// in only what the arm under test reads.
+    fn mika2680_blank_event() -> GitHubWebhookEvent {
+        GitHubWebhookEvent {
+            action: None,
+            sender: None,
+            installation: None,
+            check_suite: None,
+            issue: None,
+            pull_request: None,
+            comment: None,
+            review: None,
+            requested_reviewer: None,
+            label: None,
+            repository: Some(GitHubRepository {
+                full_name: Some("senara-solutions/mika".to_string()),
+                html_url: None,
+            }),
+            before: None,
+            after: None,
+        }
+    }
+
+    fn mika2680_issue() -> Option<GitHubIssue> {
+        Some(GitHubIssue {
+            number: Some(2680),
+            title: Some("registre des tours webhook".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/issues/2680".to_string()),
+            body: None,
+            assignee: None,
+        })
+    }
+
+    fn mika2680_pr() -> Option<GitHubPullRequest> {
+        Some(GitHubPullRequest {
+            number: Some(2681),
+            title: Some("feat: le registre".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2681".to_string()),
+            body: None,
+            head: Some(GitHubRef {
+                ref_name: Some("feat/2680/registre".to_string()),
+                sha: None,
+            }),
+            merged: Some(true),
+        })
+    }
+
+    /// mika#2680 — le contrat producteur/consommateur, étendu à la grammaire
+    /// que la taxonomie des tours webhook lit.
+    ///
+    /// `webhook_prefilter::trigger_class` classe le texte d'origine d'un
+    /// webhook en lisant ces préfixes **par constante**, donc sans écrire un
+    /// littéral de grammaire. Le prix de cette indirection est exactement ce
+    /// test : un préfixe déclaré que le gateway n'émet plus devient un terme de
+    /// taxonomie mort — il rendrait `other` pour toujours, en silence, avec
+    /// toutes les assertions de comportement encore vertes. C'est la dérive
+    /// telle qu'elle arrive : le producteur change de gabarit, le consommateur
+    /// garde l'ancien.
+    #[test]
+    fn mika2680_chaque_prefixe_declare_est_celui_que_le_gateway_emet() {
+        use mika_common::github_event_format as fmt;
+
+        // (1) `check_suite`, et le préfixe est agnostique de la conclusion.
+        for conclusion in ["success", "failure", "cancelled"] {
+            let mut event = mika2680_blank_event();
+            event.check_suite = Some(CheckSuite {
+                conclusion: Some(conclusion.to_string()),
+                head_branch: Some("main".to_string()),
+                head_sha: None,
+                pull_requests: Vec::new(),
+            });
+            let text = format_event_text("check_suite", &event);
+            assert!(
+                text.starts_with(fmt::CHECK_SUITE_EVENT_PREFIX),
+                "CHECK_SUITE_EVENT_PREFIX a dérivé sur la conclusion {conclusion:?} : {text:?}"
+            );
+            assert!(
+                text.contains(fmt::BRANCH_MARKER),
+                "BRANCH_MARKER a dérivé : c'est par lui que la taxonomie distingue \
+                 la branche par défaut d'une branche de PR. Texte : {text:?}"
+            );
+        }
+
+        // (2) `pull_request` : la forme générique, puis les deux actions
+        // que la taxonomie nomme.
+        let mut event = mika2680_blank_event();
+        event.action = Some("opened".to_string());
+        event.pull_request = mika2680_pr();
+        let text = format_event_text("pull_request", &event);
+        assert!(
+            text.starts_with(fmt::PR_OPENED_EVENT_PREFIX),
+            "PR_OPENED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::PR_EVENT_PREFIX),
+            "PR_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.contains(fmt::BRANCH_MARKER),
+            "BRANCH_MARKER a dérivé sur le gabarit `pull_request` : {text:?}"
+        );
+
+        event.action = Some("closed".to_string());
+        let text = format_event_text("pull_request", &event);
+        assert!(
+            text.starts_with(fmt::PR_CLOSED_EVENT_PREFIX),
+            "PR_CLOSED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.contains("Merged: true"),
+            "le gabarit `closed` ne distingue mergée de fermée qu'en ligne suivante — \
+             si cette ligne disparaît, la lecture de `pr_closed` change de sens : {text:?}"
+        );
+
+        // (3) `pull_request_review`, et le piège d'ordre qu'il porte : sa forme
+        // commence par `PR `, donc le bras `pr_review` doit être testé AVANT le
+        // bras générique.
+        let mut event = mika2680_blank_event();
+        event.pull_request = mika2680_pr();
+        event.review = Some(GitHubReview {
+            state: Some("changes_requested".to_string()),
+            body: None,
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2681#r1".to_string()),
+            user: Some(GitHubUser {
+                login: "mika-qa".to_string(),
+                user_type: None,
+            }),
+        });
+        let text = format_event_text("pull_request_review", &event);
+        assert!(
+            text.starts_with(fmt::PR_REVIEW_EVENT_PREFIX),
+            "PR_REVIEW_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::PR_EVENT_PREFIX),
+            "PR_REVIEW_EVENT_PREFIX doit rester un raffinement de PR_EVENT_PREFIX : \
+             c'est ce qui rend l'ordre des bras de `trigger_class` load-bearing. \
+             Si cette assertion tombe, l'ordre n'est plus nécessaire — relire le commentaire \
+             de PR_EVENT_PREFIX avant de le simplifier. Texte : {text:?}"
+        );
+
+        // (4) `issues` : la forme générique par son instance canonique
+        // `opened`, puis `closed`.
+        let mut event = mika2680_blank_event();
+        event.action = Some("opened".to_string());
+        event.issue = mika2680_issue();
+        let text = format_event_text("issues", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_OPENED_EVENT_PREFIX),
+            "ISSUE_OPENED_EVENT_PREFIX a dérivé — c'est le seul préfixe par lequel \
+             le gabarit générique `Issue {{action}}:` est épinglable : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::ISSUE_EVENT_PREFIX),
+            "ISSUE_EVENT_PREFIX a dérivé : {text:?}"
+        );
+
+        event.action = Some("closed".to_string());
+        let text = format_event_text("issues", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_CLOSED_EVENT_PREFIX),
+            "ISSUE_CLOSED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+
+        // (5) `issues.labeled`, quel que soit le label — et le second piège
+        // d'ordre : cette forme n'est PAS `Issue {action}:` et commence pourtant
+        // par `Issue `.
+        let mut event = mika2680_blank_event();
+        event.action = Some("labeled".to_string());
+        event.issue = mika2680_issue();
+        event.label = Some(GitHubLabel {
+            name: Some("loop-substrate".to_string()),
+        });
+        let text = format_event_text("issues", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_LABELED_EVENT_PREFIX),
+            "ISSUE_LABELED_EVENT_PREFIX a dérivé : {text:?}"
+        );
+        assert!(
+            text.starts_with(fmt::ISSUE_EVENT_PREFIX),
+            "ISSUE_LABELED_EVENT_PREFIX doit rester un raffinement de \
+             ISSUE_EVENT_PREFIX — même raison que pour `PR review` : {text:?}"
+        );
+        assert!(
+            !text.starts_with(fmt::READY_LABEL_DISPATCH_MARKER),
+            "un label autre que `ready` ne doit pas porter le marqueur de dispatch : {text:?}"
+        );
+
+        // (6) `issue_comment`.
+        let mut event = mika2680_blank_event();
+        event.action = Some("created".to_string());
+        event.issue = mika2680_issue();
+        event.comment = Some(GitHubComment {
+            body: Some("une consigne".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/issues/2680#c1".to_string()),
+            user: Some(GitHubUser {
+                login: "samidarko".to_string(),
+                user_type: None,
+            }),
+        });
+        let text = format_event_text("issue_comment", &event);
+        assert!(
+            text.starts_with(fmt::ISSUE_COMMENT_EVENT_PREFIX),
+            "ISSUE_COMMENT_EVENT_PREFIX a dérivé : {text:?}"
+        );
+
+        // (7) `push` — et c'est l'attrape-tout qui l'émet, pas un bras dédié.
+        // `action` vaut `"unknown"` par défaut, d'où le point dans le préfixe.
+        let event = mika2680_blank_event();
+        let text = format_event_text("push", &event);
+        assert!(
+            text.starts_with(fmt::PUSH_EVENT_PREFIX),
+            "PUSH_EVENT_PREFIX a dérivé. `format_event_text` n'a aucun bras `push` : \
+             si un bras dédié apparaît, c'est ici qu'il faut relire le préfixe. Texte : {text:?}"
+        );
+        assert_eq!(
+            text, "[GitHub] push.unknown on senara-solutions/mika",
+            "la forme réelle d'un push est celle de l'attrape-tout"
+        );
+
+        // (8) Les deux lignes de tête de mika#2917 — et leur POSITION, qui est
+        // la moitié non négociable du contrat. Les quatre lecteurs du texte
+        // `check_suite` (`parse_check_suite_success`, `parse_check_suite_failure`
+        // et les deux `CHECK_SUITE_RE`) ne lisent que la première ligne : une
+        // tête émise en ligne 1 les casserait tous, en silence pour trois
+        // d'entre eux. Ce test épingle donc l'indice de ligne, pas seulement
+        // la présence du préfixe.
+        let mut event = mika2680_blank_event();
+        event.check_suite = Some(CheckSuite {
+            conclusion: Some("success".to_string()),
+            head_branch: Some("feat/2917/x".to_string()),
+            head_sha: Some("1a2b3c4d".to_string()),
+            pull_requests: vec![CheckSuitePullRequest {
+                number: Some(2917),
+                head: Some(GitHubRef {
+                    ref_name: Some("feat/2917/x".to_string()),
+                    sha: Some("1a2b3c4d".to_string()),
+                }),
+            }],
+        });
+        let text = format_event_text("check_suite", &event);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "le gabarit `check_suite` porte exactement trois lignes depuis \
+             mika#2917 : {text:?}"
+        );
+        assert!(
+            lines[1].starts_with(fmt::CHECK_SUITE_HEAD_LINE_PREFIX),
+            "CHECK_SUITE_HEAD_LINE_PREFIX a dérivé, ou a changé de ligne : {text:?}"
+        );
+        assert!(
+            lines[2].starts_with(fmt::CHECK_SUITE_PRS_LINE_PREFIX),
+            "CHECK_SUITE_PRS_LINE_PREFIX a dérivé, ou a changé de ligne : {text:?}"
+        );
+        assert!(
+            !lines[0].contains(fmt::CHECK_SUITE_HEAD_LINE_PREFIX)
+                && !lines[0].contains(fmt::CHECK_SUITE_PRS_LINE_PREFIX),
+            "une tête en PREMIÈRE ligne casse les quatre lecteurs du texte \
+             `check_suite`, dont trois en silence : {text:?}"
+        );
+    }
+
+    /// mika#2917 — l'aller-retour producteur → consommateur, sur les quatre
+    /// formes que la charge utile peut prendre.
+    ///
+    /// Les constantes et le parse vivent dans `mika-common`, et c'est ce qui
+    /// rend ce test possible : il fait passer la sortie **réelle** de
+    /// `format_event_text` par `parse_check_suite_heads`, au lieu d'épingler de
+    /// part et d'autre deux littéraux qui peuvent dériver ensemble en restant
+    /// verts (classe mika#2158). Un format qui change et un parse qui suit
+    /// restent verts ici — un format qui change **seul** ne l'est pas.
+    #[test]
+    fn mika2917_le_texte_emis_se_relit_par_le_parse_de_mika_common() {
+        use mika_common::github_event_format::{CheckSuiteHeads, parse_check_suite_heads};
+
+        fn text_for(pull_requests: Vec<CheckSuitePullRequest>) -> String {
+            let mut event = mika2680_blank_event();
+            event.check_suite = Some(CheckSuite {
+                conclusion: Some("success".to_string()),
+                head_branch: Some("feat/2917/x".to_string()),
+                head_sha: Some("1a2b3c4d".to_string()),
+                pull_requests,
+            });
+            format_event_text("check_suite", &event)
+        }
+
+        fn pr(number: u64, sha: &str) -> CheckSuitePullRequest {
+            CheckSuitePullRequest {
+                number: Some(number),
+                head: Some(GitHubRef {
+                    ref_name: Some("feat/2917/x".to_string()),
+                    sha: Some(sha.to_string()),
+                }),
+            }
+        }
+
+        // (a) `pull_requests` ABSENT de la charge utile — la forme qui
+        // décide si `#[serde(default)]` est là, et la seule que `Vec::new()`
+        // ne peut pas simuler : sans lui, un payload dépourvu du tableau fait
+        // échouer la désérialisation de l'événement ENTIER, donc perd la
+        // livraison, pour un champ que ce vol ne fait que transmettre.
+        // Le gateway écrit alors `none` : du point de vue du consommateur, une
+        // forge qui ne nomme aucune PR et une forge qui en nomme zéro disent
+        // la même chose du payload. C'est `LineAbsent` qui est l'autre
+        // population — un binaire antérieur à ce vol (motif mika#2340) — et
+        // aucun gateway conforme ne l'émet.
+        let sans_tableau: CheckSuite = serde_json::from_str(
+            r#"{"conclusion":"success","head_branch":"feat/2917/x","head_sha":"1a2b3c4d"}"#,
+        )
+        .expect(
+            "un `check_suite` sans `pull_requests` doit se désérialiser — \
+             sinon la livraison est perdue",
+        );
+        assert!(sans_tableau.pull_requests.is_empty());
+        assert_eq!(
+            parse_check_suite_heads(&text_for(sans_tableau.pull_requests)),
+            CheckSuiteHeads::Empty
+        );
+
+        // (b) Tableau vide — la forme mesurée sur mika#2681.
+        assert_eq!(
+            parse_check_suite_heads(&text_for(Vec::new())),
+            CheckSuiteHeads::Empty
+        );
+
+        // (c) Une seule PR : le seul cas où l'événement nomme SA tête.
+        assert_eq!(
+            parse_check_suite_heads(&text_for(vec![pr(2917, "1a2b3c4d")])),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string(),
+            }
+        );
+
+        // (d) Plusieurs PR : la suite est partagée, donc elle ne nomme la tête
+        // d'aucune d'elles en particulier.
+        assert_eq!(
+            parse_check_suite_heads(&text_for(vec![pr(2917, "1a2b3c4d"), pr(2918, "9f8e7d6c")])),
+            CheckSuiteHeads::Many(2)
+        );
+
+        // (e) Une PR dont la forge ne donne pas le `head.sha` est sautée, et
+        // non promue en tête anonyme : c'est tout le point du vol que la tête
+        // soit nommée ou absente, jamais devinée.
+        let sans_sha = CheckSuitePullRequest {
+            number: Some(2919),
+            head: Some(GitHubRef {
+                ref_name: Some("feat/2919/y".to_string()),
+                sha: None,
+            }),
+        };
+        assert_eq!(
+            parse_check_suite_heads(&text_for(vec![pr(2917, "1a2b3c4d"), sans_sha])),
+            CheckSuiteHeads::One {
+                pr: 2917,
+                head_sha: "1a2b3c4d".to_string(),
+            }
+        );
+    }
+
+    /// mika#2755 — le producteur réel traversant le masque du consommateur.
+    ///
+    /// `mask_cited_branch` vit dans `mika-common` et s'épingle là-bas sur des
+    /// littéraux. Ce qu'un littéral ne peut pas voir : le jour où
+    /// `format_event_text` change de gabarit, le masque continue de passer ses
+    /// sept cas et ne masque plus rien de ce que le gateway émet vraiment. Ce
+    /// test-ci fait passer les sorties **réelles** du producteur par le
+    /// consommateur, sur les deux seuls gabarits qui citent une branche.
+    ///
+    /// Sa seconde moitié est auto-nettoyante : tout autre type d'événement
+    /// formaté doit ne contenir **aucun** [`BRANCH_MARKER`]. Un troisième
+    /// gabarit qui se met à citer une branche rend ce test rouge et se nomme —
+    /// sans quoi un nouveau slug entrerait dans le texte d'intention sans que
+    /// rien ne le dise, et c'est exactement le défaut de mika#2755.
+    #[test]
+    fn mika2755_le_masque_retire_le_slug_de_chaque_gabarit_qui_cite_une_branche() {
+        use mika_common::github_event_format as fmt;
+
+        // (1) `check_suite` — le gabarit du webhook fondateur, mot pour mot.
+        let mut event = mika2680_blank_event();
+        event.check_suite = Some(CheckSuite {
+            conclusion: Some("success".to_string()),
+            head_branch: Some("fix/2750/dispatch-un-groom-ready-label-qui-crashe".to_string()),
+            head_sha: None,
+            pull_requests: Vec::new(),
+        });
+        let text = format_event_text("check_suite", &event);
+        // La PREMIÈRE ligne, et elle seule, est le message fondateur. Depuis
+        // mika#2917 le texte en porte deux de plus — c'est précisément la
+        // contrainte R3 de ce vol : la tête s'ajoute en lignes 2 et 3, jamais
+        // en ligne 1, parce que les quatre lecteurs du texte `check_suite` ne
+        // lisent que la première. L'assertion est donc portée à la ligne
+        // plutôt que relâchée en `starts_with` : un préfixe laisserait passer
+        // le jour où un mot s'ajoute en fin de première ligne.
+        assert_eq!(
+            text.lines().next().unwrap_or_default(),
+            "[GitHub] Check suite success on senara-solutions/mika \
+             (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)",
+            "la première ligne du gabarit `check_suite` a dérivé — ce littéral \
+             EST le message du webhook du 2026-10-16 23:49Z, celui que le \
+             critère d'acceptation de mika#2755 épingle mot pour mot"
+        );
+        let masked = fmt::mask_cited_branch(&text);
+        assert_eq!(
+            masked,
+            "[GitHub] Check suite success on senara-solutions/mika (branch: )\n\
+             Head-Sha: unknown\n\
+             Check-Suite-PRs: none",
+            "le masque doit retirer le slug cité et rien d'autre — les deux \
+             lignes de tête de mika#2917 traversent intactes, et `unknown` / \
+             `none` sont ce que ce payload fondateur nomme (il ne porte ni \
+             `head_sha` ni `pull_requests[]`)"
+        );
+        assert!(
+            !masked.contains("groom"),
+            "c'est ce `groom`-là, dans le slug, qui a fait matcher le mot-clé de \
+             dev-groom et armé `required_tools` : {masked:?}"
+        );
+
+        // (2) `pull_request` — le second site, et il porte une ligne d'URL
+        // après la branche : le masque doit la conserver intacte.
+        let mut event = mika2680_blank_event();
+        event.action = Some("opened".to_string());
+        event.pull_request = Some(GitHubPullRequest {
+            number: Some(2756),
+            title: Some("une branche citée n'est pas du texte d'intention".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2756".to_string()),
+            body: None,
+            head: Some(GitHubRef {
+                ref_name: Some("fix/2755/agent-le-mot-cl-groom-match-dans-un-nom".to_string()),
+                sha: None,
+            }),
+            merged: None,
+        });
+        let text = format_event_text("pull_request", &event);
+        let masked = fmt::mask_cited_branch(&text);
+        assert_eq!(
+            masked,
+            "[GitHub] PR opened: senara-solutions/mika#2756 — une branche citée \
+             n'est pas du texte d'intention (branch: )\n\
+             https://github.com/senara-solutions/mika/pull/2756",
+            "sur `pull_request` le masque s'arrête à la première ligne : l'URL de \
+             la ligne suivante traverse intacte"
+        );
+        assert!(
+            !masked.contains("groom"),
+            "le slug d'une branche de PR est du texte cité au même titre : {masked:?}"
+        );
+
+        // (3) La moitié auto-nettoyante — aucun autre gabarit ne cite de
+        // branche. `BRANCH_MARKER` est le seul motif que `mask_cited_branch`
+        // sait retirer ; un gabarit qui citerait une branche autrement lui
+        // échapperait en silence.
+        let mut sans_branche: Vec<(&str, String)> = Vec::new();
+
+        for action in ["opened", "closed", "assigned"] {
+            let mut event = mika2680_blank_event();
+            event.action = Some(action.to_string());
+            event.issue = mika2680_issue();
+            sans_branche.push(("issues", format_event_text("issues", &event)));
+        }
+
+        let mut event = mika2680_blank_event();
+        event.action = Some("labeled".to_string());
+        event.issue = mika2680_issue();
+        event.label = Some(GitHubLabel {
+            name: Some("ready".to_string()),
+        });
+        sans_branche.push(("issues.labeled", format_event_text("issues", &event)));
+
+        let mut event = mika2680_blank_event();
+        event.action = Some("created".to_string());
+        event.issue = mika2680_issue();
+        event.comment = Some(GitHubComment {
+            body: Some("une consigne".to_string()),
+            html_url: Some("https://github.com/senara-solutions/mika/issues/2680#c1".to_string()),
+            user: Some(GitHubUser {
+                login: "samidarko".to_string(),
+                user_type: None,
+            }),
+        });
+        sans_branche.push(("issue_comment", format_event_text("issue_comment", &event)));
+
+        // `pull_request_review` porte une PR — donc une branche dans la
+        // charge utile — et ne la cite pourtant pas. C'est le cas qui rend
+        // cette moitié non vacante.
+        let mut event = mika2680_blank_event();
+        event.pull_request = mika2680_pr();
+        event.review = Some(GitHubReview {
+            state: Some("approved".to_string()),
+            body: None,
+            html_url: Some("https://github.com/senara-solutions/mika/pull/2681#r1".to_string()),
+            user: Some(GitHubUser {
+                login: "mika-qa".to_string(),
+                user_type: None,
+            }),
+        });
+        sans_branche.push((
+            "pull_request_review",
+            format_event_text("pull_request_review", &event),
+        ));
+
+        let event = mika2680_blank_event();
+        sans_branche.push(("push", format_event_text("push", &event)));
+
+        assert_eq!(
+            sans_branche.len(),
+            7,
+            "la moitié auto-nettoyante doit couvrir des gabarits, pas zéro — \
+             si ce compte tombe, c'est la boucle qui est cassée, pas le gateway"
+        );
+        for (event_type, text) in &sans_branche {
+            assert!(
+                !text.contains(fmt::BRANCH_MARKER),
+                "le gabarit {event_type:?} s'est mis à citer une branche. Le slug \
+                 qu'il cite entre désormais dans l'évaluation des mots-clés de \
+                 `match_skills`, exactement comme le `check_suite` de mika#2755 : \
+                 relire `mask_cited_branch` — il s'engage sur n'importe quelle \
+                 ligne d'événement ou enveloppe de gestionnaire, et vide chaque \
+                 occurrence de ses DEUX grammaires de citation (` (branch: )` \
+                 jusqu'au `)`, ` branch=` jusqu'à l'espace) — avant d'ajouter ce \
+                 gabarit ci-dessus. S'il en cite une troisième, c'est une passe \
+                 de plus à écrire là-bas. Texte : {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_format_event_text_issue_labeled_empty_label_name() {
         // Empty label name should fall back to generic format, not produce
@@ -2613,6 +3445,7 @@ mod tests {
                 body: None,
                 head: Some(GitHubRef {
                     ref_name: Some("feat/new".to_string()),
+                    sha: None,
                 }),
                 merged: None,
             }),

@@ -112,11 +112,59 @@ pub struct MatchedSkill<'a> {
 /// `"[GitHub]"`) are anchored only on their word-char side, so punctuation-
 /// suffixed intent phrases still work.
 ///
+/// **Données citées (mika#2755).** Un texte d'événement GitHub **cite** le nom
+/// de la branche concernée ; ce n'est pas quelqu'un qui exprime une intention.
+/// Le 2026-10-16, un `check_suite` vert sur
+/// `fix/2750/dispatch-un-groom-ready-label-qui-crashe` a fait matcher le
+/// mot-clé `groom` de dev-groom **dans le slug** — les deux ancres `\b`
+/// ci-dessus y sont satisfaites, les voisins étant des traits d'union, donc
+/// mika#1878 ne pouvait rien y faire. Le `required_tools` du skill s'est armé,
+/// la boucle a re-promptée, et le modèle a fabriqué une tâche manuelle
+/// fantôme. Le message est donc passé par
+/// [`mika_common::github_event_format::mask_cited_branch`] **avant** toute
+/// évaluation de mot-clé.
+///
+/// Le masque vit **ici**, à la tête de cette fonction, et non chez les deux
+/// appelants (`run_agent`, `run_silent`) : les deux modes et tout futur
+/// troisième appelant en héritent sans avoir à s'en souvenir. Sa portée s'arrête
+/// à cette fonction — `context::resolve_contexts`,
+/// `review_filter::apply_review_filter`, les `INTENT_GUARDS` et le prompt lisent
+/// tous le message intact.
+///
+/// **Le texte qui arrive ici n'est presque jamais celui de la passerelle
+/// (mika#2768).** Le vol 1 ci-dessus ne masquait que la **première ligne** d'un
+/// texte commençant par `[GitHub] `, et c'est le seul tour qu'un gestionnaire
+/// n'a pas touché. Les trois autres ont rejoué la classe le lendemain :
+///
+/// 1. `VerdictAction::Handled`/`Dispatched` **remplacent** le texte du tour par
+///    un pré-digest enveloppé (`<ci_success_handler>\n[GitHub] …`), donc la
+///    ligne d'événement n'est plus la première ;
+/// 2. `VerdictAction::Passthrough { enrichment }` le **préfixe**
+///    (`handlers.rs` : `req.text = format!("{e}{}", req.text)`), donc la prose
+///    de l'enrichissement cite elle-même le slug, sur une ligne qui ne commence
+///    par aucun gabarit ;
+/// 3. ce préfixe pousse en outre la ligne `[GitHub] ` de la passerelle hors de
+///    la première place.
+///
+/// Le 2026-10-17 à 08:59:18Z, le cas 1 a laissé passer le `groom` de
+/// `fix/2762/rollback-reaper-groom`, armé le `required_tools` de dev-groom, et
+/// fait groomer mika#2766 — un ticket sans label `ready`, donc hors du
+/// consentement positif de mika#841. [`mask_cited_branch`] s'engage désormais
+/// sur **n'importe quelle** ligne d'événement et sur une enveloppe de
+/// gestionnaire reconnue **par sa forme** (jamais par une liste de noms), et
+/// vide **chaque** occurrence citée des deux grammaires. Épinglé de bout en
+/// bout ici par `mika2768_un_pre_digest_enveloppe_narme_pas_dev_groom`, dont le
+/// contrôle négatif (`"groom mika#2750"`) reste le garde-fou : ce qu'on retire
+/// est une citation, pas une intention.
+///
+/// [`mask_cited_branch`]: mika_common::github_event_format::mask_cited_branch
+///
 /// Each returned skill is annotated with a [`MatchReason`] indicating why it was
 /// included. If a skill is both `always_on` and has a keyword hit, the reason is
 /// `Keyword` (the more specific match wins). Dependencies are tagged `Dependency`.
 pub fn match_skills<'a>(skills: &'a [SkillEntry], user_message: &str) -> Vec<MatchedSkill<'a>> {
-    let message_lower = user_message.to_lowercase();
+    let intent = mika_common::github_event_format::mask_cited_branch(user_message);
+    let message_lower = intent.to_lowercase();
 
     // First pass: direct matches (always_on or keyword hit), tracking reason
     let mut matched_reasons: HashMap<usize, MatchReason> = HashMap::new();
@@ -477,6 +525,157 @@ mod tests {
             .find(|m| m.entry.manifest.skill.name == "dev-pilot")
             .expect("dev-pilot must also be matched via the dependency edge");
         assert_eq!(dev_pilot.reason, MatchReason::Dependency);
+    }
+
+    // -- mika#2755 : une branche citée n'est pas du texte d'intention --
+
+    /// Message du webhook fondateur de mika#2755, **mot pour mot**.
+    const MIKA2755_CHECK_SUITE_MESSAGE: &str = "[GitHub] Check suite success on senara-solutions/mika (branch: fix/2750/dispatch-un-groom-ready-label-qui-crashe)";
+
+    /// La scène de mika#1251 ci-dessus, réutilisée telle quelle : c'est la
+    /// topologie réelle (self-dev always_on dépendant de dev-pilot et
+    /// dev-groom), donc le seul décor où la distinction Keyword / Dependency
+    /// veut dire quelque chose.
+    fn mika2755_self_dev_scene() -> Vec<SkillEntry> {
+        vec![
+            make_entry_with_deps(
+                "self-dev",
+                &["implement"],
+                true,
+                &["dev-pilot", "dev-groom"],
+            ),
+            make_entry("dev-pilot", &[], false),
+            make_entry("dev-groom", &["groom", "groom ticket"], false),
+        ]
+    }
+
+    #[test]
+    fn mika2755_a_groom_in_a_branch_slug_demotes_dev_groom_to_dependency() {
+        let skills = mika2755_self_dev_scene();
+
+        let matched = match_skills(&skills, MIKA2755_CHECK_SUITE_MESSAGE);
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom reste chargé par l'arête de dépendance de self-dev");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Dependency,
+            "le `groom` du slug ne doit pas valoir une intention : seul \
+             `MatchReason::Keyword` arme les `required_tools` (#463), et c'est \
+             cette promotion qui a produit le re-prompt de mika#2755"
+        );
+    }
+
+    #[test]
+    fn mika2755_a_human_groom_request_is_still_a_keyword_match() {
+        // Contre-épreuve : le chemin nominal du grooming manuel reste entier.
+        let skills = mika2755_self_dev_scene();
+
+        let matched = match_skills(&skills, "groom mika#2750");
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom doit matcher");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Keyword,
+            "un humain qui demande un groom exprime bien une intention"
+        );
+    }
+
+    #[test]
+    fn mika2755_the_mask_does_not_disarm_qa_review_on_a_pr_review_event() {
+        // La piste 2 du ticket — « n'appliquer les required_tools qu'aux
+        // messages humains » — aurait désarmé mika-qa sur ses propres
+        // webhooks. Ce vol ne masque que le slug : un `pull_request_review`
+        // n'en cite aucun, donc rien n'y bouge. C'est l'assertion qui
+        // distingue ce correctif de la piste large.
+        let skills = vec![make_entry("qa-review", &["review", "pr", "qa"], false)];
+
+        let matched = match_skills(
+            &skills,
+            "[GitHub] PR review (approved) on senara-solutions/mika#2754 (titre) by @mika-qa",
+        );
+
+        let qa_review = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "qa-review")
+            .expect("qa-review doit toujours matcher sur son propre webhook");
+        assert_eq!(
+            qa_review.reason,
+            MatchReason::Keyword,
+            "mika-qa n'est pas désarmé : ses mots-clés portent sur la forme du \
+             gabarit, pas sur une branche"
+        );
+    }
+
+    // -- mika#2768 : le masque s'applique aussi au texte enveloppé --
+
+    /// Le pré-digest du tour du 2026-10-17 08:59:18Z, dans la forme que
+    /// `ci_success_handler::format_merge_ready_pre_digest` produit — ses deux
+    /// citations de branche comprises. `format_merge_ready_pre_digest` est privé
+    /// à son module, donc ce littéral ne peut pas l'appeler ; c'est
+    /// `ci_success_handler::tests::mika2768_le_pre_digest_reel_ne_laisse_aucun_slug_cite_a_lintention`
+    /// (l'AC2) qui épingle l'accord entre les deux, et qui rougira si le gabarit
+    /// bouge.
+    const MIKA2768_WRAPPED_PRE_DIGEST: &str = "<ci_success_handler>\n\
+         [GitHub] Check suite success on senara-solutions/mika#2765 (branch: fix/2762/rollback-reaper-groom)\n\
+         CI checks all green + VERDICT: pass from @mika-platform-qa — every gate cleared for head abc123def.\n\n\
+         MERGE-READY-SIGNAL: senara-solutions/mika#2765 head=abc123def branch=fix/2762/rollback-reaper-groom task=task-2765 reviewer=mika-platform-qa\n\n\
+         Task: task-2765\n\n\
+         Do NOT call pr_merge_with_gate — you are not the merge actor on this path.\n\
+         </ci_success_handler>";
+
+    #[test]
+    fn mika2768_un_pre_digest_enveloppe_narme_pas_dev_groom() {
+        // Le bout en bout de l'incident : c'est CE texte qui a promu dev-groom
+        // en `Keyword`, armé son `required_tools`, et fait groomer mika#2766 —
+        // un ticket sans label `ready`, donc hors du consentement positif de
+        // mika#841. Le vol 1 de mika#2755 ne le voyait pas : son `starts_with`
+        // portait sur la première ligne, et celle-ci est la balise ouvrante.
+        let skills = mika2755_self_dev_scene();
+
+        let matched = match_skills(&skills, MIKA2768_WRAPPED_PRE_DIGEST);
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom reste chargé par l'arête de dépendance de self-dev");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Dependency,
+            "le `groom` du slug cité deux fois par ce pré-digest ne doit pas \
+             valoir une intention : seul `MatchReason::Keyword` arme les \
+             `required_tools` (#463), et c'est cette promotion-là qui a fait \
+             groomer un ticket que personne n'avait promu"
+        );
+    }
+
+    #[test]
+    fn mika2768_le_mot_cle_dun_humain_survit_au_masque_elargi() {
+        // Contre-épreuve de l'élargissement lui-même, et non du vol 1 : le
+        // masque s'engage maintenant sur bien plus de textes, donc la question
+        // « a-t-il commencé à manger de l'intention ? » se repose entière. Le
+        // même contrôle que `mika2755_a_human_groom_request_is_still_a_keyword_match`,
+        // gardé ici sous le numéro de ce vol pour qu'un futur élargissement le
+        // retrouve.
+        let skills = mika2755_self_dev_scene();
+
+        let matched = match_skills(&skills, "groom mika#2750");
+
+        let dev_groom = matched
+            .iter()
+            .find(|m| m.entry.manifest.skill.name == "dev-groom")
+            .expect("dev-groom doit matcher");
+        assert_eq!(
+            dev_groom.reason,
+            MatchReason::Keyword,
+            "un message humain ne porte ni ligne d'événement ni enveloppe : le \
+             masque doit l'emprunter intact"
+        );
     }
 
     #[test]

@@ -269,7 +269,7 @@ pub async fn run(args: crate::cli::ProviderArgs, agent_name: &str) -> Result<()>
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     }
                     OutputFormat::Yaml => {
-                        print!("{}", serde_yaml::to_string(&result)?);
+                        print!("{}", yaml_serde::to_string(&result)?);
                     }
                     OutputFormat::Text => {
                         println!(
@@ -288,7 +288,7 @@ pub async fn run(args: crate::cli::ProviderArgs, agent_name: &str) -> Result<()>
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     }
                     OutputFormat::Yaml => {
-                        print!("{}", serde_yaml::to_string(&result)?);
+                        print!("{}", yaml_serde::to_string(&result)?);
                     }
                     OutputFormat::Text => {
                         println!("Set {} = \"{}\"", result.field, result.value);
@@ -304,7 +304,7 @@ pub async fn run(args: crate::cli::ProviderArgs, agent_name: &str) -> Result<()>
                         println!("{}", serde_json::to_string_pretty(&result)?);
                     }
                     OutputFormat::Yaml => {
-                        print!("{}", serde_yaml::to_string(&result)?);
+                        print!("{}", yaml_serde::to_string(&result)?);
                     }
                     OutputFormat::Text => {
                         println!("Set {} = \"{}\"", result.field, result.value);
@@ -324,7 +324,7 @@ pub async fn run(args: crate::cli::ProviderArgs, agent_name: &str) -> Result<()>
                     println!("{}", serde_json::to_string_pretty(&providers)?);
                 }
                 OutputFormat::Yaml => {
-                    print!("{}", serde_yaml::to_string(&providers)?);
+                    print!("{}", yaml_serde::to_string(&providers)?);
                 }
                 OutputFormat::Text => {
                     println!("Current provider: {current_provider}\n\nAvailable providers:");
@@ -344,7 +344,7 @@ pub async fn run(args: crate::cli::ProviderArgs, agent_name: &str) -> Result<()>
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 }
                 OutputFormat::Yaml => {
-                    print!("{}", serde_yaml::to_string(&result)?);
+                    print!("{}", yaml_serde::to_string(&result)?);
                 }
                 OutputFormat::Text => {
                     println!("Switched to {} (model: {}).", result.provider, result.model);

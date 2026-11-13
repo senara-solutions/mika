@@ -13,7 +13,7 @@ pub fn print_structured<T: serde::Serialize>(
             Ok(true)
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(value)?);
+            print!("{}", yaml_serde::to_string(value)?);
             Ok(true)
         }
     }
@@ -81,9 +81,9 @@ mod tests {
             name: "hello".into(),
             count: 7,
         };
-        let yaml_str = serde_yaml::to_string(&sample).unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml_str).unwrap();
-        assert_eq!(parsed["name"], serde_yaml::Value::String("hello".into()));
+        let yaml_str = yaml_serde::to_string(&sample).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&yaml_str).unwrap();
+        assert_eq!(parsed["name"], yaml_serde::Value::String("hello".into()));
     }
 
     #[test]
@@ -98,8 +98,8 @@ mod tests {
                 count: 2,
             },
         ];
-        let yaml_str = serde_yaml::to_string(&items).unwrap();
-        let parsed: Vec<Sample> = serde_yaml::from_str(&yaml_str).unwrap();
+        let yaml_str = yaml_serde::to_string(&items).unwrap();
+        let parsed: Vec<Sample> = yaml_serde::from_str(&yaml_str).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].name, "a");
         assert_eq!(parsed[1].count, 2);

@@ -706,7 +706,7 @@ pub async fn run(
                 pending_tasks: pending_callbacks,
                 metadata,
             };
-            print!("{}", serde_yaml::to_string(&response)?);
+            print!("{}", yaml_serde::to_string(&response)?);
         }
     }
 
@@ -917,7 +917,7 @@ pub async fn run_team_ask(
                     failure_reason,
                 },
             };
-            print!("{}", serde_yaml::to_string(&response)?);
+            print!("{}", yaml_serde::to_string(&response)?);
         }
     }
 

@@ -148,6 +148,9 @@ fn add_server(
         url,
         headers,
         enabled: true,
+        // mika#1959 — `mika mcp add` n'expose pas le grade : défaut `operational`.
+        // Un serveur testimony se déclare à la main dans le fichier (docs/mcp.md § 5).
+        data_grade: Default::default(),
     };
 
     server_config.validate(name)?;

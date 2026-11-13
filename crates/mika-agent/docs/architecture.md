@@ -221,8 +221,8 @@ All 22 builtin tools, registered in `crates/mika-agent/src/tools/mod.rs` via
 | `cancel_reminder` | Cancel a pending reminder by full UUID. Delegates to `CancelTaskTool` (alias for backwards compatibility). | Reminders |
 | `list_scheduled_tasks` | List scheduled tasks with optional status filter. Shows full UUID, trigger_type, action_type, status, timeout_at. | Tasks |
 | `create_scheduled_task` | Create a scheduled task (time, recurring, or callback trigger; any action type). Returns full UUID. Validates trigger_type and action_type against constants. timeout_secs capped at 90 days. | Tasks |
-| `cancel_task` | Cancel a pending task by full UUID (36-char validation). | Tasks |
-| `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. | Tasks |
+| `cancel_task` | Cancel a pending task by full UUID (36-char validation). **Refuses when a pilot is alive under the task** (mika#2653, unconditional since mika#2763): liveness is read by `live_pilot::live_pilot_for_task`, the refusal names the PID and the row carrying the pgid, and an unreadable verdict refuses too (fail-closed). No turn-class term — a silent `deferred_dispatch` turn destroyed a live 4-minute groom on 2026-10-17 precisely because there was one. Audited under `cancel_task_pilot_guard`, the pass included (`allowed_no_pilot`). The operator paths (`mika tasks cancel`, `POST /tasks/{id}/cancel`) do not go through this tool and are unaffected. | Tasks |
+| `complete_task` | Mark an agent's own callback task complete with a result string. Validates trigger_type=callback and ownership via agent_id. **Refuses when a pilot is alive under the task** (mika#2739): liveness is read by `live_pilot::live_pilot_for_task`, the refusal names the PID and the row carrying the pgid, and an unreadable verdict refuses too (fail-closed). Audited under `complete_task_pilot_guard`, the pass included. The nominal delivery path (`POST /tasks/{id}/complete`) does not go through this tool and is unaffected. | Tasks |
 | `get_task` | Inspect a task by full UUID. Returns all fields including status, trigger_type, action_type, result, timeout_at. | Tasks |
 | `send_message` | Send a message to the user out-of-band. In CLI mode, prints to stdout. In server mode, POSTs to the routing URL. Required for silent mode (heartbeat/reminders). | Messaging |
 | `create_skill` | Create a new custom skill with prompt snippets and tool definitions. | Skills |
@@ -426,10 +426,13 @@ from the first of these that resolves: `MIKA_MCP_CONFIG`,
 then `./mcp-servers.json` (which emits a warning). The legacy per-agent
 `{agent_home}/mcp.json` is migrated once to that path and is no longer read.
 
-A server written there is loaded for **every** agent, and an agent's
-`[tools].disabled` denylist cannot refuse it — MCP tool definitions are appended
-after the per-agent visibility filter runs. Isolation is procedural today; see
-[mcp.md § 3](mcp.md).
+A server written there is loaded for **every** agent, and neither half of an
+agent's `[tools]` section can refuse it — not the `disabled` denylist, not the
+`allowed` allowlist added by mika#2748 — because MCP tool definitions are
+appended after the per-agent visibility filter runs. The allowlist governs the
+**builtins** that reach the filter, not the array finally served, so switching
+to it makes the builtin roster permanent without narrowing this gap by a byte.
+Isolation is procedural today; see [mcp.md § 3](mcp.md).
 
 The format is unchanged (Claude Desktop convention, written with `0600`
 permissions to protect secrets):

@@ -22,7 +22,24 @@ Reference moved to [`docs/agent-internals/agent-loop.md`](../../docs/agent-inter
 
 **Open scope question, posed and deliberately not settled here.** Three sibling carve-outs on the same builder cite mika#1925 as their follow-up — `## Distribution Doctrine` (mika#1814), the hosting line (mika#2290), `## Mika Doctrine` (mika#2292) — which reads it as an umbrella, while its acceptance criteria name only `stopped_topics`, mika#1813's AC2 and mika#1813's pinning test. Both readings cannot be true. The three were left closed and their five pinning tests green and untouched: each carries its own cost analysis, and mika#2292's is written as an **accepted** cost, not a postponement, so closing them together would assume one answer fits four. Recommendation for the operator: three sibling tickets, one per carve-out, each carrying its own trade-off, and mika#1925 closed on its literal scope.
 
-**Team-agent inheritance (mika#1926):** team-child prompts thread `stopped_topics` from the CHILD agent's own DB, not the orchestrator's — the decision on whether the operator's stop-signals should propagate down through team delegation is open under mika#1926.
+**Team-agent inheritance (mika#1926) — a team child inherits, and that is settled.** A team-child turn renders its own `stop_topic_*` rows **union the conversational parent's**. Decision A, chosen 2026-10-15: *un « arrête sur X » est la volonté de l'utilisateur, pas un état privé de l'orchestrateur ; le texte d'un enfant remonte dans la réponse que l'utilisateur lit* — so a child blind to X can re-serve it to the very person who asked for it to stop. The site is `agent_loop::resolve_team_stop_topics`, whose doc-comment carries the four properties below; `run_team_agent_inner_impl` calls it in place of the bare `ctx.stopped_topics` it used to thread.
+
+Five things a future engineer must not have to infer:
+
+- **"Parent" means the CONVERSATIONAL parent**, carried by `TeamAgentParams::parent_agent_id` — `team_db.agent_id()` on both team-engine paths, `ctx.db.agent_id()` on `delegate_task`. It is **not** `TeamDefinition.team.orchestrator`, which names a team *member* (e.g. `"planner"`) whose scope holds none of the user's own preference rows. Fill the field with the wrong one and every test stays green while the inheritance silently reads an empty scope.
+- **Same file, different scope.** One SQLite file per container, so the parent read is `AsyncDatabase::with_agent` — a clone sharing the inner `Arc`, no second connection and no second thread — never a cross-DB access. A test that opens two `open_in_memory` databases makes the inheritance untestable rather than failing.
+- **Fail-open under its OWN event name:** `stop_topic_parent_load_failed` with a `parent_agent_id` field, distinct from `load_agent_context`'s `stop_topic_load_failed`. Two populations under one name are not subtractable (mika#2205), and the grep that answers « is the inheritance reaching anybody? » must name the inheritance. A failed parent read degrades to the child's own rows; it never costs the turn.
+- **The child wins a collision, dedup is NOCASE.** `preferences.category` is `COLLATE NOCASE` with `PRIMARY KEY (agent_id, category)`, so `stop_topic_Web-Config` and `stop_topic_web-config` are one topic; the surviving row is the child's, the more specific declaration. Final order is `category`, case-insensitively.
+- **Probe:** `event = "team_stop_topic_inheritance"` (INFO, `target: "mika::otel"`), one line per team-child turn on **every** branch including the all-zero one, with `agent`, `own`, `inherited`, `effective` and `parent_agent_id`. That last field is **absent**, never `""`, when no parent was declared — absent is not zero (mika#2331). Without the line, « the child inherited nothing » and « nobody declared a parent » return identical bytes; the line's **absence** means a binary older than this change (mika#2340), never an absence of inheritance. The instrument is not live until `make deploy`.
+
+**Not the same rule as `tenant_language`**, one field away in the same `PromptContext` literal: that axis deliberately reads the child's own row (mika#2247 AC2). A stop-signal is the user's will and propagates; a register setting is a tenant fact the child's own row already carries. The comment at that field says so, because it previously cited mika#1926 as a precedent for the opposite behaviour.
+
+**Guards:** `mika1926_un_stop_du_parent_atteint_le_prompt_de_lenfant` and its negative control `mika1926_sans_parent_declare_lenfant_nherite_de_rien` (same seed, only `parent` differs — the pair is what separates inheritance from unconditional rendering), plus `mika1926_lunion_dedoublonne_en_nocase_et_lenfant_gagne` for the merge and the `parent == child` short-circuit. All three go through `run_team_agent` end-to-end, in the inline `mod tests` of `agent_loop/mod.rs`.
+
+**Transmission au changement de modèle (mika#1747, vols 1 et 2).** Un fichier `transmissions/pending-swap` posé dans l'agent home — portant le modèle **entrant** — ouvre une fenêtre pendant laquelle `build_system_prompt` rend une section `## Model Transmission` demandant à l'instance sortante une lettre à son successeur, qui **finit par une question, pas par une consigne**. Le sortant vient de `llm.provider_name()`/`model_name()` et jamais du signal (D2) ; la fenêtre s'éteint d'elle-même quand la lettre existe, quand le signal est tautologique ou quand il est absent — pas de table, pas de migration, le nom de la lettre EST la marque. Prédicat dans `model_transmission.rs`, site d'alimentation unique au corps de boucle conversationnel (`load_agent_context` ne voit pas `llm`), sonde `model_transmission_window_open`.
+**Le vol 2 (mika#2807) livre la moitié entrante** : le successeur, désigné par le NOM de la lettre, la lit **une seule fois** et est libre de la contredire ; une réponse facultative va dans `<date-de-la-lettre>-from-<entrant>-response-to-<sortant>.md`. L'unicité tient à un reçu de lecture — `transmissions/.<lettre>.read`, module `read_receipt.rs`, agnostique de la famille d'artefacts et réutilisé tel quel par mika#2805 pour `handsoffs/` — dont l'échec **re-sert** la lettre au lieu de la perdre. `Transmission::{Incoming, Outgoing}` fait de la non-cohabitation des deux blocs une propriété du type et `resolve()` arbitre : l'entrante gagne. Sonde `incoming_transmission_served` (une fois par lettre : sa répétition est le symptôme de la perte de l'unicité).
+Trois refus argumentés et non reportés, à ne pas rouvrir sans leur prémisse : les trois autres constructeurs de prompt (un tour silencieux ne délivre pas son texte, donc consommerait le reçu sans lecteur ; MikaModel attend mika#1925 AC4), et l'interrupteur STOP, que le vol 1 conditionnait à une mesure que la sonde du vol 1 n'a pas encore produite.
+Réponse à la question qu'un futur éditeur posera forcément : **`detect_config_change` (mika#2473) ne peut pas servir de déclencheur** — `reconcile_well_known_config` réécrit `config.toml` en entier *avant* que `init_agent` figent le record, donc la détection ne voit jamais un swap délibéré. Le raisonnement complet, le runbook opérateur et la distinction témoignage/transmission : [`docs/architecture/model-transmission.md`](../../docs/architecture/model-transmission.md).
 
 ## Context Injection Configuration
 
@@ -150,7 +167,7 @@ UUID per ask. *Continued on explicit request:* `_arch_ask`
 | call | `session_id`? | why |
 |---|---|---|
 | 1st pass `mika-arch-groom-ticket` | **no** | fresh session |
-| UNPARSED retry | **yes** | the architect must see **its own prior turn** — the retry does not re-ask for the review, it asks the architect to *complete* its answer with the missing `Disposition:` line. Without the session the request is unintelligible: the carry-over is the mechanism's **condition of correctness**, not its contamination |
+| UNPARSED retry | **yes** | the architect must see **its own prior turn** — the retry does not re-ask for the review, it asks the architect to *complete* its answer with the missing `Disposition:` line. Without the session the request is unintelligible: the carry-over is the mechanism's **condition of correctness**, not its contamination. Since mika#2996 the retry message (both passes) also carries the plan between two marker lines, so the review-anchor guard arms on that turn and checks anchors against the plan only (`review_anchor::anchor_reference`) — a short retry let an unanchored READY advance the chain |
 | 2nd pass `mika-arch-second-review` (both branches) | **yes** | continuing the session so findings stay in conversation memory, per that skill's session-continuity contract |
 
 The session id is even written into the body-callout published on the ticket
@@ -176,6 +193,52 @@ closes the ticket's question; pretending it does not exist would not.
 **Guards:** `test-dispatch-lib.sh` pins the table above. If those assertions
 redden, someone "fixed" the intra-invocation carry-over believing they were
 closing mika#2305 — restore, and read the retry row.
+
+**Sur un tour de revue, la garde de reprise lit le brief MOINS le plan (mika#3002).**
+Un plan de groom parle de reprise parce que c'est son sujet, et l'`INTENT_GUARD`
+`resume_reconcile` relançait mika-arch sur ces mots-là. Mesuré le 2026-10-31,
+première passe du groom de mika#2995, trace `3a066c59` : l'architecte répond en
+264 caractères qu'il a cherché des engagements actifs « comme demandé par
+l'instruction de reprise », sans ligne `Disposition:` — donc `UNPARSED`, donc la
+relance de mika#1823. Depuis mika#2997 la relance porte aussi le plan, donc la
+garde pouvait tirer à **chaque** tour de relance. `IntentPrecondition` porte
+désormais un champ `scope: IntentScope` : `resume_reconcile` déclare
+`OutsideReviewedPlan`, et sur un tour de revue — `is_verdict_producer`, résolu
+depuis `VERDICT_PRODUCER_SKILLS` — son déclencheur est évalué sur le complément du
+plan (`review_anchor::outside_reviewed_plan`, frère exact d'`anchor_reference` sur
+les deux mêmes marqueurs). Partout ailleurs, et pour les cinq autres entrées, le
+message entier. Pas de `Default` sur `IntentScope`, délibérément : une nouvelle
+entrée ne compile pas sans nommer sa portée.
+
+**AC3 se lit en PAIRE, et une seule des deux lignes ne répond pas.** `guard.intent_precondition_fired`
+(WARN) porte `intent_guard` et `is_verdict_producer` : c'est le compte de relances
+qu'AC3 demande, et une relance de `resume_reconcile` avec ce champ à `true` est une
+fuite du stand-down, pas une relance ordinaire. `guard.resume_scope_stood_down`
+(INFO, `target: "mika::otel"`) porte `brief_chars`, `envelope`, `skill`, et n'est
+émise que quand le rétrécissement a **réellement** changé l'issue du tour. Sans
+elle, « la garde ne tire plus sur les plans » et « aucune revue d'architecte n'a
+eu lieu dans la fenêtre » rendent zéro tous les deux (classe mika#2205) — et la
+cible d'AC3 *est* zéro. `envelope` est la présence des deux marqueurs, jamais la
+vacuité des régions : `outside_reviewed_plan` rend `("", "")` aussi bien sur une
+première passe sans enveloppe que sur une enveloppe aux régions vides, et ces deux
+cas ne se lisent pas pareil. `skill` est **absent** — pas `""` — quand le skill est
+au registre sans être apparié au tour, parce que le discriminant lit le registre
+entier et ce champ les entrées appariées (motif mika#2331). **L'absence de la ligne
+elle-même ne veut pas dire « pas de stand-down » mais « binaire antérieur au vol »**
+(mika#2340) : l'instrument n'est pas vivant avant `make deploy`.
+
+**La relance d'ancrage nomme l'outil qui a produit la citation (mika#3003).** Un registre de
+lecture tenu sur le tour — `review_anchor::ToolReadLedger`, alimenté depuis un **site unique**
+dans `tool_execution/dispatch.rs` et scanné par `mika3003_le_registre_de_lecture_a_un_seul_ecrivain`
+— permet de retrouver l'extrait refusé mot pour mot dans la sortie d'un outil ; alors seulement la
+phrase passe du conditionnel de mika#2794 à l'indicatif, et un registre tronqué rend `Unknown`
+plutôt qu'une absence (classe mika#2205). **Le dénominateur d'AC3 n'existait pas** : la ligne
+`guard.review_anchor_armed` (INFO) le fournit, une par **passage** armé et non par tour, branche
+saine comprise, avec `anchors_found`/`anchors_valid` **absents** sur `Satisfied` (jamais `0`,
+motif mika#2331) ; le « avant » se reconstruit hors ligne depuis `llm_calls.response_text` (v31),
+car aucune ligne ne comptait les passages. Registre, fenêtre d'attribution, protocole `jq` et
+lecture 14+14 jours : [`docs/agent-internals/agent-loop.md`](../../docs/agent-internals/agent-loop.md)
+§ *the re-prompt names the tool that produced the quote*.
 
 ## Tools
 
@@ -374,6 +437,15 @@ Agents that need to reason across multiple repositories can specify an array of 
 
 **Per-agent identity.toml recipe (mika-arch):**
 
+> **Chemins hôte, pas navigation (mika#2108).** Les six chemins ci-dessous décrivent la
+> configuration d'un agent qui tourne **côté hôte** ; ce ne sont pas des adresses à suivre.
+> Ils ne sont pas résolvables depuis un bac à sable de pilote : la racine du workspace hôte
+> n'y est pas montée, et depuis mika#2146 ce qui y est visible est un squelette de points de
+> montage.
+> C'est la seule exemption déclarée dans `scripts/check-pilot-instruction-paths.sh`, ancrée
+> sur la forme exacte de ces lignes de tableau TOML — tout autre chemin hôte ajouté à ce
+> fichier déclenche la garde.
+
 ```toml
 name = "mika-arch"
 emoji = "A"
@@ -519,11 +591,21 @@ Background tasks (heartbeat, reminders) where text output is NOT delivered. Agen
 
 **Callsite handling policy:** The `send_message` tool surfaces `Failed` as `ToolOutput::error` so the LLM knows delivery failed; `NoChannel` returns `ToolOutput::success` with redirect guidance (prevents LLM retry loops). The task-engine dispatcher absorbs `Failed` and `NoChannel` with a warning (fire-and-forget for scheduled sends). Server handlers and notification paths (verdict, CI success) log warnings on `Failed` and `NoChannel` but continue. The `failed_sends` flush path increments retry count on `Failed`; deletes entries on `NoChannel` (permanent condition).
 
+**Severity tier on operator notifications (mika#1381):** `send_with_severity(text, NotificationSeverity)` is the severity-bearing entry; `NotificationSeverity` is `{ P0, P2 }`. `P0` means *the loop is dead, a human must step in* (blocking verdict at retry limit, circuit breaker tripped, CI fix attempts exhausted) and `GatewayMessageSender` routes it to `MIKA_OPERATOR_ESCALATION_CHAT_ID` when one is configured — a surface the operator is not expected to mute — falling back to the normal chat with a named WARN when it is unset. `P2` is the routine acknowledgement tier and always goes to the normal chat. `send()` is the **severity-free** entry: its `send_with_severity` default body delegates to `self.send(text)`, so a path that goes through `send()` reaches the mutable chat regardless of how urgent its message was.
+
+Each of `verdict_handler.rs` and `ci_failure_handler.rs` therefore owns **exactly one** module-private `send_notification(sender, severity, message)`, and its `severity` has no default. That is the whole point of the shape: a new operator-notification site **cannot compile** without naming its tier, so "forgot to classify it" is not a reachable state and no reviewer has to catch it. Adding a second helper, a default argument, or a wrapper that fills the tier in gives that state back. Severity sits in second position because most sites pass a multi-line `format!`, where a trailing argument is a line a reviewer scrolls past. The invariant is held at the boundary by `verdict_handler.rs § mika1381_tests` (the tier a site names is the tier the boundary observes) and at one real site by `ci_failure_handler.rs § mika1381_un_accuse_de_surface_natteint_pas_la_surface_jamais_muette`. Since mika#1381 vol 3 the flagship P0 — the dispatch-stall notification at `agent_loop/mod.rs:4337` — is attested **end to end** through `run_agent` by `tests/eval/test_dispatch_stall_p0_1381.rs`, which injects a `MessageSender` overriding **both** `send` and `send_with_severity` and fails when the tier arrives absent: `send_with_severity` has a default body delegating to `self.send(text)`, so a site that regressed onto `send()` would drop the tier with no error at all. That closes the AC9 deferred by vol 1; the other six P0 sites remain attested at the helper boundary only.
+
+**Le second axe de mika#1381 — la suppression des accusés P2 — était déjà fermé par mika#2517 U3, et le vol 4 ne fait que l'attester.** La « INTENT_GUARD relaxation » que le ticket demandait est le stand-down de `webhook_zero_tools` sur tout le domaine Webhook Fallthrough (`webhook_zero_tools_trigger` → `is_webhook_fallthrough_domain`, commit `b1d96948`, PR #2530, mergée le 2026-09-25) : sur cette population la prémisse de la garde — *« un événement webhook exige une action »* — est fausse par contrat, et la HARD GATE § Webhook Fallthrough prescrit d'accuser et de s'arrêter. **Aucune ligne de moteur n'a donc été écrite par ce vol.** Deux attestations tiennent la fermeture à deux niveaux, et elles ne sont pas redondantes : `tests/eval/test_webhook_zero_tools_guard.rs § guard_stands_down_on_issue_webhook` dit que la **garde** ne re-prompte pas, `tests/eval/test_p2_ack_suppression_1381.rs` dit que **l'opérateur ne reçoit rien** — un compteur de pas resterait vert si un site de notification émettait de lui-même, hors de toute trace d'outil, ce qui est précisément la forme des sept sites P0. La seconde injecte donc un `MessageSender`, et son contrôle positif (`[GitHub] Check suite failure`, hors domaine) est ce qui sépare « la garde est stand-down sur le bon domaine » de « la garde a été retirée en bloc ». La propriété à retenir, parce qu'elle décide où toute suppression future doit vivre : **`tools/send_message.rs:142` passe par `sender.send(&cleaned)` et jamais par `send_with_severity`, donc un accusé émis par l'outil arrive au transport sans étage** — rien en aval ne peut distinguer un accusé P2 d'un message ordinaire, donc rien en aval ne peut le retenir. La suppression des accusés P2 est une propriété du **garde**, jamais du routage.
+
 ## Conversation Compaction & Rewind
 
 **Compaction:** Threshold-based (50 messages). Keeps 20 most recent, summarizes older via Claude API. Summary injected into system prompt. `replace_with_summary` uses RAII `rusqlite::Transaction` (DEFERRED) — auto-rollback on error prevents stuck transactions that pin the WAL snapshot (#636).
 
 **Summarizer output contract (#1024):** The compaction summarizer produces *factual state assertions*, not conversational summaries. Output bullets use one of four prefixes: `Fact:` (objective state), `Decision:` (choices and disposition), `Outcome:` (results and state transitions), `Open:` (unresolved questions). The prompt explicitly forbids first-person language, conversational verbs (discussed/agreed/decided), and process narration. This shape is per mika#1009 finding (Axis 2 — content reform): the summary block is consumed by the next session as system-prompt context, and conversational shape there causes the LLM to misread it as prior turns it participated in. The prompt is a single `const &str` at `compaction.rs:14`; tests at `compaction.rs` (`summarization_prompt_enforces_factual_shape`) assert prompt invariants.
+
+**Handsoff ceremony at the ceiling (mika#1748):** at 85 % of `COMPACTION_THRESHOLD` (= 43 messages, configurable via `MIKA_COMPACTION_HANDSOFF_THRESHOLD_PCT`), `build_system_prompt` renders a `<compaction-imminent>` block asking the agent to testify — *in this turn* — to the residue that the summary will not carry. The threshold is in **messages**, not tokens, because that is the grandeur compaction itself decides on; the predicate lives at the single site `compaction_handsoff::ceremony_due`, fed once in `load_agent_context`, fail-open under WARN `compaction_handsoff_count_failed`. Rendered by `build_system_prompt` and, since mika#2805, by `build_silent_prompt`.
+
+**Successor ritual after the compaction (mika#2805):** once the condensation has passed, an unread handsoff is served **once** to the successor — `compaction_handsoff::resolve` picks the most recent unread one, lays a colocated `read_receipt` (`a/b.md` → `a/.b.md.read`, no DDL) and `build_system_prompt` renders a `<compaction-handsoff>` block naming the deposition, its response channel (`handsoffs/<stem>-response.md`, where **writing nothing is a legitimate answer**) and the successor's freedom to contradict it. The trigger is the **past** condensation — an unread deposition *and* the pre-threshold not crossed — so the two blocks are mutually exclusive by construction (`Ceremony` is a two-arm enum): the author never re-reads itself. One call site only, in the conversational loop body, because a single-use event with two consumption sites has two places to be eaten; `SilentPromptContext` keeps an `Option<usize>` so the compiler holds that refusal. Probes: INFO `compaction_handsoff_served`, WARN `compaction_handsoff_scan_failed`. `build_compact_system_prompt` (`ProviderKind::MikaModel`) renders **neither** block — a refusal, not a deferral (mika#1925 AC4). Full cycle, decisions and instrument tables: [`docs/architecture/compaction-handsoff.md`](../../docs/architecture/compaction-handsoff.md).
 
 **Rewind:** `rewind.rs` — two-phase flow: `preview_rewind()` then `execute_rewind()` with automatic reversal of memory/fact mutations via audit log. TUI: `/undo` (1 exchange), `/rewind [N | to <message_id>]`. Server: `POST /api/v1/rewind/{resolve,preview,execute}`.
 
@@ -553,66 +635,15 @@ Axum-based with two auth layers: mutation endpoints require `MIKA_INTERNAL_TOKEN
 
 **WAL checkpoint (#636):** `server::checkpoint::spawn_dashboard_checkpoint_task()` runs `PRAGMA wal_checkpoint(PASSIVE)` on the dashboard DB connection every 60 seconds. Defense-in-depth against stale WAL snapshots: if a transaction leak pins the connection's read snapshot, the periodic checkpoint forces the connection to advance. Structured log events: `checkpoint.start`, `checkpoint.complete` (with `busy_pages`, `log_pages`, `checkpointed_pages`), `checkpoint.error`, `checkpoint.stopped`. Hard-coded 60s interval (future tunable: `MIKA_DASHBOARD_CHECKPOINT_INTERVAL_SECS`). If WAL grows despite PASSIVE checkpoints, escalate to RESTART mode per the operating-envelope trigger documented in `checkpoint.rs`.
 
+**Le registre des tours webhook a DEUX termes, joints par `request_id`.** Le premier, `webhook_turn_charged` (`server/webhook_prefilter.rs`, mika#2680), est émis **avant** le tour : son message dit « le tour a lieu », donc il ne peut pas porter l'issue. Le second, `webhook_turn_outcome` (`server/webhook_turn_outcome.rs`, mika#2855), est émis après `run_agent` depuis un **site unique** dans `handlers.rs` et porte `agent_id`, `request_id` et `outcome` — l'issue que le modèle a **attestée** par une ligne finale `Webhook-Outcome: <valeur>`, jamais une issue déduite de la trace d'outils (les arrêts 1 et 2 de `qa-review-webhook-success` laissent la même trace, et 3 et 4 aussi — classe mika#2205). Un tour qui n'atteste rien rend `outcome_absent` et une valeur hors contrat rend `outcome_unreadable` ; aucun des deux n'est atteignable par un texte du modèle, c'est une propriété du type. **L'absence de la LIGNE, elle, n'est pas une issue absente mais un binaire antérieur au vol** (motif mika#2340) : `skills/bundled/` est lu au build, donc la ligne du prompt n'existe pour aucun agent avant `make deploy`. `scripts/measure-webhook-turn-cost` **joint** ce second terme par `request_id` et en tire `by_agent_trigger_release_outcome` et `charged_by_outcome` ; les deux absences n'y sont **jamais sommées** — `outcome_absent` mesure le modèle, `outcome_line_absent` mesure le binaire servi, et un tour sans ligne de sortie est compté à part plutôt que perdu ou fusionné. Protocole de lecture, contrat des huit valeurs et sonde post-déploiement : [`docs/eval/mika-2680/README.md`](../../docs/eval/mika-2680/README.md) § 10.
+
 ## Observability
 
 Reference moved to [`docs/agent-internals/observability.md`](../../docs/agent-internals/observability.md) (20 KB). Read it before changing this subsystem, and document new material there, not here.
 
 ## Audit Log
 
-`audit_events` table tracks all memory mutations per session. All writes include `trace_id`.
-
-### `tool_name = 'auth_boundary'` — cross-boundary authentication failures (mika#1949, Porte 3)
-
-The mika-manager write path crosses four boundaries, each guarded by a different
-env-var-backed token. Before mika#1949 a failure at any of them was
-indistinguishable from a network error — mika#2013 is the measured precedent:
-a frozen installation token cycled `auth_class=401` sixteen times in one night
-without naming itself. These rows are the fix: one per observed authentication
-failure, naming the token and the boundary.
-
-**Row shape** (written only by `Database::record_auth_boundary`, `evidence/audit.rs`):
-
-| column | value |
-|---|---|
-| `tool_name` | `auth_boundary` (`evidence::audit::AUTH_BOUNDARY_TOOL_NAME`) |
-| `session_id` | `auth-boundary` (`AUTH_BOUNDARY_SESSION_ID`) — a boundary failure belongs to no conversation |
-| `target_key` | `<from>_to_<to>` |
-| `after_value` | the failure kind — `missing` \| `empty` \| `invalid` \| `rejected` \| `unreachable` |
-| `reasoning` | JSON `{"token_name","kind","from","to"}` |
-| `before_value` | always `NULL` — there is no prior state to name |
-
-**The four boundary pairs `target_key` can take:**
-
-| `target_key` | token | site |
-|---|---|---|
-| `gateway_to_spirit` | `MIKA_INTERNAL_TOKEN` | `server/auth.rs` refusal arms |
-| `cm_to_spirit` | `INTERNAL_TOKEN` | control-monitor `A2aAdapter` (mirrored shape, cm's own ledger) |
-| `cm_to_content_plane` | `CM_FULL_ACCESS_TOKEN` | cm `scope::check` |
-| `manager_to_delivery` | `MIKA_MANAGER_DELIVERY_TOKEN` | `milestone_manager` report + alarm delivery |
-
-**Two properties, both load-bearing:**
-
-- **A token NAME, never a token VALUE.** `AuthBoundaryError` (in
-  `mika-common::auth_boundary`) has no field that can hold a secret, and both
-  it and this writer carry a negative-control test built with a secret-shaped
-  *name* to pin that.
-- **Fire-and-forget.** Call sites go through
-  `crate::auth_boundary_ledger::AuthBoundaryLedger`, whose `record` returns
-  `()`. An audit failure cannot change an authentication verdict, because the
-  signature offers no way to propagate one. A failed authentication still drops
-  the request exactly as before; only the drop became visible.
-
-**Operator query:**
-
-```sql
-SELECT target_key, after_value, count(*)
-FROM audit_events
-WHERE tool_name = 'auth_boundary'
-GROUP BY 1, 2;
-```
-
-Rotation procedure for all four tokens (and the deliberate 401/403 divergence
-between mika and cm): `mika-platform/docs/operator/token-rotation-procedure.md`.
+Reference moved to [`docs/agent-internals/audit-log.md`](../../docs/agent-internals/audit-log.md) (14 KB). Read it before changing this subsystem, and document new material there, not here.
 
 ## Timestamps
 
@@ -627,7 +658,7 @@ of the DB layer lives is decided by one rule, not by taste:
 | path | holds | why there |
 |---|---|---|
 | `db.rs` | types, `open`/`open_in_memory`, the ~30 thematic `impl Database` sections, free functions | the region that *churns* — methods get rewritten, replaced, deleted |
-| `db/migrations.rs` | `migrate` + every `migrate_vN_to_vM`, and their tests | **append-only**: a migration is never deleted (v1…v55, for ever) |
+| `db/migrations.rs` | `migrate` + every `migrate_vN_to_vM`, and their tests | **append-only**: a migration is never deleted (v1…v56, for ever) |
 | `db/tests/` | the `#[cfg(test)]` module, split by theme | **append-only**: a test is rarely deleted |
 | `db/kg_schema.rs`, `db/operational.rs` | their own `impl Database` blocks | pre-existing, same idiom |
 

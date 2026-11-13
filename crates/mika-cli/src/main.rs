@@ -34,6 +34,18 @@ async fn main() -> Result<()> {
         Some(Commands::PlanCallout(args)) => {
             std::process::exit(commands::plan_callout::run(&args.body_file, args.raw));
         }
+        // mika#2194 vol 5 — même chemin court, et pour la même raison : lire la
+        // disposition d'une réponse d'architecte est un prédicat pur. Le
+        // placement est la réponse PRISE D'AVANCE à la sonde S3 du corps du
+        // ticket — « si S3 dépasse environ 500 ms, le remède est le placement
+        // dans `main.rs`, jamais un cache » — parce que la bascule ajoute un
+        // démarrage de process par passe d'architecte.
+        Some(Commands::ArchDisposition(args)) => {
+            std::process::exit(commands::arch_disposition::run(
+                &args.response_file,
+                args.pass,
+            ));
+        }
         Some(Commands::Token(args)) => {
             let global_home = home::resolve_home_dir()?;
             let agent_home = cli
@@ -431,6 +443,12 @@ async fn main() -> Result<()> {
         Some(Commands::Teams(args)) => commands::teams::run(args).await,
         Some(Commands::Mcp(args)) => commands::mcp::run(args, &agent_name).await,
         Some(Commands::Tasks(args)) => commands::tasks::run(args, &agent_name).await,
+        // mika#2922 — le chemin supporté vers le registre des verdicts de vol.
+        // Adaptateur mince : l'analyse des termes et l'écriture vivent dans
+        // `mika_agent::flight_verdict_ledger`, écrivain unique du `tool_name`.
+        Some(Commands::FlightVerdicts(args)) => {
+            commands::flight_verdicts::run(args, &agent_name).await
+        }
         Some(Commands::Doctor(args)) => commands::doctor::run(args, &agent_name).await,
         Some(Commands::Dashboard(args)) => commands::dashboard::run(args.command).await,
         Some(Commands::Provider(args)) => commands::provider::run(args, &agent_name).await,
@@ -461,7 +479,12 @@ async fn main() -> Result<()> {
             commands::notify::run(&args.text, &args.channel, &args.severity).await
         }
         // Handled by early-exit above — unreachable, but listed for exhaustive match.
-        Some(Commands::Token(_) | Commands::CredentialHelper(_) | Commands::PlanCallout(_)) => {
+        Some(
+            Commands::Token(_)
+            | Commands::CredentialHelper(_)
+            | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_),
+        ) => {
             unreachable!()
         }
     }

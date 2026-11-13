@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import datetime
 import importlib.util
+import inspect
 import io
 import os
 import pathlib
@@ -508,8 +509,9 @@ class BodyEndClosureTests(unittest.IsolatedAsyncioTestCase):
     async def test_chunked_terminator_inside_chunk_data_is_not_an_end(self) -> None:
         # THE test of this ticket (plan R1). `0\r\n\r\n` is not a substring to
         # search for: it occurs inside chunk data, which here is arbitrary SSE
-        # JSON. An `in chunk` predicate — the one the request path still uses at
-        # the other end of this file — would cut a live LLM stream right here.
+        # JSON. An `in chunk` predicate would cut a live LLM stream right here.
+        # The request path carried that same predicate until mika#2758 removed
+        # it; its mirror of this test is `UplinkChunkedBodyTests` below.
         poison = b'data: {"text":"0\r\n\r\n"}'
         chunks = [
             b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
@@ -985,6 +987,179 @@ class ChunkedDecoderTests(unittest.TestCase):
         for line in (b"", b" 5", b"5 ", b"0x5", b"-1", b"g"):
             with self.subTest(line=line):
                 self.assertIsNone(proxy._parse_chunk_size(line))
+
+
+# ---------------------------------------------------------------------------
+# The same framing discipline on the REQUEST body, client → upstream
+# (mika#2758, follow-up to mika#2317)
+#
+# mika#2317 replaced a substring search with `_ChunkedDecoder` on the RESPONSE
+# path and left the request path untouched, deliberately: its subject was the
+# strict correction of one decoder, and doing both directions would have doubled
+# the surface of a p2. These tests fence the other end of the relay, where the
+# body is not SSE JSON but a prompt, a `tool_result`, or the contents of a file
+# the pilot just read — arbitrary bytes that can carry `0\r\n\r\n` inside a
+# chunk just as easily.
+#
+# WHY these readers hand back ONE chunk per `read()` rather than reusing
+# `_held_open_reader_of`: a pre-loaded `StreamReader` coalesces every `feed_data`
+# into the FIRST `read()`, and a single read hides this defect entirely — the old
+# predicate would write the whole body upstream before searching it, and the
+# truncation test would pass against the code it is meant to condemn. The read
+# boundary IS the condition of the defect, so the double controls it.
+# ---------------------------------------------------------------------------
+
+_UPLINK_TIMEOUT = 2.0
+
+
+class _ChunkPerReadReader:
+    """Reader double handing back exactly one queued chunk per `read()`.
+
+    With `eof=False` it never reaches EOF — the real condition on this path,
+    where the client has sent its body and is waiting for the answer, so a loop
+    that fails to establish the end of the body hangs rather than returning.
+    `asyncio.wait_for` is what turns that hang into a bounded failure.
+    """
+
+    def __init__(self, chunks: tuple[bytes, ...], eof: bool) -> None:
+        self._queue = list(chunks)
+        self._eof = eof
+        self.reads = 0
+
+    async def read(self, _size: int) -> bytes:
+        self.reads += 1
+        if self._queue:
+            return self._queue.pop(0)
+        if self._eof:
+            return b""
+        await asyncio.Event().wait()  # never set: the client holds the line
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _uplink_reader(*chunks: bytes) -> _ChunkPerReadReader:
+    """One chunk per read, then the client holds the connection open."""
+    return _ChunkPerReadReader(chunks, eof=False)
+
+
+def _uplink_reader_at_eof(*chunks: bytes) -> _ChunkPerReadReader:
+    """One chunk per read, then client EOF."""
+    return _ChunkPerReadReader(chunks, eof=True)
+
+
+class UplinkChunkedBodyTests(unittest.IsolatedAsyncioTestCase):
+    """`_forward_chunked_request_body` — AC1-AC4 of mika#2758."""
+
+    async def _forward(
+        self, reader: _ChunkPerReadReader
+    ) -> tuple[str, _CapturingWriter, list[str]]:
+        writer = _CapturingWriter()
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            verdict = await asyncio.wait_for(
+                proxy._forward_chunked_request_body(reader, writer),
+                timeout=_UPLINK_TIMEOUT,
+            )
+        return verdict, writer, _strip_ts(self, buffer.getvalue().splitlines())
+
+    async def test_terminator_inside_request_chunk_data_is_not_an_end(self) -> None:
+        # THE test of this ticket (AC2), strict mirror of
+        # `test_chunked_terminator_inside_chunk_data_is_not_an_end` above. The
+        # literal lives inside chunk DATA — a prompt, a tool_result, a file the
+        # pilot read. On the pre-fix loop the payload stops at the first chunk
+        # and the upstream receives a truncated request.
+        poison = b'{"text":"0\r\n\r\n"}'
+        chunks = (
+            f"{len(poison):x}\r\n".encode("ascii") + poison + b"\r\n",
+            b"9\r\nafterward\r\n",
+            b"0\r\n\r\n",
+        )
+        verdict, writer, _ = await self._forward(_uplink_reader(*chunks))
+        self.assertEqual(verdict, proxy._UPLINK_END_FRAMED)
+        self.assertEqual(
+            writer.payload,
+            b"".join(chunks),
+            "the relay cut the request body at a substring inside chunk data",
+        )
+
+    async def test_request_body_stops_at_the_decoded_terminator(self) -> None:
+        # Non-regression of the ordinary case: the fix must not turn every
+        # pilot request into a wait for a client EOF that will not come.
+        chunks = (b"5\r\nhello\r\n", b"6\r\n world\r\n", b"0\r\n\r\n")
+        verdict, writer, _ = await self._forward(_uplink_reader(*chunks))
+        self.assertEqual(verdict, proxy._UPLINK_END_FRAMED)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    async def test_terminator_split_across_two_reads_is_still_an_end(self) -> None:
+        # The false negative of the old predicate: no single read contains the
+        # literal, so `in chunk` never fires and the loop waits out a client EOF
+        # that never arrives. A state machine does not care where reads split.
+        chunks = (b"4\r\nabcd\r\n0\r\n", b"\r\n")
+        verdict, writer, _ = await self._forward(_uplink_reader(*chunks))
+        self.assertEqual(verdict, proxy._UPLINK_END_FRAMED)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    async def test_unreadable_framing_forwards_everything_and_waits_for_eof(
+        self,
+    ) -> None:
+        # AC3. A non-hexadecimal size line is not an end of body, and it is not
+        # a licence to guess either: the decoder is disarmed and the loop keeps
+        # forwarding verbatim to client EOF — the behaviour this relay had
+        # before mika#2758. The single WARN is what fences the disarming; feeding
+        # a failed decoder again would log once per read.
+        chunks = (b"zz\r\ngarbage\r\n", b"more bytes\r\n", b"and more\r\n")
+        verdict, writer, lines = await self._forward(
+            _uplink_reader_at_eof(*chunks)
+        )
+        self.assertEqual(verdict, proxy._UPLINK_END_EOF)
+        self.assertEqual(writer.payload, b"".join(chunks))
+        warnings = [
+            line for line in lines
+            if "unreadable uplink chunked framing" in line
+        ]
+        self.assertEqual(
+            len(warnings), 1, f"expected exactly one WARN, got {lines!r}"
+        )
+
+    async def test_extensions_and_trailers_in_a_request_body(self) -> None:
+        chunks = (
+            b"5;name=value\r\nhello\r\n",
+            b"0\r\n",
+            b"x-checksum: abc\r\n",
+            b"\r\n",
+        )
+        verdict, writer, _ = await self._forward(_uplink_reader(*chunks))
+        self.assertEqual(verdict, proxy._UPLINK_END_FRAMED)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    async def test_client_eof_before_any_terminator_returns_eof(self) -> None:
+        # Anti-vacuity: the loop returns on EOF rather than raising, and every
+        # byte it did read reached the upstream.
+        chunks = (b"5\r\nhel",)
+        verdict, writer, _ = await self._forward(
+            _uplink_reader_at_eof(*chunks)
+        )
+        self.assertEqual(verdict, proxy._UPLINK_END_EOF)
+        self.assertEqual(writer.payload, b"".join(chunks))
+
+    def test_no_substring_predicate_remains_in_the_uplink_loop(self) -> None:
+        # AC1 at source level. Scoped to the one function in the repository
+        # that bounds an uplink chunked body — a file-wide scan would see the
+        # legitimate literals in these tests and in the orientation block, and
+        # would need the allowlist this scoping avoids.
+        self.assertTrue(
+            hasattr(proxy, "_forward_chunked_request_body"),
+            "the mika#2758 coroutine is gone or was renamed — the AC1 detector "
+            "is no longer watching anything",
+        )
+        source = inspect.getsource(proxy._forward_chunked_request_body)
+        for forbidden in ("0\\r\\n\\r\\n", " in chunk"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    source,
+                    f"AC1 (mika#2758): {forbidden!r} is a substring search, not "
+                    f"a framing predicate — a chunked body end is decoded",
+                )
 
 
 class SuiteWiringTests(unittest.TestCase):

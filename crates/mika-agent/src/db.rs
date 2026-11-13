@@ -32,7 +32,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 55;
+pub const CURRENT_SCHEMA_VERSION: i64 = 56;
 
 /// `(target_key, before_value, after_value, reasoning)` — return shape for
 /// [`Database::get_audit_event_rows_by_tool_name`] and its async wrapper.
@@ -40,6 +40,18 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 55;
 /// alias to satisfy `clippy::type_complexity`.
 #[doc(hidden)]
 pub type AuditEventRowTuple = (String, Option<String>, Option<String>, Option<String>);
+
+/// `(target_key, after_value, reasoning, created_at)` — forme rendue par
+/// [`Database::list_audit_events_for_tool_since`] et par son enveloppe async
+/// (mika#2922, vol 3).
+///
+/// Ce n'est **pas** [`AuditEventRowTuple`] avec une colonne de plus : celui-là
+/// est un helper de test `#[doc(hidden)]` sans borne basse, celui-ci est une
+/// lecture de production fenêtrée. `before_value` n'y est pas — le registre des
+/// verdicts de vol l'écrit toujours `NULL` — et `created_at` y est, parce que
+/// l'ordre des vols du plus récent au plus ancien est ce que le compte de
+/// concordance mesure.
+pub type AuditEventWindowRow = (String, Option<String>, Option<String>, String);
 
 /// One pending retention returned by [`Database::list_pending_audit_holds`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2063,6 +2075,67 @@ impl Database {
         Ok(row)
     }
 
+    /// La dernière **transition d'état** inscrite sur `target_key`, quel que soit
+    /// l'outil qui l'a écrite (mika#3044) — son `tool_name`, son `before_value`,
+    /// son `after_value` et son `created_at`.
+    ///
+    /// # Ce qui compte comme transition (D1)
+    ///
+    /// Une ligne qui porte un état **avant ET après** :
+    /// `before_value IS NOT NULL AND after_value IS NOT NULL`. Les lignes de
+    /// jugement (`manager_flight_verdict`, `mpc_flight_judgment` —
+    /// `flight_verdict_ledger.rs`) n'en portent qu'un et tombent du bon côté,
+    /// comme le bord `reaper_db_error` de `task_engine::engine` qui écrit un reap
+    /// **qui n'a pas eu lieu** avec `after_value = NULL`.
+    ///
+    /// # Pourquoi ce n'est pas [`Self::latest_audit_event_for_target`]
+    ///
+    /// Cette voisine filtre sur un `tool_name` donné, donc elle sait répondre
+    /// *« la dernière ligne de cet outil »* et jamais *« la dernière transition,
+    /// quel que soit l'outil »*. Ses cinq sœurs
+    /// ([`Self::count_recent_audit_events_for_target`],
+    /// [`Self::count_recent_audit_events_by_value`],
+    /// [`Self::count_audit_events_by_tool_name`],
+    /// [`Self::get_audit_event_rows_by_tool_name`],
+    /// [`Self::list_audit_events_for_tool_since`]) sont bornées à un outil elles
+    /// aussi. Or mika#3044 a besoin des deux moitiés d'une même question — *la
+    /// dernière transition est-elle le reap de groom, et aucune ne le suit-elle ?*
+    /// — et le `LIMIT 1` les rend propriétés de **la même ligne** : pas de fenêtre
+    /// entre les deux lectures.
+    ///
+    /// `before_value` et `after_value` sont rendus comme les `Option<String>` que
+    /// les colonnes sont, bien que le `WHERE` garantisse ici leur présence : la
+    /// projection reste celle de la table, et coercer un NULL en `""` est ce que
+    /// mika#2331 refuse.
+    ///
+    /// `id DESC` tranche l'égalité : `created_at` est à la seconde, donc deux
+    /// lignes écrites dans la même seconde sont sinon ordonnées arbitrairement.
+    ///
+    /// `target_key` n'est pas indexé ; la lecture chevauche
+    /// `idx_audit_agent_created(agent_id, created_at DESC)`, et elle a lieu une
+    /// fois par dispatch d'une parente terminale.
+    pub fn latest_state_transition_for_target(
+        &self,
+        agent_id: &str,
+        target_key: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestStateTransitionProjection>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT tool_name, before_value, after_value, created_at
+                 FROM audit_events
+                 WHERE agent_id = ?1 AND target_key = ?2
+                   AND before_value IS NOT NULL
+                   AND after_value IS NOT NULL
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![agent_id, target_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Read a `schema_meta` value, or `None` when the key was never stamped.
     pub fn get_schema_meta(&self, key: &str) -> Result<Option<String>> {
         let value = self
@@ -2165,6 +2238,69 @@ impl Database {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Toutes les lignes `audit_events` d'un `tool_name` écrites depuis `since`,
+    /// avec leur `created_at` (mika#2922, vol 3).
+    ///
+    /// # Pourquoi une quatrième lecture et non l'une des trois voisines
+    ///
+    /// Les trois accesseurs par `tool_name` de ce fichier
+    /// ([`Self::count_audit_events_by_tool_name`],
+    /// [`Self::get_audit_event_target_keys_by_tool_name`],
+    /// [`Self::get_audit_event_rows_by_tool_name`]) sont des helpers
+    /// `#[doc(hidden)]` de mika#1712 : **aucun ne porte de borne basse et aucun
+    /// ne projette `created_at`**. Élargir le troisième aurait fait d'un helper
+    /// de test documenté comme tel une lecture de production, sur ~25 sites
+    /// d'appel. [`Self::latest_audit_event_for_target`], elle, projette bien
+    /// `created_at` mais est clouée à **un** `target_key` : elle ne peut pas
+    /// énumérer une fenêtre. Celle-ci n'est donc pas `#[doc(hidden)]`.
+    ///
+    /// # Les deux choix de la requête
+    ///
+    /// `created_at > ?3`, borne **exclusive**, comme les trois autres lectures
+    /// fenêtrées de ce fichier ([`Self::count_recent_audit_events_for_target`],
+    /// [`Self::count_recent_audit_events_by_value`],
+    /// [`Self::latest_audit_event_for_target`]). Une quatrième fenêtre dont la
+    /// borne serait inclusive serait une seconde graphie pour une seule
+    /// grammaire, c'est-à-dire la divergence programmée de mika#2158 : elle ne
+    /// se verrait que sur la ligne écrite exactement à la seconde de la borne,
+    /// donc jamais en test et une fois en production. `since` doit être un
+    /// instant ISO 8601 UTC (`%Y-%m-%dT%H:%M:%SZ`) ; la comparaison de chaînes
+    /// est correcte parce que le format de la colonne est à largeur fixe.
+    ///
+    /// `ORDER BY id` et **non** `ORDER BY created_at` : la colonne est un TEXT
+    /// ISO 8601 à la seconde, donc deux lignes d'un même cycle peuvent être
+    /// à égalité, et `id` est le seul ordre total que la table offre. C'est la
+    /// même raison qui fait le `id DESC` de
+    /// [`Self::latest_audit_event_for_target`].
+    ///
+    /// `after_value` et `reasoning` remontent en `Option<String>`, ce que les
+    /// colonnes sont. Un NULL ramené à `""` serait indistinguable d'une ligne
+    /// qui en porte un vide — règle « `null` n'est jamais `0` » de mika#2331.
+    pub fn list_audit_events_for_tool_since(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        since: &str,
+    ) -> Result<Vec<AuditEventWindowRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT target_key, after_value, reasoning, created_at
+             FROM audit_events
+             WHERE agent_id = ?1 AND tool_name = ?2 AND created_at > ?3
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id, tool_name, since], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2512,8 +2648,15 @@ impl Database {
         Ok(rows)
     }
 
-    /// Les invocations de `build_mika` de cette session, dans une fenêtre
-    /// (mika#2565, branche B3).
+    /// Les invocations d'un outil nommé, dans cette session et dans une fenêtre
+    /// (mika#2565 branche B3 ; mika#2687 vol 2).
+    ///
+    /// **Le nom de la méthode est générique parce que la requête l'est.** Elle
+    /// s'est appelée `find_recent_build_invocation` tant qu'elle n'avait qu'un
+    /// appelant ; depuis que la preuve d'exécution pipeline (mika#2687) lit
+    /// `run_shell` par le même chemin, ce nom aurait menti à l'un de ses deux
+    /// sites. `tool_name` est déjà un paramètre : c'est la signature qui disait
+    /// vrai, pas le nom.
     ///
     /// Sœur de [`Self::find_recent_destructive_actions`] (mika#1646), et pour la
     /// même raison d'être : **un fait qu'on lit en base ne se rédige pas.** La
@@ -2531,15 +2674,16 @@ impl Database {
     /// **autre** PR il y a dix minutes ne vaut rien, et l'accepter rendrait la
     /// garde satisfaisable par le trafic de fond.
     ///
-    /// `tool_name` est passé par le paramètre plutôt qu'écrit ici : le nom
-    /// canonique est [`crate::qa_build_callback::BUILD_MIKA_TOOL`], et un
+    /// `tool_name` est passé par le paramètre plutôt qu'écrit ici : les noms
+    /// canoniques sont [`crate::qa_build_callback::BUILD_MIKA_TOOL`] et
+    /// [`crate::evidence::guards::PIPELINE_GROUNDING_SHELL_TOOL`], et un
     /// littéral recopié serait une seconde vérité.
     ///
     /// **L'échec de lecture n'est pas un `false`.** La méthode rend `Result`, et
     /// l'appelant distingue « aucun build » (refus) de « la base n'a pas
     /// répondu » (abstention) — sans quoi `MIKA_STORE_TOOL_CALLS` désarmé
     /// refuserait tout `pass` en silence.
-    pub fn find_recent_build_invocation(
+    pub fn find_recent_tool_invocation(
         &self,
         agent_id: &str,
         session_id: &str,
@@ -4861,12 +5005,19 @@ impl Database {
         }
     }
 
+    /// Indexe un embedding : la copie durable part dans `vec_search`, et
+    /// `search_content` n'en garde qu'un marqueur de dimension (mika#2658).
+    ///
+    /// La sérialisation JSON reste nécessaire — c'est la forme sous laquelle
+    /// vec0 accepte un vecteur en paramètre — mais elle est **transitoire** :
+    /// stockée dans `search_content`, elle coûtait ≈ 7,7 Ko par ligne pour
+    /// dupliquer les 2 Ko que vec0 tient déjà, et aucun lecteur ne la relisait.
     pub fn index_embedding(&self, content_id: i64, embedding: &[f32]) -> Result<()> {
         let emb_json = serde_json::to_string(embedding)?;
         self.conn.execute(
-            "UPDATE search_content SET embedding_json = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            "UPDATE search_content SET embedding_dims = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?2",
-            params![emb_json, content_id],
+            params![embedding.len() as i64, content_id],
         )?;
         // Upsert into vec0 table
         let _ = self.conn.execute(
@@ -4907,10 +5058,14 @@ impl Database {
     }
 
     /// Returns search content rows that have no embedding yet (for backfill).
+    ///
+    /// Le marqueur est `embedding_dims IS NULL` depuis mika#2658 ; le contrat
+    /// d'idempotence du backfill est inchangé — seul le nom de la colonne a
+    /// bougé.
     pub fn get_unembedded_content(&self, agent_id: &str) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, content FROM search_content
-             WHERE agent_id = ?1 AND embedding_json IS NULL",
+             WHERE agent_id = ?1 AND embedding_dims IS NULL",
         )?;
         let rows = stmt.query_map(params![agent_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5054,10 +5209,11 @@ impl Database {
         Ok((page_size * page_count) as u64)
     }
 
-    pub fn vacuum(&self) -> Result<()> {
-        self.conn.execute_batch("VACUUM;")?;
-        Ok(())
-    }
+    // `Database::vacuum` a été supprimée par mika#2735, et son absence est le
+    // livrable : une méthode sans appelant aurait été une entrée d'allowlist
+    // déguisée, que la garde structurelle de
+    // `db::migrations::tests::aucun_vacuum_au_demarrage` aurait dû exempter.
+    // Le compactage sous exclusivité explicite est le vol 2 du ticket.
 
     // ===== Dashboard Queries (unscoped, cross-agent) =====
 

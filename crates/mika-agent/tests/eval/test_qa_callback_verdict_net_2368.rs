@@ -291,6 +291,11 @@ async fn t10_the_signal_is_not_raised_while_the_guard_still_has_its_budget() {
                     "## DIFF ANALYSIS\n…\n\nVERDICT: pass"]}),
             ),
             text_response("VERDICT: pass"),
+            // La garde de l'inscription (mika#2948) reprend ensuite le tour,
+            // une seule fois : la tête jugée n'est pas inscrite. Elle demande
+            // une ligne de registre, jamais un second post — ce que
+            // l'assertion sur `calls.len()` ci-dessous continue de tenir.
+            text_response("VERDICT: pass"),
         ])
         .tools(tools)
         .skills(qa_registry())
@@ -323,6 +328,8 @@ async fn t10_a_turn_that_reviews_immediately_never_arms_the_net() {
                 json!({"command": ["pr", "review", "2368", "--comment", "--body",
                     "## DIFF ANALYSIS\n…\n\nVERDICT: pass"]}),
             ),
+            text_response("VERDICT: pass"),
+            // mika#2948 : le re-prompt de l'inscription, à un coup.
             text_response("VERDICT: pass"),
         ])
         .tools(tools)
@@ -359,6 +366,8 @@ async fn t7_the_dedup_registry_reaches_the_silent_turns_tool_context() {
                 json!({"command": ["pr", "review", "2368", "--comment", "--body",
                     "## DIFF ANALYSIS\n…\n\nVERDICT: pass"]}),
             ),
+            text_response("VERDICT: pass"),
+            // mika#2948 : le re-prompt de l'inscription, à un coup.
             text_response("VERDICT: pass"),
         ])
         .tools(tools)
@@ -399,6 +408,8 @@ async fn t7_without_a_registry_the_turn_sees_none() {
                 json!({"command": ["pr", "review", "2368", "--comment", "--body",
                     "VERDICT: pass"]}),
             ),
+            text_response("VERDICT: pass"),
+            // mika#2948 : le re-prompt de l'inscription, à un coup.
             text_response("VERDICT: pass"),
         ])
         .tools(tools)

@@ -235,7 +235,7 @@ pub struct RequiredToolArgSuffix {
 /// Three, not one: a single anchor is satisfiable by copying one line of the brief,
 /// while three quotes at non-overlapping positions of a multi-kilobyte brief are not a
 /// by-product of an acknowledgement. Measured in
-/// `agent_loop::tests::review_anchor_matrix`. See mika#2037 KTD2.
+/// `review_anchor_matrix`. See mika#2037 KTD2.
 fn default_review_anchor_min_count() -> usize {
     3
 }

@@ -102,6 +102,13 @@ pub enum Commands {
     /// no agent, no DB, no network
     #[command(name = "plan-callout")]
     PlanCallout(PlanCalloutArgs),
+    /// Read the disposition of an architect response (mika#2194) — pure predicate,
+    /// no agent, no DB, no network
+    #[command(name = "arch-disposition")]
+    ArchDisposition(ArchDispositionArgs),
+    /// Le registre des verdicts de vol — inscrire le jugement de MPC (mika#2922)
+    #[command(name = "flight-verdicts")]
+    FlightVerdicts(FlightVerdictsArgs),
 }
 
 impl Commands {
@@ -122,6 +129,7 @@ impl Commands {
             Commands::Model(args) => args.agent_flag.agent.as_deref(),
             Commands::Kg(args) => args.agent_override(),
             Commands::Logs(args) => args.agent_override(),
+            Commands::FlightVerdicts(args) => args.agent_flag.agent.as_deref(),
             // No agent override — listed explicitly so adding a new Commands variant
             // produces a compile error, forcing a conscious scoping decision.
             Commands::Setup { .. }
@@ -134,6 +142,7 @@ impl Commands {
             | Commands::Milestone(_)
             | Commands::Iterate(_)
             | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -166,6 +175,8 @@ impl Commands {
             | Commands::Milestone(_)
             | Commands::Iterate(_)
             | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_)
+            | Commands::FlightVerdicts(_)
             | Commands::CredentialHelper(_) => false,
         }
     }
@@ -198,6 +209,8 @@ impl Commands {
             | Commands::Milestone(_)
             | Commands::Iterate(_)
             | Commands::PlanCallout(_)
+            | Commands::ArchDisposition(_)
+            | Commands::FlightVerdicts(_)
             | Commands::CredentialHelper(_) => None,
         }
     }
@@ -223,6 +236,86 @@ pub struct PlanCalloutArgs {
     /// l'appartenance du plan et non le fichier à ouvrir.
     #[arg(long)]
     pub raw: bool,
+}
+
+/// `mika arch-disposition --pass <first|second> --response-file <path>` (mika#2194, vol 5).
+///
+/// **Aucune variante positionnelle, et c'est structurel** — même raison que
+/// [`PlanCalloutArgs`] : une réponse d'architecte porte des retours à la ligne,
+/// des backticks et des `$`, et la passer en argv ré-introduirait la classe de
+/// portée de guillemets dans le geste qui prétend la fermer. Le fichier est le
+/// seul canal.
+#[derive(clap::Args)]
+pub struct ArchDispositionArgs {
+    /// Quelle passe d'architecte a produit la réponse, donc quelles tables l'interrogent.
+    ///
+    /// `ArchPass` est l'énuméré du moteur, pris tel quel : un jumeau local serait
+    /// un second vocabulaire à tenir d'accord avec le premier, ce que ce ticket
+    /// existe pour retirer.
+    #[arg(long, value_name = "PASS")]
+    pub pass: mika_agent::arch_disposition::ArchPass,
+    /// Fichier contenant la réponse de l'architecte à lire.
+    #[arg(long, value_name = "PATH")]
+    pub response_file: std::path::PathBuf,
+}
+
+/// `mika flight-verdicts` — le chemin supporté vers le registre des verdicts
+/// de vol (mika#2922, vol 2/3).
+///
+/// Le ticket demande que le jugement de MPC s'inscrive « par un chemin
+/// supporté, jamais par du SQL à la main ». C'est ce chemin.
+#[derive(clap::Args)]
+pub struct FlightVerdictsArgs {
+    #[command(flatten)]
+    pub agent_flag: AgentFlag,
+
+    #[command(subcommand)]
+    pub command: FlightVerdictsCommand,
+}
+
+#[derive(Subcommand)]
+pub enum FlightVerdictsCommand {
+    /// Inscrire le jugement de MPC sur un vol, sous la même clé que le verdict
+    /// du manager.
+    ///
+    /// Un vol déjà jugé n'est pas rejugé : la commande rend le jugement en
+    /// place plutôt que de l'écraser. Les termes acceptés sont ceux que serde
+    /// écrit — ni la CLI ni ce fichier n'en tiennent la liste ; un terme hors
+    /// contrat est refusé en nommant les valeurs acceptées.
+    Judge {
+        /// Le vol : `tasks.id`, la même clé que la ligne du manager
+        #[arg(long = "task-id", value_name = "ID")]
+        task_id: String,
+        /// L'issue du vol (p. ex. `dead`, `pr_opened`, `rescue_pr`)
+        #[arg(long, value_name = "TERME")]
+        issue: String,
+        /// La cause de la mort — exigée avec `--issue dead`, refusée ailleurs
+        #[arg(long, value_name = "TERME")]
+        cause: Option<String>,
+        /// La recommandation (p. ex. `regroom`, `merge_candidate`)
+        #[arg(long, value_name = "TERME")]
+        recommendation: String,
+        /// Note libre de l'opérateur, inscrite telle quelle dans `reasoning`
+        #[arg(long, value_name = "TEXTE")]
+        note: Option<String>,
+    },
+    /// Le compte de concordance manager / MPC, en lecture seule (mika#2922,
+    /// vol 3).
+    ///
+    /// Rend, ligne par ligne du vol le plus récent au plus ancien : le vol, son
+    /// ticket, le verdict du manager, le jugement de MPC, et l'accord — avec le
+    /// champ divergent quand il y en a un. En tête : « N vols consécutifs
+    /// concordants », la mesure qu'attend le seuil de mika#2698, et la fenêtre
+    /// en jours.
+    ///
+    /// La commande **mesure** ; elle n'ouvre rien et ne corrige rien. Un
+    /// désaccord se relit avec `judge`, qui est le verbe d'écriture ; c'est
+    /// aussi pourquoi `--format` est ici et pas là-bas.
+    Concordance {
+        /// Forme de sortie
+        #[arg(long, value_enum, default_value = "text")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(clap::Args)]
@@ -967,6 +1060,12 @@ pub enum TaskCommand {
         id: String,
         #[arg(long, value_enum, default_value = "text")]
         format: OutputFormat,
+        /// Read the detail from mika-spirit over HTTP instead of the local DB
+        /// (mika#1727). The server reads by **exact** id, so no prefix is
+        /// resolved, and pilot liveness — a local measurement this door has no
+        /// answer for — is not probed.
+        #[arg(long)]
+        spirit: bool,
     },
     /// Cancel a task by ID (from `mika tasks`)
     Cancel {
@@ -1018,6 +1117,16 @@ pub enum TaskCommand {
         /// http://localhost:$MIKA_SPIRIT_PORT / http://localhost:8080).
         #[arg(long)]
         url: Option<String>,
+        /// Only print frames naming this agent.
+        ///
+        /// The stream is per **process**, not per agent, so this is a
+        /// client-side filter and never a server-side subscription. It drops
+        /// only what it has understood as foreign: an overflow marker, an
+        /// unknown event and an undecodable payload still print, since a
+        /// filtered consumer that hid them would hide the very notice that it
+        /// lost frames (mika#1727 vol V2b-2a).
+        #[arg(long)]
+        agent: Option<String>,
     },
 }
 
@@ -1553,5 +1662,151 @@ mod tests {
         let cli = parse_cli(&["mika", "-c"]);
         assert!(cli.continue_session);
         assert!(cli.command.is_none());
+    }
+
+    /// `mika flight-verdicts judge` porte les cinq termes jusqu'à l'adaptateur
+    /// (mika#2922, vol 2/3).
+    ///
+    /// Le nom de la sous-commande est tenu ici parce qu'il est le chemin
+    /// supporté que le ticket exige : un `flight_verdicts` rendu par défaut par
+    /// clap ne serait pas celui que la doc opérateur nomme.
+    #[test]
+    fn mika2922_judge_porte_les_cinq_termes() {
+        let cli = parse_cli(&[
+            "mika",
+            "flight-verdicts",
+            "judge",
+            "--task-id",
+            "task-aaa",
+            "--issue",
+            "dead",
+            "--cause",
+            "refusal",
+            "--recommendation",
+            "regroom",
+            "--note",
+            "vu avec Vincent",
+        ]);
+        match cli.command {
+            Some(Commands::FlightVerdicts(args)) => match args.command {
+                FlightVerdictsCommand::Judge {
+                    task_id,
+                    issue,
+                    cause,
+                    recommendation,
+                    note,
+                } => {
+                    assert_eq!(task_id, "task-aaa");
+                    assert_eq!(issue, "dead");
+                    assert_eq!(cause.as_deref(), Some("refusal"));
+                    assert_eq!(recommendation, "regroom");
+                    assert_eq!(note.as_deref(), Some("vu avec Vincent"));
+                }
+                // Nommée plutôt que balayée par un `_` : une quatrième variante
+                // doit faire échouer la compilation de ce test, pour que
+                // l'auteur de la variante vienne décider ce qu'elle analyse.
+                FlightVerdictsCommand::Concordance { .. } => {
+                    panic!("expected the judge verb")
+                }
+            },
+            _ => panic!("expected FlightVerdicts command"),
+        }
+    }
+
+    /// `mika flight-verdicts concordance` porte `--format`, et son défaut est le
+    /// rendu texte (mika#2922, vol 3/3).
+    ///
+    /// Les deux moitiés sont une seule décision. Le **défaut** est tenu parce
+    /// qu'il est la surface humaine du verbe : un défaut en JSON joli ferait de
+    /// la lecture d'opérateur un cas particulier à taper. Et la **présence** de
+    /// `--format` est tenue parce qu'elle est ce qui distingue ce verbe de
+    /// `judge`, qui écrit et n'en porte pas — l'asymétrie est délibérée, donc
+    /// elle est attestée plutôt que laissée à la lecture du code.
+    #[test]
+    fn mika2922_concordance_porte_le_format_et_son_defaut_est_le_texte() {
+        for (args, attendu) in [
+            (vec!["mika", "flight-verdicts", "concordance"], "text"),
+            (
+                vec!["mika", "flight-verdicts", "concordance", "--format", "json"],
+                "json",
+            ),
+            (
+                vec!["mika", "flight-verdicts", "concordance", "--format", "yaml"],
+                "yaml",
+            ),
+        ] {
+            let cli = parse_cli(&args);
+            match cli.command {
+                Some(Commands::FlightVerdicts(a)) => match a.command {
+                    FlightVerdictsCommand::Concordance { format } => {
+                        let rendu = match format {
+                            OutputFormat::Text => "text",
+                            OutputFormat::Json => "json",
+                            OutputFormat::Yaml => "yaml",
+                        };
+                        assert_eq!(rendu, attendu, "pour {args:?}");
+                    }
+                    FlightVerdictsCommand::Judge { .. } => {
+                        panic!("expected the concordance verb")
+                    }
+                },
+                _ => panic!("expected FlightVerdicts command"),
+            }
+        }
+    }
+
+    /// Un jugement partiel n'atteint pas la base, et `--cause` n'est **pas**
+    /// arbitrée par clap.
+    ///
+    /// Les deux moitiés sont une seule décision. `--task-id`, `--issue` et
+    /// `--recommendation` sont exigés par clap : sans l'un des trois il n'y a
+    /// pas de jugement à inscrire, et le refus doit tomber avant toute
+    /// ouverture de base. `--cause` reste un `Option` libre, **sans
+    /// `requires`** : « exigée avec `dead`, refusée ailleurs » est le contrat de
+    /// `parse_judgment_terms`, qui le tient depuis la forme serde. Le redire ici
+    /// en ferait une seconde table de graphies, divergente le jour où une
+    /// quatrième issue porte une cause (classe mika#2158) — et le refus de clap
+    /// ne nommerait pas les valeurs acceptées, ce que l'analyseur fait.
+    #[test]
+    fn mika2922_un_jugement_partiel_est_refuse_avant_la_base() {
+        for manquant in ["--task-id", "--issue", "--recommendation"] {
+            let complet = [
+                ("--task-id", "task-aaa"),
+                ("--issue", "pr_opened"),
+                ("--recommendation", "merge_candidate"),
+            ];
+            let mut argv = vec!["mika", "flight-verdicts", "judge"];
+            for (flag, valeur) in complet {
+                if flag == manquant {
+                    continue;
+                }
+                argv.push(flag);
+                argv.push(valeur);
+            }
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{manquant} doit être exigé : un jugement partiel ne s'inscrit pas"
+            );
+        }
+
+        // L'autre moitié : `--cause` nue passe clap, pour que ce soit
+        // l'analyseur qui tranche en nommant les valeurs acceptées.
+        assert!(
+            Cli::try_parse_from([
+                "mika",
+                "flight-verdicts",
+                "judge",
+                "--task-id",
+                "task-aaa",
+                "--issue",
+                "pr_opened",
+                "--cause",
+                "refusal",
+                "--recommendation",
+                "merge_candidate",
+            ])
+            .is_ok(),
+            "clap n'arbitre pas --cause : ce contrat est celui de parse_judgment_terms"
+        );
     }
 }

@@ -13,6 +13,43 @@ pub const MAX_CALLBACK_TOOL_STEPS: usize = 20;
 
 pub const MAX_TEAM_TOOL_STEPS: usize = 20;
 
+/// Le plafond de steps d'outil d'un tour de mika-qa (mika#2926).
+///
+/// **30 et non 20, et la chaîne de justification est une mesure, pas un
+/// arrondi.** Entre le 2026-10-23T13:45Z et le 2026-10-26T18:10Z, 13 tours de
+/// mika-qa ont été coupés au plafond (`max_steps_tool_census`, mika#2877), avec
+/// de 9 à 28 appels `run_shell` sur des totaux de 20 à 31 — `total_calls`
+/// maximum observé **31**. Le prompt `qa-review` prescrivait 14 steps et le
+/// modèle en consommait 20 sans conclure. Un plafond de 30 couvre 12 des 13
+/// tours mesurés ; le treizième (31 appels) reste coupé, et c'est accepté : le
+/// resserrement du prompt (R3) est la moitié qui s'attaque à la cause, pas au
+/// symptôme.
+///
+/// **Il ne s'applique qu'à mika-qa.** La résolution a un site unique,
+/// [`max_tool_steps_for_agent`] ; les trois constantes ci-dessus restent la
+/// source du `default` pour tous les autres agents, dans les trois modes.
+pub const MAX_TOOL_STEPS_MIKA_QA: usize = 30;
+
+/// Le plafond de steps d'outil d'un tour, résolu **par agent** (mika#2926).
+///
+/// Site unique de résolution, et c'est la propriété qui tient AC3 : un agent
+/// absent de la table reçoit `default`, c'est-à-dire exactement ce que le mode
+/// déclarait avant ce ticket ([`MAX_TOOL_STEPS`],
+/// [`MAX_CALLBACK_TOOL_STEPS`], [`MAX_TEAM_TOOL_STEPS`]). Ajouter un second site
+/// de résolution rendrait le plafond annoncé et le plafond servi divergents
+/// selon le chemin — précisément la dérive que R1b ferme en transportant la
+/// valeur résolue jusqu'au WARN de coupure.
+///
+/// `default` est pris en paramètre plutôt que recalculé ici : le mode est ce qui
+/// sait lequel des trois plafonds s'applique, et cette fonction n'a pas à le
+/// savoir une seconde fois.
+pub fn max_tool_steps_for_agent(agent_id: &str, default: usize) -> usize {
+    match agent_id {
+        "mika-qa" => MAX_TOOL_STEPS_MIKA_QA,
+        _ => default,
+    }
+}
+
 pub const TOOL_TIMEOUT_SECS: u64 = 30;
 
 /// Resolve the per-agent turn envelope, in seconds, from the provider that will
@@ -222,6 +259,55 @@ mod tests {
              `planning::policy::agent_total_timeout_secs(llm)` instead — see mika#2189 D1:\n{}",
             offenders.len(),
             offenders.join("\n")
+        );
+    }
+
+    /// mika#2926 — la table par agent rend le plafond de mika-qa, et rend
+    /// `default` à tous les autres.
+    ///
+    /// La seconde moitié est celle qui porte la charge : c'est AC3 écrit comme
+    /// une assertion. Un `match` dont le bras `_` renverrait la constante de
+    /// mika-qa relèverait le plafond de tous les agents en laissant la première
+    /// assertion verte.
+    #[test]
+    fn mika2926_le_plafond_par_agent_ne_touche_que_mika_qa() {
+        assert_eq!(
+            super::max_tool_steps_for_agent("mika-qa", super::MAX_TOOL_STEPS),
+            super::MAX_TOOL_STEPS_MIKA_QA,
+            "mika-qa doit recevoir son plafond mesuré"
+        );
+
+        // Les trois autres agents bien connus, dans les trois modes : chacun
+        // reçoit le `default` que son mode déclare, à l'octet.
+        for agent in ["mika-dev", "mika-arch", "mika", "mika-relay"] {
+            for default in [
+                super::MAX_TOOL_STEPS,
+                super::MAX_CALLBACK_TOOL_STEPS,
+                super::MAX_TEAM_TOOL_STEPS,
+            ] {
+                assert_eq!(
+                    super::max_tool_steps_for_agent(agent, default),
+                    default,
+                    "`{agent}` ne doit recevoir que le plafond de son mode — \
+                     le relèvement de mika#2926 est nommé pour mika-qa seul (AC3)"
+                );
+            }
+        }
+    }
+
+    /// mika#2926 — la casse du nom d'agent est significative, et c'est dit.
+    ///
+    /// `agent_id` vient de `Database::agent_id()`, lui-même issu du nom de
+    /// répertoire de l'agent : jamais d'une saisie libre. Le `match` est donc
+    /// exact, et cette assertion existe pour que la propriété soit **écrite**
+    /// plutôt que supposée — un futur éditeur qui voudrait la relâcher verra
+    /// d'abord ce qu'il change.
+    #[test]
+    fn mika2926_la_resolution_est_sensible_a_la_casse() {
+        assert_eq!(
+            super::max_tool_steps_for_agent("Mika-QA", super::MAX_TOOL_STEPS),
+            super::MAX_TOOL_STEPS,
+            "la table est exacte : seul `mika-qa` tel que le répertoire le nomme"
         );
     }
 }

@@ -652,6 +652,80 @@ pub(crate) mod tests {
         );
     }
 
+    // ── mika#2956 — l'implication qui porte le bassin du manager ──
+
+    /// L'implication que le bassin du manager dépend : `is_groomed(b)` ⟹ le gate du
+    /// dispatch accepte `b`.
+    fn implication_holds(body: &str) -> bool {
+        !crate::auto_pull::is_groomed(body)
+            || crate::skills::executor::check_grooming_markers(body).is_empty()
+    }
+
+    /// Les corps figés sur lesquels l'implication **ne tient pas**, s'il en existait.
+    ///
+    /// Livrée **vide**, et c'est une mesure, pas un vœu : `ac7_both_rust_predicates_agree_on_the_frozen_bodies`
+    /// est vert sur les six corps, donc l'implication y tient partout. Une entrée ici est
+    /// une dette nommée, jamais une exemption confortable — et l'assertion de péremption
+    /// ci-dessous la retire d'elle-même le jour où elle devient fausse.
+    const IMPLICATION_EXCEPTIONS: &[&str] = &[];
+
+    /// Le bassin du manager admet sur `is_groomed` (mika#2956). Cette implication
+    /// est ce qui rend « admis par le bassin ⇒ accepté par le gate du dispatch »
+    /// structurel et non constaté. Elle ne demande PAS l'égalité : le résidu
+    /// (`gate` ∖ `is_groomed` — orthographes non canoniques, callout dans un bloc
+    /// clôturé) est refusé par le bassin dans le sens sûr, et c'est voulu.
+    #[test]
+    fn mika2956_is_groomed_implique_le_gate_du_dispatch() {
+        for (ticket, body, _) in FIXTURES {
+            if IMPLICATION_EXCEPTIONS.contains(ticket) {
+                continue;
+            }
+            if crate::auto_pull::is_groomed(body) {
+                assert!(
+                    crate::skills::executor::check_grooming_markers(body).is_empty(),
+                    "fixture #{ticket}: is_groomed accepte un corps que le gate du \
+                     dispatch refuse — l'implication qui porte le bassin est rompue"
+                );
+            }
+        }
+
+        // Le geste qui rend une exception inutile est le geste qui la périme.
+        for t in IMPLICATION_EXCEPTIONS {
+            let (_, body, _) = FIXTURES
+                .iter()
+                .find(|(x, _, _)| x == t)
+                .expect("ticket inconnu");
+            assert!(
+                !implication_holds(body),
+                "exception stale pour {t} : l'implication y tient — retirez l'entrée"
+            );
+        }
+    }
+
+    /// Les deux prédicats nomment les mêmes trois signaux, avec les mêmes mots et
+    /// dans le même ordre. Sans ce croisement, un refus du bassin et un refus du
+    /// dispatch pourraient parler de la même absence en deux vocabulaires, et rien
+    /// ne le dirait (classe mika#2205 : deux populations sous deux noms ne se
+    /// rapprochent pas).
+    #[test]
+    fn mika2956_le_vocabulaire_des_signaux_est_commun_aux_deux_predicats() {
+        let gate = crate::skills::executor::check_grooming_markers("");
+        assert_eq!(
+            gate,
+            vec!["branch_callout", "plan_callout", "groomed_verdict"],
+            "le gate du dispatch rend ses trois jetons dans cet ordre"
+        );
+
+        let pool: Vec<&'static str> = crate::auto_pull::missing_grooming_signals("")
+            .iter()
+            .map(|s| s.token())
+            .collect();
+        assert_eq!(
+            pool, gate,
+            "le bassin doit nommer les mêmes signaux, dans le même ordre"
+        );
+    }
+
     // ── M1 — la garde structurelle contre la récidive (AC6) ──
 
     /// Échoue si une regex portant un marqueur de passe apparaît ailleurs que dans ce module.

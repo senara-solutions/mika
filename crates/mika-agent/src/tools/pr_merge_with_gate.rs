@@ -5,6 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use mika_common::ci_read::{CiReadToken, CiReadTokenSource};
 use mika_common::claude::ToolDefinition;
 use mika_common::forge_identity::{
     MergeClearance, MpcGateVerdict, mpc_gate_required, mpc_gate_verdict,
@@ -258,7 +259,19 @@ impl Tool for PrMergeWithGateTool {
         }
 
         // -- Step 2: Fetch EVERY check status of the head (mika#2617) --
-        let checks_result = run_gh_checks(pr_number, repo, token).await;
+        //
+        // mika#2963 — la lecture prend le jeton d'App quand le contexte en porte
+        // un, le PAT sinon. Le refus de l'étape ci-dessus (l. 170) n'a pas bougé :
+        // c'est lui qui porte AC3, et il refuse encore quand NI l'App NI le PAT
+        // n'ont donné de jeton. Une lecture au PAT dégrade vers exactement le
+        // régime d'avant ce ticket — `statusCheckRollup` échoue, l'erreur est
+        // classée `GhCliFailure`, le gate se ferme — jamais vers du vert.
+        let checks_result = run_gh_checks(
+            pr_number,
+            repo,
+            &ci_read_token_or_pat(ctx.ci_read_token, token),
+        )
+        .await;
         let checks = match checks_result {
             Ok(c) => c,
             Err(e) => {
@@ -1056,9 +1069,45 @@ pub(crate) async fn run_gh_pr_view(
 pub(crate) async fn run_gh_checks(
     pr_number: u64,
     repo: &str,
-    token: &str,
+    token: &CiReadToken,
 ) -> Result<Vec<GhCheck>, String> {
     parse_gh_checks(&run_gh_checks_raw(pr_number, repo, token).await?)
+}
+
+/// Le jeton de lecture CI de ce site, ou un repli bâti sur son PAT (mika#2963).
+///
+/// Rend le [`CiReadToken`] résolu par `Settings::resolve_ci_read_token` quand
+/// il existe, sinon un jeton de source [`CiReadTokenSource::Pat`] bâti sur le
+/// PAT de l'appelant.
+///
+/// # Pourquoi ce repli, et pourquoi il ne contredit pas AC3
+///
+/// Sans lui, un site de production dont le câblage serait oublié — ou un
+/// `ToolContext` de test — ferait refuser le gate sur une cause de
+/// configuration qui n'existe pas : une panne inventée par le câblage, pas par
+/// la forge. Avec lui, un tel site dégrade vers **exactement** le comportement
+/// d'avant mika#2963 : lecture au PAT, échec sur `statusCheckRollup`, gate
+/// fermé sur `GhCliFailure` — et le log de [`CiReadToken::report_read`] le dit
+/// honnêtement (`source = "pat"`) plutôt que de le taire.
+///
+/// Le fail-closed d'AC3 n'est pas porté par ce repli mais par le cas « ni App
+/// ni PAT », déjà refusé en tête de [`PrMergeWithGateTool::execute`].
+///
+/// # Site unique, et c'est structurel
+///
+/// C'est le seul endroit de `crates/mika-agent/src` où un `CiReadToken` de
+/// source `Pat` se construit hors module de tests, et
+/// `mika2963_la_source_pat_ne_se_construit_qu_au_site_du_repli` le refuse
+/// ailleurs : un site qui bâtirait le sien contournerait la résolution
+/// App-first, lirait au PAT, échouerait sur `statusCheckRollup` — et le log
+/// dirait `source = "pat"`, ce qui ressemble au repli nominal. Le défaut serait
+/// **invisible dans l'instrument même qui le mesure**. Seule la structure le
+/// décide.
+pub(crate) fn ci_read_token_or_pat(resolved: Option<&CiReadToken>, pat: &str) -> CiReadToken {
+    match resolved {
+        Some(t) => t.clone(),
+        None => CiReadToken::new(pat, CiReadTokenSource::Pat),
+    }
 }
 
 /// The single site that composes the `gh pr checks` argv (mika#2617).
@@ -1108,15 +1157,35 @@ pub(crate) fn gh_checks_args(pr_number: u64, repo: &str) -> Vec<String> {
 /// to the engine. Do not restore the flag believing you are repairing a
 /// regression — the divergence between two definitions of "green" is the defect,
 /// and this side is the one that fails closed.
+///
+/// # Le jeton, depuis mika#2963
+///
+/// Elle prend un [`CiReadToken`] et non une `&str` : `gh` résout ce `--json`
+/// par le champ GraphQL `statusCheckRollup`, qu'un PAT fine-grained ne peut pas
+/// lire — 77 échecs mesurés dans `server.log` du 2026-10-07 au 2026-10-29, dont
+/// 55 abstentions du garde mika#2455 sur `reason "gh_failed"`. Le jeton
+/// d'installation de l'App porte `checks=read` ; `Settings::resolve_ci_read_token`
+/// le cherche d'abord, le PAT reste le repli.
+///
+/// Elle est donc aussi, depuis ce ticket, le **seul site qui dit quel jeton a
+/// lu** ([`CiReadToken::report_read`], AC4) — les cinq consommateurs héritent de
+/// cette ligne sans un mot chez eux. Ce qui change est **par quel jeton** la
+/// lecture passe, jamais **ce qu'elle lit** : [`gh_checks_args`] n'est pas
+/// touché, ni le `--json`, ni l'absence de `--required`.
 pub(crate) async fn run_gh_checks_raw(
     pr_number: u64,
     repo: &str,
-    token: &str,
+    token: &CiReadToken,
 ) -> Result<String, String> {
     let args = gh_checks_args(pr_number, repo);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    run_gh_subprocess(&argv, token).await
+    // AC4 — émis AVANT l'appel : une lecture qui n'aboutit pas est tout de même
+    // une lecture tentée, et c'est le silence d'un lecteur qui ne tourne pas que
+    // la sonde doit pouvoir distinguer du silence d'un lecteur sain (mika#2205).
+    token.report_read(repo, pr_number);
+
+    run_gh_subprocess(&argv, token.token()).await
 }
 
 /// Prefix of the error [`parse_gh_checks`] returns when `gh` answered but its
@@ -2829,6 +2898,444 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
         assert_eq!(args[1], "checks");
         assert_eq!(args[2], "2614");
         assert!(args.iter().any(|a| a == "senara-solutions/mika"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2963 — T4 (AC4, la provenance se dit) et T5 (le détecteur)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le harnais de capture de `tracing`, dans la forme que
+    /// `compaction_handsoff.rs` a posée et que `qa_reviewed_head.rs` reprend :
+    /// seul moyen d'attester une ligne d'opérateur depuis le module qui l'émet.
+    fn abonne_capteur() -> (
+        impl tracing::Subscriber + Send + Sync,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let tampon = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plume = tampon.clone();
+        let couche = tracing_subscriber::fmt::layer()
+            .with_writer(move || PlumeDeCapture(plume.clone()))
+            .with_ansi(false)
+            .with_target(true);
+        (tracing_subscriber::registry().with(couche), tampon)
+    }
+
+    struct PlumeDeCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PlumeDeCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// **T4, moitié comportementale — AC4 : la provenance est dite, les deux
+    /// populations se distinguent, et le jeton ne fuit jamais.**
+    ///
+    /// Les deux sources dans le **même** test : ce qui est à attester n'est pas
+    /// qu'une ligne sort, c'est que `source` **varie** avec la provenance. Deux
+    /// tests séparés passeraient tous les deux sur un arbre où le champ est
+    /// écrit en dur.
+    ///
+    /// # Pourquoi la capture n'entoure pas `run_gh_checks_raw`
+    ///
+    /// Le plan la décrit « autour d'un `run_gh_checks_raw` à lecteur injecté ».
+    /// Cette fonction n'a pas de point d'injection : elle appelle
+    /// [`run_gh_subprocess`], qui `spawn` un vrai `gh` et part sur le réseau —
+    /// ce que la suite refuse (motif `DeadEndpoint`, mika#2569). La capture
+    /// porte donc sur l'émetteur réel, [`CiReadToken::report_read`], appelé tel
+    /// que la production l'appelle ; son **rattachement** au lecteur est tenu
+    /// par le test suivant, qui est la moitié que le plan visait vraiment : une
+    /// ligne correcte émise après le sous-processus ne dirait rien des lectures
+    /// qui échouent, et c'est précisément la population de 77 échecs que la
+    /// sonde AC5 doit voir.
+    #[test]
+    #[serial_test::serial]
+    fn mika2963_ac4_la_provenance_est_dite_et_ne_porte_jamais_le_jeton() {
+        const JETON_APP: &str = "ghs-app-mika2963-ne-doit-jamais-fuiter";
+        const JETON_PAT: &str = "ghp-pat-mika2963-ne-doit-jamais-fuiter";
+
+        let (abonne, tampon) = abonne_capteur();
+        {
+            let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(abonne);
+            CiReadToken::new(JETON_APP, CiReadTokenSource::App)
+                .report_read("senara-solutions/control-monitor", 217);
+            CiReadToken::new(JETON_PAT, CiReadTokenSource::Pat)
+                .report_read("senara-solutions/mika-cloud", 42);
+        }
+
+        let capture = String::from_utf8(tampon.lock().unwrap().clone()).expect("capture UTF-8");
+
+        for (source, repo, pr) in [
+            ("app", "senara-solutions/control-monitor", "217"),
+            ("pat", "senara-solutions/mika-cloud", "42"),
+        ] {
+            let ligne = capture
+                .lines()
+                .find(|l| {
+                    l.contains("ci_read_token_source") && l.contains(&format!("\"{source}\""))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "mika#2963 AC4 — aucune ligne `ci_read_token_source` de source \
+                         `{source}` dans la capture. Sans elle, « la lecture s'est faite \
+                         au PAT » et « le lecteur ne tourne pas » rendent les mêmes \
+                         octets (mika#2205).\n\ncapture :\n{capture}"
+                    )
+                });
+            assert!(
+                ligne.contains(repo),
+                "mika#2963 AC4 — la ligne de source `{source}` ne porte pas son dépôt : \
+                 la sonde AC5 compte **par dépôt**, et une ligne sans `repo` n'y est pas \
+                 soustractible. ligne = {ligne}"
+            );
+            assert!(
+                ligne.contains(pr),
+                "mika#2963 AC4 — la ligne de source `{source}` ne porte pas son PR : \
+                 sans lui, un échec ne se joint à aucune lecture. ligne = {ligne}"
+            );
+        }
+
+        for jeton in [JETON_APP, JETON_PAT] {
+            assert!(
+                !capture.contains(jeton),
+                "mika#2963 AC4 — le jeton `{jeton}` est apparu dans le log. Le `Debug` de \
+                 `CiReadToken` le rédige ; une ligne qui le réintroduirait annulerait cette \
+                 rédaction.\n\ncapture :\n{capture}"
+            );
+        }
+    }
+
+    /// **T4, moitié structurelle — l'émetteur est attaché au lecteur, et il
+    /// parle AVANT le sous-processus.**
+    ///
+    /// La seule moitié qui rougit sur l'arbre d'avant ce ticket, et la seule
+    /// qui couvre la classe qui compte. Une ligne émise **après**
+    /// `run_gh_subprocess` serait correcte sur chaque lecture qui aboutit et
+    /// muette sur chacune des 77 qui ont échoué entre le 2026-10-07 et le
+    /// 2026-10-29 — soit exactement la population que mika#2963 existe pour
+    /// rendre visible. Aucune assertion de comportement sur le chemin heureux
+    /// ne peut voir cette inversion.
+    #[test]
+    fn mika2963_ac4_le_lecteur_dit_son_jeton_avant_de_partir() {
+        let prod = merge_gate_production_half("tools/pr_merge_with_gate.rs");
+        let (_, corps) = crate::source_scan::fn_bodies(&prod)
+            .into_iter()
+            .find(|(nom, _)| nom == "run_gh_checks_raw")
+            .expect(
+                "mika#2963 — `run_gh_checks_raw` introuvable dans la moitié production : \
+                 le scan vise un nom mort et ne vérifie rien (mika#2103)",
+            );
+
+        let rang_report = corps.find("report_read(").unwrap_or_else(|| {
+            panic!(
+                "mika#2963 AC4 — `run_gh_checks_raw` n'appelle plus `report_read` : la \
+                 lecture CI ne dit plus quel jeton l'a faite, et c'est tout AC4. corps = \
+                 {corps}"
+            )
+        });
+        let rang_subprocess = corps.find("run_gh_subprocess(").unwrap_or_else(|| {
+            panic!(
+                "mika#2963 — `run_gh_checks_raw` n'appelle plus `run_gh_subprocess` : ce \
+                 scan a cessé de mesurer ce qu'il croit mesurer. corps = {corps}"
+            )
+        });
+
+        assert!(
+            rang_report < rang_subprocess,
+            "mika#2963 AC4 — `report_read` doit être émis AVANT `run_gh_subprocess`. \
+             Après, la ligne ne sort que pour les lectures qui aboutissent : les 77 \
+             échecs mesurés dans server.log resteraient muets, et le silence d'un lecteur \
+             en panne redeviendrait indistinguable du silence d'un lecteur sain \
+             (mika#2205)."
+        );
+    }
+
+    /// Les fonctions de production autorisées à construire un [`CiReadToken`]
+    /// de source `Pat` — **une seule**, le site du repli (mika#2963).
+    ///
+    /// Elle n'est pas une allowlist d'exceptions : c'est le recensement du
+    /// propriétaire attendu, et il est **non vide par construction**. Le
+    /// détecteur atterrit donc armé, sans aucune exception par donnée à
+    /// inscrire, et l'auto-nettoyage porte sur cette liste elle-même — un nom
+    /// qui ne correspond plus à aucune construction trouvée rougit au lieu de
+    /// dormir, ce qui empêche la liste de devenir l'allowlist que mika#2309
+    /// condamne.
+    ///
+    /// Quand le scan tire sur un second site : faire passer ce site par
+    /// [`ci_read_token_or_pat`], ou lui faire porter le jeton résolu. **Ne pas
+    /// l'ajouter ici** — « ce second site lit-il la même population ? » n'est
+    /// pas une question qu'une garde peut trancher à la place de l'humain
+    /// (doctrine mika#2201).
+    const SITES_AUTORISES: &[&str] = &["ci_read_token_or_pat"];
+
+    /// Les fonctions d'un contenu qui construisent un `CiReadToken`, et le
+    /// nombre **total** de constructions que ce contenu porte.
+    ///
+    /// Les deux, parce qu'ils ne se déduisent pas l'un de l'autre et que leur
+    /// écart est un trou de détection : [`crate::source_scan::fn_bodies`] borne
+    /// chaque corps au prochain `fn `, donc une construction posée **avant** la
+    /// première `fn` du fichier — l'initialiseur d'un `static`/`LazyLock`, par
+    /// exemple — n'est attribuée à personne et sortirait de la liste sans
+    /// sortir du compte. Le test exige l'égalité : un site non attribuable
+    /// rougit au lieu de disparaître.
+    ///
+    /// Les commentaires sont dépouillés par `fn_bodies` : une prose qui
+    /// *décrit* la construction interdite n'en est pas une, et le doc-comment
+    /// de [`ci_read_token_or_pat`] en porte trois paragraphes (motif mika#2050,
+    /// faux positif de prose du Signal S).
+    fn constructions_de_jeton_ci(contenu: &str, aiguille: &str) -> (Vec<String>, usize) {
+        let depouille = crate::source_scan::strip_comment_lines(contenu);
+        let total = depouille.matches(aiguille).count();
+        let mut fns = Vec::new();
+        for (nom, corps) in crate::source_scan::fn_bodies(contenu) {
+            for _ in 0..corps.matches(aiguille).count() {
+                fns.push(nom.clone());
+            }
+        }
+        (fns, total)
+    }
+
+    /// L'aiguille, composée à l'exécution.
+    ///
+    /// Sans ça, ce fichier se dénoncerait lui-même dès que son module de tests
+    /// cesserait d'être tronqué — une extraction sous `tools/pr_merge_with_gate/`
+    /// suffirait, et le scan rougirait sur sa propre fixture plutôt que sur un
+    /// vrai second site.
+    fn aiguille_construction_jeton_ci() -> String {
+        format!("CiReadToken::{}(", "new")
+    }
+
+    /// **T5 — une source `Pat` ne se construit qu'au site du repli (mika#2963,
+    /// Fire-Disposition).**
+    ///
+    /// # Pourquoi un scan de source et pas un test de comportement
+    ///
+    /// Un second site bâtissant son propre jeton ne rendrait **aucune décision
+    /// fausse le jour où il est écrit** : il lirait au PAT, échouerait sur
+    /// `statusCheckRollup`, le gate se fermerait sur `GhCliFailure`, et toutes
+    /// les assertions de ce fichier resteraient vertes. Ce qu'il casserait est
+    /// la **sonde AC5** : le log dirait `source = "pat"`, ce qui ressemble trait
+    /// pour trait au repli nominal. Le défaut serait invisible dans
+    /// l'instrument même qui le mesure. Seule la structure le décide.
+    ///
+    /// Le recensement au moment de l'écriture de ce ticket donne **une** seule
+    /// construction dans `crates/mika-agent/src` hors module de tests, et c'est
+    /// le repli. Les constructions sous `#[cfg(test)]` — T1, T4 et le contrôle
+    /// de bonne foi ci-dessous en bâtissent, et T2 *doit* bâtir un jeton de
+    /// source `Pat` — sont exclues par le chemin de lecture
+    /// ([`crate::source_scan::production_files`], qui écarte le code de test par
+    /// son chemin **et** par la troncature au `mod tests`), jamais par une
+    /// exception.
+    #[test]
+    fn mika2963_la_source_pat_ne_se_construit_qu_au_site_du_repli() {
+        let aiguille = aiguille_construction_jeton_ci();
+        let mut sites: Vec<String> = Vec::new();
+        let mut attribues = 0usize;
+        let mut total = 0usize;
+
+        for (rel, prod) in crate::source_scan::production_files() {
+            let (fns, n) = constructions_de_jeton_ci(&prod, &aiguille);
+            total += n;
+            attribues += fns.len();
+            for nom in fns {
+                sites.push(format!("{rel}::{nom}"));
+            }
+        }
+        sites.sort();
+
+        assert_eq!(
+            attribues,
+            total,
+            "mika#2963 — {} construction(s) de jeton de lecture CI ne sont attribuées à \
+             aucune fonction : elles vivent avant la première `fn` de leur fichier \
+             (initialiseur de `static`, de `LazyLock`…), donc hors de ce que ce scan sait \
+             nommer. Les déplacer dans une fonction, ou élargir le découpage — ne PAS les \
+             laisser sortir du compte en silence.\nSites nommés : {sites:#?}",
+            total - attribues
+        );
+
+        let inconnus: Vec<&String> = sites
+            .iter()
+            .filter(|s| {
+                let f = s.rsplit("::").next().unwrap_or_default();
+                !SITES_AUTORISES.contains(&f)
+            })
+            .collect();
+        assert!(
+            inconnus.is_empty(),
+            "mika#2963 — un site de production hors `ci_read_token_or_pat` construit son \
+             propre jeton de lecture CI : {inconnus:#?}\n\n\
+             Il contourne la résolution App-first de `Settings::resolve_ci_read_token`, \
+             lit donc au PAT, et échoue sur `statusCheckRollup` — tout en écrivant \
+             `source = \"pat\"` dans le log, exactement comme le repli nominal.\n\
+             RÉSOLUTION (halt-and-surface) : faire passer ce site par \
+             `ci_read_token_or_pat`, ou lui faire porter le jeton résolu. Ne PAS l'ajouter \
+             à SITES_AUTORISES."
+        );
+
+        // Anti-vacuité, et auto-nettoyage dans la même assertion : le
+        // propriétaire attendu doit ÊTRE trouvé. Zéro se lit exactement comme un
+        // scan propre (mika#2103 / mika#2205), et un nom devenu stale rougit ici
+        // plutôt que de dormir (mika#2309).
+        for autorise in SITES_AUTORISES {
+            assert!(
+                sites.iter().any(|s| s.ends_with(&format!("::{autorise}"))),
+                "mika#2963 — `{autorise}` est déclaré site autorisé mais ne construit plus \
+                 aucun jeton de lecture CI. Soit il a été renommé — et ce scan ne vérifie \
+                 plus rien — soit le repli a disparu, et avec lui la dégradation nommée \
+                 d'AC4. Sites trouvés : {sites:#?}"
+            );
+        }
+    }
+
+    /// Contrôle de bonne foi : le scan voit-il seulement un second site ?
+    ///
+    /// Sans lui, « le scan tient » est indistinguable de « le scan ne regarde
+    /// rien » — la classe que l'anti-vacuité couvre par le **nom** attendu et
+    /// que celui-ci couvre par la **forme** du prédicat. Quatre termes, et
+    /// chacun est un mode de panne réel du découpage par indentation :
+    ///
+    /// 1. **Le site légitime**, pour que l'attendu du scan de l'arbre soit
+    ///    exercé sur une fixture et pas seulement sur le vrai fichier.
+    /// 2. **Un second site**, à l'intérieur d'un `impl` — la forme qu'un
+    ///    consommateur prendrait en pratique.
+    /// 3. **La prose.** Un doc-comment et un commentaire de ligne qui citent la
+    ///    construction ne la font pas : les compter rendrait le scan rouge sur
+    ///    la documentation qu'il protège (mika#2050, mika#2329).
+    /// 4. **Le site non attribuable**, posé avant la première `fn` : il doit
+    ///    apparaître dans le **total** sans apparaître dans la liste, ce qui est
+    ///    exactement l'écart que le scan de l'arbre refuse.
+    #[test]
+    fn mika2963_le_scan_voit_un_second_site_et_compte_les_inattribuables() {
+        let aiguille = aiguille_construction_jeton_ci();
+        let fixture = r#"static REPLI: LazyLock<CiReadToken> =
+    LazyLock::new(|| CiReadToken::new("x", CiReadTokenSource::Pat));
+
+/// Prose citant `CiReadToken::new(` — ne doit PAS compter.
+// Ni ce commentaire portant CiReadToken::new(.
+pub(crate) fn ci_read_token_or_pat(
+    resolved: Option<&CiReadToken>,
+    pat: &str,
+) -> CiReadToken {
+    match resolved {
+        Some(t) => t.clone(),
+        None => CiReadToken::new(pat, CiReadTokenSource::Pat),
+    }
+}
+
+impl Consommateur {
+    fn lit_la_ci(&self) -> CiReadToken {
+        CiReadToken::new(&self.pat, CiReadTokenSource::Pat)
+    }
+}
+"#;
+        let (fns, total) = constructions_de_jeton_ci(fixture, &aiguille);
+
+        assert_eq!(
+            fns,
+            vec!["ci_read_token_or_pat".to_string(), "lit_la_ci".to_string()],
+            "le scan doit nommer le site légitime ET la méthode d'un `impl`, et IGNORER \
+             le doc-comment comme le commentaire de ligne. Un terme manquant le rend soit \
+             aveugle, soit rouge sur la prose qu'il protège."
+        );
+        assert_eq!(
+            total, 3,
+            "le total doit porter les trois constructions, y compris celle de \
+             l'initialiseur de `static` qu'aucune fonction n'englobe : c'est son écart \
+             avec la liste qui fait rougir un site inattribuable au lieu de le perdre."
+        );
+    }
+
+    /// **AC3, le terme qui compte — une liste vide est lue « tout vert », donc
+    /// un échec de lecture ne doit JAMAIS en produire une.**
+    ///
+    /// Ce test commence par établir le danger plutôt que de le supposer :
+    /// `decide_merge_gate(&[])` rend bien `AllChecksPassed`. C'est correct pour
+    /// une PR sans aucun check — mais cela veut dire que la fermeture du gate
+    /// sur un échec de lecture ne tient **pas** à la décision, elle tient
+    /// entièrement au `return` du bras `Err` juste avant. Ce `return` est donc
+    /// l'invariant, et c'est lui qu'on assertit.
+    ///
+    /// Pourquoi structurellement : l'étape 2 n'est atteignable qu'après un vrai
+    /// `gh pr view` en sous-processus (étape 1), donc aucun test de cette suite
+    /// ne peut faire échouer la lecture *en position*. Supprimer ce `return` —
+    /// par exemple en « dégradant gracieusement » vers `Vec::new()` — laisserait
+    /// chaque assertion de comportement de ce fichier verte, et ferait merger
+    /// toute PR dont la CI est illisible. C'est le défaut exact de mika#2963,
+    /// retourné contre le gate.
+    #[test]
+    fn mika2963_ac3_un_echec_de_lecture_natteint_jamais_la_decision() {
+        // Le danger, établi et non supposé.
+        assert_eq!(
+            decide_merge_gate(&[]),
+            MergeGateDecision::AllChecksPassed,
+            "mika#2963 AC3 — prémisse de ce test : une liste vide SE LIT « tout vert ». Si \
+             cette ligne change, relire l'assertion ci-dessous, qui n'a de sens que sous \
+             cette prémisse."
+        );
+
+        let prod = merge_gate_production_half("tools/pr_merge_with_gate.rs");
+        let (_, corps) = crate::source_scan::fn_bodies(&prod)
+            .into_iter()
+            .find(|(nom, _)| nom == "execute")
+            .expect("mika#2963 — `execute` introuvable : ce scan vise un nom mort (mika#2103)");
+
+        let rang_lecture = corps.find("run_gh_checks(").unwrap_or_else(|| {
+            panic!("mika#2963 — `execute` n'appelle plus `run_gh_checks` : ce scan ne mesure plus son objet")
+        });
+        let rang_decision = corps.find("decide_merge_gate(").unwrap_or_else(|| {
+            panic!("mika#2963 — `execute` n'appelle plus `decide_merge_gate` : idem")
+        });
+        let entre = &corps[rang_lecture..rang_decision];
+
+        assert!(
+            entre.contains("Err(e) =>") && entre.contains("return emit_gate_result("),
+            "mika#2963 AC3 — entre la lecture CI et la décision, le bras d'erreur doit \
+             RETOURNER. Sans ce `return`, un échec de lecture retombe sur la décision avec \
+             une liste vide, `decide_merge_gate` rend `AllChecksPassed` (assertion \
+             ci-dessus) et le gate merge une PR dont la CI est illisible — le défaut de \
+             mika#2963 retourné contre le gate.\n\nentre-deux :\n{entre}"
+        );
+        assert!(
+            !entre.contains("Vec::new()") && !entre.contains("unwrap_or_default()"),
+            "mika#2963 AC3 — un repli vers une liste de checks vide est apparu entre la \
+             lecture et la décision. C'est la forme littérale d'« un échec lu comme du \
+             vert ».\n\nentre-deux :\n{entre}"
+        );
+    }
+
+    /// AC3, second terme : un échec de lecture au PAT se classe `GhCliFailure`,
+    /// jamais en succès.
+    ///
+    /// `statusCheckRollup` est l'erreur mesurée 77 fois dans `server.log` entre
+    /// le 2026-10-07 et le 2026-10-29 — la population même que ce ticket ferme.
+    /// Quand le repli PAT est en vigueur et qu'elle revient, le gate doit la
+    /// porter comme une panne de lecture et non comme une absence de check.
+    #[test]
+    fn mika2963_ac3_lerreur_du_pat_se_classe_en_panne_de_lecture() {
+        const MESURE: &str = "GraphQL: Resource not accessible by personal access token \
+                              (node.statusCheckRollup)";
+
+        let result = classify_credential_scope_error(MESURE, "senara-solutions/mika-cloud")
+            .unwrap_or(MergeGateResult::GateError {
+                kind: GateErrorKind::GhCliFailure {
+                    exit_code: parse_exit_code_from_error(MESURE),
+                },
+                detail: format!("Failed to fetch check statuses: {MESURE}"),
+            });
+
+        assert!(
+            matches!(result, MergeGateResult::GateError { .. }),
+            "mika#2963 AC3 — l'erreur `statusCheckRollup` du repli PAT doit se classer en \
+             `GateError`. Tout autre classement rendrait la lecture échouée exploitable par \
+             la suite du gate. Obtenu : {result:?}"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -4922,6 +5429,7 @@ if c.label == crate::agent::DEFERRED_DISPATCH_LABEL {}
             gateway_url: None,
             internal_token: None,
             github_token: None,
+            ci_read_token: None,
             skills_dirty,
             is_reflection: false,
             is_task_context: false,

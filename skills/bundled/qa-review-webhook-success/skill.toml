@@ -12,3 +12,11 @@ keywords = [
     "ci success",
     "check_suite success",
 ]
+
+# mika#2934 — `qa_head_reviews` est l'outil de l'étape 3, et le SEUL qui dise sur
+# quelle tête une revue a statué (`commit_id`). Le déclarer requis n'est pas une
+# décoration : les étapes 3 et 4 jugeaient la tête sur `reviewDecision`, un état
+# de PR qui survit au force-push, et c'est ce qui a déclaré trois têtes conclues
+# avant tout verdict le 2026-10-27. `run_gh` est l'outil de l'étape 1.
+[constraints]
+required_tools = ["qa_head_reviews", "run_gh"]

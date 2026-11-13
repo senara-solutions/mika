@@ -63,6 +63,20 @@ succès. Lire le compte, jamais le code de sortie. Et dans un dépôt dont les
 tests sont inline, un filtre qui nomme un module sans son `tests::` ne matchera
 jamais rien.
 
+> **Depuis mika#3024, le piège a un étage de plus.** Le bloc de tests de la
+> boucle est réparti en quinze fichiers sous `agent_loop/tests/`, donc le chemin
+> réel est `agent_loop::tests::<tranche>::<nom>` — et
+> `agent_loop::tests::mika2342`, le filtre qui rendait `2 passed` ci-dessus, n'en
+> est **plus** une sous-chaîne. Le transcript reste ce qu'il a mesuré le
+> 2026-09-22 ; ce qu'il faut en retenir change de forme, pas de nature.
+>
+> **La forme à citer est le nom nu** — `mika2342_every_llm_call_is_wrapped_in_a_timeout`,
+> jamais son chemin. Un nom de test porte son numéro de ticket, donc il est
+> unique dans le dépôt, donc `cargo test -p mika-agent <nom>` le trouve. Et il
+> survit au prochain redécoupage, ce qu'aucun préfixe de module ne fait. Les
+> citations vivantes du dépôt ont été réécrites sous cette forme par mika#3024,
+> pour cette raison exacte.
+
 ## 2. Le scan structurel qui ne scanne qu'un fichier
 
 La garde d'AC7 devait établir qu'une primitive n'est appelée **qu'une fois**,

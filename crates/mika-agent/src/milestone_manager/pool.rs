@@ -1,0 +1,3272 @@
+//! Pool — le bassin `ready` : sa profondeur, sa bande, et qui devrait y entrer.
+//!
+//! **LECTURE SEULE**, et ce module le reste au vol 4. mika#2699 Phase 2 (a) :
+//! le manager *voit* le bassin et *dit* qui devrait y entrer, et pourquoi il
+//! refuse les autres. Il ne pose aucun label, ne rattache aucun milestone, ne
+//! déclare aucun interrupteur. `assess_pool` est une fonction pure sans E/S.
+//! Depuis le vol 4 le verdict a une seconde destination, et une seule :
+//! [`super::pool_writer`] — voir § *Ce que ce module ne fait pas* en bas.
+//!
+//! # Le bassin n'est pas une propriété du milestone cible
+//!
+//! Le webhook `ready` dispatche à l'échelle du **dépôt**, pas du milestone. Un
+//! bassin compté sur les seules `sub_issues` du milestone serait sous-compté, et
+//! la recommandation fausse exactement le jour où elle compte. Mesuré le
+//! 2026-10-15 : 2 issues `ready` ouvertes (mika#2699, mika#2687), **les deux**
+//! portant `dispatch:loop` — profondeur disponible 0, bande *famine*. Un bassin
+//! lu sur le seul milestone aurait affiché « 2, nominal ».
+//!
+//! # Deux ensembles de candidats, et pourquoi le rang de provenance ne vient pas
+//! en premier
+//!
+//! Le vol 2 ajoute les candidats **hors milestone cible**
+//! ([`CandidateOrigin::Outside`]), parce que le ticket demande un ordre à deux
+//! critères : « priorité (p0, puis p1, puis p2) ; dans le milestone cible, avant
+//! le reste ». L'ordre des deux critères dans cette phrase est la décision :
+//! **la priorité domine la provenance**. Un p0 hors milestone passe donc devant
+//! un p1 du milestone, et la provenance ne tranche qu'à priorité égale. Lire
+//! l'inverse — milestone d'abord, priorité ensuite — ferait tenir un p0 critique
+//! derrière un p2 de confort, ce que l'orchestrateur ne fait pas à la main.
+//!
+//! # Le second motif de refus mesure, et il refuse — là où le bash ne refuse pas
+//!
+//! Le vol 3 ajoute [`RefusalReason::EstimateOverFlightBound`] : un candidat dont
+//! le plan annonce plus de lignes que la borne par vol de **son** plafond de
+//! tours n'est pas recommandé. La taille vient du plan lu au ref de la branche
+//! du candidat, et le contrat de lecture est celui de [`super::plan_size`].
+//!
+//! Le gate 3 de `dispatch-lib.sh` fait le même calcul et **ne refuse rien**, ce
+//! qui n'est pas une incohérence mais la conséquence de l'endroit où chacun se
+//! tient. Le bash juge au **dispatch**, sur une file déjà groomée dont aucun
+//! plan ne repasse par une porte de groom : y refuser gèlerait d'un coup tout
+//! `docs/plans/`. Le manager juge à l'**admission**, en amont, sur un ticket qui
+//! n'est pas encore `ready` — le refus y est réversible d'un découpage de plan,
+//! et le ticket demande explicitement qu'il ait lieu (« n'est jamais
+//! recommandé. Le rapport dit pourquoi »).
+//!
+//! **Seul un total mesuré strictement au-dessus de la borne refuse.** Un plan
+//! sans section de taille, un total illisible, un plan non lu : aucun n'est une
+//! estimation « au-delà », donc aucun n'est ce refus-là. Ils ne sont pas non
+//! plus tus — [`PlanSizeReading`] les distingue et le rapport les nomme, parce
+//! qu'admettre en silence sous une taille jamais mesurée serait présenter une
+//! absence de mesure comme un `under_bound` (*un `null` n'est jamais un `0`*,
+//! mika#2331).
+//!
+//! # Le troisième motif : un ticket que l'opérateur tient n'est pas admissible
+//!
+//! mika#2923 ajoute [`RefusalReason::OperatorHeld`] : un candidat portant l'un
+//! des labels de [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`]
+//! (`blocked`, `operator-review`, `operator-gated`) est refusé, et le refus
+//! **nomme lequel** — le geste correctif est de retirer *ce* label-là.
+//!
+//! Mesuré le 2026-10-26 : le rapport du sink recommandait d'admettre #2698,
+//! #2699 et #1806, tous trois `operator-gated`. Le prédicat d'admission ne
+//! lisait aucun de ces labels, donc le jour où `MIKA_MANAGER_POOL_WRITE`
+//! s'ouvrirait, le poseur aurait posé `ready` sur un ticket que l'opérateur
+//! retient — exactement l'autorité que l'interrupteur devait borner.
+//!
+//! Les deux littéraux ne sont pas retapés ici : la liste est celle de
+//! mika#2263, déjà « la liste unique derrière deux surfaces » (le feeder
+//! d'`auto_pull` et la porte du `ready_label_handler`). Le bassin est la
+//! troisième surface qui pose la même question, et une quatrième orthographe de
+//! la liste serait la divergence que mika#2263 a déjà payée une fois.
+//!
+//! # Le quatrième motif : un vol déjà livré n'est pas admissible
+//!
+//! mika#2952 ajoute [`RefusalReason::PriorPlanOnly`] : un candidat dont le corps
+//! ne porte plus qu'une ligne `Plan antérieur :` — celle que la porte d'auto-pull
+//! (mika#2839) écrit à la place du callout quand le merge a supprimé la branche —
+//! est refusé, et son refus **ne passe pas par la relève à grommer** : aucun
+//! groom ne débloque un vol livré.
+//!
+//! Mesuré le 2026-10-28 (rapport du sink `…T17-06-59`) : le bassin recommandait
+//! d'admettre #2943, #2946, #2680 et #2854, dont les trois premiers n'avaient
+//! plus qu'une sonde ou une mesure à faire, PR mergées. La cause n'est pas
+//! l'absence d'une lecture de PR : c'est que le lecteur lâche
+//! [`super::reader::plan_callout_present`] voit la ligne antérieure comme un
+//! callout vivant. La levée a donc pris la forme d'une **séparation** — la
+//! lecture à trois états [`crate::plan_callout::PlanReading`], orthogonale au
+//! booléen que mika#2608 a ratifié — et non d'un resserrement.
+//!
+//! # Le cinquième motif : un ticket dormant n'est pas admissible
+//!
+//! Le quatrième candidat de cette mesure, #2854, n'a rien d'un vol livré de
+//! plus : il est **dormant**. Son corps porte une ligne `Condition de réveil`
+//! — règle « Dormeurs visibles », ratifiée par Vincent le 2026-09-01 — et le
+//! vol 2/2 de mika#2952 ajoute [`RefusalReason::Dormant`] pour le dire.
+//!
+//! Un **second axe**, et non un état de plus sur le précédent : #2854 porte les
+//! deux ensemble (ses trois vols sont mergés *et* il attend
+//! `MIKA_WEBHOOK_COMMENT_TRIAGE`), donc une lecture qui les empilerait rendrait
+//! le couple inexprimable — la classe mika#2205, deux populations sous un seul
+//! nom. [`PoolCandidate::dormancy`] se lit donc à côté de `plan_reading`, et le
+//! bras de dormance passe **devant** celui du vol livré : des deux motifs, un
+//! seul décrit ce que l'opérateur peut faire aujourd'hui.
+//!
+//! Le refus **cite** la condition sans jamais l'arbitrer. Les cinq conditions
+//! mesurées sur le dépôt nomment une variable d'environnement, une commande
+//! `gh issue list`, un `git rev-list`, une date : les évaluer demanderait un
+//! sous-processus, un appel réseau et une horloge dans une fonction que ce
+//! module tient **pure**. Le bassin dit donc ce que le corps dit, et l'opérateur
+//! juge.
+//!
+//! Et ce qu'il fait d'un marqueur **absent** — la seconde moitié de l'AC2 — est
+//! une valeur, pas un silence : [`DormancyReading::Awake`] est une mesure, le
+//! candidat continue sa route et reste admissible. `None`, lui, dit « ce binaire
+//! n'a pas lu le corps » (motif mika#2340) et n'autorise aucun refus.
+//!
+//! # Le sixième motif : le bassin admet sur le prédicat du dispatch
+//!
+//! mika#2956 ajoute [`RefusalReason::UngroomedForDispatch`], et il fait plus
+//! qu'ajouter un motif : il déplace la **décision**. Jusqu'ici le dernier
+//! filtre était `!plan_present`, donc le lecteur lâche
+//! [`super::reader::plan_callout_present`] (mika#2608) — toute ligne de citation
+//! contenant `docs/plans/`. Le gate du dispatch, lui, exige **trois** signaux :
+//! le callout de branche, le callout de plan et le marqueur GROOMED. Le bassin
+//! admettait donc un ticket que le dispatch refusait ensuite en
+//! `dispatch_no_grooming_marker` : un dispatch vide, la population même que
+//! mika#2952 a voulu fermer.
+//!
+//! Mesuré le 2026-10-29 (rapport du sink `…T10-11-41`) : #2194 était la **seule**
+//! admission du rapport, et le même rapport disait d'elle, deux sections plus
+//! bas, « callout de plan ou de branche absent ». Son corps cite un plan dans
+//! une ligne de prose citée, et n'a ni callout de branche ni verdict.
+//!
+//! L'admission se décide donc sur [`crate::auto_pull::missing_grooming_signals`],
+//! la face mesurée du prédicat **strict** que le feeder utilise déjà pour
+//! promouvoir. Les deux écrivains de `ready` partagent désormais un seul
+//! prédicat d'admission, et l'implication qui le rend sûr — `is_groomed(b)` ⟹ le
+//! gate accepte `b` — est épinglée dans `grooming_marker.rs`, sur les six corps
+//! figés.
+//!
+//! **Ce n'est pas un resserrement de `plan_callout_present`**, et le ticket
+//! l'interdisait : ce lecteur alimente aussi `tier2_pick` et le tier 3 du
+//! « Next », qui lisent [`SubIssue::plan_present`] et jamais le champ mesuré
+//! (AC3, fermée par non-modification). Le booléen garde une voix au bassin, mais
+//! une seule : il choisit entre deux **libellés** — « plan groomé absent » quand
+//! rien ne cite de plan, « grooming incomplet » quand un plan est cité sans ses
+//! deux autres signaux. Il nomme, il ne décide plus.
+//!
+//! Le refus **entre dans la relève à grommer**, seul des quatre motifs nommés
+//! après `NoGroomedPlan` à le faire : un groom débloque ce candidat, et c'est la
+//! seule chose qui le débloque.
+//!
+//! # Ce que ce module ne fait pas
+//!
+//! L'écriture. Le vol 4 l'a livrée, et délibérément **pas ici** : `assess_pool`
+//! doit rester pure pour que le verdict se teste sans exécutant, et le grep plat
+//! de `no_dispatch_test.rs` doit pouvoir nommer **un seul** fichier en
+//! exception. Le geste vit donc dans [`super::pool_writer`] —
+//! `MIKA_MANAGER_POOL_WRITE`, OFF par défaut, et les deux mutations en un seul
+//! `gh issue edit` : poser `ready` et rattacher au milestone cible, jamais un
+//! retrait. L'exception nommée à `no_dispatch_test.rs` est arrivée dans le même
+//! commit que ce geste, au fichier et au jeton près, jamais comme un
+//! relâchement du gabarit.
+//!
+//! Ce module reste pourtant le lieu de la **décision**, et c'est ce qui tient le
+//! poseur court : il n'écrit que ce que [`PoolVerdict::admit`] nomme. Les deux
+//! motifs de refus des vols 2 et 3 protègent donc le dépôt une fois
+//! l'interrupteur ouvert, sans qu'une ligne du poseur les reprenne.
+//!
+//! Reste au **vol 5** : la seconde moitié de l'AC3 — l'idempotence inter-cycle
+//! épinglée par un test de verdict rejoué, là où elle n'est aujourd'hui qu'une
+//! propriété du filtre de candidats ci-dessous — et le rapport nommant ce qui a
+//! été réellement posé. Suivi sur `senara-solutions/mika#2699`.
+
+use super::plan_size;
+use super::types::{IssueState, SubIssue};
+use crate::auto_pull::GroomingSignal;
+use crate::plan_callout::PlanReading;
+use crate::webhook_dispatch::{DISPATCH_SEAT_LABEL_PREFIX, READY_LABEL, operator_held_label};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+
+/// Le mot d'une ligne de condition de réveil, décorations retirées.
+///
+/// Recensé le 2026-10-29 sur les tickets du dépôt — treize corps ouverts et deux
+/// fermés le portent, en **sept** orthographes : `> - **Condition de réveil :**`
+/// (#2854), `> **Condition de réveil :**` (#2472, #2117),
+/// `**Condition de réveil : …**` (#2912, #2913, sans blockquote, le deux-points
+/// **dans** l'emphase), `## Condition de réveil (…)` (#2592, #2506 en `###`),
+/// `## Dormant : condition de réveil` (#2871),
+/// `> **Dormant, ouvert. Condition de réveil :**` (#1761, #1721) et
+/// `> - **Dormeur visible** … **condition de réveil datée et concrète :**`
+/// (#2262). D'où un test sur le mot seul, après normalisation des décorations :
+/// ni le deux-points ni l'emphase fermante n'en font partie.
+///
+/// Les quatre dernières orthographes sont celles que mika#2959 a ajoutées. Les
+/// trois premières étaient seules reconnues, et les sept corps qui emploient les
+/// autres entraient dans la relève à grommer sous le motif « plan groomé
+/// absent » — un motif faux, qui aurait fait groomer des dormants le jour de
+/// l'ouverture de `MIKA_MANAGER_GROOM_WRITE` (mika#2958).
+///
+/// La ligne **n'a pas d'écrivain** dans ce dépôt — des humains l'écrivent à la
+/// main — ce qui est la raison pour laquelle la grammaire vit ici et non dans
+/// [`crate::plan_callout`], où un écrivain et un lecteur se tiennent par un test
+/// d'aller-retour (mika#2952 § 2.b). C'est aussi pourquoi le lecteur s'élargit
+/// sur ce qu'il mesure, et jamais sur ce qu'il voudrait qu'on écrive.
+pub(crate) const DORMANCY_MARKER: &str = "Condition de réveil";
+
+/// Les mots qui **ouvrent** une déclaration de dormance quand
+/// [`DORMANCY_MARKER`] n'est pas en tête de ligne, décorations retirées.
+///
+/// Mesurés : `Dormant` ouvre #2871 (`## Dormant : condition de réveil`), #1761
+/// et #1721 (`> **Dormant, ouvert. Condition de réveil :** …`) ; `Dormeur` ouvre
+/// #2262 (`> - **Dormeur visible** … **condition de réveil …**`). Comparés en
+/// **préfixe**, donc les flexions suivent (`Dormante`, `Dormants`) sans entrée
+/// supplémentaire.
+///
+/// **Ce n'est pas l'allowlist que mika#2309 condamne.** Une allowlist y est une
+/// liste de *valeurs tolérées* qui dispense de poser le prédicat ; ici la liste
+/// **est** le prédicat — la grammaire dit « une déclaration de dormance ouvre en
+/// nommant la dormance », et ces deux racines sont la forme française de ce
+/// nom. Elle ne contient aucun ticket, aucune condition, aucun corps : rien
+/// qu'un ticket neuf ferait expirer. Ce qui la ferait grandir, c'est une
+/// troisième racine mesurée, pas un dormant de plus.
+pub(crate) const DORMANCY_OPENERS: &[&str] = &["dormant", "dormeur"];
+
+/// Budget de citation de la condition, en **caractères**.
+///
+/// Un budget, pas une borne, exactement comme `PRIOR_PLAN_LINE_BUDGET` du vol
+/// 1 : la condition de #2609 fait plusieurs centaines de caractères et un
+/// rapport de sink n'a pas à en porter le corps entier. Au-delà, la citation
+/// est coupée **sur frontière de caractère** (jamais un `&s[..n]` d'octets —
+/// garde `byte-slice-lint` de mika#764) et porte un `…` qui dit à l'opérateur
+/// d'ouvrir le ticket.
+pub(crate) const DORMANCY_CONDITION_BUDGET: usize = 200;
+
+/// Ce que le corps d'une issue dit de sa **dormance** (mika#2952, vol 2/2).
+///
+/// Axe orthogonal à [`crate::plan_callout::PlanReading`], et non un variant de
+/// plus : un ticket peut porter les deux ensemble — #2854 le fait — et deux
+/// populations sous un seul nom ne sont pas soustrayables (classe mika#2205).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DormancyReading {
+    /// Le corps porte une ligne [`DORMANCY_MARKER`] : le travail est dû, sa
+    /// condition d'exécution ne l'est pas.
+    ///
+    /// `condition` est la condition **citée**, jamais interprétée : le contrat
+    /// du registre des dormeurs veut un lecteur capable de dire *sans contexte*
+    /// si elle est remplie, et ce lecteur est un humain ou une commande — les
+    /// conditions mesurées contiennent `git rev-list`, `gh issue list`, une date
+    /// et une variable d'environnement. Les arbitrer demanderait un
+    /// sous-processus, un appel réseau et une horloge dans une fonction pure.
+    Dormant { condition: String },
+    /// Le corps a été lu et ne porte pas le marqueur.
+    ///
+    /// **Preuve positive seule** : `Awake` ne dit pas « le travail est à
+    /// faire », il dit « rien ici ne dit qu'il dort » — et le candidat continue
+    /// vers les portes suivantes.
+    Awake,
+}
+
+/// Où [`DORMANCY_MARKER`] commence dans `texte`, en **caractères**.
+///
+/// `Some(0)` quand le marqueur ouvre le texte, `Some(n)` quand il est ailleurs,
+/// `None` quand il est absent. La comparaison est caractère par caractère, casse
+/// ASCII ignorée : aucun octet n'est découpé, donc aucune frontière de caractère
+/// à risquer (garde `byte-slice-lint`, mika#764). L'index rendu est un index de
+/// **caractère**, consommable par `chars().skip(…)` et par rien d'autre — le
+/// passer à `&texte[n..]` couperait un `é` en deux.
+///
+/// Fonction plutôt que code inline parce que [`dormancy_reading`] en a besoin
+/// deux fois : pour savoir *si* le marqueur est là, et pour savoir *où* la
+/// citation commence.
+fn marker_char_position(texte: &str) -> Option<usize> {
+    let marqueur: Vec<char> = DORMANCY_MARKER.chars().collect();
+    let lu: Vec<char> = texte.chars().collect();
+    (0..=lu.len().checked_sub(marqueur.len())?).find(|&depart| {
+        marqueur
+            .iter()
+            .zip(&lu[depart..])
+            .all(|(attendu, c)| attendu.eq_ignore_ascii_case(c))
+    })
+}
+
+/// La dormance d'un corps d'issue — lecteur unique de [`DORMANCY_MARKER`].
+///
+/// La normalisation des décorations de tête est **inline** : un seul appelant,
+/// aucun second site à tenir en cohérence. Elle retire de façon répétée les
+/// espaces, `>`, `-`, `*`, `_` et `#`, ce qui couvre les sept orthographes
+/// mesurées sans allowlist de littéraux. Un `starts_with` sur
+/// `"**Condition de réveil :**"` en raterait celle de #2912, dont le deux-points
+/// est à l'intérieur de l'emphase.
+///
+/// # La grammaire : deux portes, et un rang
+///
+/// Une ligne **déclare** une dormance si, décorations retirées, l'une des deux
+/// portes s'ouvre :
+///
+/// 1. le marqueur est en **tête** (`Condition de réveil :** quand …`, #2854) ;
+/// 2. la ligne ouvre sur un [`DORMANCY_OPENERS`] **et** porte le marqueur
+///    ailleurs (`Dormant, ouvert. Condition de réveil :** …`, #1761).
+///
+/// Le marqueur en milieu de ligne n'est **jamais** accepté seul, et c'est
+/// l'arbitrage central de mika#2959 : ce ticket-là décrit la dormance d'autrui
+/// en prose et en table, et un lecteur qui prendrait le marqueur n'importe où
+/// retirerait du bassin, sous le motif « dormant », le ticket actionnable qui
+/// corrige ce lecteur. L'ouvreur est ce qui sépare une déclaration d'une
+/// mention — mesuré, pas supposé : #2871 l.3 (`> **Redémarrage : …** … C'est la
+/// condition de réveil.`) et #2506 l.5 (`… **DORMANT** — voir Condition de
+/// réveil en bas.`) sont deux mentions qu'il refuse.
+///
+/// Un **titre** de section (`#`) n'est pas exclu — #2592 et #2871 déclarent leur
+/// dormance en titre, #2506 n'a que ça — mais il cède : un titre ne rend sa
+/// condition que si aucune ligne non-titre n'en déclare une. Sur #2592 le titre
+/// l.60 (`## Condition de réveil (orchestrateur, 2026-10-17)`) précède la
+/// déclaration l.62, et c'est la seconde que l'opérateur doit lire dans le
+/// rapport du sink. D'où deux rangs : rang 0 pour une déclaration hors titre,
+/// qui sort immédiatement ; rang 1 pour tout le reste, retenu et rendu en
+/// dernier recours.
+pub(crate) fn dormancy_reading(body: &str) -> DormancyReading {
+    let mut rang_1: Option<String> = None;
+    for ligne in body.lines() {
+        // Mesuré **avant** la normalisation, qui retire précisément le `#`.
+        let est_un_titre = ligne.trim_start().starts_with('#');
+        let texte = ligne.trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '>' | '-' | '*' | '_' | '#')
+        });
+        let Some(position) = marker_char_position(texte) else {
+            continue;
+        };
+        let porte_1 = position == 0;
+        let porte_2 = DORMANCY_OPENERS.iter().any(|ouvreur| {
+            texte.chars().count() >= ouvreur.chars().count()
+                && ouvreur
+                    .chars()
+                    .zip(texte.chars())
+                    .all(|(attendu, lu)| attendu.eq_ignore_ascii_case(&lu))
+        });
+        if !porte_1 && !porte_2 {
+            continue;
+        }
+        // La citation commence **au marqueur** : sur #2262 elle laisse dehors
+        // `Dormeur visible** (règle ratifiée 2026-09-01) —`, qui n'est pas la
+        // condition. Index en caractères, jamais en octets (mika#764).
+        let citee: String = texte.chars().skip(position).collect();
+        let citee = citee.trim_end();
+        let condition = if citee.chars().count() > DORMANCY_CONDITION_BUDGET {
+            let mut coupee: String = citee.chars().take(DORMANCY_CONDITION_BUDGET).collect();
+            coupee.push('…');
+            coupee
+        } else {
+            citee.to_string()
+        };
+        if porte_1 && !est_un_titre {
+            return DormancyReading::Dormant { condition };
+        }
+        // Rang 1, premier gagnant : un titre ou une porte 2 attend qu'aucune
+        // déclaration de rang 0 ne se présente plus loin dans le corps.
+        if rang_1.is_none() {
+            rang_1 = Some(condition);
+        }
+    }
+    match rang_1 {
+        Some(condition) => DormancyReading::Dormant { condition },
+        None => DormancyReading::Awake,
+    }
+}
+
+/// Ce qu'il faut savoir d'un ticket pour décider s'il entre au bassin — et rien
+/// de plus.
+///
+/// Pourquoi pas [`SubIssue`] : cette structure porte douze champs, dont la PR,
+/// l'état CI et la présence de branche. La lecture dépôt-large des candidats
+/// hors milestone (`gh issue list`) **n'en mesure aucun**, et les remplir à leur
+/// valeur neutre ferait dire « pas de CI » à une absence de mesure — le motif
+/// mika#2331 que ce dépôt refuse ailleurs (« un null n'est jamais un 0 »). Les
+/// sept champs ci-dessous sont exactement ceux que `assess_pool` consulte, donc
+/// les deux ensembles de candidats partagent un type sans qu'aucun ait à
+/// inventer de valeur.
+///
+/// Les trois lectures du **corps** — `plan_reading` et `dormancy` (mika#2952),
+/// `missing_grooming_signals` (mika#2956) — ne sont pas une entorse à cette
+/// borne : les deux lectures d'issues demandent déjà le corps (`--json body`),
+/// donc les deux origines les paient à l'identique et aucune n'a de valeur à
+/// inventer. C'est exactement ce qui les distingue de `pr_state`, `ci_state` et
+/// `branch_present`, qui sont mesurés sur un seul chemin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolCandidate {
+    pub number: u64,
+    pub state: IssueState,
+    pub priority_rank: Option<u8>,
+    pub plan_present: bool,
+    /// Ce que le corps dit de son plan, en trois états (mika#2952).
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison de `SubIssue::merged_prs` :
+    /// le puits hors-ligne tient des blobs écrits avant ce champ, et `None` y
+    /// dit « ce binaire n'a pas lu le corps », jamais « aucun plan »
+    /// (mika#2340). C'est pourquoi `None` ne déclenche aucun refus ici.
+    #[serde(default)]
+    pub plan_reading: Option<PlanReading>,
+    /// Ce que le corps dit de sa dormance (mika#2952, vol 2/2).
+    ///
+    /// Orthogonal à `plan_reading` et non un état de plus sur lui : #2854 porte
+    /// les deux ensemble, et deux populations sous un seul nom ne sont pas
+    /// soustrayables (mika#2205). Les deux arbitrages se lisent donc
+    /// indépendamment, dans l'ordre que fixe `well_formed_candidates`.
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison du champ précédent : `None`
+    /// dit « ce binaire n'a pas lu le corps », jamais « éveillé » (mika#2340), et
+    /// ne déclenche donc aucun refus ici — c'est la réponse de ce vol à la
+    /// question de l'AC2, « que fait le bassin d'un ticket dont le marqueur est
+    /// absent ». Un marqueur absent rend [`DormancyReading::Awake`], une valeur
+    /// mesurée ; `None` est l'autre chose, l'absence de mesure.
+    #[serde(default)]
+    pub dormancy: Option<DormancyReading>,
+    /// Lesquels des trois signaux de grooming manquent au corps (mika#2956).
+    ///
+    /// Troisième lecture du **corps**, donc dans la même borne que les deux
+    /// précédentes : les deux lectures d'issues demandent déjà `--json body`, et
+    /// aucune n'a de valeur à inventer.
+    ///
+    /// `#[serde(default)]` et `Option` pour la raison des deux champs précédents :
+    /// `None` dit « ce binaire n'a pas lu le corps », jamais « rien ne manque »
+    /// (mika#2340), et ne déclenche donc aucun refus ici — un blob écrit avant ce
+    /// vol retombe sur le plancher `plan_present`, celui d'avant. `Some(vec![])`
+    /// est la mesure « les trois signaux sont là ».
+    #[serde(default)]
+    pub missing_grooming_signals: Option<Vec<GroomingSignal>>,
+    pub labels: Vec<String>,
+}
+
+impl From<&SubIssue> for PoolCandidate {
+    /// Une `sub_issue` du milestone cible vue comme candidat au bassin. La
+    /// projection est sans perte pour ce que `assess_pool` décide : elle laisse
+    /// tomber les champs qu'aucune règle d'admission ne lit.
+    fn from(s: &SubIssue) -> Self {
+        PoolCandidate {
+            number: s.number,
+            state: s.state.clone(),
+            priority_rank: s.priority_rank,
+            plan_present: s.plan_present,
+            plan_reading: s.plan_reading,
+            dormancy: s.dormancy.clone(),
+            missing_grooming_signals: s.missing_grooming_signals.clone(),
+            labels: s.labels.clone(),
+        }
+    }
+}
+
+/// Plancher du bassin : sous cette profondeur **disponible**, le rail risque de
+/// se vider et le manager recommande une admission.
+pub const POOL_MIN: usize = 2;
+
+/// Plafond du bassin : la cible à atteindre quand on admet. Au-delà, saturé.
+pub const POOL_MAX: usize = 4;
+
+/// Un ticket `ready` ouvert quelque part dans le dépôt, vu depuis la forge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyTicket {
+    pub number: u64,
+    pub labels: Vec<String>,
+}
+
+impl ReadyTicket {
+    /// Ce ticket porte-t-il un siège de dispatch — autrement dit, un vol est-il
+    /// en cours dessus ?
+    ///
+    /// Le prédicat est sur la **famille** `dispatch:`, jamais sur
+    /// `KNOWN_DISPATCH_SEATS` : un siège neuf ne doit pas rendre le bassin
+    /// optimiste le jour de son introduction. Insensible à la casse pour la même
+    /// raison — `Dispatch:SSC` réclame le même siège que `dispatch:ssc`
+    /// (`webhook_dispatch::classify_dispatch_seat` le lit ainsi), et un vol lu
+    /// comme du rail disponible est une admission de trop.
+    pub fn holds_dispatch_seat(&self) -> bool {
+        labels_hold_dispatch_seat(&self.labels)
+    }
+}
+
+/// D'où vient un candidat — le second critère de tri du point 1 du ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateOrigin {
+    /// Une `sub_issue` du milestone cible.
+    Milestone,
+    /// Une issue ouverte du dépôt qui n'appartient pas au milestone cible.
+    Outside,
+}
+
+impl CandidateOrigin {
+    /// Rang de provenance dans la clé de tri — `Milestone` avant `Outside`, et
+    /// **après** la priorité (voir le docstring du module).
+    fn rank(self) -> u8 {
+        match self {
+            CandidateOrigin::Milestone => 0,
+            CandidateOrigin::Outside => 1,
+        }
+    }
+}
+
+/// Profondeur du bassin à l'instant du cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolDepth {
+    /// Tickets portant `ready`, ouverts, à l'échelle du dépôt.
+    pub ready_total: usize,
+    /// … dont un siège `dispatch:<seat>` est posé.
+    pub in_flight: usize,
+    /// `ready_total − in_flight` — le seul chiffre qui décide la bande.
+    pub available: usize,
+}
+
+/// Où se situe la profondeur **disponible** vis-à-vis de [`POOL_MIN`]/[`POOL_MAX`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolBand {
+    /// Sous le plancher : le rail risque de se vider.
+    Starved,
+    /// Entre le plancher et le plafond, bornes incluses — rien à dire.
+    Nominal,
+    /// Au-dessus du plafond.
+    Saturated,
+}
+
+/// Nombre maximal de plans lus à la forge par cycle (mika#2699 vol 3).
+///
+/// Chaque lecture est un appel `gh api` de plus, et la liste des candidats
+/// recevables peut compter quelques dizaines de tickets sur ce dépôt : sans
+/// borne, le coût du cycle suivrait la taille du dépôt plutôt que celle de la
+/// décision. La borne porte sur les candidats **dans l'ordre du bassin**, donc
+/// elle mesure d'abord ceux qui peuvent entrer.
+///
+/// `3 × POOL_MAX`, et pas `POOL_MAX` : une admission refusée pour dépassement
+/// laisse la place à la suivante, donc mesurer quatre candidats pour quatre
+/// places rendrait un bassin plus creux que nécessaire le jour où deux d'entre
+/// eux dépassent. Au-delà, la taille est *non mesurée* et le rapport le dit —
+/// jamais « sous la borne » par défaut.
+pub const PLAN_SIZE_READ_MAX: usize = 3 * POOL_MAX;
+
+/// Ce que le manager sait de la taille estimée d'un candidat.
+///
+/// Les trois premières variantes sont les trois jetons de
+/// [`plan_size::PlanSizeTotal`] ; la quatrième est la cause que le bash n'a pas,
+/// parce que là-bas le plan est un fichier local déjà validé et qu'ici c'est une
+/// lecture distante. Les replier sur `absent` ferait lire « ce plan n'est pas
+/// dimensionné » là où le fait est « nous n'avons pas réussi à le lire » — deux
+/// remèdes opposés sous un seul mot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanSizeReading {
+    /// Le total annoncé par la section `## Taille estimée` du plan.
+    Measured(u64),
+    /// Le plan a été lu ; il ne porte pas de section de taille.
+    SectionAbsent,
+    /// La section est là, sa ligne `Total estimé :` non.
+    Unparsable,
+    /// Le plan n'a pas été lu — et la cause est dite.
+    Unread(UnreadCause),
+}
+
+/// Pourquoi le plan d'un candidat n'a pas été lu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnreadCause {
+    /// Le corps ne porte pas, sous leur forme stricte, le callout `Plan:` et le
+    /// callout `Branch:` qu'il faut pour savoir *quel fichier* lire *où*.
+    ///
+    /// Distinct de [`RefusalReason::NoGroomedPlan`], et pas par excès de
+    /// prudence : `plan_present` vient d'un lecteur **lâche** (quatrième
+    /// tolérance de [`crate::plan_callout`]), donc un corps peut passer le
+    /// prédicat d'admission sans livrer de chemin au lecteur strict.
+    NoCallout,
+    /// La forge n'a pas rendu le plan à ce ref — branche disparue, plan absent
+    /// de la branche, appel en échec.
+    FetchFailed,
+    /// La lecture n'a pas été tentée : candidat au-delà de
+    /// [`PLAN_SIZE_READ_MAX`], ou verdict d'un cycle antérieur au champ.
+    NotMeasured,
+}
+
+impl PlanSizeReading {
+    /// Le défaut de désérialisation : *pas mesuré*, jamais un nombre.
+    fn default_unread() -> Self {
+        PlanSizeReading::Unread(UnreadCause::NotMeasured)
+    }
+
+    /// Le motif, pour l'opérateur, quand la taille n'est **pas** un nombre.
+    ///
+    /// `None` sur [`Self::Measured`] : une taille mesurée sous la borne n'a rien
+    /// à signaler, et une ligne par admission conforme serait du bruit qui finit
+    /// par cacher celle qui compte.
+    pub fn unmeasured_label(self) -> Option<&'static str> {
+        match self {
+            PlanSizeReading::Measured(_) => None,
+            PlanSizeReading::SectionAbsent => Some("section « Taille estimée » absente du plan"),
+            PlanSizeReading::Unparsable => Some("total du plan illisible"),
+            PlanSizeReading::Unread(UnreadCause::NoCallout) => {
+                Some("callout de plan ou de branche absent")
+            }
+            PlanSizeReading::Unread(UnreadCause::FetchFailed) => {
+                Some("plan introuvable au ref de sa branche")
+            }
+            PlanSizeReading::Unread(UnreadCause::NotMeasured) => Some("taille non mesurée"),
+        }
+    }
+}
+
+/// Un ticket que le manager recommande de faire entrer dans le bassin.
+///
+/// Porte sa provenance parce que le rapport doit la dire : « #2708 (p2-normal,
+/// hors milestone) » est une recommandation qu'un opérateur peut arbitrer,
+/// « #2708 » seul ne l'est pas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Admission {
+    pub number: u64,
+    pub origin: CandidateOrigin,
+    /// Ce que vaut sa taille estimée — porté sur l'admission, pas seulement sur
+    /// le refus (mika#2699 vol 3).
+    ///
+    /// Sans ce champ, « admis » couvrirait indifféremment « mesuré sous la
+    /// borne » et « jamais mesuré », et le second se lirait comme le premier.
+    /// `#[serde(default)]` pour la raison des autres champs du vol : le puits
+    /// hors-ligne tient des blobs écrits avant lui.
+    #[serde(default = "PlanSizeReading::default_unread")]
+    pub size: PlanSizeReading,
+}
+
+/// Pourquoi un candidat n'est pas recommandé.
+///
+/// Un `enum` plutôt qu'un message, et le vol 3 est ce que cette forme achetait :
+/// le second motif du point 2 du ticket arrive comme un **variant**, pas comme
+/// une refonte du rapport. mika#2923 en est la confirmation : le troisième
+/// motif arrive de la même façon.
+///
+/// **`Clone` sans `Copy`**, depuis mika#2923 : [`RefusalReason::OperatorHeld`]
+/// porte une `String` parce que ce type est `Serialize + Deserialize` (le
+/// verdict va dans le puits hors-ligne du sink) et qu'un `&'static str` ne se
+/// désérialise pas. Précédent exact une porte plus loin :
+/// `auto_pull::RefusalReason` est `Clone` sans `Copy` pour la même raison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// Aucun callout `Plan: docs/plans/…` dans le corps du ticket.
+    NoGroomedPlan,
+    /// Le plan annonce plus de lignes que la borne par vol de ce ticket, et ne
+    /// se découpe pas — second motif du point 2 (mika#2699 vol 3).
+    ///
+    /// Les deux nombres voyagent avec le motif : « au-delà de la borne » sans
+    /// eux ne dit pas de combien découper, et le geste correctif est
+    /// précisément un découpage chiffré.
+    EstimateOverFlightBound { total_loc: u64, bound_loc: u32 },
+    /// Le candidat porte un label par lequel l'opérateur — ou une autre
+    /// instance — le tient (mika#2923).
+    ///
+    /// `label` dit **lequel**, pour la raison que porte déjà
+    /// [`crate::webhook_dispatch::operator_held_label`] : le geste correctif est
+    /// de retirer *ce* label-là, et un compteur doit pouvoir distinguer « tenu
+    /// par `blocked` » de « tenu par `operator-gated` ».
+    OperatorHeld { label: String },
+    /// Le corps ne porte plus de callout `Plan:` vivant — seulement une ligne
+    /// `Plan antérieur :`, écrite par la livraison du vol (mika#2952).
+    ///
+    /// Distinct de [`RefusalReason::NoGroomedPlan`] et **pas** par excès de
+    /// précision : le lecteur lâche rend `plan_present == true` sur cette
+    /// population, donc `NoGroomedPlan` la ferait entrer dans la relève à
+    /// grommer alors qu'aucun groom ne la débloque — c'est l'exigence d'AC1.
+    ///
+    /// **Variant sans charge, et c'est une décision.** Le plan laissait
+    /// `PriorPlanOnly { plan: … }` en ellipse ; [`PoolCandidate`] ne porte pas
+    /// de chemin de plan, et le seul endroit où il en existe un est la *prose*
+    /// de la ligne antérieure. Or le contrat du marqueur est son **préfixe**
+    /// (site unique [`crate::plan_callout::PRIOR_PLAN_PREFIX`], tenu par le
+    /// test d'aller-retour) ; le chemin qui le suit n'est contractuel que pour
+    /// la ligne écrite par la machine, et la ligne manuscrite de #2680 montre
+    /// qu'un humain en écrit aussi. Un libellé qui nommerait parfois
+    /// `` plan `` `` dirait moins que celui qui nomme le fait mesuré. Le ticket,
+    /// lui, est nommé par [`AdmissionRefusal::number`], et c'est ce que
+    /// l'opérateur ouvre.
+    PriorPlanOnly,
+    /// Le corps porte une ligne `Condition de réveil` : le ticket dort derrière
+    /// un évènement, règle « Dormeurs visibles » ratifiée le 2026-09-01
+    /// (mika#2952 AC2).
+    ///
+    /// **La condition voyage avec le motif, et elle est citée.** L'AC2 exige un
+    /// refus qui la *cite* : sans elle le libellé dirait « dormant » et
+    /// l'opérateur devrait ouvrir le ticket pour savoir quoi attendre — or les
+    /// conditions mesurées nomment une variable d'environnement, une commande
+    /// `gh`, une date. Le bassin ne l'**évalue** jamais : `assess_pool` est une
+    /// fonction pure, et arbitrer `git rev-list` demanderait un sous-processus,
+    /// un appel réseau et une horloge.
+    ///
+    /// Distinct de [`RefusalReason::PriorPlanOnly`] bien que #2854 porte les
+    /// deux : le geste correctif n'est pas le même — là une mesure de fermeture,
+    /// ici une attente. Et distinct de [`RefusalReason::OperatorHeld`], qui est
+    /// une tenue par **label**, visible sur la forge ; la dormance vit dans le
+    /// corps et aucun label ne la dit.
+    Dormant { condition: String },
+    /// Le corps **cite** un plan, mais il échoue au prédicat que le gate du
+    /// dispatch exige : il manque le callout de branche, le marqueur GROOMED, ou
+    /// les deux (mika#2956).
+    ///
+    /// Distinct de [`RefusalReason::NoGroomedPlan`], et pour la raison de
+    /// mika#2205 : les deux populations ne se soustraient pas. « Plan groomé
+    /// absent » est honnête quand rien ne cite de plan ; sur #2194 il a fait
+    /// mécroire le rapport, qui disait d'elle « à admettre » dans une section et
+    /// « callout de plan ou de branche absent » dans la suivante. Un seul libellé
+    /// pour les deux rendrait ce couple illisible, et un compteur ne pourrait pas
+    /// distinguer « rien à groomer n'existe » de « le groom est à finir ».
+    ///
+    /// **La charge nomme ce qui manque**, avec les jetons du dispatch
+    /// (`GroomingSignal::token`, croisés par
+    /// `grooming_marker::mika2956_le_vocabulaire_des_signaux_est_commun_aux_deux_predicats`) :
+    /// le geste correctif n'est pas le même selon que le groom n'a jamais eu lieu
+    /// ou qu'il s'est arrêté avant d'écrire son verdict, et un refus du bassin
+    /// doit pouvoir se rapprocher du `missing_signals` d'un refus du dispatch.
+    UngroomedForDispatch { missing: Vec<GroomingSignal> },
+}
+
+impl RefusalReason {
+    /// Le motif, dit à l'opérateur. Vit ici et non dans le rapport pour qu'un
+    /// variant neuf ne puisse pas être rendu sans libellé — y compris quand le
+    /// libellé porte des nombres, auquel cas il est **composé ici** plutôt
+    /// qu'épelé une seconde fois par le rapporteur.
+    pub fn label(&self) -> String {
+        match self {
+            RefusalReason::NoGroomedPlan => "plan groomé absent".to_string(),
+            RefusalReason::EstimateOverFlightBound {
+                total_loc,
+                bound_loc,
+            } => format!(
+                "estimation {total_loc} lignes au-delà de la borne par vol ({bound_loc}) \
+                 — à découper"
+            ),
+            RefusalReason::OperatorHeld { label } => {
+                format!("tenu par l'opérateur — label `{label}` à retirer")
+            }
+            // Le geste correctif, et aucun numéro de PR : le bassin ne lit pas
+            // l'état des PR, donc en nommer une serait affirmer plus que ce
+            // qu'il a mesuré (mika#2205). Ce qu'il a mesuré est le corps.
+            RefusalReason::PriorPlanOnly => "travail de vol livré — le corps ne porte plus \
+                 qu'un « Plan antérieur » ; à mesurer et fermer, ou à re-groomer pour le vol \
+                 suivant"
+                .to_string(),
+            // La condition est **citée**, entre guillemets, telle que le corps
+            // l'écrit : le bassin ne l'a pas arbitrée, et le libellé ne doit pas
+            // laisser croire le contraire. C'est l'opérateur qui juge si elle
+            // est remplie.
+            RefusalReason::Dormant { condition } => {
+                format!("dormant — « {condition} » ; à réveiller quand la condition est remplie")
+            }
+            // Les signaux sont nommés avec les jetons du dispatch, et non
+            // traduits : c'est ce qui permet à l'opérateur de rapprocher ce refus
+            // du `missing_signals` que le gate écrit dans son
+            // `dispatch_no_grooming_marker`. Une paraphrase française lirait
+            // mieux et se rapprocherait de rien.
+            RefusalReason::UngroomedForDispatch { missing } => {
+                let noms = missing
+                    .iter()
+                    .map(|s| format!("`{}`", s.token()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("grooming incomplet — manque {noms} ; à (re)groomer")
+            }
+        }
+    }
+
+    /// Ce refus se corrige-t-il par un **grooming** ?
+    ///
+    /// `match` exhaustif, sans bras `_` : un variant neuf ne compile pas sans
+    /// que son auteur ait répondu. C'est ce qui empêche la relève de proposer
+    /// un travail que rien ne débloque — « à grommer : tenu par l'opérateur »
+    /// serait un faux conseil dans le rapport, et le lecteur agirait dessus.
+    pub fn remediable_by_grooming(&self) -> bool {
+        match self {
+            RefusalReason::NoGroomedPlan => true,
+            // Le geste correctif est un découpage chiffré du plan, donc un
+            // re-groom : comportement d'aujourd'hui, inchangé.
+            RefusalReason::EstimateOverFlightBound { .. } => true,
+            RefusalReason::OperatorHeld { .. } => false,
+            // La moitié structurelle d'AC1 : le vol est livré, donc il n'y a
+            // rien à groomer. Un re-groom n'arrive qu'au vol *suivant*, et ce
+            // vol-là est un autre ticket — ou le même, re-groomé par un humain
+            // qui a vu la mesure. La relève ne doit pas le proposer d'elle-même.
+            RefusalReason::PriorPlanOnly => false,
+            // La moitié structurelle d'AC2 : un plan groomé ne réveille pas un
+            // dormeur, c'est l'évènement cité qui le fait. Proposer « à
+            // grommer » ici ferait agir le lecteur sur un conseil faux, et le
+            // plan n'y gagnerait rien — il existe souvent déjà (#2854 en porte
+            // un, livré sur trois vols).
+            RefusalReason::Dormant { .. } => false,
+            // `true`, et l'AC1 de mika#2956 le demande explicitement : un groom
+            // débloque ce candidat — c'est la seule chose qui le débloque. La
+            // relève à grommer est donc exactement l'endroit où il doit
+            // apparaître, et c'est ce qui le sépare des trois `false`
+            // ci-dessus : là le travail n'existe pas (vol livré), attend un
+            // évènement (dormant) ou appartient à l'opérateur (tenu).
+            RefusalReason::UngroomedForDispatch { .. } => true,
+        }
+    }
+}
+
+/// Un candidat refusé à l'admission, **nommé** — point 2 du ticket.
+///
+/// Le vol 1 rendait un compte (« Écartés : 1 candidat sans plan groomé »), ce
+/// qui disait à l'opérateur qu'un filtre avait eu lieu sans lui dire sur quoi
+/// agir. Nommer le ticket est ce qui rend le refus actionnable : le geste
+/// correctif est de groomer *ce* ticket-là.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionRefusal {
+    pub number: u64,
+    pub origin: CandidateOrigin,
+    pub reason: RefusalReason,
+}
+
+/// Le verdict du bassin pour ce cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolVerdict {
+    pub depth: PoolDepth,
+    pub band: PoolBand,
+    /// Tickets à faire entrer, dans l'ordre d'admission. Vide hors famine.
+    pub admit: Vec<Admission>,
+    /// Candidats écartés, nommés, avec leur motif. Rempli **même hors famine** :
+    /// un ticket mal formé reste mal formé quand le bassin est plein, et c'est
+    /// le moment utile pour le dire — avant que la famine le réclame.
+    #[serde(default)]
+    pub refusals: Vec<AdmissionRefusal>,
+}
+
+/// La clé de tri du bassin : `(priorité, provenance, numéro)` — **site unique**
+/// du dépôt (mika#2700 Phase 2 (c) vol 1).
+///
+/// Extraite parce qu'un second lecteur est arrivé : la relève nommée doit
+/// présenter les prochains tickets à grommer *dans l'ordre du bassin*, et une
+/// deuxième écriture du triplet est une divergence silencieuse — les deux
+/// listes se contrediraient dans le même rapport sans qu'aucune assertion de
+/// comportement rougisse (doctrine du lecteur unique, mika#2201).
+///
+/// `None` vaut `u8::MAX`, donc **en dernier** : l'absence de label de priorité
+/// n'est pas p0. La priorité domine la provenance — voir le docstring du module
+/// pour pourquoi l'ordre des deux critères est la décision et non un détail.
+pub fn pool_sort_key(
+    priority_rank: Option<u8>,
+    origin: CandidateOrigin,
+    number: u64,
+) -> (u8, u8, u64) {
+    (priority_rank.unwrap_or(u8::MAX), origin.rank(), number)
+}
+
+/// Juge le bassin et nomme les admissions comme les refus — fonction **pure**,
+/// sans E/S.
+///
+/// Cinq décisions, chacune pour une raison nommable :
+///
+/// 1. **C'est `available` qui décide la bande**, pas `ready_total`. Un ticket
+///    `ready` déjà en vol n'est pas du rail disponible.
+/// 2. **Hystérésis.** On ne recommande une admission que **sous** [`POOL_MIN`],
+///    et on recommande alors de remonter à [`POOL_MAX`]. Sans elle, à 3
+///    disponibles le manager recommanderait un ticket à chaque cycle jusqu'à 4,
+///    puis à nouveau dès qu'un vol démarre : un geste par cycle, soit exactement
+///    le bruit que l'orchestrateur évite à la main.
+/// 3. **Le tri passe par [`pool_sort_key`]**, son site unique depuis
+///    mika#2700. La priorité domine la provenance — voir le docstring du module
+///    pour pourquoi l'ordre des deux critères est la décision et non un détail.
+///    Un ticket sans label de priorité passe **en dernier** : l'absence de
+///    priorité n'est pas p0.
+/// 4. **Un même numéro n'est jugé qu'une fois.** Les deux ensembles sont pris à
+///    deux appels `gh` distincts et se recoupent par construction (une
+///    `sub_issue` du milestone est aussi une issue ouverte du dépôt). Le premier
+///    vu gagne, et les candidats du milestone sont parcourus d'abord — donc un
+///    ticket du milestone n'est jamais étiqueté `Outside`.
+/// 5. **Les refus sont rendus hors famine aussi**, et triés par la même clé,
+///    priorité absente, pour que le rapport soit stable d'un cycle à l'autre
+///    quand rien n'a changé.
+/// 6. **Une taille non mesurée n'admet pas en silence et ne refuse pas non
+///    plus** (vol 3). Seul un total strictement au-dessus de la borne refuse ;
+///    les trois autres lectures passent, en portant leur cause sur l'admission
+///    pour que le rapport la dise. Voir le docstring du module.
+///
+/// `sizes` est indexé par numéro d'issue ; un candidat absent de la table vaut
+/// [`UnreadCause::NotMeasured`]. C'est l'appelant qui décide combien de plans il
+/// va chercher ([`numbers_needing_size`]) — cette fonction reste pure.
+pub fn assess_pool(
+    pool: &[ReadyTicket],
+    milestone_candidates: &[PoolCandidate],
+    outside_candidates: &[PoolCandidate],
+    sizes: &BTreeMap<u64, PlanSizeReading>,
+) -> PoolVerdict {
+    let ready_total = pool.len();
+    let in_flight = pool.iter().filter(|t| t.holds_dispatch_seat()).count();
+    let available = ready_total.saturating_sub(in_flight);
+
+    let band = if available < POOL_MIN {
+        PoolBand::Starved
+    } else if available <= POOL_MAX {
+        PoolBand::Nominal
+    } else {
+        PoolBand::Saturated
+    };
+
+    let (eligible, mut refusals) =
+        well_formed_candidates(pool, milestone_candidates, outside_candidates);
+
+    // Le second motif, appliqué dans l'ordre du bassin : un candidat dont le
+    // plan annonce plus que la borne par vol de SON plafond quitte la liste des
+    // recevables pour celle des refusés. La borne est par ticket et non de
+    // flotte — un `loop-substrate` tient 429 lignes là où un ticket nu en tient
+    // 279, et les comparer à la même borne refuserait le premier à tort.
+    let mut admissible: Vec<(&PoolCandidate, CandidateOrigin, PlanSizeReading)> = Vec::new();
+    for (s, origin) in eligible {
+        let bound = plan_size::per_flight_bound(plan_size::turn_ceiling_for_labels(&s.labels));
+        let size = sizes
+            .get(&s.number)
+            .copied()
+            .unwrap_or(PlanSizeReading::Unread(UnreadCause::NotMeasured));
+        match size {
+            // `>` et non `>=` : un plan qui tient exactement la borne la tient.
+            PlanSizeReading::Measured(total) if total > u64::from(bound) => {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::EstimateOverFlightBound {
+                        total_loc: total,
+                        bound_loc: bound,
+                    },
+                });
+            }
+            _ => admissible.push((s, origin, size)),
+        }
+    }
+
+    // Un `AdmissionRefusal` ne porte pas de rang de priorité — la décision de
+    // refus ne le consulte pas — donc il entre dans la clé en **absent**. Le
+    // premier terme est alors constant sur toute la liste et l'ordre obtenu est
+    // exactement l'ancien `(origin.rank(), number)` : les tests du bassin sont
+    // le contrôle de non-régression de cette égalité. Le tri a lieu **après**
+    // les refus du vol 3, sans quoi ils s'empileraient derrière ceux du vol 2
+    // dans l'ordre d'arrivée.
+    refusals.sort_by_key(|r| pool_sort_key(None, r.origin, r.number));
+
+    // `POOL_MAX - available` ne peut pas déborder : la bande famine impose
+    // `available < POOL_MIN`, et `POOL_MIN <= POOL_MAX`.
+    let admit: Vec<Admission> = match band {
+        PoolBand::Starved => admissible
+            .iter()
+            .take(POOL_MAX - available)
+            .map(|(s, origin, size)| Admission {
+                number: s.number,
+                origin: *origin,
+                size: *size,
+            })
+            .collect(),
+        PoolBand::Nominal | PoolBand::Saturated => Vec::new(),
+    };
+
+    PoolVerdict {
+        depth: PoolDepth {
+            ready_total,
+            in_flight,
+            available,
+        },
+        band,
+        admit,
+        refusals,
+    }
+}
+
+/// Les candidats dont le plan mérite une lecture à la forge, dans l'ordre du
+/// bassin et bornés par [`PLAN_SIZE_READ_MAX`] (mika#2699 vol 3).
+///
+/// Rendue **publique et séparée** parce que l'appelant qui paie les appels `gh`
+/// n'est pas celui qui juge : [`super::reader`] va chercher les plans,
+/// [`assess_pool`] reste pure. Les deux passent par
+/// [`well_formed_candidates`], donc ils ne peuvent pas diverger sur qui est un
+/// candidat — une seconde écriture du filtre serait deux réponses à la même
+/// question dans le même cycle.
+///
+/// La liste est bornée **après** le tri, jamais avant : borner d'abord
+/// mesurerait les plus petits numéros plutôt que les plus prioritaires.
+pub fn numbers_needing_size(
+    pool: &[ReadyTicket],
+    milestone_candidates: &[PoolCandidate],
+    outside_candidates: &[PoolCandidate],
+) -> Vec<u64> {
+    let (eligible, _) = well_formed_candidates(pool, milestone_candidates, outside_candidates);
+    eligible
+        .iter()
+        .take(PLAN_SIZE_READ_MAX)
+        .map(|(s, _)| s.number)
+        .collect()
+}
+
+/// Les candidats recevables **sur la forme du ticket seule**, triés, et les
+/// refus que cette seule lecture suffit à nommer.
+///
+/// Site unique du filtre d'admission, partagé par [`assess_pool`] et
+/// [`numbers_needing_size`]. Ce qui est décidé ici ne consulte aucune lecture
+/// distante : c'est précisément ce qui permet d'appeler cette fonction *avant*
+/// d'aller chercher les plans.
+fn well_formed_candidates<'a>(
+    pool: &[ReadyTicket],
+    milestone_candidates: &'a [PoolCandidate],
+    outside_candidates: &'a [PoolCandidate],
+) -> (
+    Vec<(&'a PoolCandidate, CandidateOrigin)>,
+    Vec<AdmissionRefusal>,
+) {
+    // Deux lectures distinctes peuvent dire « ce ticket est déjà `ready` » : le
+    // bassin dépôt-large et les labels de la sub-issue. Elles sont prises à deux
+    // appels `gh` différents, donc elles peuvent diverger d'un cycle ; on écarte
+    // sur l'union, parce qu'une admission en double est pire qu'une admission
+    // tardive.
+    let already_ready: HashSet<u64> = pool.iter().map(|t| t.number).collect();
+
+    let mut eligible: Vec<(&PoolCandidate, CandidateOrigin)> = Vec::new();
+    let mut refusals: Vec<AdmissionRefusal> = Vec::new();
+    // Décision 4 : le milestone est parcouru d'abord, donc un ticket présent
+    // dans les deux ensembles est jugé `Milestone` et le dehors le saute.
+    let mut seen: HashSet<u64> = HashSet::new();
+    for (set, origin) in [
+        (milestone_candidates, CandidateOrigin::Milestone),
+        (outside_candidates, CandidateOrigin::Outside),
+    ] {
+        for s in set {
+            if !seen.insert(s.number) {
+                continue;
+            }
+            if s.state != IssueState::Open {
+                continue;
+            }
+            if already_ready.contains(&s.number) || labels_carry_ready(&s.labels) {
+                continue;
+            }
+            if labels_hold_dispatch_seat(&s.labels) {
+                continue;
+            }
+            // À partir d'ici le candidat est recevable *en principe* : ouvert,
+            // pas déjà dans le bassin, pas en vol. Ce qui le refuse maintenant
+            // est un défaut de forme, donc un refus qui se **nomme** — les
+            // filtres ci-dessus, eux, ne sont pas des reproches : un ticket
+            // déjà `ready` n'a rien à corriger.
+            //
+            // Premier des refus nommés, et l'ordre des deux est la priorité du
+            // motif : `AdmissionRefusal` n'en porte qu'un. Un ticket que
+            // l'opérateur tient n'a pas besoin d'un plan — le geste correctif
+            // est de retirer le label — donc le nommer `NoGroomedPlan` le
+            // ferait entrer dans la relève à grommer (`relief::name_relief`) et
+            // proposerait un travail que rien ne débloque.
+            //
+            // Après les filtres silencieux, pas avant : un ticket déjà `ready`
+            // *et* tenu est une anomalie réelle, mais elle n'appartient pas à
+            // l'admission — poser `ready` n'y est plus en jeu, et cette
+            // population est déjà la charge de la porte du
+            // `ready_label_handler` (mika#2263).
+            if let Some(held) = operator_held_label(s.labels.iter().map(String::as_str)) {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::OperatorHeld {
+                        label: held.to_string(),
+                    },
+                });
+                continue;
+            }
+            // Deuxième refus nommé — la dormance (mika#2952 AC2), et sa place
+            // devant `PriorPlanOnly` est une décision, pas un ordre d'écriture.
+            // #2854 porte les **deux** : son corps ne garde qu'un « Plan
+            // antérieur » et il dort derrière `MIKA_WEBHOOK_COMMENT_TRIAGE`.
+            // `AdmissionRefusal` ne porte qu'un motif, et de ces deux-là un seul
+            // décrit ce que l'opérateur peut faire aujourd'hui : « à mesurer et
+            // fermer » lui ferait ouvrir un ticket qui attend un évènement,
+            // tandis que « dormant — <condition> » est vrai des deux populations
+            // superposées. Le motif le plus **bloquant** gagne, comme
+            // `OperatorHeld` gagne sur l'absence de plan juste au-dessus.
+            //
+            // `Awake` ne déclenche rien — c'est une mesure, et c'est la réponse
+            // à la question d'AC2 sur le marqueur absent : le candidat continue
+            // sa route et reste admissible. `None` non plus : aucun corps n'a été
+            // lu par ce binaire (mika#2340), et refuser sur une absence de
+            // mesure serait exclure en silence sous un nom.
+            if let Some(DormancyReading::Dormant { condition }) = &s.dormancy {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::Dormant {
+                        condition: condition.clone(),
+                    },
+                });
+                continue;
+            }
+            // Troisième refus nommé, et sa place dans l'ordre n'est pas un
+            // raffinement : le lecteur lâche (`reader::plan_callout_present`,
+            // ratifié par mika#2608) voit la ligne `Plan antérieur :` comme un
+            // callout, donc `plan_present == true` sur toute cette population.
+            // Après `!s.plan_present`, ce bras serait **inerte** — pas
+            // seulement moins précis.
+            //
+            // `None` (corps non lu par ce binaire, mika#2340), `Absent` et
+            // `Live` ne déclenchent rien ici : `Absent` tombe sur
+            // `NoGroomedPlan` comme aujourd'hui.
+            if s.plan_reading == Some(PlanReading::PriorOnly) {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::PriorPlanOnly,
+                });
+                continue;
+            }
+            // Quatrième refus nommé, et c'est lui qui **décide** de l'admission
+            // depuis mika#2956. Le prédicat STRICT décide seul : le lecteur lâche
+            // de mika#2608 n'y a plus voix, il choisit le LIBELLÉ et rien
+            // d'autre.
+            //
+            // L'implication qui porte ce bras est épinglée ailleurs —
+            // `grooming_marker::mika2956_is_groomed_implique_le_gate_du_dispatch`
+            // : un `Vec` vide ici veut dire `is_groomed`, donc un corps que le
+            // gate du dispatch accepte. C'est ce qui rend « admis par le bassin
+            // ⇒ accepté au dispatch » structurel et non constaté.
+            //
+            // Ce bras ne demande PAS l'égalité des deux prédicats, et ne doit
+            // pas la demander : le résidu (`gate` ∖ `is_groomed` —
+            // orthographes non canoniques, callout dans un bloc clôturé) est
+            // refusé **ici** et accepté là-bas, donc dans le sens sûr. Harmoniser
+            // dans l'autre sens est interdit par le doc-comment de
+            // `auto_pull::is_groomed`.
+            //
+            // `None` ne déclenche rien : ce binaire n'a pas lu le corps
+            // (mika#2340), et le candidat retombe sur le plancher ci-dessous,
+            // celui d'avant ce vol. Refuser sur une absence de mesure serait
+            // exclure en silence sous un nom.
+            if let Some(missing) = s.missing_grooming_signals.as_deref()
+                && !missing.is_empty()
+            {
+                let reason = if s.plan_present {
+                    // Le corps CITE `docs/plans/` et échoue quand même au
+                    // prédicat du dispatch : c'est la population de mika#2956,
+                    // celle dont le libellé « plan groomé absent » a fait
+                    // mécroire le rapport.
+                    RefusalReason::UngroomedForDispatch {
+                        missing: missing.to_vec(),
+                    }
+                } else {
+                    // Rien ne cite de plan : « plan groomé absent » est honnête
+                    // et complet, et c'est le libellé que l'opérateur lit depuis
+                    // le vol 1. Le changer ici déplacerait une population que ce
+                    // ticket ne touche pas.
+                    RefusalReason::NoGroomedPlan
+                };
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason,
+                });
+                continue;
+            }
+            // Plancher, et il n'est plus atteint que par un candidat **non
+            // mesuré** — un blob du puits hors ligne écrit avant mika#2956. Il
+            // garde donc exactement le verdict qu'il avait.
+            if !s.plan_present {
+                refusals.push(AdmissionRefusal {
+                    number: s.number,
+                    origin,
+                    reason: RefusalReason::NoGroomedPlan,
+                });
+                continue;
+            }
+            eligible.push((s, origin));
+        }
+    }
+    eligible.sort_by_key(|(s, origin)| pool_sort_key(s.priority_rank, *origin, s.number));
+    (eligible, refusals)
+}
+
+/// Un label de la famille `dispatch:` est-il posé ? Voir
+/// [`ReadyTicket::holds_dispatch_seat`] pour le pourquoi de la famille et de la
+/// casse.
+fn labels_hold_dispatch_seat(labels: &[String]) -> bool {
+    labels.iter().any(|l| {
+        l.trim()
+            .to_ascii_lowercase()
+            .starts_with(DISPATCH_SEAT_LABEL_PREFIX)
+    })
+}
+
+/// Le label `ready` est-il posé ? Casse ignorée, comme le fait la forge.
+fn labels_carry_ready(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.trim().eq_ignore_ascii_case(READY_LABEL))
+}
+
+/// [`assess_pool`] avec **aucune taille mesurée** — double de test partagé par
+/// les trois modules qui jugent un verdict de bassin (mika#2699 vol 3).
+///
+/// Les tests des vols 1 et 2 portent sur la profondeur, le tri, la provenance
+/// et le refus « plan groomé absent » ; aucun ne parle de taille. Leur passer
+/// une table vide est donc la lecture fidèle de ce qu'ils mesurent, et le nom
+/// le dit plutôt que de le cacher derrière un `&BTreeMap::new()` recopié
+/// trente fois. **Ce que ce double ne doit pas devenir** : le chemin par
+/// défaut. Les tests du vol 3 appellent [`assess_pool`] directement, avec une
+/// table peuplée — sans quoi la borne ne serait exercée nulle part.
+#[cfg(test)]
+pub(super) fn assess_pool_sans_tailles(
+    pool: &[ReadyTicket],
+    milestone_candidates: &[PoolCandidate],
+    outside_candidates: &[PoolCandidate],
+) -> PoolVerdict {
+    assess_pool(
+        pool,
+        milestone_candidates,
+        outside_candidates,
+        &BTreeMap::new(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready(number: u64, labels: &[&str]) -> ReadyTicket {
+        ReadyTicket {
+            number,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Un bassin de `n` tickets dont `in_flight` portent un siège.
+    fn pool_of(n: usize, in_flight: usize) -> Vec<ReadyTicket> {
+        (0..n)
+            .map(|i| {
+                if i < in_flight {
+                    ready(1000 + i as u64, &["ready", "dispatch:loop"])
+                } else {
+                    ready(1000 + i as u64, &["ready"])
+                }
+            })
+            .collect()
+    }
+
+    fn cand(number: u64, rank: Option<u8>, plan_present: bool, labels: &[&str]) -> PoolCandidate {
+        PoolCandidate {
+            number,
+            state: IssueState::Open,
+            priority_rank: rank,
+            plan_present,
+            // `None` et non `Some(Live)` / `Some(Awake)` / `Some(vec![])` : la
+            // graine partagée reste celle d'un blob antérieur sur les **trois**
+            // lectures de corps, donc les verdicts que les tests du vol 2 et du
+            // vol 3 épinglent ne bougent pas. Les tests de mika#2952 et de
+            // mika#2956 posent la lecture qui les concerne explicitement, par
+            // `..cand(…)`.
+            //
+            // `Some(vec![])` serait en outre une graine **incohérente** sous
+            // `plan_present: false` — « les trois signaux sont là » alors que rien
+            // ne cite de plan est un état qu'aucun corps ne produit, puisque
+            // `PlanCallout` manquerait. `None` se compose avec les deux valeurs
+            // de l'argument.
+            plan_reading: None,
+            dormancy: None,
+            missing_grooming_signals: None,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Les numéros admis, dans l'ordre — la plupart des cas ne portent que sur
+    /// l'ordre et pas sur la provenance.
+    fn admitted(v: &PoolVerdict) -> Vec<u64> {
+        v.admit.iter().map(|a| a.number).collect()
+    }
+
+    /// L'admission telle que la rendent les cas des vols 1 et 2 : taille **non
+    /// mesurée**, puisqu'ils passent par [`assess_pool_sans_tailles`].
+    fn admis(number: u64, origin: CandidateOrigin) -> Admission {
+        Admission {
+            number,
+            origin,
+            size: PlanSizeReading::Unread(UnreadCause::NotMeasured),
+        }
+    }
+
+    /// Une table de tailles, pour les cas du vol 3.
+    fn tailles(entries: &[(u64, PlanSizeReading)]) -> BTreeMap<u64, PlanSizeReading> {
+        entries.iter().copied().collect()
+    }
+
+    /// Cas 1 — les bandes, au littéral de « entre 2 et 4 ».
+    #[test]
+    fn mika2699_les_bandes_disent_entre_2_et_4() {
+        for (n, expected) in [
+            (0, PoolBand::Starved),
+            (1, PoolBand::Starved),
+            (2, PoolBand::Nominal),
+            (3, PoolBand::Nominal),
+            (4, PoolBand::Nominal),
+            (5, PoolBand::Saturated),
+        ] {
+            let v = assess_pool_sans_tailles(&pool_of(n, 0), &[], &[]);
+            assert_eq!(
+                v.band, expected,
+                "{n} disponibles doivent donner {expected:?}, obtenu {:?}",
+                v.band
+            );
+            assert_eq!(v.depth.available, n, "profondeur disponible à {n}");
+        }
+    }
+
+    /// Cas 2 — `available` retranche les vols. Le fixture est l'état mesuré le
+    /// 2026-10-15 élargi d'un ticket libre : 3 `ready` dont 2 en vol → 1
+    /// disponible, famine. Un bassin qui ne retrancherait pas aurait dit
+    /// « 3, nominal ».
+    #[test]
+    fn mika2699_un_ready_en_vol_nest_pas_du_rail_disponible() {
+        let v = assess_pool_sans_tailles(&pool_of(3, 2), &[], &[]);
+        assert_eq!(v.depth.ready_total, 3);
+        assert_eq!(v.depth.in_flight, 2);
+        assert_eq!(v.depth.available, 1);
+        assert_eq!(v.band, PoolBand::Starved);
+    }
+
+    /// Cas 3 — un siège **inconnu** compte quand même comme vol en cours : le
+    /// prédicat est sur la famille `dispatch:`, pas sur `KNOWN_DISPATCH_SEATS`.
+    /// La casse ne le sauve pas non plus. Sans cela, le jour où un siège neuf
+    /// est introduit, le bassin devient optimiste et admet en trop.
+    #[test]
+    fn mika2699_un_siege_inconnu_compte_comme_vol() {
+        let pool = vec![
+            ready(1, &["ready", "dispatch:zorglub"]),
+            ready(2, &["ready", "Dispatch:SSC"]),
+            ready(3, &["ready"]),
+        ];
+        let v = assess_pool_sans_tailles(&pool, &[], &[]);
+        assert_eq!(v.depth.in_flight, 2, "les deux sièges comptent: {:?}", v);
+        assert_eq!(v.depth.available, 1);
+    }
+
+    /// Cas 4 — hystérésis : muette entre 2 et 4, et en famine elle remonte à
+    /// [`POOL_MAX`], pas d'un cran.
+    #[test]
+    fn mika2699_lhysteresis_ne_parle_quen_famine() {
+        let candidates: Vec<PoolCandidate> = (1..=6).map(|n| cand(n, Some(1), true, &[])).collect();
+
+        let nominal = assess_pool_sans_tailles(&pool_of(3, 0), &candidates, &[]);
+        assert!(
+            nominal.admit.is_empty(),
+            "à 3 disponibles, rien à recommander: {:?}",
+            nominal.admit
+        );
+
+        let starved = assess_pool_sans_tailles(&pool_of(1, 0), &candidates, &[]);
+        assert_eq!(
+            starved.admit.len(),
+            POOL_MAX - 1,
+            "à 1 disponible, de quoi atteindre {POOL_MAX}: {:?}",
+            starved.admit
+        );
+    }
+
+    /// Cas 5 — le tri : p0 avant p1 avant p2 ; à priorité égale, numéro
+    /// croissant ; **un candidat sans label de priorité passe après tous les
+    /// autres** — l'absence de priorité n'est pas p0.
+    #[test]
+    fn mika2699_le_tri_met_labsence_de_priorite_en_dernier() {
+        let candidates = vec![
+            cand(50, None, true, &[]),
+            cand(40, Some(3), true, &[]),
+            cand(30, Some(1), true, &[]),
+            cand(20, Some(1), true, &[]),
+            cand(10, Some(0), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &candidates, &[]);
+        assert_eq!(
+            admitted(&v),
+            vec![10, 20, 30, 40],
+            "ordre (priorité, numéro) attendu, obtenu {:?}",
+            v.admit
+        );
+        assert!(
+            !admitted(&v).contains(&50),
+            "le non-priorisé ne passe pas devant un p2"
+        );
+    }
+
+    /// Cas 6 — le filtre « plan groomé présent » : jamais dans `admit`, et
+    /// **nommé** dans `refusals` avec son motif. Un filtre muet est
+    /// indistinguable d'un bassin sans candidat, et un filtre qui ne rend qu'un
+    /// compte ne dit pas sur quel ticket agir.
+    #[test]
+    fn mika2699_un_candidat_sans_plan_est_ecarte_et_nomme() {
+        let candidates = vec![
+            cand(10, Some(0), false, &[]),
+            cand(11, Some(0), false, &[]),
+            cand(12, Some(2), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &candidates, &[]);
+        assert_eq!(admitted(&v), vec![12], "seul le candidat groomé entre");
+        assert_eq!(
+            v.refusals,
+            vec![
+                AdmissionRefusal {
+                    number: 10,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::NoGroomedPlan,
+                },
+                AdmissionRefusal {
+                    number: 11,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::NoGroomedPlan,
+                },
+            ],
+            "les deux non-groomés sont nommés avec leur motif"
+        );
+    }
+
+    /// Cas 7 — déjà `ready` (par le bassin **ou** par ses propres labels), déjà
+    /// en vol, ou fermé : jamais recommandé, et jamais **refusé** non plus. Un
+    /// ticket déjà dans le bassin n'est pas un candidat mal formé ; le nommer
+    /// comme refusé serait un reproche sans geste correctif.
+    #[test]
+    fn mika2699_deja_ready_deja_en_vol_ou_ferme_nest_ni_admis_ni_refuse() {
+        let pool = vec![ready(10, &["ready"])];
+        let mut closed = cand(13, Some(0), true, &[]);
+        closed.state = IssueState::Closed;
+        let candidates = vec![
+            cand(10, Some(0), true, &[]),
+            cand(11, Some(0), true, &["ready"]),
+            cand(12, Some(0), true, &["dispatch:loop"]),
+            closed,
+            cand(14, Some(2), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool, &candidates, &[]);
+        assert_eq!(
+            admitted(&v),
+            vec![14],
+            "seul #14 est admissible: {:?}",
+            v.admit
+        );
+        assert!(
+            v.refusals.is_empty(),
+            "aucun motif de refus: {:?}",
+            v.refusals
+        );
+    }
+
+    /// Cas 8 — bassin vide et aucun candidat : famine, `admit` vide, pas de
+    /// panique (et surtout pas de soustraction qui déborde).
+    #[test]
+    fn mika2699_bassin_vide_sans_candidat_ne_panique_pas() {
+        let v = assess_pool_sans_tailles(&[], &[], &[]);
+        assert_eq!(v.depth.available, 0);
+        assert_eq!(v.band, PoolBand::Starved);
+        assert!(v.admit.is_empty());
+        assert!(v.refusals.is_empty());
+    }
+
+    /// Cas 9 — à priorité égale, le milestone cible passe **avant le reste**, et
+    /// chaque admission porte sa provenance pour que le rapport puisse la dire.
+    #[test]
+    fn mika2699_a_priorite_egale_le_milestone_passe_avant_le_reste() {
+        let inside = vec![cand(90, Some(1), true, &[])];
+        let outside = vec![cand(20, Some(1), true, &[])];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &inside, &outside);
+        assert_eq!(
+            v.admit,
+            vec![
+                admis(90, CandidateOrigin::Milestone),
+                admis(20, CandidateOrigin::Outside),
+            ],
+            "le #90 du milestone précède le #20 hors milestone malgré son numéro plus grand"
+        );
+    }
+
+    /// Cas 10 — la priorité domine la provenance : un p0 hors milestone passe
+    /// devant un p1 du milestone. C'est l'ordre des deux critères dans le point
+    /// 1 du ticket, et l'inverse tiendrait un p0 critique derrière un ticket de
+    /// confort.
+    #[test]
+    fn mika2699_un_p0_hors_milestone_passe_devant_un_p1_du_milestone() {
+        let inside = vec![cand(90, Some(1), true, &[])];
+        let outside = vec![cand(91, Some(0), true, &[])];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &inside, &outside);
+        assert_eq!(
+            admitted(&v),
+            vec![91, 90],
+            "le p0 hors milestone passe premier: {:?}",
+            v.admit
+        );
+    }
+
+    /// Cas 11 — les candidats hors milestone subissent les mêmes filtres, et
+    /// leur refus est nommé avec la provenance. Sans la provenance, l'opérateur
+    /// ne sait pas si le ticket à groomer est dans son milestone ou ailleurs.
+    #[test]
+    fn mika2699_un_candidat_hors_milestone_subit_les_memes_filtres() {
+        let mut closed = cand(23, Some(0), true, &[]);
+        closed.state = IssueState::Closed;
+        let outside = vec![
+            cand(20, Some(0), false, &[]),
+            cand(21, Some(0), true, &["ready"]),
+            cand(22, Some(0), true, &["dispatch:loop"]),
+            closed,
+            cand(24, Some(2), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &[], &outside);
+        assert_eq!(
+            admitted(&v),
+            vec![24],
+            "seul #24 est admissible: {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 20,
+                origin: CandidateOrigin::Outside,
+                reason: RefusalReason::NoGroomedPlan,
+            }],
+            "le non-groomé hors milestone est nommé comme tel"
+        );
+    }
+
+    /// Cas 12 — un ticket présent dans les deux ensembles n'est jugé qu'une
+    /// fois, et comme ticket **du milestone**. Les deux lectures se recoupent
+    /// par construction : la lecture dépôt-large rend aussi les `sub_issues` du
+    /// milestone cible. Sans la déduplication, le manager recommanderait deux
+    /// fois le même ticket et consommerait deux places du bassin pour une.
+    #[test]
+    fn mika2699_un_candidat_vu_deux_fois_nest_juge_quune_fois() {
+        let shared = cand(90, Some(1), true, &[]);
+        // Le **même** candidat dans les deux ensembles, par `from_ref` plutôt que
+        // par `clone` : c'est précisément le recoupement que le test décrit.
+        let v = assess_pool_sans_tailles(
+            &pool_of(0, 0),
+            std::slice::from_ref(&shared),
+            std::slice::from_ref(&shared),
+        );
+        assert_eq!(
+            v.admit,
+            vec![admis(90, CandidateOrigin::Milestone)],
+            "une seule admission, provenance milestone: {:?}",
+            v.admit
+        );
+    }
+
+    /// Cas 13 — un refus vu dans les deux ensembles n'est nommé qu'une fois, et
+    /// l'ordre des refus est déterministe : milestone d'abord, puis numéro
+    /// croissant. Un rapport dont la section bouge sans que l'état ait changé
+    /// est un rapport qu'on cesse de lire.
+    #[test]
+    fn mika2699_lordre_des_refus_est_deterministe() {
+        let shared = cand(50, Some(0), false, &[]);
+        let inside = vec![cand(60, Some(0), false, &[]), shared.clone()];
+        let outside = vec![cand(30, Some(0), false, &[]), shared];
+        let v = assess_pool_sans_tailles(&pool_of(3, 0), &inside, &outside);
+        assert_eq!(
+            v.refusals,
+            vec![
+                AdmissionRefusal {
+                    number: 50,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::NoGroomedPlan,
+                },
+                AdmissionRefusal {
+                    number: 60,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::NoGroomedPlan,
+                },
+                AdmissionRefusal {
+                    number: 30,
+                    origin: CandidateOrigin::Outside,
+                    reason: RefusalReason::NoGroomedPlan,
+                },
+            ],
+            "refus triés (provenance, numéro), sans doublon: {:?}",
+            v.refusals
+        );
+    }
+
+    /// Cas 14 — les refus sont rendus **hors famine aussi**. Un ticket mal formé
+    /// reste mal formé quand le bassin est plein, et c'est le moment utile pour
+    /// le dire : attendre la famine, c'est découvrir le refus quand le rail est
+    /// déjà vide.
+    #[test]
+    fn mika2699_un_refus_est_dit_meme_quand_le_bassin_est_plein() {
+        let inside = vec![cand(60, Some(0), false, &[])];
+        let v = assess_pool_sans_tailles(&pool_of(4, 0), &inside, &[]);
+        assert_eq!(v.band, PoolBand::Nominal);
+        assert!(v.admit.is_empty(), "rien à admettre hors famine");
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 60,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::NoGroomedPlan,
+            }],
+            "le refus est dit quand même: {:?}",
+            v.refusals
+        );
+    }
+
+    /// Cas 15 — la projection `SubIssue → PoolCandidate` porte les cinq champs
+    /// que l'admission consulte. Un champ oublié ici ne casse aucune règle de
+    /// façon visible : il rend simplement tous les candidats du milestone
+    /// non-priorisés, ou tous non-groomés, ce qui se lit comme un bassin sans
+    /// candidat.
+    #[test]
+    fn mika2699_la_projection_dune_sub_issue_porte_les_champs_de_ladmission() {
+        use crate::milestone_manager::types::CiState;
+        let sub = SubIssue {
+            missing_grooming_signals: None,
+            number: 2699,
+            title: "le manager tient le bassin ready".into(),
+            state: IssueState::Open,
+            priority_rank: Some(2),
+            plan_present: true,
+            // La projection doit **transporter** les lectures, pas les refaire :
+            // le corps est lu une fois, au composeur (mika#2952). La dormance y
+            // est posée non triviale — une condition citée, pas `Awake` — pour
+            // que le test redevienne rouge si la projection la remplaçait par
+            // une valeur neutre au lieu de la cloner.
+            plan_reading: Some(PlanReading::Live),
+            dormancy: Some(DormancyReading::Dormant {
+                condition: "Condition de réveil : quand POOL_WRITE s'ouvre".into(),
+            }),
+            branch_present: true,
+            pr_number: Some(2710),
+            pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
+            merged_prs: None,
+            ci_state: CiState::Success,
+            blockers: vec![2701],
+            updated_at: "2026-10-15T00:00:00Z".into(),
+            labels: vec!["ready".into(), "agent-core".into()],
+        };
+        assert_eq!(
+            PoolCandidate::from(&sub),
+            PoolCandidate {
+                missing_grooming_signals: None,
+                number: 2699,
+                state: IssueState::Open,
+                priority_rank: Some(2),
+                plan_present: true,
+                plan_reading: Some(PlanReading::Live),
+                dormancy: Some(DormancyReading::Dormant {
+                    condition: "Condition de réveil : quand POOL_WRITE s'ouvre".into(),
+                }),
+                labels: vec!["ready".into(), "agent-core".into()],
+            }
+        );
+    }
+
+    // -- mika#2699 vol 2 : le format fil du verdict -------------------------
+
+    /// Cas 17 — `refusals` absent se relit en liste vide, et une admission se
+    /// dit sur le fil comme un **objet** portant sa provenance.
+    ///
+    /// Le verdict voyage : il est le champ `pool` de [`Assessment`], donc il part
+    /// dans chaque `DeliveryBody` et chaque fichier du puits hors-ligne. Les deux
+    /// moitiés du test sont les deux questions qu'un lecteur futur se posera sur
+    /// ces fichiers — un champ que le vol 2 a ajouté peut-il manquer, et la
+    /// provenance est-elle sur le fil ou seulement dans le Markdown rendu.
+    ///
+    /// [`Assessment`]: crate::milestone_manager::types::Assessment
+    #[test]
+    fn mika2699_un_verdict_sans_refus_se_relit_et_ladmission_porte_sa_provenance() {
+        let sans_refus = r#"{
+            "depth": {"ready_total": 1, "in_flight": 1, "available": 0},
+            "band": "starved",
+            "admit": [{"number": 1700, "origin": "outside"}]
+        }"#;
+        let v: PoolVerdict =
+            serde_json::from_str(sans_refus).expect("`refusals` absent doit valoir la liste vide");
+        assert!(v.refusals.is_empty(), "champ absent ⇒ vide, pas d'erreur");
+        assert_eq!(
+            v.admit,
+            vec![admis(1700, CandidateOrigin::Outside)],
+            "la provenance se lit depuis le fil, pas seulement depuis le rendu ; \
+             et une admission du vol 2, sans champ `size`, se relit en « non \
+             mesurée » — jamais en taille nulle (mika#2699 vol 3, motif mika#2331)"
+        );
+        let out = serde_json::to_string(&v).unwrap();
+        assert_eq!(
+            serde_json::from_str::<PoolVerdict>(&out).unwrap(),
+            v,
+            "aller-retour fidèle : le puits doit rester relisible par lui-même"
+        );
+    }
+
+    /// Cas 18 — un verdict écrit par le **vol 1** ne se relit plus, et ce test
+    /// est là pour que ce soit dit.
+    ///
+    /// Le vol 1 écrivait `admit: [1802]` (des entiers) et `withheld_no_plan: 1`
+    /// (un compte). Le vol 2 écrit `admit: [{number, origin}]` et `refusals`
+    /// nommés — un changement de forme, pas une extension, parce qu'un compte
+    /// agrégé ne peut pas être rouvert en une liste de tickets nommés : les
+    /// numéros n'y sont plus. Un `#[serde(default)]` n'aurait rien sauvé ici ;
+    /// seul un `#[serde(untagged)]` sur `admit` l'aurait fait, au prix d'un
+    /// chemin de lecture ambigu permanent pour un arriéré d'un seul vol.
+    ///
+    /// La rupture est **acceptée** : le dépôt est pré-1.0 (racine `CLAUDE.md`
+    /// § *Versioning*), et surtout **aucun code ne relit ces fichiers** —
+    /// `sink_dir::list_sink_reports` énumère des chemins et ne désérialise rien,
+    /// et le `DeliveryBody` part vers le control-monitor sans retour. L'arriéré
+    /// du puits est une archive lue par un opérateur, et un opérateur voit
+    /// `withheld_no_plan` pour ce qu'il est.
+    ///
+    /// Ce qui serait une régression, et que ce test attrape : qu'un futur vol
+    /// casse à nouveau la forme **en croyant qu'elle n'a jamais bougé**. Si ce
+    /// test rougit parce que le blob du vol 1 se relit de nouveau, quelqu'un a
+    /// ajouté un chemin de compatibilité — qu'il le documente ici plutôt que de
+    /// supprimer le cas.
+    #[test]
+    fn mika2699_un_verdict_du_vol_1_ne_se_relit_pas_et_cest_assume() {
+        let blob_vol_1 = r#"{
+            "depth": {"ready_total": 2, "in_flight": 2, "available": 0},
+            "band": "starved",
+            "admit": [1802],
+            "withheld_no_plan": 1
+        }"#;
+        assert!(
+            serde_json::from_str::<PoolVerdict>(blob_vol_1).is_err(),
+            "`admit` a changé de forme au vol 2 : la relecture échoue, et le test \
+             existe pour que ce fait soit nommé plutôt que découvert"
+        );
+    }
+
+    // -- mika#2699 vol 3 : la borne par vol, second motif de refus -----------
+
+    /// Cas 19 — un plan au-delà de la borne de **son** plafond est refusé, et le
+    /// refus porte les deux nombres.
+    ///
+    /// Les deux nombres, parce qu'un « estimation au-delà de la borne » sans
+    /// chiffres n'indique pas de geste : découper en deux ou en cinq ne se
+    /// décide pas sans savoir de combien on dépasse.
+    #[test]
+    fn mika2699_une_estimation_au_dela_de_la_borne_refuse_et_dit_les_deux_nombres() {
+        let candidats = vec![cand(90, Some(1), true, &[])];
+        // Plafond par défaut 150 ⇒ borne 279. 500 est au-delà.
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[(90, PlanSizeReading::Measured(500))]),
+        );
+        assert!(
+            v.admit.is_empty(),
+            "un plan de 500 lignes ne passe pas une borne de 279 : {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 90,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::EstimateOverFlightBound {
+                    total_loc: 500,
+                    bound_loc: 279,
+                },
+            }],
+        );
+        assert_eq!(
+            v.refusals[0].reason.label(),
+            "estimation 500 lignes au-delà de la borne par vol (279) — à découper",
+            "l'opérateur lit de combien il dépasse, pas seulement qu'il dépasse"
+        );
+    }
+
+    /// Cas 20 — un plan qui tient **exactement** la borne la tient.
+    ///
+    /// Le ticket dit « au-delà de la borne », pas « à la borne ». Un `>=` ici
+    /// refuserait le plan dimensionné *pour* ce plafond — c'est-à-dire celui que
+    /// le grooming a correctement découpé — et la correction serait de le
+    /// découper encore, sans raison.
+    #[test]
+    fn mika2699_un_plan_qui_tient_exactement_la_borne_la_tient() {
+        let candidats = vec![cand(90, Some(1), true, &[])];
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[(90, PlanSizeReading::Measured(279))]),
+        );
+        assert_eq!(
+            v.admit,
+            vec![Admission {
+                number: 90,
+                origin: CandidateOrigin::Milestone,
+                size: PlanSizeReading::Measured(279),
+            }],
+            "279 est la borne du plafond par défaut, donc elle est tenue"
+        );
+        assert!(v.refusals.is_empty());
+    }
+
+    /// Cas 21 — la borne est celle du plafond **du candidat**, pas une borne de
+    /// flotte.
+    ///
+    /// Un `loop-substrate` porte un plafond de 200 tours (mika#2542) donc une
+    /// borne de 429. Juger les deux candidats à la même borne refuserait le
+    /// premier à tort — et c'est le seul test qui voit cette erreur-là : avec une
+    /// borne unique, les deux tickets ci-dessous rendraient le même verdict pour
+    /// la mauvaise raison si l'un des deux manquait.
+    #[test]
+    fn mika2699_la_borne_est_celle_du_plafond_du_candidat() {
+        let candidats = vec![
+            cand(90, Some(1), true, &["loop-substrate"]),
+            cand(91, Some(1), true, &[]),
+        ];
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[
+                (90, PlanSizeReading::Measured(400)),
+                (91, PlanSizeReading::Measured(400)),
+            ]),
+        );
+        assert_eq!(
+            admitted(&v),
+            vec![90],
+            "400 tient sous la borne 429 d'un `loop-substrate`, pas sous les 279 d'un ticket nu"
+        );
+        assert_eq!(
+            v.refusals.iter().map(|r| r.number).collect::<Vec<_>>(),
+            vec![91],
+        );
+        assert!(matches!(
+            v.refusals[0].reason,
+            RefusalReason::EstimateOverFlightBound { bound_loc: 279, .. }
+        ));
+    }
+
+    /// Cas 22 — aucune des trois lectures non mesurées ne refuse, et aucune ne
+    /// se tait.
+    ///
+    /// C'est le cœur du vol 3. « Plan sans section de taille » n'est pas « plan
+    /// au-delà de la borne » : refuser dessus inventerait un motif que la
+    /// mesure ne porte pas. Mais admettre en silence ferait lire « À admettre »
+    /// comme « borne vérifiée », qui est précisément ce que le point 2 promet.
+    /// La sortie est donc l'admission **plus** la cause, que le rapporteur
+    /// rendra.
+    #[test]
+    fn mika2699_une_taille_non_mesuree_nadmet_pas_en_silence_et_ne_refuse_pas() {
+        let candidats = vec![
+            cand(90, Some(1), true, &[]),
+            cand(91, Some(1), true, &[]),
+            cand(92, Some(1), true, &[]),
+            cand(93, Some(1), true, &[]),
+        ];
+        let v = assess_pool(
+            &pool_of(0, 0),
+            &candidats,
+            &[],
+            &tailles(&[
+                (90, PlanSizeReading::SectionAbsent),
+                (91, PlanSizeReading::Unparsable),
+                (92, PlanSizeReading::Unread(UnreadCause::FetchFailed)),
+                // #93 est absent de la table : non mesuré par omission.
+            ]),
+        );
+        assert!(
+            v.refusals.is_empty(),
+            "aucune de ces lectures n'est une estimation « au-delà » : {:?}",
+            v.refusals
+        );
+        assert_eq!(
+            v.admit.iter().map(|a| a.size).collect::<Vec<_>>(),
+            vec![
+                PlanSizeReading::SectionAbsent,
+                PlanSizeReading::Unparsable,
+                PlanSizeReading::Unread(UnreadCause::FetchFailed),
+                PlanSizeReading::Unread(UnreadCause::NotMeasured),
+            ],
+            "chaque cause voyage avec son admission ; un candidat absent de la \
+             table est « non mesuré », jamais de taille nulle (mika#2331)"
+        );
+        for a in &v.admit {
+            assert!(
+                a.size.unmeasured_label().is_some(),
+                "le rapport doit pouvoir nommer chacune : {:?}",
+                a.size
+            );
+        }
+    }
+
+    /// Cas 23 — les plans à lire sont ceux de l'admission, dans l'ordre du
+    /// bassin et bornés.
+    ///
+    /// Deux propriétés qu'aucune autre assertion ne voit. **L'ordre** : la liste
+    /// est tronquée après le tri, donc une borne atteinte garde les plus
+    /// prioritaires et non les plus petits numéros. **Le filtre** : un ticket
+    /// sans plan groomé est déjà refusé, donc ne coûte aucun appel `gh` — c'est
+    /// ce qui tient le coût de la lecture par candidat.
+    #[test]
+    fn mika2699_les_plans_a_lire_sont_ceux_de_ladmission_tries_et_bornes() {
+        let mut candidats: Vec<PoolCandidate> = (0..PLAN_SIZE_READ_MAX as u64 + 3)
+            // Numéros décroissants à priorité croissante : si la borne était
+            // appliquée avant le tri, la liste commencerait par les numéros
+            // hauts et ce test le verrait.
+            .map(|i| cand(900 - i, Some((i % 3) as u8), true, &[]))
+            .collect();
+        candidats.push(cand(50, Some(0), false, &[]));
+
+        let wanted = numbers_needing_size(&pool_of(0, 0), &candidats, &[]);
+        assert_eq!(
+            wanted.len(),
+            PLAN_SIZE_READ_MAX,
+            "la liste est bornée par `PLAN_SIZE_READ_MAX`"
+        );
+        assert!(
+            !wanted.contains(&50),
+            "#50 n'a pas de plan groomé : il est refusé avant d'avoir coûté une lecture"
+        );
+        let attendu: Vec<u64> = {
+            let (eligible, _) = well_formed_candidates(&pool_of(0, 0), &candidats, &[]);
+            eligible
+                .iter()
+                .take(PLAN_SIZE_READ_MAX)
+                .map(|(c, _)| c.number)
+                .collect()
+        };
+        assert_eq!(wanted, attendu, "l'ordre est celui du bassin");
+        // #886 est le plus petit numéro de l'ensemble, et il est p2 : le
+        // premier à lire est #888, le plus petit numéro **parmi les p0**.
+        assert_eq!(
+            wanted[0], 888,
+            "le premier à lire est le p0 de plus petit numéro, pas le plus petit numéro"
+        );
+    }
+
+    /// Cas 24 — le filtre d'admission a **un site**, partagé par le jugement et
+    /// par la désignation des plans à lire.
+    ///
+    /// Les deux réponses sont identiques aujourd'hui ; ce qu'elles ne doivent
+    /// pas devenir, c'est deux écritures du même filtre qui divergent en silence
+    /// — le manager irait alors lire le plan d'un ticket qu'il ne jugera pas, et
+    /// jugerait sans taille un ticket dont le plan était lisible (doctrine du
+    /// lecteur unique, mika#2201).
+    #[test]
+    fn mika2699_le_filtre_dadmission_a_un_site_partage() {
+        let candidats = vec![
+            cand(90, Some(1), true, &[]),
+            cand(91, Some(0), true, &[]),
+            cand(92, None, false, &[]),
+            cand(93, Some(2), true, &["ready"]),
+        ];
+        let outside = vec![cand(20, Some(0), true, &[])];
+        let pool = pool_of(0, 0);
+
+        let wanted = numbers_needing_size(&pool, &candidats, &outside);
+        // Le même état jugé : l'ordre des admissions, bande famine, est le
+        // préfixe de l'ordre des lectures.
+        let v = assess_pool(&pool, &candidats, &outside, &BTreeMap::new());
+        assert_eq!(
+            admitted(&v),
+            wanted[..v.admit.len()].to_vec(),
+            "ce qui est admis est le préfixe de ce qui a été désigné à la lecture"
+        );
+        assert!(
+            !wanted.contains(&93),
+            "un ticket déjà `ready` n'est pas un candidat, donc pas une lecture"
+        );
+    }
+
+    // -- mika#2700 Phase 2 (c) vol 1 : la clé de tri a un site unique --------
+
+    /// La clé de tri du bassin n'a qu'un site, et c'est [`pool_sort_key`].
+    ///
+    /// Deux moitiés, parce qu'aucune des deux ne voit la panne de l'autre.
+    /// **Le comportement** : la priorité domine la provenance, qui domine le
+    /// numéro, et une priorité absente passe en dernier. **Le balayage** :
+    /// `origin.rank()` ne s'appelle que là. Sans lui, la relève nommée pourrait
+    /// réécrire le triplet à son compte et présenter, dans le même rapport, un
+    /// ordre qui contredit celui du bassin — sans qu'aucune assertion de
+    /// comportement rougisse (doctrine du lecteur unique, mika#2201 ; classe
+    /// du marqueur silencieux, mika#2158).
+    ///
+    /// Le balayage lit le répertoire **à plat** : la porte 1 du `DecisionCore`
+    /// interdit un `tests/` imbriqué sous `milestone_manager/`, donc tout test
+    /// du module vit derrière un `#[cfg(test)]` de son propre fichier et la
+    /// troncature ci-dessous suffit (prémisse mika#2321).
+    #[test]
+    fn mika2700_la_cle_de_tri_du_bassin_a_un_site_unique() {
+        assert!(
+            pool_sort_key(Some(0), CandidateOrigin::Outside, u64::MAX)
+                < pool_sort_key(Some(1), CandidateOrigin::Milestone, 1),
+            "la priorité domine la provenance comme le numéro"
+        );
+        assert!(
+            pool_sort_key(Some(1), CandidateOrigin::Milestone, u64::MAX)
+                < pool_sort_key(Some(1), CandidateOrigin::Outside, 1),
+            "à priorité égale, le milestone passe avant le dehors"
+        );
+        assert!(
+            pool_sort_key(Some(1), CandidateOrigin::Milestone, 1)
+                < pool_sort_key(Some(1), CandidateOrigin::Milestone, 2),
+            "à priorité et provenance égales, le plus petit numéro passe devant"
+        );
+        assert!(
+            pool_sort_key(Some(u8::MAX - 1), CandidateOrigin::Outside, u64::MAX)
+                < pool_sort_key(None, CandidateOrigin::Milestone, 1),
+            "une priorité absente passe en dernier — l'absence n'est pas p0"
+        );
+
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/milestone_manager");
+        let mut sites: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("le répertoire du module doit être lisible") {
+            let path = entry.expect("entrée de répertoire lisible").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let src = std::fs::read_to_string(&path).expect("source du module lisible");
+            // La production seule : un test a le droit d'appeler la clé, et
+            // celui-ci l'appelle quatre fois juste au-dessus.
+            let production = src.split("#[cfg(test)]").next().unwrap_or_default();
+            for (i, line) in production.lines().enumerate() {
+                // La prose *sur* la clé n'est pas un appel : trois paragraphes
+                // en parlent au-dessus (forme du signal S, mika#2050).
+                let code = line.split("//").next().unwrap_or_default();
+                if code.contains(".rank()") {
+                    sites.push(format!("{name}:{}", i + 1));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "`origin.rank()` ne doit s'appeler que dans `pool_sort_key` ; \
+             sites trouvés : {sites:?}. Un second site réécrit la clé de tri : \
+             route-le par `pool_sort_key` plutôt que d'allonger ce compte"
+        );
+        assert!(
+            sites[0].starts_with("pool.rs:"),
+            "le site unique vit dans `pool.rs` ; trouvé : {}",
+            sites[0]
+        );
+    }
+
+    // -- mika#2923 : un ticket que l'opérateur tient n'entre pas -------------
+
+    /// Membres de `OPERATOR_HELD_LABELS` qui, délibérément, **n'excluent pas**
+    /// un candidat du bassin. **Livrée vide, et c'est l'état nominal** : les
+    /// trois membres d'aujourd'hui tiennent tous le ticket au même titre
+    /// (mika#2263).
+    ///
+    /// Une entrée future doit nommer le label, dire pourquoi l'admission
+    /// l'ignore, et référencer son ticket de suivi — jamais un nom seul.
+    const EXCEPTIONS_ADMISSION: &[(&str, &str)] = &[];
+
+    /// V1 — le corpus du rapport du 2026-10-26, contrôle positif et contrôle
+    /// négatif dans le **même** test (AC1).
+    ///
+    /// Les vrais numéros et les vrais labels : un corpus inventé testerait le
+    /// prédicat sans attester la cause du ticket. Le rapport recommandait
+    /// d'admettre #2698, #2699 et #1806, tous trois `operator-gated` ; le
+    /// quatrième candidat, groomé et sans label gaté, est ce qui sépare « le
+    /// filtre marche » de « plus rien n'est admis ».
+    #[test]
+    fn mika2923_le_corpus_du_2026_10_26_refuse_les_trois_gates_et_admet_le_non_gate() {
+        let milestone = vec![
+            cand(2698, Some(1), true, &["p1-important", "operator-gated"]),
+            cand(2699, Some(1), true, &["p1-important", "operator-gated"]),
+            // Le candidat non gaté, groomé : le contrôle négatif.
+            cand(2923, Some(1), true, &["p1-important"]),
+        ];
+        let outside = vec![cand(
+            1806,
+            Some(1),
+            true,
+            &["p1-important", "operator-gated"],
+        )];
+        // Bande famine pour que `admit` soit non vide.
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &outside);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2923],
+            "seul le candidat sans label gaté est recommandé : {:?}",
+            v.admit
+        );
+        let refuses: Vec<(u64, String)> = v
+            .refusals
+            .iter()
+            .map(|r| (r.number, r.reason.label()))
+            .collect();
+        assert_eq!(
+            refuses,
+            vec![
+                (
+                    2698,
+                    "tenu par l'opérateur — label `operator-gated` à retirer".to_string()
+                ),
+                (
+                    2699,
+                    "tenu par l'opérateur — label `operator-gated` à retirer".to_string()
+                ),
+                // Le dehors vient après le milestone : les refus sortent dans
+                // l'ordre de parcours des candidats, pas dans l'ordre de tri du
+                // bassin — c'est `admit` qui est trié.
+                (
+                    1806,
+                    "tenu par l'opérateur — label `operator-gated` à retirer".to_string()
+                ),
+            ],
+            "les trois gatés sont refusés, et le refus **nomme** le label à retirer"
+        );
+    }
+
+    /// V2a — `operator-gated` **seul** suffit à refuser (AC2).
+    ///
+    /// Son jumeau non labellisé est dans le même test : sans lui, un refus
+    /// pourrait venir de n'importe quel autre filtre du semis.
+    #[test]
+    fn mika2923_operator_gated_seul_suffit_a_refuser() {
+        let milestone = vec![
+            cand(70, Some(1), true, &["operator-gated"]),
+            cand(71, Some(1), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![71],
+            "le jumeau sans label est admis — c'est le label qui écarte #70, \
+             pas le hasard du semis : {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 70,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "operator-gated".to_string(),
+                },
+            }],
+        );
+    }
+
+    /// V2b — `blocked` **seul** suffit à refuser (AC2).
+    ///
+    /// Un test distinct de V2a, exprès : neutraliser un terme du prédicat ne
+    /// doit pas laisser l'autre vert par accident.
+    #[test]
+    fn mika2923_blocked_seul_suffit_a_refuser() {
+        let milestone = vec![
+            cand(80, Some(1), true, &["blocked"]),
+            cand(81, Some(1), true, &[]),
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![81],
+            "le jumeau sans label est admis : {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 80,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "blocked".to_string(),
+                },
+            }],
+        );
+    }
+
+    /// V3 — **chaque** membre de `OPERATOR_HELD_LABELS` refuse à l'admission.
+    ///
+    /// L'itération est sur la constante, jamais sur une liste recopiée : donc
+    /// `operator-review` est couvert aujourd'hui sans l'avoir nommé, et un
+    /// membre ajouté demain l'est le jour de son arrivée. C'est le détecteur de
+    /// ce vol, et il atterrit vert sur les trois membres.
+    #[test]
+    fn mika2923_chaque_label_tenu_refuse_a_ladmission() {
+        use crate::webhook_dispatch::OPERATOR_HELD_LABELS;
+
+        // Sans cette assertion, la boucle garderait zéro chose et le test
+        // passerait en ne mesurant rien.
+        assert!(
+            !OPERATOR_HELD_LABELS.is_empty(),
+            "une liste vide ferait de ce test une boucle sur rien"
+        );
+
+        for label in OPERATOR_HELD_LABELS {
+            if EXCEPTIONS_ADMISSION.iter().any(|(l, _)| l == label) {
+                continue;
+            }
+            let milestone = vec![cand(60, Some(1), true, &[label])];
+            let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+            assert!(
+                v.admit.is_empty(),
+                "`{label}` tient le ticket : il ne doit pas être admis — {:?}",
+                v.admit
+            );
+            assert_eq!(
+                v.refusals,
+                vec![AdmissionRefusal {
+                    number: 60,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::OperatorHeld {
+                        label: (*label).to_string(),
+                    },
+                }],
+                "`{label}` doit refuser en se nommant"
+            );
+        }
+
+        // Une exception qui survit au label qu'elle exemptait est la façon dont
+        // une allowlist meurt sans bruit.
+        for (label, _raison) in EXCEPTIONS_ADMISSION {
+            assert!(
+                OPERATOR_HELD_LABELS.contains(label),
+                "exception stale : `{label}` n'est plus dans OPERATOR_HELD_LABELS — \
+                 retire l'entrée, l'exception ne protège plus rien"
+            );
+        }
+    }
+
+    /// V6 — `MIKA_MANAGER_POOL_WRITE` reste lu exactement comme avant (AC4).
+    ///
+    /// Épinglage **par valeur**, dans le même commit que le filtre : « rien
+    /// n'a changé » doit être une assertion et pas une déclaration. Le vol
+    /// n'écrit aucune ligne dans `pool_writer.rs`, et c'est ce test qui le dit.
+    #[test]
+    fn mika2923_linterrupteur_decriture_reste_lu_comme_avant() {
+        use crate::milestone_manager::pool_writer::ENV_POOL_WRITE;
+
+        assert_eq!(
+            ENV_POOL_WRITE, "MIKA_MANAGER_POOL_WRITE",
+            "le nom de l'interrupteur est le contrat opérateur : il ne bouge pas"
+        );
+    }
+
+    // ───────── Un vol livré n'est pas admissible (mika#2952) ─────────
+
+    /// Le corps que le bassin lisait comme portant un plan vivant : la ligne que
+    /// la porte d'auto-pull a écrite à la place du callout, et rien d'autre.
+    /// Mesuré sur #2943, #2946 et #2680 le 2026-10-28.
+    const CORPS_VOL_LIVRE: &str = concat!(
+        "## Le défaut\n",
+        "\n",
+        "> Plan antérieur : `docs/plans/2026-10-27-001-fix-2943-plan.md` — la branche ",
+        "`fix/2943/x` qui le portait a été supprimée par le merge de #2945 dans `main`. ",
+        "Callout réécrit par la porte d'auto-pull (mika#2839).\n",
+    );
+
+    /// Le même corps, plus le callout du vol **suivant** : le découpage en N vols
+    /// dont le vol 1/2 est livré et le vol 2/2 dû.
+    const CORPS_VOL_1_SUR_2: &str = concat!(
+        "> - **Branch:** `fix/2952/vol-2`\n",
+        "> - **Plan:** `docs/plans/2026-10-28-004-fix-2952-vol-2-plan.md`\n",
+        "\n",
+        "> Plan antérieur : `docs/plans/2026-10-28-003-fix-2952-vol-1-plan.md` — la branche ",
+        "`fix/2952/vol-1` qui le portait a été supprimée par le merge de #2953 dans `main`.\n",
+    );
+
+    /// **AC1** — un vol livré porte un refus nommé, n'est pas admis, et ce refus
+    /// n'est pas remédiable par un groom.
+    ///
+    /// La lecture n'est pas écrite à la main : elle sort de
+    /// [`crate::plan_callout::plan_reading`] sur un corps mesuré, donc le test
+    /// joint la grammaire du marqueur au verdict du bassin. Un test qui poserait
+    /// `Some(PriorOnly)` au littéral resterait vert si l'écrivain et le lecteur
+    /// divergeaient d'orthographe.
+    ///
+    /// `plan_present: true` est le fait de la mesure, pas une commodité : le
+    /// lecteur lâche voit la ligne antérieure comme un callout (mika#2608), et
+    /// c'est exactement pourquoi ce bras passe **avant** `NoGroomedPlan`.
+    #[test]
+    fn mika2952_un_vol_livre_porte_un_refus_nomme_et_nest_pas_admis() {
+        let reading = crate::plan_callout::plan_reading(CORPS_VOL_LIVRE);
+        assert_eq!(
+            reading,
+            PlanReading::PriorOnly,
+            "le corps mesuré doit se lire comme un vol livré"
+        );
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(reading),
+            ..cand(2943, Some(1), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(
+            v.admit.is_empty(),
+            "aucun vol n'est dû : #2943 ne doit pas être admis — {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2943,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::PriorPlanOnly,
+            }],
+            "le refus doit se nommer, et se distinguer de `NoGroomedPlan`"
+        );
+        assert!(
+            !RefusalReason::PriorPlanOnly.remediable_by_grooming(),
+            "aucun groom ne débloque un vol livré : la relève ne doit pas le proposer"
+        );
+    }
+
+    /// **AC3-a** — contrôle négatif : même graine, seul `plan_reading` change.
+    ///
+    /// C'est la paire qui sépare « le bras lit la lecture » de « le bras refuse
+    /// tout candidat portant un plan » (mika#2205).
+    #[test]
+    fn mika2952_un_plan_groome_sans_marqueur_anterieur_reste_admis() {
+        let corps = "> - **Plan:** `docs/plans/2026-10-28-009-feat-x-plan.md`\n";
+        let reading = crate::plan_callout::plan_reading(corps);
+        assert_eq!(reading, PlanReading::Live);
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(reading),
+            ..cand(2943, Some(1), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2943],
+            "un plan groomé vivant reste admis : {:?}",
+            v.admit
+        );
+        assert!(v.refusals.is_empty(), "aucun refus ici — {:?}", v.refusals);
+    }
+
+    /// **AC3-b** — un vol 1/2 livré avec un vol suivant dû reste admissible.
+    ///
+    /// Le corps porte la ligne antérieure **et** le callout frais. Le prédicat ne
+    /// tombe donc pas sur « au moins une livraison » : il tombe sur « plus aucun
+    /// callout vivant ».
+    #[test]
+    fn mika2952_un_vol_1_sur_2_livre_avec_un_callout_vivant_reste_admissible() {
+        let reading = crate::plan_callout::plan_reading(CORPS_VOL_1_SUR_2);
+        assert_eq!(
+            reading,
+            PlanReading::Live,
+            "un callout vivant à côté d'une ligne antérieure reste un vol dû"
+        );
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(reading),
+            ..cand(2952, Some(1), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2952],
+            "le vol 2/2 est dû : le ticket reste admissible — {:?}",
+            v.admit
+        );
+        assert!(v.refusals.is_empty(), "aucun refus ici — {:?}", v.refusals);
+    }
+
+    /// Une lecture **absente** n'est pas un refus, et une lecture `Absent` n'en
+    /// est pas un non plus : elle retombe sur `NoGroomedPlan`, comme avant.
+    ///
+    /// `None` veut dire « le corps n'a pas été lu par ce binaire » (mika#2340) :
+    /// un blob du puits hors-ligne écrit avant ce vol garde son verdict. Si ce
+    /// test rougissait, le champ aurait cessé d'être un `Option` au sens de
+    /// mika#2331 et serait devenu un booléen à trois valeurs dont l'une ment.
+    #[test]
+    fn mika2952_une_lecture_absente_nest_pas_un_refus() {
+        // Blob antérieur : la lecture n'a pas eu lieu.
+        let anterieur = vec![cand(70, Some(1), true, &[])];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &anterieur, &[]);
+        assert_eq!(
+            admitted(&v),
+            vec![70],
+            "un blob antérieur garde son comportement — {:?}",
+            v.admit
+        );
+        assert!(v.refusals.is_empty(), "{:?}", v.refusals);
+
+        // Lecture faite, aucun marqueur : le motif reste celui d'aujourd'hui.
+        assert_eq!(
+            crate::plan_callout::plan_reading("rien du tout\n"),
+            PlanReading::Absent
+        );
+        let sans_plan = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::Absent),
+            ..cand(71, Some(1), false, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &sans_plan, &[]);
+        assert!(v.admit.is_empty(), "{:?}", v.admit);
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 71,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::NoGroomedPlan,
+            }],
+            "`Absent` tombe sur `NoGroomedPlan` : ce vol ne déplace pas ce motif"
+        );
+    }
+
+    /// L'ordre des bras **est** la priorité du motif, et un ticket tenu par
+    /// l'opérateur dont le vol est livré doit lire « tenu », pas « livré ».
+    ///
+    /// `AdmissionRefusal` ne porte qu'un motif, donc cette précédence est un
+    /// choix, et un choix non épinglé se perd au premier déplacement de bras.
+    #[test]
+    fn mika2952_un_ticket_tenu_et_livre_lit_dabord_le_label() {
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::PriorOnly),
+            ..cand(2680, Some(2), true, &["operator-gated"])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2680,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "operator-gated".to_string(),
+                },
+            }],
+            "le geste correctif vérifiable d'abord : retirer le label"
+        );
+    }
+
+    // ───────── La dormance : la grammaire et son corpus (mika#2952) ─────────
+
+    /// #2854 — `> - **Condition de réveil :**`, forme la plus décorée des trois.
+    /// Ligne relue sur la forge le 2026-10-29.
+    const CORPS_DORMANT_2854: &str = concat!(
+        "> - **Branch:** `fix/2854/x`\n",
+        "> - **Condition de réveil :** quand `MIKA_WEBHOOK_COMMENT_TRIAGE` passe à `on`.\n",
+        "\n",
+        "## Le défaut\n",
+    );
+
+    /// #2472 — `> **Condition de réveil :**`, sans le tiret de liste. Le corps
+    /// réel porte **aussi** un titre de section qui nomme le marqueur ; il est
+    /// repris ici parce qu'il ne doit pas suffire (contrôle plus bas).
+    const CORPS_DORMANT_2472: &str = concat!(
+        "## Pourquoi ce ticket est `blocked` — condition de réveil (2026-09-22)\n",
+        "\n",
+        "> **Condition de réveil :** feu vert explicite de Vincent sur la dérogation\n",
+    );
+
+    /// #2912 — `**Condition de réveil : …**`, **sans** blockquote et le
+    /// deux-points **dans** l'emphase : la forme qu'un `starts_with` sur
+    /// `"**Condition de réveil :**"` raterait.
+    ///
+    /// La ligne réelle continue au-delà de ce point (« D'ici là : ni groom ni
+    /// `ready` … ») ; elle est abrégée ici à sa première phrase pour que la
+    /// condition attendue s'écrive en entier. La coupe au budget est mesurée
+    /// par la dernière assertion du test.
+    const CORPS_DORMANT_2912: &str = concat!(
+        "**Condition de réveil : quand Vincent rouvre le travail sur l'onboarding ",
+        "cloud** (mika-cloud#287, lui-même suspendu).\n",
+        "\n",
+        "## Le défaut\n",
+    );
+
+    /// #2592 — le titre `## Condition de réveil (orchestrateur, 2026-10-17)`
+    /// (l.60) **suivi** de la déclaration (l.62). La paire *est* le corps,
+    /// parce que c'est elle qui mesure le rang (mika#2959 § 2.3) : le titre
+    /// vient d'abord, et la déclaration seule porte la condition que
+    /// l'opérateur doit lire.
+    ///
+    /// La l.62 réelle continue (« Cette ligne reprend le paragraphe ci-dessous
+    /// sans le changer. Elle a été ajoutée le 2026-10-29 … ») ; elle est
+    /// abrégée ici à sa première phrase, comme [`CORPS_DORMANT_2912`], pour que
+    /// la condition attendue s'écrive en entier sous le budget. La coupe au
+    /// budget est mesurée par la dernière assertion du test 1.
+    const CORPS_DORMANT_2592: &str = concat!(
+        "## Condition de réveil (orchestrateur, 2026-10-17)\n",
+        "\n",
+        "> **Condition de réveil :** quand la fenêtre S2 de 30 jours est close, ",
+        "au plus tôt le 2026-11-01.\n",
+    );
+
+    /// #2871 — le titre `## Dormant : condition de réveil` (l.11), où le
+    /// marqueur n'est **pas** en tête, suivi de sa déclaration (l.13). Même
+    /// raison que #2592 : la paire mesure le rang.
+    ///
+    /// La l.3 est reprise en tête parce qu'elle porte le marqueur en fin de
+    /// phrase (« C'est la condition de réveil. ») derrière un ouvreur qui n'en
+    /// est pas un : si le lecteur acceptait le marqueur **n'importe où**, la
+    /// citation sortirait de là. Elle est abrégée en son milieu (la ligne réelle
+    /// nomme les deux PR contenues dans le binaire) ; sa tête et sa queue sont
+    /// mot pour mot. La l.13 est abrégée à sa première phrase comme #2592.
+    const CORPS_DORMANT_2871: &str = concat!(
+        "> **Redémarrage : 2026-10-23 à 13:01:03Z**, sur 94b21916. ",
+        "C'est la condition de réveil.\n",
+        "\n",
+        "## Dormant : condition de réveil\n",
+        "\n",
+        "> **Condition de réveil :** 7 jours après le redémarrage du moteur sur ",
+        "un binaire qui contient #2870, soit le 2026-10-30 à 13:01Z.\n",
+    );
+
+    /// #1761 (l.9) — le marqueur en **milieu de ligne**, derrière l'ouvreur
+    /// `Dormant`. C'est l'orthographe que l'arbitrage du § 2.1 de mika#2959
+    /// accepte, et seulement derrière un ouvreur.
+    ///
+    /// La l.7 du corps réel — une déclaration ordinaire ajoutée le 2026-10-29 —
+    /// est délibérément **absente** : elle satisfait la porte 1, qui existait
+    /// déjà, et la laisser ici ferait sortir le test en rang 0 sans que la
+    /// porte 2 soit jamais exercée. La ligne est abrégée à sa première phrase.
+    const CORPS_DORMANT_1761: &str = concat!(
+        "> **Dormant, ouvert. Condition de réveil :** Vincent ou Prime écrit ",
+        "dans ce ticket la forme retenue (« via le pilote » ou un canal nommé).\n",
+    );
+
+    /// #2262 (l.1) — l'ouvreur `Dormeur` et le marqueur **en minuscules**, au
+    /// milieu de la ligne. La citation commence donc au marqueur et laisse
+    /// `Dormeur visible** (règle ratifiée 2026-09-01) —` dehors.
+    ///
+    /// Le parenthétique final de la ligne réelle (« (le seul chemin d'escalade
+    /// pour cette classe MITM). ») est abrégé en un point, pour la raison de
+    /// #2592 : la condition attendue doit s'écrire entière sous le budget.
+    ///
+    /// Ce ticket porte `operator-gated`, donc `OperatorHeld` mord **avant** sa
+    /// dormance (`mika2952_un_ticket_tenu_et_dormant_lit_dabord_le_label`) :
+    /// son arbitrage au bassin ne change pas, ce qui change c'est que le motif
+    /// cesse d'être faux en amont.
+    const CORPS_DORMANT_2262: &str = concat!(
+        "> - **Dormeur visible** (règle ratifiée 2026-09-01) — **condition de ",
+        "réveil datée et concrète :** *quand l'opérateur (Vincent/sami) arbitre ",
+        "l'édition du bras de refus de `crates/mika-agent/src/server/auth.rs`*.\n",
+        "> - **Companion :** suite de mika#1949 / PR#2124.\n",
+    );
+
+    /// #2506 (fermé) — `### Condition de réveil (datée, concrète)` **seul** : sa
+    /// condition vit sur les lignes suivantes, sous des puces numérotées. C'est
+    /// le corps qui interdit de refuser les titres en bloc, et le cas où le
+    /// **rang 1** doit sortir faute de déclaration ailleurs.
+    ///
+    /// La l.5 est reprise parce qu'elle porte `**DORMANT**` et le marqueur, tous
+    /// deux en milieu de ligne derrière `Enfant` : elle doit être refusée, sans
+    /// quoi la citation en sortirait. C'est aussi ce qui dit que l'ouvreur est
+    /// testé en **préfixe** et non n'importe où.
+    const CORPS_DORMANT_2506: &str = concat!(
+        "> **Enfant 8 de #2491** (umbrella substrat nuit 2026-09-22). ",
+        "**DORMANT** — voir Condition de réveil en bas. Ne PAS poser `ready` ",
+        "tant que la condition n'est pas remplie.\n",
+        "\n",
+        "### Condition de réveil (datée, concrète)\n",
+        "Réveiller (retirer DORMANT, groomer, poser `ready`) dès **l'un** de :\n",
+    );
+
+    /// #2872 (fermé, **réveillé** le 2026-10-22) — l'historique, l.17 et l.36.
+    ///
+    /// Le faux positif que l'AC2 de mika#2959 demande de contrôler, et il est
+    /// mesuré : un lecteur qui accepterait tout titre contenant le marqueur
+    /// lirait ce ticket réveillé comme dormant.
+    const CORPS_REVEILLE_2872: &str = concat!(
+        "## Réveillé le 2026-10-22 (ancienne condition de réveil)\n",
+        "\n",
+        "## Ce qu'il faut faire au réveil\n",
+    );
+
+    /// #2959 — un ticket qui **décrit la dormance d'autrui**, en prose et en
+    /// table. C'est le second faux positif de l'AC2, et c'est l'argument qui
+    /// tranche la question que l'AC1 laissait ouverte : un lecteur qui
+    /// accepterait le marqueur **n'importe où** endormirait ce ticket-ci —
+    /// `p1-important`, actionnable, et qui corrige précisément ce lecteur.
+    ///
+    /// Les deux dernières lignes de table citent une forme de porte 2
+    /// (`Dormant : condition de réveil`, `Dormant, ouvert. Condition de
+    /// réveil :`). Elles restent refusées parce que `|` n'est pas une
+    /// décoration de tête retirée : le texte ouvre sur `| #2871 |`.
+    const CORPS_CITE_LA_DORMANCE_DAUTRUI_2959: &str = concat!(
+        "Le lecteur de dormance du bassin (`pool::dormancy_reading`, mika#2952 ",
+        "vol 2) ne reconnaît qu'une orthographe. La ligne doit **commencer** ",
+        "par `Condition de réveil`, une fois retirés `>`, `-`, `*` et `_`.\n",
+        "\n",
+        "| #2592 | `## Condition de réveil (orchestrateur, 2026-10-17)` | ",
+        "C'est un titre de section : `#` n'est pas retiré. |\n",
+        "| #2871 | `## Dormant : condition de réveil` | C'est un titre, et le ",
+        "marqueur n'est pas en tête. |\n",
+        "| #1761 | `> **Dormant, ouvert. Condition de réveil :** …` | Le ",
+        "marqueur est en milieu de ligne. |\n",
+    );
+
+    /// **Test 1** — le corpus mesuré, en table : les trois orthographes rendent
+    /// `Dormant` avec leur condition citée, et un corps sans marqueur rend
+    /// `Awake`.
+    ///
+    /// Un seul test paramétré parce que les quatre cas interrogent la même
+    /// frontière — la normalisation des décorations de tête — et qu'un test par
+    /// orthographe la ré-affirmerait trois fois.
+    #[test]
+    fn mika2952_le_corpus_dormant_mesure_rend_dormant_avec_sa_condition() {
+        for (ticket, corps, condition_attendue) in [
+            (
+                "#2854",
+                CORPS_DORMANT_2854,
+                "Condition de réveil :** quand `MIKA_WEBHOOK_COMMENT_TRIAGE` passe à `on`.",
+            ),
+            (
+                "#2472",
+                CORPS_DORMANT_2472,
+                "Condition de réveil :** feu vert explicite de Vincent sur la dérogation",
+            ),
+            (
+                "#2912",
+                CORPS_DORMANT_2912,
+                "Condition de réveil : quand Vincent rouvre le travail sur l'onboarding \
+                 cloud** (mika-cloud#287, lui-même suspendu).",
+            ),
+        ] {
+            assert_eq!(
+                dormancy_reading(corps),
+                DormancyReading::Dormant {
+                    condition: condition_attendue.to_string(),
+                },
+                "{ticket} doit se lire dormant, et citer sa condition sans l'interpréter"
+            );
+        }
+
+        // Contrôle négatif de bonne foi (mika#2205) : le prédicat n'est pas un
+        // « tout rend Dormant ». Un corps ordinaire rend `Awake`, et le candidat
+        // continue vers les portes suivantes.
+        assert_eq!(
+            dormancy_reading("## Le défaut\n\nUn ticket que rien ne retient.\n"),
+            DormancyReading::Awake
+        );
+
+        // Le titre de section de #2472, **seul** : il ouvre sur `Pourquoi`, donc
+        // ni le marqueur ni un ouvreur de dormance n'y est en tête. Une section
+        // qui *parle* de la condition n'endort pas le ticket. C'est la frontière
+        // qui sépare la prose du marqueur, et mika#2959 l'a déplacée sans la
+        // supprimer : un titre qui **ouvre** sur le marqueur, lui, déclare
+        // (`CORPS_DORMANT_2506`).
+        assert_eq!(
+            dormancy_reading(
+                "## Pourquoi ce ticket est `blocked` — condition de réveil (2026-09-22)\n"
+            ),
+            DormancyReading::Awake,
+            "un titre qui nomme le marqueur n'est pas une condition de réveil"
+        );
+
+        // Le budget, et sa coupe sur frontière de **caractère** : la condition
+        // de #2609 fait plusieurs centaines de caractères, et un rapport de sink
+        // n'a pas à en porter le corps entier.
+        let longue = format!("> **{DORMANCY_MARKER} :** {}\n", "é".repeat(400));
+        let DormancyReading::Dormant { condition } = dormancy_reading(&longue) else {
+            panic!("une ligne longue reste une ligne de dormance");
+        };
+        assert_eq!(
+            condition.chars().count(),
+            DORMANCY_CONDITION_BUDGET + 1,
+            "le budget borne la citation, plus le `…` qui dit qu'elle est coupée"
+        );
+        assert!(
+            condition.ends_with('…'),
+            "l'opérateur doit voir que la ligne est coupée : {condition}"
+        );
+    }
+
+    /// **Test 1 bis (AC1 de mika#2959)** — les orthographes mesurées que le
+    /// lecteur ratait rendent `Dormant`, avec la condition de la **déclaration**.
+    ///
+    /// La condition attendue n'est jamais celle du titre quand une déclaration
+    /// existe sur une autre ligne (#2592, #2871) : c'est elle que l'opérateur
+    /// doit lire dans le rapport du sink, et c'est ce que mesure le système de
+    /// rangs. Quand la déclaration *est* le titre (#2506), le rang 1 sort.
+    ///
+    /// Un seul test paramétré, pour la raison du test 1 : les cinq cas
+    /// interrogent la même frontière — ce qui fait d'une ligne une déclaration
+    /// de dormance plutôt qu'une mention du mot.
+    #[test]
+    fn mika2959_les_orthographes_mesurees_de_dormance_sont_lues() {
+        for (ticket, corps, condition_attendue) in [
+            (
+                "#2592 (titre puis déclaration : la déclaration gagne)",
+                CORPS_DORMANT_2592,
+                "Condition de réveil :** quand la fenêtre S2 de 30 jours est close, \
+                 au plus tôt le 2026-11-01.",
+            ),
+            (
+                "#2871 (titre sans marqueur en tête, puis déclaration)",
+                CORPS_DORMANT_2871,
+                "Condition de réveil :** 7 jours après le redémarrage du moteur sur \
+                 un binaire qui contient #2870, soit le 2026-10-30 à 13:01Z.",
+            ),
+            (
+                "#1761 (marqueur en milieu de ligne, derrière `Dormant`)",
+                CORPS_DORMANT_1761,
+                "Condition de réveil :** Vincent ou Prime écrit dans ce ticket la \
+                 forme retenue (« via le pilote » ou un canal nommé).",
+            ),
+            (
+                "#2262 (ouvreur `Dormeur`, marqueur en minuscules)",
+                CORPS_DORMANT_2262,
+                "condition de réveil datée et concrète :** *quand l'opérateur \
+                 (Vincent/sami) arbitre l'édition du bras de refus de \
+                 `crates/mika-agent/src/server/auth.rs`*.",
+            ),
+            (
+                "#2506 (le titre *est* la déclaration : rang 1)",
+                CORPS_DORMANT_2506,
+                "Condition de réveil (datée, concrète)",
+            ),
+        ] {
+            assert_eq!(
+                dormancy_reading(corps),
+                DormancyReading::Dormant {
+                    condition: condition_attendue.to_string(),
+                },
+                "{ticket} doit se lire dormant, et citer la ligne qui le déclare"
+            );
+        }
+    }
+
+    /// **Test 1 ter (AC2 de mika#2959)** — citer une condition de réveil n'est
+    /// pas en déclarer une.
+    ///
+    /// Les trois corps sont mesurés, et chacun porte un faux positif distinct :
+    /// l'historique d'un ticket réveillé (#2872), un ticket qui décrit la
+    /// dormance d'autrui en prose et en table (#2959), et un titre qui nomme le
+    /// marqueur sans ouvrir dessus (#2472). Le second est l'argument qui
+    /// tranche l'arbitrage laissé ouvert par l'AC1 : accepter le marqueur
+    /// n'importe où endormirait le ticket qui corrige ce lecteur.
+    ///
+    /// C'est le contrôle que mika#2205 réclame — deux populations sous un nom —
+    /// et il est ici du côté cher : un faux positif retire du bassin un ticket
+    /// actionnable, sous un motif faux.
+    #[test]
+    fn mika2959_une_citation_de_condition_nest_pas_une_declaration_de_dormance() {
+        for (cas, corps) in [
+            (
+                "#2872, réveillé le 2026-10-22 : son historique garde le mot",
+                CORPS_REVEILLE_2872,
+            ),
+            (
+                "#2959, qui décrit la dormance d'autrui",
+                CORPS_CITE_LA_DORMANCE_DAUTRUI_2959,
+            ),
+            (
+                "#2472, dont un titre nomme le marqueur sans ouvrir dessus",
+                "## Pourquoi ce ticket est `blocked` — condition de réveil (2026-09-22)\n",
+            ),
+        ] {
+            assert_eq!(
+                dormancy_reading(corps),
+                DormancyReading::Awake,
+                "{cas} : une mention n'est pas une déclaration, et le lecteur ne \
+                 retire pas un ticket actionnable du bassin sur ce motif"
+            );
+        }
+    }
+
+    /// **Livrée vide, et elle le reste** — l'exception nommée de la
+    /// Fire-Disposition de mika#2952 vol 2/2, forme mika#2425 / mika#1833, et
+    /// sœur de `MIKA2952_CORPUS_EXCEPTIONS` que le vol 1 a posée vide.
+    ///
+    /// Corps de la population dormante qui **échappent** au prédicat du § 1.b.
+    ///
+    /// Vide au 2026-10-29, et elle le reste après mika#2959. Le recensement de
+    /// ce jour (plan de mika#2959 § 1.2) rend **treize** corps ouverts porteurs
+    /// du marqueur, plus deux fermés, en **sept** orthographes — contre cinq
+    /// corps et trois orthographes au recensement de mika#2952, qui ne comptait
+    /// que ce que le lecteur d'alors savait lire. Les sept sont couvertes par les
+    /// deux tests ci-dessus : #2854 / #2472 / #2117 / #2912 / #2913 par le
+    /// test 1, #2592 / #2871 / #1761 / #2262 / #2506 par le test 1 bis, et #1721
+    /// partage l'orthographe de #1761.
+    ///
+    /// Une entrée ici nomme le corps précis, la raison, et son ticket de suivi.
+    const MIKA2952_DORMANCY_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// L'assertion auto-nettoyante de l'allowlist ci-dessus : une entrée dont le
+    /// corps rend désormais `Dormant` fait rougir le test.
+    ///
+    /// Le geste qui rend l'exception inutile est donc le geste qui la fait
+    /// expirer — c'est ce qui sépare cette allowlist de celle que mika#2309
+    /// condamne. Sur une allowlist vide la boucle tourne zéro fois : le test
+    /// existe pour le jour où quelqu'un y écrit une ligne.
+    #[test]
+    fn mika2952_une_exception_de_dormance_qui_passe_est_une_exception_morte() {
+        for (corps, suivi) in MIKA2952_DORMANCY_EXCEPTIONS {
+            assert_eq!(
+                dormancy_reading(corps),
+                DormancyReading::Awake,
+                "cette exception ne sert plus : le prédicat lit désormais sa dormance.\n\n\
+                 RÉSOLUTION : retirer l'entrée et fermer {suivi}."
+            );
+        }
+    }
+
+    // ───────── La dormance : le motif et son bras (mika#2952) ─────────
+
+    /// **Test 2 — AC2, moitié positive.** Un dormant n'est pas admis, son refus
+    /// se **nomme**, et il **cite** la condition.
+    ///
+    /// La lecture sort de [`dormancy_reading`] sur le corps mesuré de #2854,
+    /// jamais d'un littéral : c'est ce qui joint la grammaire du marqueur au
+    /// verdict du bassin. Un test qui poserait `Dormant { condition: "x" }` à la
+    /// main resterait vert si l'écrivain et le lecteur divergeaient.
+    ///
+    /// `plan_reading: Live` est délibéré : le refus ne doit rien emprunter aux
+    /// deux autres motifs de ce vol — c'est la dormance **seule** qui l'arrête.
+    #[test]
+    fn mika2952_un_dormant_nest_pas_admis_et_son_refus_cite_la_condition() {
+        let lecture = dormancy_reading(CORPS_DORMANT_2854);
+        let DormancyReading::Dormant { condition } = lecture.clone() else {
+            panic!("le corps mesuré de #2854 doit se lire dormant : {lecture:?}");
+        };
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::Live),
+            dormancy: Some(lecture),
+            ..cand(2854, Some(2), true, &[])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(
+            v.admit.is_empty(),
+            "#2854 dort derrière un évènement : il ne doit pas être admis — {:?}",
+            v.admit
+        );
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2854,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::Dormant {
+                    condition: condition.clone(),
+                },
+            }],
+            "le refus doit se nommer, et se distinguer de `NoGroomedPlan`"
+        );
+
+        // Le rapport que l'opérateur lit doit porter la condition **mot pour
+        // mot** : un motif qui dit « dormant » sans dire derrière quoi oblige à
+        // rouvrir le ticket pour le savoir.
+        let dit = v.refusals[0].reason.label();
+        assert!(
+            dit.contains("MIKA_WEBHOOK_COMMENT_TRIAGE"),
+            "le motif doit citer la condition : {dit}"
+        );
+
+        assert!(
+            !RefusalReason::Dormant { condition }.remediable_by_grooming(),
+            "aucun groom ne réveille un dormeur : la relève ne doit pas le proposer"
+        );
+    }
+
+    /// **Test 3 — AC2, moitié négative.** Marqueur absent, le candidat
+    /// **continue**.
+    ///
+    /// C'est la réponse à la question qu'AC2 pose explicitement — « ce que le
+    /// bassin fait d'un ticket dont le marqueur est absent » — et la paire qui
+    /// sépare « le bras lit la dormance » de « le bras refuse tout candidat dont
+    /// le corps a été lu » (mika#2205). Même graine que le test 2, seule la
+    /// lecture change.
+    ///
+    /// Les deux absences sont ici, et ce ne sont pas la même : `Awake` est une
+    /// **mesure** (le corps a été lu, il ne porte pas le marqueur) et `None`
+    /// l'absence de mesure (mika#2340). Aucune des deux n'autorise un refus, et
+    /// aucun `AdmissionRefusal` ne doit nommer ces candidats.
+    #[test]
+    fn mika2952_un_marqueur_absent_laisse_le_candidat_continuer() {
+        assert_eq!(
+            dormancy_reading("## Le défaut\n\nRien ne retient ce ticket.\n"),
+            DormancyReading::Awake,
+            "la graine du contrôle négatif doit vraiment se lire éveillée"
+        );
+
+        let milestone = vec![
+            PoolCandidate {
+                plan_reading: Some(PlanReading::Live),
+                dormancy: Some(DormancyReading::Awake),
+                ..cand(2940, Some(1), true, &[])
+            },
+            // Blob du puits hors-ligne écrit avant ce vol : aucun corps lu.
+            PoolCandidate {
+                plan_reading: Some(PlanReading::Live),
+                dormancy: None,
+                ..cand(2941, Some(1), true, &[])
+            },
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![2940, 2941],
+            "un marqueur absent et une lecture absente restent tous deux admissibles — {:?}",
+            v.admit
+        );
+        assert!(
+            v.refusals.is_empty(),
+            "aucun de ces deux candidats ne doit être nommé dans un refus — {:?}",
+            v.refusals
+        );
+    }
+
+    /// **Test 4** — `OperatorHeld` mord **avant** la dormance.
+    ///
+    /// Le cas #2117/#2472 : un corps qui dort **et** un label `blocked`. Des deux
+    /// motifs, un seul nomme un geste que l'opérateur peut faire aujourd'hui —
+    /// retirer le label — donc c'est celui que le refus doit porter.
+    /// `AdmissionRefusal` n'en portant qu'un, cette précédence est un choix, et
+    /// un choix non épinglé se perd au premier déplacement de bras.
+    #[test]
+    fn mika2952_un_ticket_tenu_et_dormant_lit_dabord_le_label() {
+        let lecture = dormancy_reading(CORPS_DORMANT_2472);
+        assert!(
+            matches!(lecture, DormancyReading::Dormant { .. }),
+            "la graine doit vraiment dormir, sans quoi le test ne mesure rien : {lecture:?}"
+        );
+
+        let milestone = vec![PoolCandidate {
+            plan_reading: Some(PlanReading::Live),
+            dormancy: Some(lecture),
+            ..cand(2472, Some(2), true, &["blocked"])
+        }];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(v.admit.is_empty(), "{:?}", v.admit);
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 2472,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::OperatorHeld {
+                    label: "blocked".to_string(),
+                },
+            }],
+            "le geste correctif vérifiable d'abord : retirer le label"
+        );
+    }
+
+    /// **Test 5** — la dormance mord **avant** `PriorPlanOnly` et avant
+    /// `NoGroomedPlan`.
+    ///
+    /// Les deux cas tiennent dans un seul test parce que c'est la même frontière
+    /// lue deux fois : de part et d'autre du bras de la dormance, les deux
+    /// motifs qu'elle précède.
+    ///
+    /// #2854 porte les **deux** faits — plus aucun callout vivant, et une
+    /// condition de réveil. Entre « à mesurer et fermer » et « dormant », le
+    /// second est vrai des deux populations superposées, et c'est le plus
+    /// bloquant : le premier ferait ouvrir un ticket qui attend un évènement.
+    ///
+    /// #2912/#2913 est l'autre côté : dormant **sans** plan du tout. Le motif
+    /// doit dire la dormance et non l'absence de plan, sans quoi le ticket
+    /// entrerait dans la relève à grommer et proposerait un groom que rien
+    /// n'attend (le `remediable_by_grooming` du test 2).
+    #[test]
+    fn mika2952_la_dormance_mord_avant_le_vol_livre_et_avant_labsence_de_plan() {
+        let lecture_2854 = dormancy_reading(CORPS_DORMANT_2854);
+        let lecture_2912 = dormancy_reading(CORPS_DORMANT_2912);
+        let DormancyReading::Dormant {
+            condition: cond_2854,
+        } = lecture_2854.clone()
+        else {
+            panic!("la graine de #2854 doit dormir : {lecture_2854:?}");
+        };
+        let DormancyReading::Dormant {
+            condition: cond_2912,
+        } = lecture_2912.clone()
+        else {
+            panic!("la graine de #2912 doit dormir : {lecture_2912:?}");
+        };
+
+        let milestone = vec![
+            // Vol livré **et** dormant : le lecteur lâche voit la ligne
+            // antérieure comme un callout, donc `plan_present == true`.
+            PoolCandidate {
+                plan_reading: Some(PlanReading::PriorOnly),
+                dormancy: Some(lecture_2854),
+                ..cand(2854, Some(2), true, &[])
+            },
+            // Dormant et sans plan du tout.
+            PoolCandidate {
+                plan_reading: Some(PlanReading::Absent),
+                dormancy: Some(lecture_2912),
+                ..cand(2912, Some(2), false, &[])
+            },
+        ];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert!(v.admit.is_empty(), "{:?}", v.admit);
+        assert_eq!(
+            v.refusals,
+            vec![
+                AdmissionRefusal {
+                    number: 2854,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::Dormant {
+                        condition: cond_2854,
+                    },
+                },
+                AdmissionRefusal {
+                    number: 2912,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::Dormant {
+                        condition: cond_2912,
+                    },
+                },
+            ],
+            "la dormance est le motif le plus bloquant des deux côtés"
+        );
+    }
+
+    // -- mika#2956 : le bassin admet sur le prédicat du dispatch ------------
+
+    /// La forme mesurée le 2026-10-29 : une ligne de citation en **prose** qui
+    /// nomme un plan sous `docs/plans/`, sans callout de branche et sans
+    /// marqueur GROOMED.
+    ///
+    /// Fixture synthétique et non #2194, parce que ce numéro est aujourd'hui
+    /// capté par le bras `Dormant`, en amont du bras que ce vol ajoute : un
+    /// test posé sur lui mesurerait l'autre bras. La cause, elle, vaut pour
+    /// tout ticket dans cette situation — et elle valait pour #2194 avant que
+    /// son corps ne soit ajusté.
+    const CORPS_CITE_UN_PLAN_SANS_GROOM: &str = "\
+Le vol 3 est à refaire, et sa branche a disparu.
+
+> Plan de référence : `docs/plans/2026-01-01-001-fix-3101-fixture-plan.md` (sur
+> main, § 1). La branche du vol 3 n'existe plus.
+";
+
+    /// Le callout de plan **strict** est là ; les deux autres signaux ne sont
+    /// pas.
+    ///
+    /// C'est la population dont le `missing` se lit exactement comme le
+    /// `missing_signals` d'un refus `dispatch_no_grooming_marker` — deux
+    /// jetons, dans l'ordre du gate, la forme du refus de ffa8a6aa du
+    /// 2026-10-29 à 07:00Z que le ticket cite.
+    const CORPS_CALLOUT_SANS_BRANCHE_NI_VERDICT: &str = "\
+> - **Plan:** `docs/plans/2026-01-01-002-fix-3102-fixture-plan.md`
+
+## Le défaut
+";
+
+    /// Les trois signaux : le corps que le gate du dispatch accepte **par
+    /// construction**, donc celui que le bassin doit continuer d'admettre
+    /// (AC2).
+    const CORPS_GROOME: &str = "\
+> - **Branch:** `fix/3103/fixture-groomee`
+> - **Plan:** `docs/plans/2026-01-01-003-fix-3103-fixture-plan.md`
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED)
+
+## Le défaut
+";
+
+    /// Un candidat dont les **quatre** lectures du corps viennent des vrais
+    /// lecteurs — ceux que `reader.rs` appelle à son composeur, et dans le même
+    /// ordre.
+    ///
+    /// Fabriquer la mesure à la main rendrait ces tests tautologiques : ce qui
+    /// est en jeu est précisément l'écart entre le lecteur lâche de mika#2608 et
+    /// le prédicat strict du dispatch, et seul le vrai couple de lecteurs le
+    /// porte. `priority_rank` est le même pour tous les candidats de ces cas :
+    /// l'ordre y est celui des numéros, jamais celui de la liste.
+    fn candidat_lu(number: u64, body: &str) -> PoolCandidate {
+        PoolCandidate {
+            plan_present: crate::milestone_manager::reader::plan_callout_present(body),
+            plan_reading: Some(crate::plan_callout::plan_reading(body)),
+            dormancy: Some(dormancy_reading(body)),
+            missing_grooming_signals: Some(crate::auto_pull::missing_grooming_signals(body)),
+            ..cand(number, Some(2), false, &[])
+        }
+    }
+
+    /// AC1 et AC2 dans la même fonction, et c'est la **paire** qui compte :
+    /// elle sépare « le bras refuse la bonne population » de « le bras refuse
+    /// tout ».
+    ///
+    /// Précision sur le plan (§ 5.4, ligne 1), qui annonçait un `missing` sans
+    /// `PlanCallout` pour la fixture en prose, au motif que « le gate est lâche
+    /// sur cet axe » : le champ ne porte pas la mesure du gate mais celle du
+    /// prédicat **strict**, dont `extract_plan_path` est ancré. Une ligne de
+    /// prose n'y est un callout sur aucun des trois axes, donc `PlanCallout`
+    /// manque bel et bien — et c'est la raison même pour laquelle ce vol
+    /// existe. La propriété que le plan décrivait est celle de la **seconde**
+    /// fixture, qui porte le callout strict ; elle est testée telle quelle
+    /// ci-dessous, avec son libellé.
+    #[test]
+    fn mika2956_un_corps_qui_cite_docs_plans_sans_branche_ni_verdict_nest_pas_admis() {
+        let en_prose = candidat_lu(3101, CORPS_CITE_UN_PLAN_SANS_GROOM);
+        let callout_seul = candidat_lu(3102, CORPS_CALLOUT_SANS_BRANCHE_NI_VERDICT);
+        let groome = candidat_lu(3103, CORPS_GROOME);
+
+        // Les deux prémisses du défaut, mesurées et non supposées. Sans la
+        // première, ces fixtures auraient cessé d'être celles de la population
+        // du ticket et le test passerait pour une autre raison que la bonne.
+        for c in [&en_prose, &callout_seul, &groome] {
+            assert!(
+                c.plan_present,
+                "#{} : le lecteur lâche de mika#2608 doit voir un plan ici",
+                c.number
+            );
+        }
+        assert_eq!(
+            groome.missing_grooming_signals.as_deref(),
+            Some(&[] as &[GroomingSignal]),
+            "le corps canonique ne manque d'aucun des trois signaux"
+        );
+        assert_eq!(
+            en_prose.missing_grooming_signals.as_deref(),
+            Some(
+                &[
+                    GroomingSignal::BranchCallout,
+                    GroomingSignal::PlanCallout,
+                    GroomingSignal::GroomedVerdict,
+                ][..]
+            ),
+            "une citation en prose n'est un callout pour aucun des trois axes \
+             du prédicat strict"
+        );
+        assert_eq!(
+            callout_seul.missing_grooming_signals.as_deref(),
+            Some(
+                &[
+                    GroomingSignal::BranchCallout,
+                    GroomingSignal::GroomedVerdict
+                ][..]
+            ),
+            "le callout de plan est là : il manque la branche et le verdict, \
+             dans l'ordre du gate"
+        );
+
+        let milestone = vec![en_prose, callout_seul, groome];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+
+        assert_eq!(
+            admitted(&v),
+            vec![3103],
+            "seul le corps que le gate du dispatch accepte est admis (AC2) : \
+             les deux autres auraient produit un `dispatch_no_grooming_marker`, \
+             donc un dispatch vide"
+        );
+        assert_eq!(
+            v.refusals,
+            vec![
+                AdmissionRefusal {
+                    number: 3101,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::UngroomedForDispatch {
+                        missing: vec![
+                            GroomingSignal::BranchCallout,
+                            GroomingSignal::PlanCallout,
+                            GroomingSignal::GroomedVerdict,
+                        ],
+                    },
+                },
+                AdmissionRefusal {
+                    number: 3102,
+                    origin: CandidateOrigin::Milestone,
+                    reason: RefusalReason::UngroomedForDispatch {
+                        missing: vec![
+                            GroomingSignal::BranchCallout,
+                            GroomingSignal::GroomedVerdict,
+                        ],
+                    },
+                },
+            ],
+            "le refus est nommé, distinct de `NoGroomedPlan`, et sa charge dit \
+             ce qui manque"
+        );
+        assert_eq!(
+            v.refusals[1].reason.label(),
+            "grooming incomplet — manque `branch_callout`, `groomed_verdict` ; \
+             à (re)groomer",
+            "le libellé porte les jetons du dispatch, pas une paraphrase : \
+             c'est ce qui permet de le rapprocher du `missing_signals` du gate"
+        );
+    }
+
+    /// AC1, seconde moitié : un groom débloque ce candidat — c'est la seule
+    /// chose qui le débloque — donc la relève à grommer est exactement
+    /// l'endroit où il doit apparaître.
+    ///
+    /// Contrôle négatif dans le même test, et il n'est pas décoratif : un
+    /// dormant n'entre pas dans la relève, parce que ce qu'il attend n'est pas
+    /// un groom. C'est la paire qui dit que `remediable_by_grooming` discrimine
+    /// au lieu de tout laisser passer.
+    #[test]
+    fn mika2956_un_refus_de_grooming_entre_dans_la_releve() {
+        use crate::milestone_manager::relief::name_relief;
+
+        let non_groome = candidat_lu(3101, CORPS_CITE_UN_PLAN_SANS_GROOM);
+        let dormant = PoolCandidate {
+            dormancy: Some(DormancyReading::Dormant {
+                condition: "quand POOL_WRITE s'ouvre".into(),
+            }),
+            ..cand(3104, Some(2), true, &[])
+        };
+        let milestone = vec![non_groome, dormant];
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &milestone, &[]);
+        let releve = name_relief(&v, &milestone, &[]);
+
+        assert_eq!(
+            releve.next.iter().map(|t| t.number).collect::<Vec<_>>(),
+            vec![3101],
+            "le refus de grooming est nommé dans la relève ; le dormant, non"
+        );
+        assert_eq!(
+            releve.beyond, 0,
+            "le filtre de la décision 5 passe avant le calcul de `beyond`, donc \
+             un refus non groomable ne gonfle pas le reste"
+        );
+        assert_eq!(
+            releve.next[0].motive,
+            RefusalReason::UngroomedForDispatch {
+                missing: vec![
+                    GroomingSignal::BranchCallout,
+                    GroomingSignal::PlanCallout,
+                    GroomingSignal::GroomedVerdict,
+                ],
+            },
+            "la relève porte **le motif du bassin**, pas une reformulation : \
+             l'opérateur lit dans la relève ce qui manque au corps"
+        );
+    }
+
+    /// Effet de bord voulu du site de filtrage unique : `numbers_needing_size`
+    /// passe par le même `well_formed_candidates`, donc un candidat refusé en
+    /// amont ne demande plus d'estimation.
+    ///
+    /// Estimer un ticket non groomé est du travail jeté — un appel `gh` et une
+    /// lecture de plan pour un candidat qui ne sera pas admis — et la ligne
+    /// « Taille non vérifiée » du rapport rétrécit d'autant.
+    #[test]
+    fn mika2956_un_candidat_non_groome_ne_demande_plus_destimation() {
+        let non_groome = candidat_lu(3101, CORPS_CITE_UN_PLAN_SANS_GROOM);
+        let groome = candidat_lu(3103, CORPS_GROOME);
+        assert_eq!(
+            numbers_needing_size(&pool_of(0, 0), &[non_groome, groome], &[]),
+            vec![3103],
+            "le bras du bassin décide une seule fois, pour les deux lecteurs"
+        );
+    }
+
+    /// Le plancher d'avant ce vol est intact, et c'est ce qui rend le vol sûr
+    /// pour les blobs du puits hors ligne : `cand` sème `None` sur les trois
+    /// lectures du corps, soit exactement un blob écrit avant mika#2956.
+    ///
+    /// `None` veut dire « ce binaire n'a pas lu le corps » (mika#2340) : il ne
+    /// refuse rien de lui-même, et il n'admet rien non plus. Le verdict d'un
+    /// blob antérieur est donc exactement celui qu'il avait.
+    #[test]
+    fn mika2956_un_corps_non_mesure_retombe_sur_lancien_plancher() {
+        let sans_plan = cand(3105, Some(2), false, &[]);
+        let avec_plan = cand(3106, Some(2), true, &[]);
+        let v = assess_pool_sans_tailles(&pool_of(0, 0), &[sans_plan, avec_plan], &[]);
+
+        assert_eq!(
+            v.refusals,
+            vec![AdmissionRefusal {
+                number: 3105,
+                origin: CandidateOrigin::Milestone,
+                reason: RefusalReason::NoGroomedPlan,
+            }],
+            "sans mesure, le plancher décide seul et son libellé ne change pas"
+        );
+        assert_eq!(
+            admitted(&v),
+            vec![3106],
+            "un candidat non mesuré que le lecteur lâche accepte reste admis — \
+             le vol ne rétroagit pas sur ce qu'il n'a pas mesuré"
+        );
+    }
+}

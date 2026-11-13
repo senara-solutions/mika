@@ -1,0 +1,2 @@
+{"timestamp":"2026-10-19T12:00:00.000Z","level":"INFO","event":"webhook_turn_outcome","agent_id":"mika-qa","request_id":"req-only-1","outcome":"review","message":"issue du tour webhook, attestée par le modèle (mika#2855)","target":"mika::otel"}
+{"timestamp":"2026-10-19T12:01:00.000Z","level":"INFO","event":"webhook_turn_outcome","agent_id":"mika-qa","request_id":"req-only-2","outcome":"stop_verdict_recorded","message":"issue du tour webhook, attestée par le modèle (mika#2855)","target":"mika::otel"}

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth_boundary;
 pub mod build_info;
+pub mod ci_read;
 pub mod claude;
 pub mod config;
 /// Point de terminaison de boucle locale **réservé** et refusant les connexions

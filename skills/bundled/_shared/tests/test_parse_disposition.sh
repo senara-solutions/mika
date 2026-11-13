@@ -23,6 +23,31 @@ source "$DISPATCH_LIB"
 
 PASS=0
 FAIL=0
+SKIPPED=0
+
+# mika#2194 vol 5 — CETTE SUITE A MAINTENANT UNE DÉPENDANCE DE FABRICATION.
+#
+# Les 55 cas ci-dessous appellent `_parse_disposition` et `_parse_verdict`, qui
+# depuis la bascule ne décident plus rien : elles écrivent la réponse dans un
+# fichier et appellent `mika arch-disposition`. Leurs ATTENTES ne changent pas
+# d'une ligne (AC2) — c'est le canal qui a changé, pas le contrat. Mais sans le
+# binaire il n'y a plus rien à mesurer, et un UNPARSED silencieux ferait rougir
+# les 55 cas sur une cause qui n'est pas la leur.
+#
+# La résolution est partagée avec `../test-dispatch-lib.sh` : une seule décision,
+# une seule copie (R6).
+# shellcheck source=skills/bundled/_shared/tests/lib-mika-bin.sh
+source "$SCRIPT_DIR/lib-mika-bin.sh"
+
+if ! mika_bin_or_skip "mika#2194 vol 5 — les 55 cas des deux lecteurs"; then
+    echo ""
+    echo "Suite non exécutée : le binaire 'mika' est requis depuis la bascule du vol 5."
+    echo "  PASS: $PASS  FAIL: $FAIL  SKIP: $SKIPPED"
+    # En CI le helper a compté un FAIL (binaire absent = panne de câblage) : la
+    # suite sort non nulle. Hors CI, un SKIP dit reste un 0.
+    [ "$FAIL" -eq 0 ] || exit 1
+    exit 0
+fi
 
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
@@ -42,8 +67,11 @@ check_fuzzy() {
     _disposition_was_fuzzy && echo "1" || echo "0"
 }
 
-# Cleanup tmpfile on exit
-trap 'rm -f "$_DISPOSITION_FUZZY_FILE"' EXIT
+# Cleanup tmpfiles on exit. DEUX canaux par fichier depuis mika#2194 vol 5 : le
+# booléen fuzzy, et le motif de refus du code `≥2` (`_arch_disposition_refuse`).
+# Les deux sont `$`-suffixés et les deux se nettoient ici — en laisser un derrière
+# ferait lire à la suite suivante le refus de celle-ci.
+trap 'rm -f "$_DISPOSITION_FUZZY_FILE" "${_ARCH_DISPOSITION_REFUSAL_FILE:-}"' EXIT
 
 # ============================================================================
 # _parse_disposition — tier 1 (literal)
@@ -248,17 +276,20 @@ assert_eq "Disposition: ESCALATE on second-pass carry-over → ESCALATE" "ESCALA
 
 # Disposition: ITERATE is NOT mapped — spec §4.5 R11 forbids a third-pass, so
 # ITERATE at second-pass falls through to Tier 2 fuzzy. On the fixture below
-# the fuzzy tier catches "human review" and returns ESCALATE.
-result=$(printf 'Findings require another iteration but need human review.\n\nDisposition: ITERATE' | _parse_verdict 2>/dev/null)
+# the fuzzy tier catches "human review needed" (the literal _parse_verdict_fuzzy
+# pattern) and returns ESCALATE.
+result=$(printf 'Findings require another iteration; human review needed.\n\nDisposition: ITERATE' | _parse_verdict 2>/dev/null)
 assert_eq "Disposition: ITERATE does not map to GROOMED — falls through" "ESCALATE" "$result"
 
 # Tier 1a (Verdict: GROOMED) still wins when both keywords are present
 result=$(printf 'Disposition: READY\n\nVerdict: ESCALATE' | _parse_verdict 2>/dev/null)
 assert_eq "tier 1a wins over tier 1b when both Verdict: and Disposition: present" "ESCALATE" "$result"
 
-# Bare "READY" alone (no Disposition: prefix) does NOT trigger tier 1b
+# Bare "READY" alone (no Disposition: prefix) does NOT trigger tier 1b. The
+# fixture matches no tier-2 pattern either, so the result is empty — GROOMED
+# here would be exactly the tier-1b mapping this case rules out.
 result=$(printf 'The plan appears READY overall.' | _parse_verdict 2>/dev/null)
-assert_eq "bare READY (no Disposition: prefix) does not trigger tier 1b" "GROOMED" "$result"
+assert_eq "bare READY (no Disposition: prefix) does not trigger tier 1b" "" "$result"
 
 # ============================================================================
 # _parse_verdict — tier 2 (fuzzy)

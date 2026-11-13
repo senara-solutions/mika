@@ -303,6 +303,11 @@ impl Database {
             info!(version = 55, "database migrated to v55");
         }
 
+        if (3..=55).contains(&version) {
+            self.migrate_v55_to_v56()?;
+            info!(version = 56, "database migrated to v56");
+        }
+
         Ok(())
     }
 
@@ -380,6 +385,136 @@ impl Database {
         Ok(())
     }
 
+    /// v55→v56 : `search_content` cesse de stocker un embedding qu'elle ne
+    /// relit jamais (mika#2658).
+    ///
+    /// **Ce qu'on retire.** `search_content.embedding_json` était une colonne
+    /// **en écriture seule** : trois sites la touchaient et aucun ne lisait sa
+    /// valeur — `index_embedding` écrivait le JSON puis passait *la même
+    /// chaîne* à `vec_search`, `get_unembedded_content` ne lisait que le
+    /// prédicat `IS NULL`, et le reste était du DDL. La copie durable qu'emprunte
+    /// réellement le chemin de recherche est la table virtuelle `vec_search`
+    /// (`vec0(embedding float[512])`), interrogée par `vec_search_internal` en
+    /// joignant `search_content` **par rowid**, sans jamais toucher
+    /// `embedding_json`. vec0 tient 512 × 4 = 2 Ko par vecteur ; le JSON en
+    /// coûtait ≈ 7,7 Ko. Les 483 Mo mesurés le 2026-10-03 sur `mika.db`
+    /// (1 012 338 688 octets au total) étaient donc ≈ 475 Mo de duplication
+    /// d'un index que SQLite tient déjà sous forme compacte.
+    ///
+    /// **Ce qu'on met à la place, et pourquoi pas un booléen.** Un
+    /// `embedding_dims INTEGER` nullable. Le prédicat `IS NULL` du backfill
+    /// n'avait besoin que d'un marqueur, mais la dimension coûte les mêmes 8
+    /// octets et rend lisible une classe de panne réelle : vec0 est déclarée
+    /// `float[512]`, donc une ligne dont l'embedding a une autre dimension a
+    /// été **refusée** par vec0 — l'insert est `let _ =`, l'erreur est avalée —
+    /// tout en paraissant indexée dans `search_content`. Avec `embedding_dims`,
+    /// cette divergence est une requête
+    /// (`SELECT count(*) FROM search_content WHERE embedding_dims NOT IN (512)`) ;
+    /// avec un booléen elle reste invisible.
+    ///
+    /// **`CASE WHEN json_valid(…)` n'est pas une précaution de style.**
+    /// `json_array_length` lève sur un JSON malformé, ce qui ferait échouer la
+    /// migration entière ; et sans branche `ELSE`, une ligne malformée reçoit
+    /// `NULL`, donc **repart dans la file de backfill**. C'est le choix
+    /// conservateur : une ligne dont le JSON était illisible n'a jamais pu
+    /// entrer dans vec0, donc la traiter comme « indexée » (`ELSE 512`) aurait
+    /// figé un trou dans l'index de recherche.
+    ///
+    /// **`DROP COLUMN`, pas une reconstruction de table.** rusqlite 0.32
+    /// (`bundled`) embarque SQLite 3.46 ; `ALTER TABLE … DROP COLUMN` existe
+    /// depuis 3.35. Les deux conditions de refus sont absentes :
+    /// `embedding_json` n'est dans aucun index (`idx_search_agent` porte
+    /// `(agent_id, source_type)`) et `search_content` n'apparaît pas dans la
+    /// vue `unified_timeline`. Si `DROP COLUMN` était malgré tout refusé à
+    /// l'exécution, la contingence nommée est l'idiome de reconstruction
+    /// complète déjà employé en v28→v29 — même résultat, une douzaine de
+    /// lignes de plus.
+    ///
+    /// **Le `VACUUM` a été retiré de cette migration le 2026-10-16 (mika#2735),
+    /// et il ne doit pas revenir.** Le raisonnement de mika#2658 reste vrai :
+    /// `DROP COLUMN` réécrit les lignes mais rend les pages libérées à la
+    /// *freelist*, pas au système, donc sans compactage le fichier garde sa
+    /// taille. Ce qui a changé, c'est le prix de l'obtenir **ici**. Le
+    /// déploiement du 2026-10-16 a joué cette migration au démarrage de
+    /// mika-spirit ; `v56: vacuum complete` à 08:50:38Z, premier
+    /// `file is not a database` 25 s plus tard, et à 11:00Z `PRAGMA quick_check`
+    /// rendait 25 arbres abîmés — `tasks`, `sessions`, `messages`, `llm_calls`,
+    /// `tool_calls`, `audit_events`, `a2a_task_map` et leurs index — avec les
+    /// signatures `Bad ptr map entry` et `2nd reference to page`. Ces deux-là
+    /// nomment la *pointer map*, et c'est l'indice de ce que le `VACUUM` faisait
+    /// réellement : la base est née en `auto_vacuum=NONE`, `Database::open`
+    /// demande `PRAGMA auto_vacuum = INCREMENTAL` — une demande **inopérante**
+    /// jusqu'au prochain `VACUUM` —, si bien que ce `VACUUM` n'était pas un
+    /// compactage mais une **conversion de format** qui ajoute des pages de
+    /// pointer map au fichier. Rejouer la v56 *sans* `VACUUM` sur la sauvegarde
+    /// v55 prend 6 s et laisse `quick_check` à `ok`.
+    ///
+    /// **Où l'espace est rendu, désormais.** Nulle part dans le chemin de
+    /// démarrage : plus aucun `VACUUM` n'y tourne, et c'est la garde (a) de
+    /// mika#2735, tenue structurellement par
+    /// `db::migrations::tests::aucun_vacuum_au_demarrage`. Le compactage devient
+    /// un geste d'opérateur, moteur arrêté — runbook dans `docs/deployment.md`
+    /// § 4b *Schema Migrations and File Rewrites*.
+    /// Une commande `mika db vacuum` sous exclusivité explicite est le vol 2 du
+    /// ticket ; elle n'existe pas encore.
+    ///
+    /// **Coût nommé, et il est permanent jusqu'au geste opérateur.** Le fichier
+    /// garde sa taille après la migration, donc l'avertissement
+    /// `database size exceeds threshold` de `startup_cleanup`
+    /// (`server/mod.rs`, seuil `DB_SIZE_WARN_BYTES`) continue de sonner **à
+    /// chaque démarrage** — ce n'est plus un signal transitoire qu'un `VACUUM`
+    /// éteint tout seul. C'est le prix assumé : un avertissement qui insiste
+    /// coûte l'attention de l'opérateur, un fichier abîmé coûte la base. Le
+    /// runbook le dit aussi, pour que la ligne ne soit pas lue comme une panne.
+    fn migrate_v55_to_v56(&mut self) -> Result<()> {
+        let version = self.schema_version()?;
+        if version >= 56 {
+            return Ok(());
+        }
+        if version != 55 {
+            anyhow::bail!(
+                "migrate_v55_to_v56 called with unexpected baseline version {version} \
+                 (expected 55) — refusing to apply migration; investigate migration order"
+            );
+        }
+
+        // Chaque `ALTER TABLE` est gardé par son propre `column_exists` —
+        // l'idiome de v30→v31. Une base déjà en forme cible mais estampillée
+        // plus bas existe réellement : c'est la forme d'une reprise après
+        // crash, et celle de `test_v1_and_incremental_schemas_converge`, qui
+        // rejoue le DDL courant puis redescend la version à 24.
+        let has_marker = self.column_exists("search_content", "embedding_dims")?;
+        let has_payload = self.column_exists("search_content", "embedding_json")?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if !has_marker {
+            tx.execute_batch(
+                "-- v56: mika#2658 — le payload jamais relu devient un marqueur de dimension.
+                 ALTER TABLE search_content ADD COLUMN embedding_dims INTEGER;",
+            )?;
+        }
+        if has_payload {
+            tx.execute_batch(
+                "UPDATE search_content
+                    SET embedding_dims = CASE WHEN json_valid(embedding_json)
+                                              THEN json_array_length(embedding_json) END
+                  WHERE embedding_json IS NOT NULL;
+
+                 ALTER TABLE search_content DROP COLUMN embedding_json;",
+            )?;
+        }
+
+        tx.execute("INSERT INTO schema_version (version) VALUES (56)", [])?;
+        tx.commit()?;
+
+        info!("v55→v56: search_content.embedding_json → embedding_dims (mika#2658)");
+
+        Ok(())
+    }
+
     fn migrate_v1(&mut self) -> Result<()> {
         info!("applying migration v1: unified task engine schema (clean slate)");
 
@@ -431,7 +566,7 @@ impl Database {
                 version INTEGER NOT NULL,
                 applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );
-            INSERT INTO schema_version (version) VALUES (55);
+            INSERT INTO schema_version (version) VALUES (56);
 
             -- Schema meta table for migration state tracking (v27+).
             CREATE TABLE schema_meta (
@@ -748,7 +883,14 @@ impl Database {
                 source_type TEXT NOT NULL,
                 source_id INTEGER,
                 content TEXT NOT NULL,
-                embedding_json TEXT,
+                -- mika#2658 : un marqueur de dimension, pas le payload. L'embedding
+                -- durable vit dans la table virtuelle `vec_search` (2 Ko/vecteur) ;
+                -- le JSON qui était ici n'en était qu'une copie jamais relue
+                -- (7,7 Ko/ligne). Ne pas écrire ici le nom du module de cette
+                -- table virtuelle : `test_v1_and_incremental_schemas_converge`
+                -- filtre les DDL par sous-chaîne sur le SQL **commentaires
+                -- compris**, et sauterait ce `CREATE TABLE` entier.
+                embedding_dims INTEGER,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
             );

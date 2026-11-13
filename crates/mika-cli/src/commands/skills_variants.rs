@@ -64,7 +64,7 @@ fn run_list(skills_dir: &Path, name: &str, format: &OutputFormat) -> Result<()> 
             println!("{}", serde_json::to_string_pretty(&all_variants)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&all_variants)?);
+            print!("{}", yaml_serde::to_string(&all_variants)?);
         }
         OutputFormat::Text => {
             if all_variants.is_empty() {
@@ -109,7 +109,7 @@ fn run_status(skills_dir: &Path, format: &OutputFormat) -> Result<()> {
             OutputFormat::Json => println!("[]"),
             OutputFormat::Yaml => print!(
                 "{}",
-                serde_yaml::to_string(&serde_json::json!([])).unwrap_or_default()
+                yaml_serde::to_string(&serde_json::json!([])).unwrap_or_default()
             ),
             OutputFormat::Text => {
                 println!("\n  No skills directory found.\n");
@@ -139,7 +139,7 @@ fn run_status(skills_dir: &Path, format: &OutputFormat) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&summaries)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&summaries)?);
+            print!("{}", yaml_serde::to_string(&summaries)?);
         }
         OutputFormat::Text => {
             if summaries.is_empty() {
@@ -251,7 +251,7 @@ fn run_diff(
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&report)?);
+            print!("{}", yaml_serde::to_string(&report)?);
         }
         OutputFormat::Text => {
             println!("\n  Diff: {name} {provider}/{model}");
@@ -287,7 +287,7 @@ fn run_reflect(skills_dir: &Path, name: &str, format: &OutputFormat) -> Result<(
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&report)?);
+            print!("{}", yaml_serde::to_string(&report)?);
         }
         OutputFormat::Text => {
             println!("\n  Reflection report for '{name}':");
@@ -467,7 +467,7 @@ fn run_validate(skills_dir: &Path, name: Option<&str>, format: &OutputFormat) ->
             println!("{}", serde_json::to_string_pretty(&all_json)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&all_json)?);
+            print!("{}", yaml_serde::to_string(&all_json)?);
         }
         OutputFormat::Text => println!(),
     }

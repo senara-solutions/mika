@@ -25,6 +25,69 @@ pub enum SendOutcome {
     NoChannel,
 }
 
+/// Severity tier of an operator notification (mika#1381).
+///
+/// There is exactly one question this axis answers: *must this line cross a
+/// mute?* Two variants, therefore — a `P1` without a distinct destination would
+/// only be a third name for the normal chat.
+///
+/// - `P0` — « the machine is broken or stalled, a human must step in ».
+///   Routed to the escalation chat when one is configured.
+/// - `P2` — everything else, including nominal hand-backs where the machine did
+///   its job. Routed to the normal chat, which the operator may mute.
+///
+/// The P0 surface stays **low-volume by construction**: a "never-muted" surface
+/// receiving seventeen classes of message is a surface that will be muted. See
+/// `docs/plans/2026-10-19-001-feat-1381-notifications-severity-tiered-operator-plan.md`
+/// § *Classification des 17 sites* for the per-site arbitration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationSeverity {
+    /// Breakage or stall requiring operator intervention.
+    P0,
+    /// Routine acknowledgement — the machine is working.
+    P2,
+}
+
+impl NotificationSeverity {
+    /// Stable token for structured log fields.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::P0 => "p0",
+            Self::P2 => "p2",
+        }
+    }
+}
+
+/// Which surface a notification resolved to (mika#1381).
+///
+/// This is the discriminant the routing tests assert and the fallback WARN
+/// reads — the resolved `chat_id` alone cannot distinguish "the escalation chat
+/// happens to equal the normal chat" from "there is no escalation chat".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetKind {
+    /// The normal chat, as every notification used before mika#1381.
+    Normal,
+    /// The dedicated escalation chat.
+    Escalation,
+    /// A P0 that found no usable escalation chat and fell back to the normal
+    /// one. Always paired with the `operator_escalation_chat_unset` WARN — a
+    /// silent fallback is the "alarm into the void" this work exists to close.
+    EscalationUnsetFallback,
+}
+
+/// Cette valeur est-elle une route P0 utilisable ? (mika#2871)
+///
+/// Extrait de [`GatewayMessageSender::resolve_notification_target`] pour que la
+/// garde de démarrage et le transport posent *la même* question. `Some(0)` est
+/// faux : voir la doc de `resolve_notification_target` — c'est le sentinelle
+/// « aucun canal de réponse » (mika#650/#1090), donc un chat d'escalade à `0`
+/// retombe sur le chat normal exactement comme une variable absente. Une garde
+/// qui ne testerait que `is_none()` serait verte sur cette configuration, et la
+/// notification d'opérateur partirait chez l'utilisateur final.
+pub(crate) fn p0_route_is_usable(escalation_chat_id: Option<i64>) -> bool {
+    matches!(escalation_chat_id, Some(id) if id != 0)
+}
+
 /// Trait for sending outbound messages to the user.
 /// CLI mode uses the fallback in send_message tool; HTTP mode will POST to the gateway.
 ///
@@ -40,13 +103,40 @@ pub enum SendOutcome {
 #[async_trait]
 pub trait MessageSender: Send + Sync {
     async fn send(&self, text: &str) -> Result<SendOutcome>;
+
+    /// Send carrying an explicit operator severity (mika#1381).
+    ///
+    /// **Default: the severity is ignored.** A rail with no second channel
+    /// (`NoopSender`, the CLI rail, every test double) keeps exactly its
+    /// current behaviour and needs no edit. Only `GatewayMessageSender`
+    /// overrides this.
+    async fn send_with_severity(
+        &self,
+        text: &str,
+        _severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        self.send(text).await
+    }
+}
+
+/// What the `failed_sends` flush needs, and nothing more: deliver a text and
+/// say whether it went through (mika#2935).
+///
+/// Deliberately **not** `MessageSender` — that trait parks, and the parking is
+/// the defect mika#2935 closes. A `MessageSender` double would not park while
+/// the real `GatewayMessageSender` does, so a test written against it would
+/// stay green above the bug.
+#[async_trait]
+pub trait FlushDelivery: Send + Sync {
+    async fn try_deliver(&self, text: &str) -> Result<SendOutcome>;
 }
 
 /// Sends outbound messages by POSTing to the gateway's /send endpoint.
 ///
-/// On failure, retries once after 2s. If both attempts fail, saves to
-/// `failed_sends` table for later flush and returns `Ok(SendOutcome::Failed)`
-/// so the caller can surface the delivery failure to the LLM.
+/// Two entries, and the difference between them is the whole of mika#2935:
+/// [`Self::try_deliver_with_severity`] delivers and reports, with no side
+/// effect on `failed_sends`; `MessageSender::send_with_severity` adds the
+/// parking. See the latter's doc-comment.
 pub struct GatewayMessageSender {
     client: reqwest::Client,
     gateway_url: String,
@@ -64,6 +154,14 @@ pub struct GatewayMessageSender {
     /// (CLI/dev, single-bot deployments), the field is omitted and the gateway
     /// falls back to its global single-bot path — no behavioral change.
     customer_id: Option<String>,
+    /// Dedicated escalation chat for `P0` notifications (mika#1381), from
+    /// `MIKA_OPERATOR_ESCALATION_CHAT_ID` → `Settings.operator_escalation_chat_id`.
+    ///
+    /// `None` is the nominal state (a deployment with a single channel): a P0
+    /// then falls back to the normal chat with a named WARN. Armed via
+    /// [`GatewayMessageSender::with_escalation_chat_id`], never through
+    /// `new()` — see that method for why.
+    escalation_chat_id: Option<i64>,
 }
 
 impl GatewayMessageSender {
@@ -91,6 +189,57 @@ impl GatewayMessageSender {
             agent_name,
             chat_id,
             customer_id,
+            escalation_chat_id: None,
+        }
+    }
+
+    /// Arm the second channel for `P0` notifications (mika#1381). Chainable
+    /// behind `new()` so that the constructor's arity — and its 16 callsites,
+    /// 10 of which are tests — does not move for a field only 2 of them care
+    /// about.
+    ///
+    /// Chained rather than a `builder()` entry point for a second, structural
+    /// reason: `qa_head_supersession.rs` scans the literal
+    /// `"GatewayMessageSender::new("` inside `run_agent_for_message` and
+    /// asserts it follows `skip_superseded_review_turn(`. A chained builder
+    /// leaves that literal in place; a `GatewayMessageSender::builder()` entry
+    /// point would redden `mika2671_b2_la_garde_de_revue_precede_le_tour` with
+    /// an error message that does not explain why.
+    pub fn with_escalation_chat_id(mut self, chat_id: Option<i64>) -> Self {
+        self.escalation_chat_id = chat_id;
+        self
+    }
+
+    /// Resolve which chat a notification of this severity goes to (mika#1381).
+    ///
+    /// Pure past the already-resolved `normal_chat_id`, so routing is testable
+    /// without an HTTP server — the same property `resolve_chat_id` and
+    /// `build_payload` already have.
+    ///
+    /// `Some(0)` is refused as a route: `chat_id == 0` is the documented
+    /// "no reply channel" sentinel that `send()` short-circuits on before any
+    /// POST (mika#650/#1090), so an escalation chat set to `0` would swallow
+    /// every P0 silently — the exact failure mode mika#1381 closes. Depuis
+    /// mika#2871 ce refus est porté par [`p0_route_is_usable`], que la garde de
+    /// démarrage lit aussi — une seconde écriture du prédicat serait libre de
+    /// divergir en silence.
+    fn resolve_notification_target(
+        &self,
+        severity: NotificationSeverity,
+        normal_chat_id: i64,
+    ) -> (i64, TargetKind) {
+        match severity {
+            NotificationSeverity::P2 => (normal_chat_id, TargetKind::Normal),
+            NotificationSeverity::P0 => {
+                if p0_route_is_usable(self.escalation_chat_id) {
+                    (
+                        self.escalation_chat_id.unwrap_or(normal_chat_id),
+                        TargetKind::Escalation,
+                    )
+                } else {
+                    (normal_chat_id, TargetKind::EscalationUnsetFallback)
+                }
+            }
         }
     }
 
@@ -168,12 +317,38 @@ impl GatewayMessageSender {
             anyhow::anyhow!("gateway request failed: {e}")
         }
     }
-}
 
-#[async_trait]
-impl MessageSender for GatewayMessageSender {
-    async fn send(&self, text: &str) -> Result<SendOutcome> {
-        let chat_id = self.resolve_chat_id().await?;
+    /// Deliver `text` and report the outcome — **without any side effect on
+    /// `failed_sends`** (mika#2935).
+    ///
+    /// Resolves the chat, routes the severity, short-circuits on the
+    /// `NoChannel` sentinel, POSTs and retries once after 2s. Everything
+    /// `send_with_severity` used to do, minus the parking, which is why a
+    /// caller that already owns a `failed_sends` row — the flush — can use it
+    /// without the row being duplicated underneath it.
+    pub async fn try_deliver_with_severity(
+        &self,
+        text: &str,
+        severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        let normal_chat_id = self.resolve_chat_id().await?;
+        let (chat_id, target) = self.resolve_notification_target(severity, normal_chat_id);
+
+        // A P0 that found no escalation chat must never fall back in silence —
+        // that is the "alarm into the void" this work exists to close. One named
+        // WARN, greppable, carrying the chat it fell back to.
+        if target == TargetKind::EscalationUnsetFallback {
+            warn!(
+                event = "operator_escalation_chat_unset",
+                agent_name = ?self.agent_name,
+                request_id = ?self.request_id,
+                severity = severity.as_str(),
+                fallback_chat_id = chat_id,
+                "operator_escalation_chat_unset: P0 notification falls back to the \
+                 normal chat — set MIKA_OPERATOR_ESCALATION_CHAT_ID to a non-zero \
+                 chat so breakage alarms survive a mute"
+            );
+        }
 
         // chat_id == 0 is the documented sentinel for "no reply channel" (GitHub
         // webhooks, non-Telegram sessions). Short-circuit before the HTTP POST —
@@ -186,6 +361,7 @@ impl MessageSender for GatewayMessageSender {
                 agent_name = ?self.agent_name,
                 request_id = ?self.request_id,
                 message_text = %truncate_for_log(text, 500),
+                severity = severity.as_str(),
                 "send_message_nochannel: message lost — chat_id=0, no reply channel available"
             );
             return Ok(SendOutcome::NoChannel);
@@ -195,6 +371,8 @@ impl MessageSender for GatewayMessageSender {
             agent_name = ?self.agent_name,
             chat_id,
             text_len = text.len(),
+            severity = severity.as_str(),
+            target = ?target,
             "GatewayMessageSender: sending outbound message"
         );
 
@@ -211,17 +389,78 @@ impl MessageSender for GatewayMessageSender {
         match self.try_send(&payload).await {
             Ok(()) => Ok(SendOutcome::Delivered),
             Err(e) => {
-                warn!(error = %e, "retry failed, saving to failed_sends");
-                let reason = e.to_string();
-                // Capture the delivery failure reason before attempting DB write.
-                // If save_failed_send fails, we still surface the original gateway
-                // error to the caller (not the DB error).
-                if let Err(db_err) = self.db.save_failed_send(text, None).await {
-                    warn!(error = %db_err, "failed to save to failed_sends table");
-                }
-                Ok(SendOutcome::Failed { reason })
+                // Says what this function did, and nothing it did not: the
+                // parking happens one level up, in `send_with_severity`
+                // (mika#2935). The former wording — "saving to failed_sends" —
+                // is what made a failed flush testify to a parking that had
+                // not happened on this path.
+                warn!(error = %e, "both /send attempts failed");
+                Ok(SendOutcome::Failed {
+                    reason: e.to_string(),
+                })
             }
         }
+    }
+}
+
+#[async_trait]
+impl MessageSender for GatewayMessageSender {
+    /// Delegates to [`Self::send_with_severity`] with `P2` (mika#1381).
+    ///
+    /// This direction — and not the reverse — is what guarantees the two paths
+    /// cannot drift: there is exactly one copy of the resolve/payload/retry/
+    /// failed_sends sequence, and `P2` resolves to the same chat `send()`
+    /// always used.
+    async fn send(&self, text: &str) -> Result<SendOutcome> {
+        self.send_with_severity(text, NotificationSeverity::P2)
+            .await
+    }
+
+    /// Deliver, then park on failure: retries once after 2s, and if both
+    /// attempts fail, saves to the `failed_sends` table for later flush and
+    /// returns `Ok(SendOutcome::Failed)` so the caller can surface the delivery
+    /// failure to the LLM.
+    ///
+    /// **The parking belongs to whoever owns no row** (mika#2935). A normal
+    /// turn owns none, so it parks here. The flush owns one, so it decides that
+    /// row's fate itself (`delete` or `increment`) and goes through
+    /// [`Self::try_deliver_with_severity`] instead — otherwise a failed flush
+    /// keeps its row *and* gets a second, already-prefixed one from this
+    /// clause, one extra `⏳ from earlier — ` per pass.
+    async fn send_with_severity(
+        &self,
+        text: &str,
+        severity: NotificationSeverity,
+    ) -> Result<SendOutcome> {
+        let outcome = self.try_deliver_with_severity(text, severity).await?;
+        if let SendOutcome::Failed { .. } = &outcome {
+            // Site UNIQUE de parquage du crate (mika#2935). Voir le détecteur
+            // `mika2935_le_parquage_a_un_seul_site`.
+            warn!(
+                event = "failed_send_parked",
+                agent_name = ?self.agent_name,
+                request_id = ?self.request_id,
+                text_len = text.len(),
+                "failed_send_parked: saving the undelivered text to failed_sends"
+            );
+            // Capture the delivery failure reason before attempting DB write.
+            // If save_failed_send fails, we still surface the original gateway
+            // error to the caller (not the DB error).
+            if let Err(db_err) = self.db.save_failed_send(text, None).await {
+                warn!(error = %db_err, "failed to save to failed_sends table");
+            }
+        }
+        Ok(outcome)
+    }
+}
+
+/// The flush's delivery rail (mika#2935): the severity `send()` already
+/// resolved on this path, so routing does not move — only the parking does.
+#[async_trait]
+impl FlushDelivery for GatewayMessageSender {
+    async fn try_deliver(&self, text: &str) -> Result<SendOutcome> {
+        self.try_deliver_with_severity(text, NotificationSeverity::P2)
+            .await
     }
 }
 
@@ -590,5 +829,321 @@ mod tests {
     #[test]
     fn test_truncate_for_log_zero_limit() {
         assert_eq!(truncate_for_log("hello", 0), "");
+    }
+
+    // --- severity-tiered operator notifications (mika#1381) ---
+    //
+    // The routing decision is asserted on `resolve_notification_target`, not
+    // through `send()`: the selector is pure past the already-resolved normal
+    // chat, so these four cases need no HTTP server and no gateway — the same
+    // property `resolve_chat_id` and `build_payload` are tested on above.
+
+    /// Fixture carrying only what the selector reads. `chat_id` is the explicit
+    /// override so `resolve_chat_id` is deterministic, even though these tests
+    /// pass the normal chat in directly.
+    fn sender_with_escalation(escalation: Option<i64>) -> GatewayMessageSender {
+        let harness = TestHarness::with_agent("severity-agent");
+        GatewayMessageSender::new(
+            "http://localhost:9999".to_string(),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("severity-agent".to_string()),
+            Some(111),
+            None,
+        )
+        .with_escalation_chat_id(escalation)
+    }
+
+    /// AC2 — a `P0` leaves for the escalation chat when one is armed.
+    #[test]
+    fn mika1381_un_p0_part_sur_le_chat_descalade() {
+        let sender = sender_with_escalation(Some(222));
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P0, 111),
+            (222, TargetKind::Escalation),
+            "un P0 doit quitter le chat normal pour le chat d'escalade"
+        );
+    }
+
+    /// AC3 — a `P2` ignores the escalation chat even when one is armed. This is
+    /// the half that makes the mute usable: a P2 routed to the never-muted
+    /// surface would re-create the problem on the other side.
+    #[test]
+    fn mika1381_un_p2_ignore_le_chat_descalade() {
+        let sender = sender_with_escalation(Some(222));
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P2, 111),
+            (111, TargetKind::Normal),
+            "un P2 reste sur le chat normal, chat d'escalade armé ou non"
+        );
+    }
+
+    /// AC4 — a `P0` with no escalation chat falls back to the normal chat and is
+    /// marked as such. Deliberately a fallback and not a drop: a deployment with
+    /// a single channel is the nominal state (D4), and losing the alarm would be
+    /// worse than delivering it to a chat the operator may have muted.
+    #[test]
+    fn mika1381_un_p0_sans_chat_descalade_retombe_sur_le_chat_normal() {
+        let sender = sender_with_escalation(None);
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P0, 111),
+            (111, TargetKind::EscalationUnsetFallback),
+            "sans second canal, le P0 retombe sur le chat normal — et le dit"
+        );
+    }
+
+    /// AC5 — `Some(0)` is refused as a route. `chat_id == 0` is the documented
+    /// "no reply channel" sentinel `send()` short-circuits on, so honouring it
+    /// as an escalation chat would swallow every P0 in silence.
+    #[test]
+    fn mika1381_un_chat_descalade_a_zero_est_refuse_comme_route() {
+        let sender = sender_with_escalation(Some(0));
+        assert_eq!(
+            sender.resolve_notification_target(NotificationSeverity::P0, 111),
+            (111, TargetKind::EscalationUnsetFallback),
+            "Some(0) vaut « pas de chat d'escalade », jamais « route vers 0 »"
+        );
+    }
+
+    /// AC6 — the trait's default method ignores the severity and delegates to
+    /// `send`. This is what lets every rail without a second channel (the CLI,
+    /// `NoopSender`, ~24 `impl MessageSender` blocks across `src/` and
+    /// `tests/eval/`) stay untouched by mika#1381.
+    #[tokio::test]
+    async fn mika1381_le_defaut_du_trait_ignore_la_severite() {
+        /// Records what reached `send`, so the test asserts delegation rather
+        /// than merely a successful outcome.
+        struct RecordingSender(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl MessageSender for RecordingSender {
+            async fn send(&self, text: &str) -> Result<SendOutcome> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(SendOutcome::Delivered)
+            }
+        }
+
+        let sender = RecordingSender(std::sync::Mutex::new(Vec::new()));
+        for severity in [NotificationSeverity::P0, NotificationSeverity::P2] {
+            assert_eq!(
+                sender.send_with_severity("alarme", severity).await.unwrap(),
+                SendOutcome::Delivered
+            );
+        }
+
+        assert_eq!(
+            *sender.0.lock().unwrap(),
+            vec!["alarme".to_string(), "alarme".to_string()],
+            "le défaut du trait passe le texte à send(), quelle que soit la sévérité"
+        );
+    }
+
+    /// AC1 à la racine, et AC2 comme contrôle négatif dans le même test
+    /// (mika#2935).
+    ///
+    /// La paire est ce qui distingue « le parquage a été déplacé » de « le
+    /// parquage a été supprimé » : un seul des deux appels suffirait à l'un des
+    /// deux énoncés, jamais aux deux.
+    ///
+    /// Le point de terminaison vient de [`mika_common::dead_endpoint::DeadEndpoint`],
+    /// tenu pour toute la durée du test — jamais un `bind(:0)` suivi d'un
+    /// `drop` (mika#2569 : ce binaire est le plus parallèle de l'arbre, et un
+    /// port libéré est repris par le voisin, qui répond alors à l'appel censé
+    /// échouer).
+    #[tokio::test]
+    async fn mika2935_le_parquage_appartient_a_send_jamais_a_la_tentative_nue() {
+        let dead = mika_common::dead_endpoint::DeadEndpoint::reserve();
+        let harness = TestHarness::new();
+        harness
+            .db
+            .set_customer_config("chat_id", "4242")
+            .await
+            .unwrap();
+
+        let sender = GatewayMessageSender::new(
+            format!("http://{}", dead.addr()),
+            SecretString::from("test-token"),
+            harness.db.clone(),
+            reqwest::Client::new(),
+            None,
+            Some("mika".to_string()),
+            None,
+            None,
+        );
+
+        // 1. La primitive échoue et n'écrit pas. C'est AC1 à la racine : le
+        //    chemin que le flush emprunte ne peut pas créer de ligne.
+        let outcome = FlushDelivery::try_deliver(&sender, "réponse parquée")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "un point de terminaison mort doit rendre Failed, pas {outcome:?}"
+        );
+        let parked = harness.db.get_pending_failed_sends(10).await.unwrap();
+        assert!(
+            parked.is_empty(),
+            "try_deliver n'a aucun effet de bord sur failed_sends, or la table \
+             porte {} ligne(s) : {:?}",
+            parked.len(),
+            parked.iter().map(|p| &p.text).collect::<Vec<_>>()
+        );
+
+        // 2. Même sender, l'entrée avec effet de bord : un tour normal parque
+        //    toujours. C'est AC2 — le contrôle négatif demandé dans ce test.
+        let outcome = MessageSender::send(&sender, "un tour normal")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, SendOutcome::Failed { .. }),
+            "même transport, même issue attendue, pas {outcome:?}"
+        );
+        let parked = harness.db.get_pending_failed_sends(10).await.unwrap();
+        assert_eq!(
+            parked.len(),
+            1,
+            "un envoi raté hors flush parque exactement une ligne : {:?}",
+            parked.iter().map(|p| &p.text).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parked[0].text, "un tour normal",
+            "la ligne parquée porte le texte de l'envoi, et seulement lui"
+        );
+    }
+
+    // ---- mika#2935 / R4 — le parquage n'a qu'un site de production ---------
+
+    /// Fichiers dispensés du détecteur de parquage unique. LIVRÉE VIDE, et
+    /// c'est le contrat. `(chemin relatif à `src/`, ticket de suivi)`.
+    const PARKING_SITE_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// L'aiguille : un **appel** de `save_failed_send`, pas sa définition.
+    const PARKING_NEEDLE: &str = ".save_failed_send(";
+
+    /// Hors périmètre, et ce n'est **pas** une exception (mika#2935).
+    ///
+    /// - `messaging.rs` est le propriétaire autorisé : le fichier qui porte le
+    ///   seul site de parquage, et ce détecteur.
+    /// - `db.rs` porte la définition et `async_db.rs` le délégué vers le fil
+    ///   DB. Ces deux-là *sont* la méthode ; les compter reviendrait à déclarer
+    ///   le type en violation de lui-même. (`db.rs` n'écrit aujourd'hui
+    ///   `pub fn save_failed_send(`, que l'aiguille ne reconnaît pas — la
+    ///   déclarer ici rend le périmètre indépendant de cette orthographe.)
+    ///
+    /// La distinction compte : une exclusion de périmètre décrit ce que le
+    /// détecteur **mesure**, une exception décrit une dette qu'il **tolère**.
+    const PARKING_SCOPE_EXCLUSIONS: &[&str] = &["messaging.rs", "db.rs", "async_db.rs"];
+
+    /// `true` si `src`, lu comme la production de `path`, parque une ligne
+    /// `failed_sends` alors que ce n'est pas son rôle (mika#2935).
+    ///
+    /// Extrait du test porteur pour que le contrôle de bonne foi puisse le
+    /// nourrir d'une source synthétique sans écrire sur le disque — une
+    /// allowlist vide au-dessus d'un scan qui ne voit rien serait verte pour la
+    /// mauvaise raison.
+    fn is_unexpected_parker(path: &std::path::Path, src: &str) -> bool {
+        if crate::source_scan::is_test_source_path(path) {
+            return false;
+        }
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if PARKING_SCOPE_EXCLUSIONS.contains(&rel.as_str()) {
+            return false;
+        }
+        if PARKING_SITE_ALLOWLIST.iter().any(|(p, _)| *p == rel) {
+            return false;
+        }
+        let prod = crate::source_scan::production_half(src);
+        crate::source_scan::strip_comment_lines(prod).contains(PARKING_NEEDLE)
+    }
+
+    /// La correction de mika#2935 est locale ; la classe ne l'est pas. Un futur
+    /// site qui parque de son côté — ou qui rebranche le flush sur `send` —
+    /// réinstalle le défaut sans rougir aucune assertion de comportement.
+    #[test]
+    fn mika2935_le_parquage_a_un_seul_site() {
+        let files = crate::source_scan::production_files();
+        assert!(
+            files.len() > 50,
+            "le parcours de `src/` n'a rendu que {} fichiers : un scan qui ne \
+             trouve plus rien doit être rouge, pas vert",
+            files.len()
+        );
+
+        let coupables: Vec<String> = files
+            .iter()
+            .filter(|(rel, prod)| is_unexpected_parker(std::path::Path::new(rel), prod))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+
+        assert!(
+            coupables.is_empty(),
+            "ces fichiers de production parquent une ligne `failed_sends` alors \
+             que `send_with_severity` est le site unique : {coupables:?}. Un \
+             second site rouvre exactement mika#2935 — la ligne ratée est \
+             conservée par son propriétaire ET recréée par le transport, avec \
+             un préfixe de plus à chaque passe. Retirez le second site, ne \
+             l'allowlistez pas : routez-le par `send_with_severity`, ou passez \
+             par `try_deliver_with_severity` si l'appelant possède déjà sa ligne."
+        );
+    }
+
+    /// L'assertion auto-nettoyante de la Fire-Disposition (mika#2309) :
+    /// l'exception expire par le geste qui la rend inutile.
+    #[test]
+    fn mika2935_lallowlist_du_parqueur_unique_est_livree_vide_et_le_reste() {
+        assert!(
+            PARKING_SITE_ALLOWLIST.is_empty(),
+            "Une entrée a été ajoutée ici. Un second site de parquage rouvre \
+             exactement mika#2935 : la ligne ratée est conservée par son \
+             propriétaire ET recréée par le transport, avec un préfixe de plus \
+             à chaque passe. Route le site par `send_with_severity`, ou ouvre \
+             un ticket de suivi et nomme-le dans l'entrée."
+        );
+    }
+
+    /// Le contrôle de bonne foi : le détecteur rougit bel et bien sur un second
+    /// parqueur, et reste muet sur une fixture de test (mika#2935).
+    ///
+    /// Sans lui, `mika2935_le_parquage_a_un_seul_site` serait vert aussi bien
+    /// parce qu'il n'y a qu'un site que parce qu'il ne sait pas en voir deux.
+    #[test]
+    fn mika2935_le_detecteur_rougit_sur_un_second_parqueur() {
+        let second_parqueur = "\
+async fn flush(db: &AsyncDatabase, text: &str) {
+    let _ = db.save_failed_send(text, None).await;
+}
+";
+
+        // Un chemin de production réel — celui du flush, qui est précisément
+        // l'endroit où le second site vivait avant R3.
+        let prod = std::path::Path::new("server/handlers.rs");
+        assert!(
+            is_unexpected_parker(prod, second_parqueur),
+            "le détecteur ne voit pas un second site de parquage : \
+             `mika2935_le_parquage_a_un_seul_site` est décoratif"
+        );
+
+        // La même source sous un chemin de test : une fixture pose
+        // légitimement l'aiguille, et l'accuser rougirait sur du code sain.
+        assert!(
+            !is_unexpected_parker(
+                std::path::Path::new("server/tests/flush_fixtures.rs"),
+                second_parqueur
+            ),
+            "une fixture de test n'est pas un site de parquage de production"
+        );
+        assert!(
+            !is_unexpected_parker(std::path::Path::new("server/tests.rs"), second_parqueur),
+            "un `tests.rs` isolé non plus (mika#2321)"
+        );
+
+        // Et le propriétaire autorisé reste hors de cause, par périmètre.
+        assert!(
+            !is_unexpected_parker(std::path::Path::new("messaging.rs"), second_parqueur),
+            "`messaging.rs` porte le site unique : c'est une exclusion de \
+             périmètre, pas une exception"
+        );
     }
 }

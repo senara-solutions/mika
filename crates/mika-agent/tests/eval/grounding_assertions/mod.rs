@@ -823,6 +823,8 @@ mod tests {
                 run_usage: None,
                 // Fixture replaying a recorded response: the turn concluded.
                 deadline_exceeded: None,
+                // …sans avoir épuisé son budget de pas non plus (mika#2943).
+                max_steps_exceeded: None,
                 // …and delivered whatever it sent (mika#2136).
                 undelivered_sends: None,
                 // A replayed fixture never ran a provider, so there is nothing

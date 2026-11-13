@@ -1,0 +1,22 @@
+[
+  { "event": "milestoned", "source": null },
+  { "event": "labeled", "source": null },
+  { "event": "labeled", "source": null },
+  { "event": "labeled", "source": null },
+  { "event": "labeled", "source": null },
+  { "event": "unlabeled", "source": null },
+  { "event": "labeled", "source": null },
+  { "event": "labeled", "source": null },
+  {
+    "event": "cross-referenced",
+    "source": {
+      "issue": {
+        "number": 2936,
+        "pull_request": { "merged_at": null }
+      }
+    }
+  },
+  { "event": "unlabeled", "source": null },
+  { "event": "labeled", "source": null },
+  { "event": "unlabeled", "source": null }
+]

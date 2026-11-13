@@ -74,10 +74,11 @@ use crate::messaging::MessageSender;
 use crate::perimeter::{self, Classification};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
-    describe_behind_main_remediation, is_behind_main, remediate_behind_main, run_gh_checks,
-    run_gh_pr_view, run_gh_subprocess,
+    BehindMainInfo, BehindMainRemediation, CheckClassification, ci_read_token_or_pat,
+    classify_checks, describe_behind_main_remediation, is_behind_main, remediate_behind_main,
+    run_gh_checks, run_gh_pr_view, run_gh_subprocess,
 };
+use mika_common::ci_read::CiReadToken;
 use mika_common::forge_identity::{DISPATCHER_AGENT, MergeReadySignal, owns_merge_transition};
 
 use super::check_suite_dedup;
@@ -172,11 +173,17 @@ pub(crate) fn decision_core_notification_value(
 /// the LLM. It never merges — see the `mika#2248` invariant above.
 /// Returns `VerdictAction::Passthrough` for all other cases (non-matching events,
 /// no open PR, no QA verdict, stale verdict, checks not all green).
+///
+/// `ci_read_token` est le jeton de **lecture** de CI (mika#2963, câblé par
+/// mika#2965), résolu une seule fois dans `server/handlers.rs`. Second jeton à
+/// côté de `github_token`, jamais son remplaçant : lire des checks n'est
+/// identitaire pour personne, donc la priorité s'y inverse (App d'abord).
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ci_success(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -428,7 +435,15 @@ pub async fn try_handle_ci_success(
     }
 
     // 5. CI aggregation gate (load-bearing — check_suite event is per-workflow)
-    let checks_future = run_gh_checks(pr.number, &event.repo, token);
+    //
+    // mika#2963, câblé par mika#2965 — jeton App-first résolu une seule fois
+    // dans `server/handlers.rs` et descendu en paramètre. Le repli au PAT reste
+    // atteignable (pas d'App configurée, ou échange échoué) et dégrade vers le
+    // régime d'avant mika#2963 : échec sur `statusCheckRollup`, gate fermé sur
+    // une erreur de lecture. La ligne `ci_read_token_source` dit laquelle des
+    // deux sources a servi.
+    let ci_token = ci_read_token_or_pat(ci_read_token, token);
+    let checks_future = run_gh_checks(pr.number, &event.repo, &ci_token);
     let checks = match tokio::time::timeout(std::time::Duration::from_secs(60), checks_future).await
     {
         Ok(Ok(c)) => c,
@@ -1162,6 +1177,52 @@ mod tests {
         assert!(
             text.contains(mika_common::forge_identity::DISPATCHER_AGENT),
             "le pré-digest doit nommer qui merge, sinon le LLM comble le vide : {text}"
+        );
+    }
+
+    /// mika#2768 — le producteur réel du pré-digest traversant le masque.
+    ///
+    /// Un littéral épinglé dans `mika-common` ne voit pas le jour où **ce**
+    /// gabarit change : le masque continuerait de passer ses treize cas et ne
+    /// masquerait plus rien de ce que ce gestionnaire émet vraiment. C'est la
+    /// leçon du test cross-crate de mika#2755
+    /// (`mika-gateway/src/github.rs`), appliquée au producteur qui a produit
+    /// l'incident — le tour du 2026-10-17 08:59:18Z sur la PR mika#2765.
+    #[test]
+    fn mika2768_le_pre_digest_reel_ne_laisse_aucun_slug_cite_a_lintention() {
+        let event = CheckSuiteEvent {
+            repo: "senara-solutions/mika".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+        };
+        let signal = MergeReadySignal {
+            repo: "senara-solutions/mika".to_string(),
+            pr_number: 2765,
+            head_sha: "abc123def".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+            task_id: "task-2765".to_string(),
+            reviewer_login: "mika-platform-qa".to_string(),
+        };
+
+        let text = format_merge_ready_pre_digest(&event, &signal);
+        assert!(
+            text.contains("groom"),
+            "sans slug cité dans le pré-digest le test serait vacant : {text}"
+        );
+
+        let masked = mika_common::github_event_format::mask_cited_branch(&text);
+
+        assert!(
+            !masked.contains("groom"),
+            "le slug cité par CE producteur doit partir : c'est lui qui a armé \
+             `required_tools` de dev-groom le 2026-10-17 : {masked}"
+        );
+        assert!(
+            masked.contains("senara-solutions/mika#2765 (branch: )"),
+            "le marqueur reste, et la ligne d'événement garde sa forme : {masked}"
+        );
+        assert!(
+            masked.contains("Do NOT call pr_merge_with_gate"),
+            "la consigne que le LLM doit lire traverse intacte : {masked}"
         );
     }
 

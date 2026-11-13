@@ -8,7 +8,7 @@ use mika_common::llm::{
     LlmContent, LlmContentBlock, LlmImage, LlmMessage, LlmProvider, LlmRequest, LlmResponseContent,
     LlmRole, LlmStopReason, LlmToolDefinition, LlmToolResultBlock, LlmToolResultContent, LlmUsage,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,20 +21,21 @@ use crate::async_db::AsyncDatabase;
 use crate::compaction;
 use crate::evidence::guards::{
     ASSERT_GROUNDED_LABEL, ASSERTED_UNAVAILABILITY_LABEL, DOCTRINE_PUBLIC_PROMO_LABEL,
-    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL,
+    DeliveryRecord, EQUIVALENCE_CLAIM_LABEL, FALSE_LOCAL_HOSTING_LABEL, FrequencyAssertionNature,
+    PendingFabricationP0, PendingFabricationP0Site, RESPONSE_CJK_SCRIPT_LABEL,
     RESPONSE_LANGUAGE_DRIFT_LABEL, TESTIMONY_ACCESS_PROPOSAL_LABEL, TIME_OF_DAY_GREETING_LABEL,
     TestimonyProposalChannel, UNACKNOWLEDGED_SEND_FAILURE_LABEL,
     UNACTIONED_FREQUENCY_PROMISE_LABEL, UndeliveredSends, assert_grounded_satisfied,
     asserted_unavailability_satisfied, detect_affirmative_state_claim,
-    detect_asserted_unavailability, detect_doctrine_public_promo, detect_equivalence_claim,
-    detect_fabricated_action_claim, detect_false_local_hosting_claim,
+    detect_asserted_unavailability, detect_cjk_script_response, detect_doctrine_public_promo,
+    detect_equivalence_claim, detect_fabricated_action_claim, detect_false_local_hosting_claim,
     detect_response_language_drift, detect_testimony_access_proposal,
     detect_time_of_day_greeting_mismatch, detect_unactioned_frequency_promise,
     detect_unverified_callback_state_claim, equivalence_claim_satisfied,
     undelivered_send_correction, undelivered_sends,
 };
 use crate::mcp::McpManager;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::post_condition::{GuardDecision, POST_CONDITION_GUARDS};
 use crate::prompt;
 use crate::skills::SkillRegistry;
@@ -54,8 +55,11 @@ use mika_common::llm::ProviderKind;
 /// Nudge-driven skill creation (mika#1583) — turn-end counter + advisory
 /// prompt-injection helpers. Co-located with the loop that reads them.
 pub mod context_history;
+pub mod max_steps_census;
+mod pr_review_groom; // mika#3004
 pub mod review_anchor;
 pub mod skill_nudge;
+use pr_review_groom::ProprietesDuTour;
 use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pending_nudge};
 
 /// Skills whose LLM output legitimately contains `Verdict:` lines.
@@ -64,7 +68,12 @@ use skill_nudge::{SkillNudgeContext, SkillNudgeState, apply_turn_end, inject_pen
 /// guard skips — verdict text is the agent's real output, not fabrication.
 ///
 /// Adding a new verdict-producing skill? Add it here — single point of truth.
-const VERDICT_PRODUCER_SKILLS: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
+///
+/// `pub` depuis mika#3002 : c'est aussi la population du stand-down de la garde de
+/// reprise (`IntentScope::OutsideReviewedPlan`), et le test d'AC1/AC2 nomme son skill
+/// **depuis cette constante**. Retapé en littéral là-bas, un renommage en production
+/// laisserait le test vert sur un nom mort.
+pub const VERDICT_PRODUCER_SKILLS: &[&str] = &["mika-arch-groom-ticket", "mika-arch-second-review"];
 
 /// Check if any skill in the registry is a known verdict producer.
 /// mika#2355 — the names of the skills injected on a turn, in registry order.
@@ -81,6 +90,24 @@ fn has_verdict_producer_skill(skills: &[crate::skills::index::SkillEntry]) -> bo
     skills
         .iter()
         .any(|s| VERDICT_PRODUCER_SKILLS.contains(&s.manifest.skill.name.as_str()))
+}
+
+/// mika#3002 — lequel des skills **injectés sur ce tour** produit un verdict, pour la
+/// sonde `guard.resume_scope_stood_down`.
+///
+/// Ne mesure PAS la même population que [`has_verdict_producer_skill`], et c'est la seule
+/// chose qu'un lecteur de la sonde doit savoir : le discriminant `is_verdict_producer` est
+/// résolu sur le registre **entier** (`params.skills.skills()`), celui-ci sur les entrées
+/// **appariées** au tour. Un skill au registre sans être apparié rend donc le champ `skill`
+/// **absent** sur une ligne pourtant émise. Absent n'est pas « aucun skill » (motif
+/// mika#2331) : c'est « le tour appartenait à la population sans que l'entrée soit
+/// injectée » — en pratique un contrat `always_on` retiré, et une anomalie à lire comme
+/// telle plutôt qu'un zéro.
+fn verdict_producer_skill_name(loaded: &[String]) -> Option<&str> {
+    loaded
+        .iter()
+        .map(String::as_str)
+        .find(|name| VERDICT_PRODUCER_SKILLS.contains(name))
 }
 
 /// Fallback message sent when the agent completes without producing text output
@@ -416,6 +443,25 @@ pub struct AgentOutput {
     /// everywhere else, including max-steps continuation — a turn that ran out
     /// of *steps* did produce a summary and is not this class.
     pub deadline_exceeded: Option<DeadlineOverrun>,
+    /// The turn ended because it ran out of its **tool-step budget**, not
+    /// because it concluded (mika#2943).
+    ///
+    /// Same reasoning as [`Self::deadline_exceeded`] one field above, and the
+    /// half it could not cover: a turn cut off at the step ceiling produces a
+    /// continuation text, so `text` reads exactly like an answer and the call
+    /// site saw `Concluded`. Six webhook turns of mika-qa between 2026-10-26 and
+    /// 2026-10-28 ended that way, each leaving its PR unreviewed and silent.
+    ///
+    /// `Some` **only** on the "continuation performed" exit of the
+    /// `LoopResult::MaxStepsExceeded` arm, and only when no QA build callback was
+    /// dispatched in the turn — that callback's own net (mika#2368/#2515) carries
+    /// the verdict, so posting here would double the `hold` (AC3).
+    ///
+    /// `None` everywhere else, **including the "continuation skipped" exit** of
+    /// that same arm: it goes through `persist_deadline_fallback` and already
+    /// poses `deadline_exceeded`. The two fields are mutually exclusive by
+    /// construction — each exit of `run_loop` poses at most one.
+    pub max_steps_exceeded: Option<MaxStepsCutOff>,
     /// A `send_message` of this turn failed and nothing repaired it
     /// (mika#2136).
     ///
@@ -474,6 +520,21 @@ pub struct DeadlineOverrun {
     pub steps_completed: usize,
 }
 
+/// Le tour a épuisé son **budget de pas d'outil** sans conclure sur ce qu'il
+/// devait conclure (mika#2943).
+///
+/// Symétrique de [`DeadlineOverrun`], et distinct à dessein : confondre les deux
+/// ferait dire au corps du verdict « a atteint la limite de son enveloppe de
+/// temps » d'un tour qui avait encore 295 s devant lui (trace `b22e6ea0`), et
+/// couperait en deux une population que l'opérateur agrège par `cause`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxStepsCutOff {
+    /// Le plafond **servi**, transporté par `LoopResult::MaxStepsExceeded`
+    /// (mika#2926 R1b) — jamais relu depuis une constante, qui annoncerait 20
+    /// pour un tour de mika-qa qui en a consommé 30.
+    pub steps_completed: usize,
+}
+
 // -- Shared helpers --
 
 /// Shared context loaded from the agent's home directory and database.
@@ -503,6 +564,15 @@ struct AgentContext {
     /// error here must not block the turn; the `<stopped-topics>` block simply
     /// stays empty.
     stopped_topics: Vec<crate::db::Preference>,
+    /// Le compte de messages, quand la fenêtre approche sa condensation
+    /// (mika#1748). `Some(n)` **est** le franchissement : le prédicat a déjà été
+    /// évalué ici, et `prompt::build_system_prompt` n'a plus qu'à rendre. `None`
+    /// couvre les trois cas où rien ne doit être rendu — sous le seuil, lecture
+    /// en échec, ou boucle sans destinataire pour la cérémonie.
+    ///
+    /// Lu fail-open comme ses voisins : un défaut de comptage ne coûte jamais le
+    /// tour, il rend seulement la cérémonie muette pour ce tour-là.
+    compaction_imminent: Option<usize>,
 }
 
 async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<AgentContext> {
@@ -582,6 +652,48 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
             Vec::new()
         }
     };
+    // mika#1748 — le prédicat de cérémonie, posé ici et nulle part ailleurs.
+    // `load_agent_context` est l'entonnoir des trois boucles (conversation,
+    // silencieuse, équipe) : un prédicat posé dans un corps de boucle serait
+    // aveugle aux deux autres, exactement la raison que le détecteur mika#2473
+    // au sommet de cette fonction porte déjà.
+    //
+    // Fail-open, comme `stopped_topics` juste au-dessus : une erreur de comptage
+    // laisse le champ à `None` sous un WARN qui la nomme. Un défaut de comptage
+    // ne coûte jamais le tour — au pire la cérémonie reste muette ce tour-ci, et
+    // le prédicat la rendra au suivant (elle est répétée à chaque tour au-dessus
+    // du seuil, pas déclenchée une fois).
+    let threshold_pct = crate::compaction_handsoff::threshold_pct();
+    let compaction_imminent = match db.count_messages().await {
+        Ok(total) if crate::compaction_handsoff::ceremony_due(total, threshold_pct) => {
+            // Sur la branche de franchissement **seulement** : au régime nominal
+            // cette ligne tomberait à chaque tour de chaque agent, et un
+            // instrument qui parle tout le temps ne dit plus rien. Le pendant
+            // négatif — « le seuil n'est pas franchi » — se lit à l'absence de
+            // ligne pour un agent dont on connaît le compte.
+            info!(
+                target: "mika::otel",
+                event = "compaction_handsoff_due",
+                agent = db.agent_id(),
+                messages = total,
+                threshold_pct,
+                window = crate::compaction::COMPACTION_THRESHOLD,
+                "plafond de contexte approché — la cérémonie de handsoff est posée au prompt"
+            );
+            Some(total)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                target: "mika::otel",
+                event = "compaction_handsoff_count_failed",
+                agent = db.agent_id(),
+                error = %e,
+                "comptage de messages indisponible — la cérémonie de handsoff reste muette ce tour-ci"
+            );
+            None
+        }
+    };
     Ok(AgentContext {
         soul_content,
         identity,
@@ -591,6 +703,7 @@ async fn load_agent_context(db: &AsyncDatabase, home_dir: &Path) -> Result<Agent
         db_history_scope,
         db_history_max_tokens,
         stopped_topics,
+        compaction_imminent,
     })
 }
 
@@ -615,6 +728,94 @@ async fn read_optional_customer_config(
         warn!(error = %e, key = %key, event = event, "customer_config read failed");
         None
     })
+}
+
+/// Stop-topics in force for a team-child turn: its own, **union** the
+/// conversational parent's (mika#1926, decision A).
+///
+/// A « arrête sur X » is the user's will, not a private state of the agent that
+/// received it: the child's text flows back into the answer the user reads, so a
+/// child blind to X can re-serve it. `parent_agent_id` is a *fact* posed by the
+/// caller ([`TeamAgentParams::parent_agent_id`]); the policy is here.
+///
+/// Four properties, each of which undoes itself if guessed:
+///
+/// - **Same file, different scope.** There is one SQLite file per container, so
+///   the parent read is [`AsyncDatabase::with_agent`] — a clone sharing the inner
+///   `Arc` (no second connection, no second thread) — and never a cross-DB access.
+/// - **Fail-open under its OWN event name.** `stop_topic_parent_load_failed`, not
+///   the `stop_topic_load_failed` of [`load_agent_context`]: two populations under
+///   one name are not subtractable (mika#2205), and the grep that answers « is the
+///   inheritance reaching anybody? » must name the inheritance. A failed parent
+///   read degrades to the child's own rows.
+/// - **The filter is mandatory on the parent read too.** `search_preferences` is a
+///   substring `LIKE` over both `category` and `value`, and `_` is a SQLite
+///   single-char wildcard — the same two leaks
+///   [`prompt::filter_stop_topic_preferences`] exists for.
+/// - **The child wins a collision.** `preferences.category` is `COLLATE NOCASE`
+///   with `PRIMARY KEY (agent_id, category)`, so dedup is
+///   `eq_ignore_ascii_case`: `stop_topic_Web-Config` and `stop_topic_web-config`
+///   are one topic, and the row kept is the child's, which is the more specific
+///   declaration.
+async fn resolve_team_stop_topics(
+    db: &AsyncDatabase,
+    agent_name: &str,
+    parent_agent_id: Option<&str>,
+    own: Vec<crate::db::Preference>,
+) -> Vec<crate::db::Preference> {
+    // A delegation to oneself is already refused upstream (`delegate_task`), but
+    // the team engine can run the conversational agent as a member of its own
+    // team. Re-reading the same scope would double every row before dedup ate it
+    // again, and would say `inherited = N` for an inheritance that happened not
+    // to exist.
+    let parent = parent_agent_id.filter(|id| *id != db.agent_id());
+    let own_count = own.len();
+
+    let mut inherited = match parent {
+        Some(parent_id) => {
+            match db
+                .with_agent(parent_id)
+                .search_preferences(prompt::STOP_TOPIC_PREFIX)
+                .await
+            {
+                Ok(rows) => prompt::filter_stop_topic_preferences(rows),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        parent_agent_id = %parent_id,
+                        "stop_topic_parent_load_failed"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    inherited.retain(|p| {
+        !own.iter()
+            .any(|o| o.category.eq_ignore_ascii_case(&p.category))
+    });
+    let inherited_count = inherited.len();
+
+    let mut effective = own;
+    effective.extend(inherited);
+    effective.sort_by(|a, b| a.category.to_lowercase().cmp(&b.category.to_lowercase()));
+
+    // Emitted on EVERY branch, all-zero included: without this line « the child
+    // inherited nothing » and « nobody declared a parent » return identical bytes
+    // (mika#2205), and the absence of the line means an older binary (mika#2340),
+    // never an absence of inheritance. `parent_agent_id` is **absent** rather
+    // than `""` when no parent was declared — absent is not zero (mika#2331).
+    info!(
+        target: "mika::otel",
+        event = "team_stop_topic_inheritance",
+        agent = %agent_name,
+        parent_agent_id = parent,
+        own = own_count,
+        inherited = inherited_count,
+        effective = effective.len(),
+    );
+    effective
 }
 
 /// Last `tenant_language_resolved` couple this process announced, per agent.
@@ -1147,7 +1348,7 @@ enum LoopResult {
         /// Original system prompt length before step-awareness nudge was appended.
         system_prompt_original_len: usize,
     },
-    /// Loop exited because `crate::planning::policy::MAX_TOOL_STEPS` was reached without an EndTurn.
+    /// Loop exited because the turn's step ceiling was reached without an EndTurn.
     /// Caller is expected to attempt a continuation turn for a final summary.
     MaxStepsExceeded {
         thinking: Option<String>,
@@ -1157,6 +1358,16 @@ enum LoopResult {
         run_usage: Option<LlmUsage>,
         tool_call_summaries: Vec<ToolCallSummary>,
         system_prompt_original_len: usize,
+        /// Le plafond que la boucle a **servi** (mika#2926).
+        ///
+        /// Transporté plutôt que recalculé en aval : depuis mika#2926 le
+        /// plafond est résolu par agent à un site unique, et chaque lecteur qui
+        /// le recalculait annonçait celui que son chemin *déclarait* — 20 pour
+        /// un `SilentTrigger::Callback`, 20 pour `MAX_TOOL_STEPS` sur le chemin
+        /// conversationnel — pendant que la boucle en servait 30. Un opérateur
+        /// lisant ces sorties aurait diagnostiqué un tour coupé à 20 steps
+        /// alors qu'il en avait consommé 30.
+        max_steps: usize,
     },
     /// Loop exited because the agent total-turn deadline was reached between steps.
     /// Caller is expected to emit the mode-appropriate fallback message. The
@@ -1337,6 +1548,21 @@ async fn run_loop(
     qa_verdict_unmet: Option<&crate::qa_build_callback::VerdictSignal>,
     store_llm_calls: bool,
     store_tool_calls: bool,
+    // mika#2867 — la porte de la classe `fabrication-detected`. `false` par
+    // défaut et résolue chez les trois appelants depuis `Settings`
+    // (`fabrication_p0_notify`) : un `Settings` absent laisse la porte fermée,
+    // donc un appelant qui n'en a pas n'arme rien.
+    //
+    // Un paramètre sur le modèle de `store_llm_calls` plutôt qu'un champ de
+    // `ToolContext` : c'est un fait de *tour* lu par un seul garde, pas une
+    // capacité dont les outils ont besoin — et `ToolContext` compte une
+    // vingtaine de sites de construction que cela ferait tous bouger.
+    //
+    // Elle ne garde que la *notification*. La détection et le `warn!` de
+    // récidive sont armés inconditionnellement : ce `warn!` est l'instrument de
+    // comptage qui doit précéder l'armement (mika#1574, et le diagnostic
+    // « alarm-into-void » de mika#1381).
+    fabrication_p0_notify: bool,
     prompt_variant: Option<&str>,
     internal: bool,
     deadline: Instant,
@@ -1353,11 +1579,54 @@ async fn run_loop(
     // the return; see the parameter's doc in `tool_execution::dispatch` for why
     // it travels by `&mut` rather than in `LoopResult`.
     delivery_log: &mut Vec<crate::evidence::guards::DeliveryRecord>,
+    webhook_event_text: Option<&str>, // mika#3004 — [`pr_review_groom`]
 ) -> Result<LoopResult> {
+    // Capture the user's input text for persistence evaluation guard (#648).
+    // Extracted once before the loop starts so it always reflects the real user
+    // message, not synthetic messages injected by guards during re-prompts.
+    //
+    // mika#2757 — remonté ici depuis le bloc des compteurs de boucle, pour
+    // précéder `effective_required_tools` ci-dessous. Entre les deux lignes rien
+    // ne lit `request.messages` ni `effective_required_tools`, donc le
+    // déplacement n'a pas d'autre effet que de rendre la chaîne disponible plus
+    // tôt.
+    let user_input_text: String = request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, LlmRole::User))
+        .map(|m| match &m.content {
+            LlmContent::Text(t) => t.clone(),
+            LlmContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    LlmContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        })
+        .unwrap_or_default();
+
     // Filter required_tools to only include tools that are actually available in the
     // current tool set (builtins + skill tools + MCP). See #516, #517.
-    let effective_required_tools =
-        filter_available_required_tools(required_tools, tools, skill_tool_map, mcp_manager);
+    //
+    // mika#2757 — les deux derniers arguments sont ce qui interdit à ce calcul de
+    // contredire le tour. `enabled_tool_names` (#862) est le tableau d'outils
+    // *réellement servi* au modèle, après les quatre couches de retrait ; et
+    // `user_input_text` est le **même binding** que celui sur lequel les
+    // `INTENT_GUARDS` évaluent `is_unauthorized_webhook_dispatch` plus bas — ce
+    // partage est ce qui interdit aux deux couches de désigner deux tours
+    // différents.
+    let effective_required_tools = filter_available_required_tools(
+        required_tools,
+        tools,
+        skill_tool_map,
+        mcp_manager,
+        enabled_tool_names,
+        &user_input_text,
+        webhook_event_text, // mika#3004 — le texte d'AVANT les handlers
+    );
 
     // All registered tool names (builtins + skills + MCP) for prose-style tool call
     // detection (#569). Built once before the loop — the tool set is stable across
@@ -1395,6 +1664,8 @@ async fn run_loop(
     let mut run_usage: Option<LlmUsage> = None;
     let mut thinking_text = None;
     let mut all_tool_summaries: Vec<ToolCallSummary> = Vec::new();
+    // mika#3003 — portée = le tour, d'où la déclaration AVANT la boucle des pas.
+    let mut tool_read_ledger = review_anchor::ToolReadLedger::default();
     // Track which tools have been called across all steps for required_tools enforcement.
     let mut tools_called: HashSet<String> = HashSet::new();
     // Whether we already injected a required-tools correction. Only allow one retry.
@@ -1446,6 +1717,27 @@ async fn run_loop(
     // mika#2037 — review-anchor guard. Independent of the flags above: an F-list
     // re-prompt must not consume the anchor guard's single corrective attempt.
     let mut review_anchor_retry_done = false;
+    // mika#2867 — la récidive d'ancrage a été observée une fois sur ce tour.
+    // Même forme que les verrous ci-dessus, et pour la même raison : la branche
+    // `assert_grounded_uncorrected` est évaluée à chaque `EndTurn`, et un tour
+    // qui repasse par là (une autre garde ayant repris la main entre-temps)
+    // émettrait un second `warn!` et une seconde notification pour un seul
+    // incident. Le verrou couvre les deux : un P0 dupliqué érode la surface
+    // jamais muette aussi sûrement qu'un P0 trop fréquent.
+    let mut assert_grounded_uncorrected_notified = false;
+    // mika#2867 — la notification P0 de la récidive, différée jusqu'à
+    // l'acceptation de l'`EndTurn`. Les gardes en aval de la branche (6e, 6f,
+    // #1313, #864, #901, #2037) peuvent encore refuser la clôture : la réponse
+    // qui a récidivé ne sortirait alors jamais, et la notification dirait le
+    // contraire. Rempli seulement porte ouverte, consommé une fois.
+    //
+    // mika#2872 — le créneau porte désormais SON SITE avec elle. Un seul
+    // créneau pour toute la classe `fabrication-detected`, donc une seule P0
+    // par tour quel que soit le nombre de sites qui récidivent (le coût est
+    // nommé sur `PendingFabricationP0Site`), et la revérification à
+    // l'acceptation rejoue le prédicat *du site qui a déposé* plutôt qu'un
+    // prédicat câblé en dur.
+    let mut pending_fabrication_p0: Option<PendingFabricationP0> = None;
     // Guard telemetry correlation (#953). Set by any fabrication-class guard firing
     // (last-writer-wins); consumed on the next successful EndTurn to emit a paired
     // `guard.correction_accepted` event with `corrected_content`.
@@ -1455,26 +1747,6 @@ async fn run_loop(
     // former `webhook_zero_tools_retry_done` boolean and generalizes to all
     // intent guards in `INTENT_GUARDS`.
     let mut intent_guard_retries: HashSet<&'static str> = HashSet::new();
-    // Capture the user's input text for persistence evaluation guard (#648).
-    // Extracted once before the loop starts so it always reflects the real user
-    // message, not synthetic messages injected by guards during re-prompts.
-    let user_input_text: String = request
-        .messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, LlmRole::User))
-        .map(|m| match &m.content {
-            LlmContent::Text(t) => t.clone(),
-            LlmContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    LlmContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(""),
-        })
-        .unwrap_or_default();
     // mika#2355 — is a QA verdict DUE on this turn? Conjunctive: the message
     // is a build callback AND `qa-review` is among the turn's skills. Computed
     // once, here, from the same `user_input_text` every other guard reads, so
@@ -1482,10 +1754,27 @@ async fn run_loop(
     // `callback_trigger_active` cannot disagree on what a build callback is.
     let qa_verdict_due =
         crate::qa_build_callback::qa_verdict_required(&user_input_text, loaded_skill_names);
+    // mika#2727 — is a SUBMITTED review DUE on this turn? Same shape, same two
+    // sources, the other end of the same review: the message is one of the four
+    // PR webhook actions the gateway routes to mika-qa AND `qa-review` is among
+    // the turn's skills. Disjoint from `qa_verdict_due` by construction (the two
+    // message prefixes cannot both match), pinned by
+    // `qa_review_submission::tests::mika2727_les_deux_gardes_ne_sont_jamais_dues_sur_le_meme_message`.
+    let qa_review_due = crate::qa_review_submission::review_submission_required(
+        &user_input_text,
+        loaded_skill_names,
+    );
     // Track system prompt length before nudge so we can strip it later
     let system_prompt_len = request.system.as_ref().map_or(0, |s| s.len());
 
-    let max_steps = mode.max_steps();
+    // Le plafond de steps du tour, résolu **par agent** (mika#2926). Site
+    // unique : `mode.max_steps()` fournit le `default` — celui des trois
+    // plafonds que le mode déclare — et la table par agent le remplace quand
+    // elle nomme cet agent. Les trois modes passent par ici, donc un seul site
+    // les couvre tous, et la valeur résolue est celle que le WARN de coupure et
+    // le recensement annoncent (R1b) : rien en aval ne recalcule un plafond.
+    let max_steps =
+        crate::planning::policy::max_tool_steps_for_agent(db.agent_id(), mode.max_steps());
     for step in 0..max_steps {
         // Deadline check at iteration top — refuses to start the next step when
         // the agent total-turn deadline has been reached. Any in-flight LLM HTTP
@@ -1891,6 +2180,10 @@ async fn run_loop(
                         mode.is_conversation(),
                         stream_ctx,
                         delivery_log,
+                        // mika#2934 — l'emprunt immuable meurt avec l'appel,
+                        // l'`extend` juste en dessous reprend la main.
+                        &all_tool_summaries,
+                        &mut tool_read_ledger,
                     )
                     .await;
                     all_tool_summaries.extend(step_summaries);
@@ -2110,6 +2403,25 @@ async fn run_loop(
                                 // Fall through — let the response proceed to the next guard.
                             } else {
                                 required_tools_retry_done = true;
+                                // mika#2772 — ce re-prompt EST le forçage : il est le
+                                // seul site du moteur qui dise au modèle « appelle cet
+                                // outil ». Un dispatch qui part après lui dans le même
+                                // tour n'a pas été demandé, il a été exigé.
+                                //
+                                // Les deux arms au-dessus ne l'écrivent pas, et c'est
+                                // le cœur de la précision du drapeau : l'early-accept
+                                // `has_successful_pr_review` (#821) et l'accept
+                                // `has_terminal_required_tool_failure` (#516)
+                                // *relâchent* la contrainte, ils ne la forcent pas.
+                                //
+                                // `Relaxed` suffit : le drapeau est écrit et lu dans
+                                // le même tour, sur le même objet, et aucun ordre
+                                // inter-champ n'est à garantir — même raisonnement que
+                                // `dispatch_count`.
+                                if let Some(ctx) = long_running_ctx {
+                                    ctx.tool_constraint_forced
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                                 let missing_names: Vec<&str> =
                                     missing.iter().map(|s| s.as_str()).collect();
                                 warn!(
@@ -2665,6 +2977,47 @@ async fn run_loop(
                             "False local-hosting claim guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
+                        // mika#2872 — ce site est RATTACHÉ à la classe P0
+                        // `fabrication-detected`. Par le critère D1 : « je tourne
+                        // en local sur ta machine » affirme un état du
+                        // déploiement qu'aucun résultat d'outil de ce tour ne
+                        // porte — et que `tool_ctx.deployment` contredit. Le
+                        // tenant vient d'être rassuré sur la confidentialité de
+                        // ce qu'il écrit, sur la foi d'une affirmation fausse
+                        // qu'aucun aval ne corrigera : c'est la forme même du
+                        // réveil d'opérateur que mika#1381 a réservé à P0.
+                        //
+                        // Porte désarmée par défaut (`fabrication_p0_notify`,
+                        // mika#1574 option (b)) et verrou de classe
+                        // (`is_none()`) : une seule P0 par tour pour toute la
+                        // classe, le premier écrivain de la chaîne gagne.
+                        if fabrication_p0_notify && pending_fabrication_p0.is_none() {
+                            pending_fabrication_p0 = Some(PendingFabricationP0 {
+                                message: format!(
+                                    "Fabrication detected (uncorrected) on deployment \
+                                     locality: the false local-hosting guard fired and \
+                                     the re-prompt budget is spent, yet the response \
+                                     still asserts «{assertion} … {subject}» while the \
+                                     runtime deployment is {deployment:?}. The answer \
+                                     went out, and the tenant was told their data stays \
+                                     on their machine. Investigate trace_id {trace_id} \
+                                     in /var/log/mika/server.log.",
+                                    // Assertion puis localité, dans l'ordre où la
+                                    // garde les a appariées — les deux couches sont
+                                    // capturées séparément, et les rendre dans
+                                    // l'ordre inverse donnait « en local je tourne »
+                                    // à l'opérateur. L'ellipse dit le trou : les
+                                    // deux fragments ne sont pas contigus dans la
+                                    // phrase, ils sont à moins de `CLAIM_GAP_MAX`
+                                    // l'un de l'autre.
+                                    assertion = hosting.assertion,
+                                    subject = hosting.subject,
+                                    deployment = tool_ctx.deployment,
+                                    trace_id = tool_ctx.trace_id,
+                                ),
+                                site: PendingFabricationP0Site::FalseLocalHosting,
+                            });
+                        }
                     }
 
                     // 5e. Unactioned frequency-promise guard (mika#2358) — refuse
@@ -2716,6 +3069,15 @@ async fn run_loop(
                             step,
                             matched_subject = %promise.subject,
                             matched_assertion = %promise.assertion,
+                            // mika#2879 — les deux natures que mika#2878 a
+                            // séparées sont deux populations sous un seul nom
+                            // d'événement, donc non soustractibles (classe
+                            // mika#2205). Ce champ est ce qui les sépare, et
+                            // c'est à lui que le vol 3 adossera le rattachement
+                            // de la seule moitié accomplie. Son ABSENCE d'une
+                            // ligne signifie un binaire antérieur à ce vol
+                            // (classe mika#2340), jamais « aucune des deux ».
+                            assertion_nature = promise.nature.as_str(),
                             guard_correlation_id = %corr_id,
                             label = mode.label(),
                             event = "guard.unactioned_frequency_promise",
@@ -2782,11 +3144,68 @@ async fn run_loop(
                             step,
                             matched_subject = %promise.subject,
                             matched_assertion = %promise.assertion,
+                            // mika#2879, même raison qu'au site corrigé
+                            // ci-dessus : le résidu se compte aussi par nature,
+                            // sinon les deux populations du résidu restent
+                            // confondues là où celles du tir sont séparées.
+                            assertion_nature = promise.nature.as_str(),
                             label = mode.label(),
                             event = "guard.unactioned_frequency_promise_uncorrected",
                             "Unactioned frequency-promise guard already fired this turn — \
                              accepting EndTurn with second violation (budget exhausted)"
                         );
+                        // mika#2879 (vol 3) — ce site est rattaché à la classe
+                        // P0 `fabrication-detected` **sur sa seule moitié « état
+                        // accompli »**. Par le critère mika#2872 D1 : « c'est
+                        // corrigé » affirme un état du système que le terme (C)
+                        // du détecteur vient de contredire (aucun `set_config`
+                        // sur les deux clés proactives n'a tourné ce tour), donc
+                        // personne dans le système ne sait si c'est vrai et seul
+                        // un humain peut l'établir. « Je vais réduire » reste
+                        // dehors : une promesse non tenue ne pose aucun état, et
+                        // aucun geste d'opérateur ne la rendrait vraie.
+                        //
+                        // Trois termes, trois rôles distincts :
+                        // - la porte, désarmée par défaut (mika#1574 (b)) ;
+                        // - le verrou de **classe** : une seule P0 par tour pour
+                        //   toute la classe, le premier écrivain gagne ;
+                        // - l'appartenance. Ce dernier n'est pas redondant avec
+                        //   le bras de `still_violated` : sans lui un engagement
+                        //   sur l'avenir **occuperait le créneau**, la P0 du 5d
+                        //   du même tour serait perdue, puis celle de 5e
+                        //   supprimée à l'acceptation. Le terme protège le
+                        //   créneau, là où la revérification protège l'émission.
+                        if fabrication_p0_notify
+                            && pending_fabrication_p0.is_none()
+                            && promise.nature == FrequencyAssertionNature::AccomplishedState
+                        {
+                            pending_fabrication_p0 = Some(PendingFabricationP0 {
+                                message: format!(
+                                    "Fabrication detected (uncorrected) on message \
+                                     frequency: the frequency-promise guard fired and \
+                                     the re-prompt budget is spent, yet the response \
+                                     still asserts «{assertion} … {subject}» as an \
+                                     accomplished state, and no set_config on \
+                                     {budget_key} or {pause_key} ran this turn. The \
+                                     answer went out, and the tenant was told the \
+                                     frequency had already changed. Investigate \
+                                     trace_id {trace_id} in /var/log/mika/server.log.",
+                                    // Assertion puis sujet, dans l'ordre où la
+                                    // garde les a appariés ; l'ellipse dit le trou
+                                    // (les deux fragments sont à moins de
+                                    // `CLAIM_GAP_MAX` l'un de l'autre, pas
+                                    // contigus). Même forme qu'au site 5d
+                                    // ci-dessus, et pour la même raison.
+                                    assertion = promise.assertion,
+                                    subject = promise.subject,
+                                    budget_key = crate::config_keys::PROACTIVE_DAILY_BUDGET_KEY,
+                                    pause_key = crate::config_keys::PROACTIVE_PAUSE_UNTIL_KEY,
+                                    trace_id = tool_ctx.trace_id,
+                                ),
+                                site:
+                                    PendingFabricationP0Site::UnactionedFrequencyPromiseAccomplished,
+                            });
+                        }
                     }
 
                     // 5f. Response language-drift guard (mika#2247 AC2) — refuse
@@ -3145,6 +3564,135 @@ async fn run_loop(
                         );
                     }
 
+                    // 5i. CJK-script response guard (mika#1680) — refuse a turn
+                    // written in Chinese ideographs rather than the Latin script.
+                    //
+                    // **The measured defect.** 2026-10-29, `messages` table of
+                    // `~/.mika/data/mika.db`, `agent_id='mika-dev'`,
+                    // `role='assistant'`: 5 responses of 15 are written entirely
+                    // in Chinese — webhook acknowledgements, no-ops, a CI report.
+                    // The content is correct; only the language is wrong. The
+                    // model is `z-ai/glm-5.2`, and the swap of model *class* is
+                    // precisely why the prompt line of `write_latin_script_line`
+                    // does not travel alone: mika#2120 already established that
+                    // the execution of an instruction does not bind across model
+                    // classes, so the prompt gets the right answer first try and
+                    // this guard is what **measures** what the prompt obtains.
+                    //
+                    // **Why mika#2247's 5f does not cover it.** Three independent
+                    // reasons, each sufficient, all written at
+                    // `detect_cjk_script_response`: 5f needs a *declared*
+                    // language and nothing declares one here, its verdict domain
+                    // has no Chinese and its function-word threshold fails at the
+                    // opening on an ideographic text, and its correction names a
+                    // `zh` that `TenantLanguage::parse` does not accept. The axis
+                    // is therefore the **script**, which needs no declaration to
+                    // arm.
+                    //
+                    // **Appended at the tail rather than placed next to 5f**,
+                    // which would read better and would cost renumbering 5g and
+                    // 5h across eight sites. The order is observably neutral
+                    // here, for two reasons: every earlier guard's lexicon is
+                    // Latin, so a fully Chinese text fires none of them; and if a
+                    // suffix-line guard fires first, the budgets are **per
+                    // label**, so 5i fires on the following turn without losing
+                    // anything.
+                    //
+                    // **Scope, taken from 5h's doc and not widened:** this reads
+                    // the turn's final assistant text, never a `send_message`
+                    // argument. Chinese passed as a tool argument is not seen.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries.contains(RESPONSE_CJK_SCRIPT_LABEL)
+                        && let Some(cjk) = detect_cjk_script_response(&text)
+                    {
+                        intent_guard_retries.insert(RESPONSE_CJK_SCRIPT_LABEL);
+                        let corr_id = format!("{}:{}:response_cjk_script", tool_ctx.trace_id, step);
+                        guard_correlation = Some(GuardCorrelation {
+                            correlation_id: corr_id.clone(),
+                            guard_label: "response_cjk_script",
+                            step,
+                        });
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            ideographs = cjk.ideographs,
+                            latin = cjk.latin,
+                            share_pct = cjk.share_pct,
+                            guard_correlation_id = %corr_id,
+                            label = mode.label(),
+                            event = "guard.response_cjk_script",
+                            "CJK-script response guard fired — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        // The second sentence of the last paragraph is there
+                        // because the measured defect is one of language, not of
+                        // content: without it, a re-prompted model has every
+                        // reason to rebuild its answer and lose the correct fact
+                        // it was carrying.
+                        let correction = format!(
+                            "[mika-engine] Your response is written in Chinese ideographs \
+                             ({ideographs} of {ideographs}+{latin} script characters, \
+                             {share_pct}%). The operator who reads this agent's output does \
+                             not read that script, and the only declared conversation \
+                             languages of this platform are `fr` and `en` - both Latin \
+                             script.\n\n\
+                             Offending excerpt: {excerpt}\n\n\
+                             Rewrite your response now in the Latin script. Keep the \
+                             substance exactly as it is - the content of your previous \
+                             answer was correct, only its script is wrong. If you must name \
+                             a CJK string that is itself data (a filename, a test fixture), \
+                             keep it inside backticks and write the sentence around it in \
+                             the Latin script.",
+                            ideographs = cjk.ideographs,
+                            latin = cjk.latin,
+                            share_pct = cjk.share_pct,
+                            excerpt = cjk.excerpt,
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(correction),
+                        });
+                        continue;
+                    }
+
+                    // mika#1680 — the residue of 5i's single-retry budget, named.
+                    //
+                    // Same gesture and same reason as 5d/5e/5f/5g/5h above. Without
+                    // this line, "the guard corrected" and "the guard gave up"
+                    // render the same bytes, and the AC4 probe stays an assertion
+                    // instead of being a measurement: `guard.response_cjk_script`
+                    // counts the turns caught, this one counts the turns the guard
+                    // did not close. If it is non-negligible the remedy is an engine
+                    // net of the mika#2368 shape — **a ticket, not a loosened
+                    // threshold**. Expected regime: zero lines.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(RESPONSE_CJK_SCRIPT_LABEL)
+                        && let Some(cjk) = detect_cjk_script_response(&text)
+                    {
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            ideographs = cjk.ideographs,
+                            latin = cjk.latin,
+                            share_pct = cjk.share_pct,
+                            label = mode.label(),
+                            event = "guard.response_cjk_script_uncorrected",
+                            "CJK-script response guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                    }
+
                     // Intent-precondition registry (#702): iterate INTENT_GUARDS
                     // and reject EndTurn once per entry when the trigger matches but
                     // the precondition is not satisfied.  Generalizes the former
@@ -3157,14 +3705,57 @@ async fn run_loop(
                             if intent_guard_retries.contains(guard.label) {
                                 continue; // already fired once — single-retry semantics
                             }
-                            if (guard.trigger)(&user_input_text)
-                                && !(guard.satisfied)(&all_tool_summaries)
+                            // mika#3002 — le contrôle positif de la paire (doctrine
+                            // mika#2205). Sans cette ligne, « la garde ne tire plus sur
+                            // les plans » et « aucune revue d'architecte n'a eu lieu dans
+                            // la fenêtre » rendent les mêmes octets : AC3 compte des
+                            // relances, et zéro relance a deux causes de signe opposé.
+                            // Elle n'est émise que quand le rétrécissement a RÉELLEMENT
+                            // changé l'issue de ce tour — pas à chaque tour de revue.
+                            if guard.scope.stood_down(
+                                guard.trigger,
+                                &user_input_text,
+                                is_verdict_producer,
+                            ) {
+                                info!(
+                                    target: "mika::otel",
+                                    event = "guard.resume_scope_stood_down",
+                                    intent_guard = guard.label,
+                                    brief_chars = user_input_text.chars().count(),
+                                    // Présence des DEUX marqueurs, pas vacuité des deux
+                                    // régions : `outside_reviewed_plan` rend `("", "")`
+                                    // aussi bien sur un brief sans enveloppe que sur une
+                                    // enveloppe aux régions vides, et c'est précisément
+                                    // ces deux cas qu'il faut pouvoir séparer à la
+                                    // lecture — le premier est la première passe, le
+                                    // second serait un défaut du shell.
+                                    envelope = user_input_text
+                                        .contains(review_anchor::RETRY_PLAN_BEGIN)
+                                        && user_input_text
+                                            .contains(review_anchor::RETRY_PLAN_END),
+                                    skill = verdict_producer_skill_name(loaded_skill_names),
+                                    "Resume-intent guard stood down — the trigger words live in the reviewed plan"
+                                );
+                            }
+                            if guard.scope.triggered(
+                                guard.trigger,
+                                &user_input_text,
+                                is_verdict_producer,
+                            ) && !(guard.satisfied)(&all_tool_summaries)
                             {
                                 intent_guard_retries.insert(guard.label);
                                 warn!(
                                     step,
                                     label = mode.label(),
+                                    // mika#3002 — nommée pour être comptée : AC3 compte
+                                    // les relances de `resume_reconcile` sur vingt revues,
+                                    // et `is_verdict_producer` dit si le tour appartenait à
+                                    // la population du rétrécissement. Une garde qui tire
+                                    // avec ce champ à `true` est une fuite du stand-down,
+                                    // pas une relance ordinaire.
+                                    event = "guard.intent_precondition_fired",
                                     intent_guard = guard.label,
+                                    is_verdict_producer,
                                     "Intent-precondition guard fired — re-prompting"
                                 );
                                 request.messages.push(LlmMessage {
@@ -3260,6 +3851,133 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 crate::qa_build_callback::QA_VERDICT_REQUIRED_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2727 — QA review-submission guard (non-empty text path).
+                    // A PR webhook turn with `qa-review` loaded concludes by
+                    // SUBMITTING the review: `required_tools` only checks that a tool
+                    // NAMED `run_gh` was called, so a read-only `pr list` / `pr view`
+                    // satisfied it while nothing reached GitHub (n=2 on #2704,
+                    // 2026-10-15, both needing a manual relaunch). Inline for the same
+                    // reason as mika#2355 above: the trigger is conjunctive, and the
+                    // first term alone would re-prompt mika-dev (which receives
+                    // `pull_request.closed`) to post a review it does not owe.
+                    // Satisfaction is disjunctive — dispatching `build_mika` is a valid
+                    // way to end a review turn, and that is where mika#2355 takes over.
+                    // Single retry via intent_guard_retries.
+                    if !skip_remaining_guards
+                        && matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && qa_review_due
+                        && !intent_guard_retries
+                            .contains(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL)
+                        && !crate::qa_review_submission::review_submission_satisfied(
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_review_submission::REVIEW_SUBMISSION_LABEL,
+                            "qa-review turn ending without a submitted review — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_review_submission::REVIEW_SUBMISSION_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2948 — QA reviewed-head record guard (non-empty text
+                    // path). A build callback that POSTED its review concludes by
+                    // RECORDING the head it ruled on, so the (g′) pre-filter of
+                    // mika#2917 can discard the next green `check_suite` on that
+                    // same head. Measured 2026-10-28: ten callbacks posted a
+                    // successful `pr review` since 2026-10-27 09:20Z, one called
+                    // `record_reviewed_head` — the instruction was in the deployed
+                    // prompt and the model did not execute it, so each of the nine
+                    // others paid a full webhook turn for mika-qa AND mika-dev.
+                    //
+                    // The engine re-prompts; it never writes the registry itself.
+                    // SOLE WRITER (`qa_reviewed_head.rs`) holds, and it must: the
+                    // engine does not own the head — `PrTarget` carries only
+                    // `{repo, pr_number}`, the `headRefOid` was read in the previous
+                    // turn, and a head re-read now may be a head that moved (the
+                    // founding incident of mika#2727).
+                    //
+                    // **Mutually exclusive with the mika#2355 guard above, by
+                    // construction**: that one arms on `!pr_review_posted_in_turn`,
+                    // this one on `pr_review_posted_in_turn`. A turn cannot consume
+                    // both re-prompt budgets, so the order of the two `if`s is
+                    // immaterial — a property of the predicates, pinned by
+                    // `mika2948_les_deux_gardes_du_callback_sont_mutuellement_exclusives`,
+                    // not a discipline of this site. `qa_verdict_due` is the same
+                    // value both read; it is never recomputed (mika#2158).
+                    //
+                    // Like 5c/5d/6c/6d/6e, NOT skipped by
+                    // `skip_remaining_guards` (#1178): a posted PR review does
+                    // not write the registry row that the review's own head
+                    // needs. Here that opt-out is **load-bearing rather than
+                    // conventional**, and it is the one thing a future editor
+                    // must not "restore". That flag is
+                    // `EndTurn && has_successful_pr_review(&all_tool_summaries)`
+                    // — the exact population this guard arms on
+                    // (`record_due_but_missing` requires
+                    // `pr_review_posted_in_turn`), so a leading
+                    // `!skip_remaining_guards` makes the condition
+                    // **structurally unsatisfiable**: the guard would never fire
+                    // once, on any turn, and read as a precaution rather than as
+                    // dead code (mika#2272 — a condition that can never hold has
+                    // to be said). Measured: with the term in place both L4 eval
+                    // populations came back with an empty registry.
+                    // The early accept exists because a FORCED CONTINUATION
+                    // might post a duplicate review; that risk is answered at
+                    // the source by the first sentence of
+                    // `RECORD_REVIEWED_HEAD_CORRECTION` — "The review IS posted
+                    // — do not post it again." What is missing is not the
+                    // action, it is its ledger row.
+                    // Single retry via intent_guard_retries.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries
+                            .contains(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL)
+                        && crate::qa_reviewed_head::record_due_but_missing(
+                            qa_verdict_due,
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL,
+                            "QA build-callback posted its verdict without recording the head \
+                             it ruled on — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_CORRECTION
                                     .to_string(),
                             ),
                         });
@@ -3425,6 +4143,77 @@ async fn run_loop(
                             )),
                         });
                         continue;
+                    }
+
+                    // mika#2867 — le résidu du budget de 6d, nommé, et le
+                    // premier site d'émission de la classe `fabrication-detected`
+                    // de mika#1381.
+                    //
+                    // **Ce que le prédicat dit.** `intent_guard_retries` contient
+                    // déjà le label, donc la garde ci-dessus a tiré sur ce tour et
+                    // son unique re-prompt est dépensé ; le détecteur est rejoué,
+                    // donc la *seconde* réponse affirme encore un état que rien
+                    // n'ancre. C'est la récidive, pas la première prise — une
+                    // garde qui tire et corrige fait son travail nominal, et le
+                    // ticket le pose en préalable : le prédicat devait être *la
+                    // fabrication qui survit à la garde*. La première prise est
+                    // structurellement inatteignable ici : `continue` plus haut.
+                    //
+                    // **Pas de second re-prompt.** La famille mika#953 accorde un
+                    // budget de un, et une garde qui en divergerait deviendrait
+                    // celle qu'on relit pour comprendre pourquoi. La réponse sort ;
+                    // ce que ce bloc ajoute, c'est qu'elle ne sort plus en silence.
+                    //
+                    // **Le `warn!` est armé, la notification non.** Le `warn!` est
+                    // l'instrument qui mesure la fréquence réelle de la récidive,
+                    // et cette mesure doit précéder l'armement : une classe P0 qui
+                    // tirerait sur chaque re-prompt d'ancrage rendrait
+                    // `MIKA_OPERATOR_ESCALATION_CHAT_ID` muette en pratique, le
+                    // diagnostic « alarm-into-void » de mika#1381 vu par l'autre
+                    // bout. Porte : `MIKA_FABRICATION_P0_NOTIFY`, défaut `false`
+                    // (mika#1574, option (b) — livrer désarmé).
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && intent_guard_retries.contains(ASSERT_GROUNDED_LABEL)
+                        && !assert_grounded_uncorrected_notified
+                        && let Some(claim) = detect_affirmative_state_claim(&text)
+                        && !assert_grounded_satisfied(&claim, &all_tool_summaries)
+                    {
+                        assert_grounded_uncorrected_notified = true;
+                        warn!(
+                            target: "mika::otel",
+                            trace_id = %tool_ctx.trace_id,
+                            agent_id = %db.agent_id(),
+                            session_id,
+                            step,
+                            resource_type = claim.resource_type,
+                            resource_ref = %claim.resource_ref,
+                            claim = %claim.claim_text,
+                            label = mode.label(),
+                            event = "guard.assert_grounded_uncorrected",
+                            "Assert-grounded guard already fired this turn — \
+                             accepting EndTurn with second violation (budget exhausted)"
+                        );
+                        // mika#2872 — `pending_fabrication_p0.is_none()` est le
+                        // verrou de CLASSE, distinct du verrou de site juste
+                        // au-dessus (`assert_grounded_uncorrected_notified`) :
+                        // celui-là borne les `EndTurn` successifs de CE site,
+                        // celui-ci borne la classe entière à une P0 par tour.
+                        if fabrication_p0_notify && pending_fabrication_p0.is_none() {
+                            pending_fabrication_p0 = Some(PendingFabricationP0 {
+                                message: format!(
+                                    "Fabrication detected (uncorrected) on {} {}: the \
+                                     assert-grounded guard fired and the re-prompt budget \
+                                     is spent, yet the response still claims «{}» with no \
+                                     grounding tool call this turn. The answer went out. \
+                                     Investigate trace_id {} in /var/log/mika/server.log.",
+                                    claim.resource_type,
+                                    claim.resource_ref,
+                                    claim.claim_text,
+                                    tool_ctx.trace_id,
+                                ),
+                                site: PendingFabricationP0Site::AssertGrounded,
+                            });
+                        }
                     }
 
                     // #1645 — Cross-artifact equivalence-claim guard
@@ -3652,7 +4441,7 @@ async fn run_loop(
                         && ready_label_dispatch_trigger(&user_input_text)
                         && let Some(ref expected_location) = expected_hash_n
                         && let Some(mismatched) = all_tool_summaries.iter().find(|s| {
-                            (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+                            is_dispatch_tool(&s.name)
                                 && !s.input_summary.contains(expected_location.as_str())
                         })
                     {
@@ -3893,31 +4682,54 @@ async fn run_loop(
                     if !skip_remaining_guards
                         && matches!(response.stop_reason, LlmStopReason::EndTurn)
                         && !review_anchor.is_empty()
-                        && let Some(brief) = review_brief
+                        // mika#2996 — a groom retry carries the plan inside an envelope;
+                        // anchors are checked against the plan only, never against the
+                        // corrective instruction around it. Any other brief is used whole.
+                        && let Some(brief) = review_brief.map(review_anchor::anchor_reference)
                         // A brief too short to contain the proof cannot be reviewed into
                         // one. Demanding evidence that cannot exist is the false-positive
-                        // direction this guard is forbidden to take: it would break both
-                        // `/mika-ask-arch` and the mika#1823 UNPARSED recovery, whose user
-                        // message is a corrective prompt rather than the plan (mika#2037).
+                        // direction this guard is forbidden to take: it would break
+                        // `/mika-ask-arch` (mika#2037). The UNPARSED retries of mika#1823 and
+                        // mika#2641 used to be the other population below this line; since
+                        // mika#2996 they carry the plan, so they arm the guard like the turn
+                        // they repair — a retry was the one path where an advancing
+                        // disposition owed no evidence.
                         && brief.chars().count() >= review_anchor.min_brief_chars
                         && !is_terminal_disposition(&text, required_suffix_lines)
                         && has_declared_disposition(&text, required_suffix_lines)
                     {
                         let verdict = review_anchor::verify_review_anchors(
                             &text,
-                            brief,
+                            brief, // the plan region (mika#2996), not the whole message
                             &review_anchor.prefixes,
                             required_suffix_lines,
                             review_anchor.min_count,
                             review_anchor.min_quote_chars,
                         );
 
+                        // mika#3003 (AC3) — le dénominateur, dont le contrat entier
+                        // vit dans `review_anchor::ArmedPassage`.
+                        let mut armed = review_anchor::ArmedPassage::default();
+                        let mut reprompted = false;
+
                         if let review_anchor::AnchorVerdict::Missing {
                             anchors_found,
                             anchors_valid,
                             reason,
+                            per_anchor,
                         } = verdict
                         {
+                            let (accepted_labels, refused_labels) =
+                                anchor_label_fields(&per_anchor);
+                            // mika#3003 — une seule lecture du registre nourrit la
+                            // prose de la relance et les champs des deux lignes.
+                            let attributions = armed.attribute(
+                                &tool_read_ledger,
+                                &per_anchor,
+                                review_anchor.min_quote_chars,
+                                anchors_found,
+                                anchors_valid,
+                            );
                             if !review_anchor_retry_done {
                                 review_anchor_retry_done = true;
                                 let correlation_id = format!(
@@ -3940,6 +4752,14 @@ async fn run_loop(
                                     anchors_found,
                                     anchors_valid,
                                     miss_reason = ?reason,
+                                    // mika#2794's denominator carries which lines failed, so
+                                    // the before/after measurement can be read per label.
+                                    refused_labels = %refused_labels,
+                                    accepted_labels = %accepted_labels,
+                                    // mika#3003 — les outils du tour d'où sortent les
+                                    // citations refusées, quand une recherche verbatim
+                                    // l'a établi. Vide, jamais absent.
+                                    attributed_sources = %armed.sources(),
                                     event = "guard.review_anchor",
                                     "Review-anchor guard: non-terminal disposition without \
                                      a verifiable attestation — re-prompting (#2037)"
@@ -3961,6 +4781,7 @@ async fn run_loop(
                                          `[output] required_review_anchor_prefixes` \
                                          contract.\n\n\
                                          What blocked it: {}.\n\n\
+                                         {}\
                                          A disposition keyword is not an attestation. To \
                                          return READY (or Verdict: GROOMED), the message \
                                          body must carry at least {} anchor lines starting \
@@ -3974,63 +4795,98 @@ async fn run_loop(
                                          review it now and then answer. If the plan genuinely \
                                          has concerns, return ITERATE with an F-list instead.",
                                         reason.describe(),
+                                        // mika#2794 — which anchor failed, between the reason
+                                        // and the contract recap. Empty when the matcher
+                                        // reported no per-line fate, so the message is then
+                                        // character for character its pre-mika#2794 form.
+                                        review_anchor::format_anchor_diagnosis(
+                                            &per_anchor,
+                                            &attributions,
+                                        )
+                                        .map(|d| format!("{d}\n\n"))
+                                        .unwrap_or_default(),
                                         review_anchor.min_count,
                                         review_anchor.prefixes.join(", "),
                                         review_anchor.min_quote_chars,
                                         review_anchor.min_count,
                                     )),
                                 });
-                                continue;
-                            }
-
-                            // Second failure: withhold rather than accept.
-                            //
-                            // Take the correlation rather than leaving it set: the #953
-                            // block below emits `guard.correction_accepted` for whatever is
-                            // still pending, and a withheld attestation is the opposite of a
-                            // correction. Leaving it would count a refused forgery as a
-                            // successful repair on the Signal K surface operators read.
-                            let withheld_correlation_id = guard_correlation
-                                .take()
-                                .map(|c| c.correlation_id)
-                                .unwrap_or_default();
-                            // mika#2338 — fail-visible: rewrite into a terminal ESCALATE that
-                            // names the cause, so the groom reports it instead of an opaque
-                            // "verdict missing". The withheld marker remains the fallback for
-                            // a skill that declares no ESCALATE of the withdrawn family.
-                            let escalated = escalate_unattested_disposition(
-                                &text,
-                                required_suffix_lines,
-                                required_finding_list_prefixes,
-                                anchors_found,
-                                anchors_valid,
-                                reason,
-                            );
-                            let emitted = if escalated.is_some() {
-                                "escalate"
+                                // mika#3003 — le `continue` historique a reculé
+                                // derrière `armed.emit()` : une relance est un
+                                // passage armé de la garde.
+                                reprompted = true;
                             } else {
-                                "withheld-marker"
-                            };
-                            error!(
-                                target: "mika::otel",
-                                trace_id = %tool_ctx.trace_id,
-                                agent_id = %db.agent_id(),
-                                session_id,
-                                step,
-                                label = mode.label(),
-                                guard_correlation_id = %withheld_correlation_id,
-                                anchors_found,
-                                anchors_valid,
-                                miss_reason = ?reason,
-                                emitted,
-                                event = "guard.review_anchor_withheld",
-                                "Review-anchor guard: attestation still absent after the \
-                                 corrective re-prompt — disposition withheld from the final \
-                                 response (#2037, escalated with its cause since #2338)"
-                            );
-                            text = escalated.unwrap_or_else(|| {
-                                withhold_disposition(&text, required_suffix_lines)
-                            });
+                                // Second failure: withhold rather than accept.
+                                //
+                                // Take the correlation rather than leaving it set: the #953
+                                // block below emits `guard.correction_accepted` for whatever is
+                                // still pending, and a withheld attestation is the opposite of a
+                                // correction. Leaving it would count a refused forgery as a
+                                // successful repair on the Signal K surface operators read.
+                                let withheld_correlation_id = guard_correlation
+                                    .take()
+                                    .map(|c| c.correlation_id)
+                                    .unwrap_or_default();
+                                // mika#2338 — fail-visible: rewrite into a terminal ESCALATE that
+                                // names the cause, so the groom reports it instead of an opaque
+                                // "verdict missing". The withheld marker remains the fallback for
+                                // a skill that declares no ESCALATE of the withdrawn family.
+                                let escalated = escalate_unattested_disposition(
+                                    &text,
+                                    required_suffix_lines,
+                                    required_finding_list_prefixes,
+                                    anchors_found,
+                                    anchors_valid,
+                                    reason,
+                                );
+                                let emitted = if escalated.is_some() {
+                                    "escalate"
+                                } else {
+                                    "withheld-marker"
+                                };
+                                error!(
+                                    target: "mika::otel",
+                                    trace_id = %tool_ctx.trace_id,
+                                    agent_id = %db.agent_id(),
+                                    session_id,
+                                    step,
+                                    label = mode.label(),
+                                    guard_correlation_id = %withheld_correlation_id,
+                                    anchors_found,
+                                    anchors_valid,
+                                    miss_reason = ?reason,
+                                    // mika#2794's numerator. Same two fields as the denominator
+                                    // above: a withhold is read against the re-prompt that
+                                    // preceded it, label by label.
+                                    refused_labels = %refused_labels,
+                                    accepted_labels = %accepted_labels,
+                                    // mika#3003 — même champ que sur la relance, pour
+                                    // que le numérateur dise aussi d'où venaient les
+                                    // citations. Vide, jamais absent.
+                                    attributed_sources = %armed.sources(),
+                                    emitted,
+                                    event = "guard.review_anchor_withheld",
+                                    "Review-anchor guard: attestation still absent after the \
+                                     corrective re-prompt — disposition withheld from the final \
+                                     response (#2037, escalated with its cause since #2338)"
+                                );
+                                text = escalated.unwrap_or_else(|| {
+                                    withhold_disposition(&text, required_suffix_lines)
+                                });
+                                armed.mark_withheld();
+                            }
+                        }
+
+                        armed.emit(
+                            tool_ctx.trace_id,
+                            db.agent_id(),
+                            session_id,
+                            step,
+                            mode.label(),
+                            brief.chars().count(),
+                        );
+                        if reprompted {
+                            continue;
                         }
                     }
 
@@ -4074,7 +4930,13 @@ async fn run_loop(
                                  label.",
                                 tool_ctx.trace_id
                             );
-                            let _ = sender.send(&notification).await;
+                            // The flagship P0 of mika#1381: the `ready` label is
+                            // gone and dispatch never ran, so the loop is dead and
+                            // no further webhook will say so. This is the one line
+                            // that must cross a mute.
+                            let _ = sender
+                                .send_with_severity(&notification, NotificationSeverity::P0)
+                                .await;
                         }
                     }
 
@@ -4091,6 +4953,35 @@ async fn run_loop(
                         )
                         .await?;
                     }
+                    // mika#2867 — l'envoi différé de la classe
+                    // `fabrication-detected`. Ici l'`EndTurn` a passé toutes les
+                    // gardes : la réponse sort. La violation est revérifiée sur
+                    // le texte accepté, parce qu'une garde aval a pu re-prompter
+                    // et obtenir une réponse qui ne la porte plus.
+                    //
+                    // mika#2872 — le prédicat de revérification vient du SITE qui
+                    // a déposé, pas de ce site-ci. Câblé en dur, il revérifiait
+                    // tout dépôt avec le prédicat d'`assert_grounded` : un
+                    // message posé par `false_local_hosting_claim` serait
+                    // supprimé sur un texte qui porte pourtant toujours la fausse
+                    // revendication de localité.
+                    if let Some(pending) = pending_fabrication_p0.take()
+                        && pending.site.still_violated(
+                            &text,
+                            &all_tool_summaries,
+                            tool_ctx.deployment,
+                        )
+                        && let Some(ref sender) = tool_ctx.message_sender
+                    {
+                        // L'étage est en seconde position et sans défaut : la
+                        // classe `fabrication-detected` de mika#1381 est P0
+                        // parce que la fabrication a franchi la garde et
+                        // atteint l'opérateur — rien d'aval ne le dira.
+                        let _ = sender
+                            .send_with_severity(&pending.message, NotificationSeverity::P0)
+                            .await;
+                    }
+
                     // #953 — Guard correction telemetry. When a guard fired on a
                     // previous step and the current EndTurn passes all guards, emit
                     // a paired correction event with the accepted content.
@@ -4151,6 +5042,31 @@ async fn run_loop(
                     {
                         flag.mark_unmet_after_retry();
                     }
+
+                    // mika#2732 — sortie 1/3 : le re-prompt de la garde
+                    // mika#2727 a échoué aussi, et le tour partirait en
+                    // silence. Le dire à l'opérateur.
+                    crate::qa_review_submission::emit_turn_ended_without_review(
+                        qa_review_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
+                    // mika#2948 — sortie 1/3 : le re-prompt de la garde de
+                    // l'inscription a échoué aussi. Le verdict est posté, la tête
+                    // n'est pas inscrite, et le prochain `check_suite` vert sur
+                    // cette tête paiera son tour. C'est la population résiduelle
+                    // d'AC4, et elle n'a pas d'autre instrument.
+                    crate::qa_reviewed_head::emit_turn_ended_without_record(
+                        qa_verdict_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
 
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, stop_reason = ?response.stop_reason, label = mode.label(), "agent done");
@@ -4226,6 +5142,103 @@ async fn run_loop(
                             role: LlmRole::User,
                             content: LlmContent::Text(
                                 crate::qa_build_callback::QA_VERDICT_REQUIRED_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2727 — QA review-submission guard for empty-text exits.
+                    // Mirror of the inline guard in the non-empty text path, byte for
+                    // byte but for the log message.
+                    //
+                    // UNREACHABLE for this population TODAY, and that is said here
+                    // rather than left to be inferred: a review turn arrives through
+                    // `server::handlers::run_agent_for_message` → `run_agent`, i.e.
+                    // CONVERSATION mode, and this whole block is gated on
+                    // `!mode.follow_up_on_empty()` — true only for Silent. There is no
+                    // `SilentTrigger::Webhook`. The mirror is kept because the sibling
+                    // mika#2355 guard above has one and the two must not drift (if a
+                    // webhook turn ever runs silent, a guard present at one exit only
+                    // is blind by construction — mika#2515 measured the bare EndTurn as
+                    // the more probable half). Its silence is therefore NOT evidence
+                    // that no bare-EndTurn review turn exists (mika#2272): nothing can
+                    // reach it yet. The covered site is the non-empty one above.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && qa_review_due
+                        && !intent_guard_retries
+                            .contains(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL)
+                        && !crate::qa_review_submission::review_submission_satisfied(
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_review_submission::REVIEW_SUBMISSION_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_review_submission::REVIEW_SUBMISSION_LABEL,
+                            "qa-review turn ending without a submitted review on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_review_submission::REVIEW_SUBMISSION_CORRECTION
+                                    .to_string(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    // mika#2948 — QA reviewed-head record guard for empty-text
+                    // exits. Mirror of the inline guard in the non-empty text path,
+                    // byte for byte but for the log message.
+                    //
+                    // REACHABLE for this population, unlike the mika#2727 mirror
+                    // just above, and that is the asymmetry worth naming: a build
+                    // callback arrives through `run_silent_agent` with
+                    // `SilentTrigger::Callback`, so `follow_up_on_empty()` is false
+                    // and this block runs. mika#2515 measured the bare EndTurn as
+                    // the MORE probable half of the population — a model that just
+                    // posted a review and considers itself done is exactly the
+                    // shape that returns EndTurn with no text. Omitting this mirror
+                    // would leave the modal half of the defect uncovered.
+                    //
+                    // Mutually exclusive with the mika#2355 mirror above for the
+                    // same structural reason as the non-empty pair.
+                    if matches!(response.stop_reason, LlmStopReason::EndTurn)
+                        && !intent_guard_retries
+                            .contains(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL)
+                        && crate::qa_reviewed_head::record_due_but_missing(
+                            qa_verdict_due,
+                            &all_tool_summaries,
+                        )
+                    {
+                        intent_guard_retries
+                            .insert(crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL);
+                        warn!(
+                            step,
+                            label = mode.label(),
+                            intent_guard = crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_LABEL,
+                            "QA build-callback posted its verdict without recording the head \
+                             it ruled on, on empty-text exit — re-prompting"
+                        );
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::Assistant,
+                            content: LlmContent::Blocks(
+                                mika_common::llm::response_content_to_blocks(&response.content),
+                            ),
+                        });
+                        request.messages.push(LlmMessage {
+                            role: LlmRole::User,
+                            content: LlmContent::Text(
+                                crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_CORRECTION
                                     .to_string(),
                             ),
                         });
@@ -4348,6 +5361,29 @@ async fn run_loop(
                         flag.mark_unmet_after_retry();
                     }
 
+                    // mika#2732 — sortie 2/3 : même ligne, même population. Un
+                    // EndTurn sec est la forme la plus probable d'un tour de
+                    // revue qui n'a rien soumis.
+                    crate::qa_review_submission::emit_turn_ended_without_review(
+                        qa_review_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
+                    // mika#2948 — sortie 2/3 : même ligne, même population, et
+                    // c'est ici qu'elle est **la plus probable** — un callback qui
+                    // a posté sa revue et se croit quitte rend un EndTurn sec.
+                    crate::qa_reviewed_head::emit_turn_ended_without_record(
+                        qa_verdict_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
                     apply_nudge_turn_end(tool_use_occurred);
                     info!(step, label = mode.label(), "agent done");
                     return Ok(LoopResult::Done {
@@ -4436,6 +5472,12 @@ async fn run_loop(
                     mode.is_conversation(),
                     stream_ctx,
                     delivery_log,
+                    // mika#2934 — c'est ce site qui porte le cas réel : la
+                    // preuve exigée (un `pr review` posté, une lecture de cette
+                    // tête) vient presque toujours d'un pas **antérieur** du
+                    // même tour.
+                    &all_tool_summaries,
+                    &mut tool_read_ledger,
                 )
                 .await;
                 all_tool_summaries.extend(step_summaries);
@@ -4571,6 +5613,31 @@ async fn run_loop(
                         flag.mark_unmet_after_retry();
                     }
 
+                    // mika#2732 — sortie 3/3, sur la même population que le
+                    // bloc ci-dessus : un EndTurn forcé après un tour qui n'a
+                    // fait qu'outiller.
+                    crate::qa_review_submission::emit_turn_ended_without_review(
+                        qa_review_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        &user_input_text,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
+                    // mika#2948 — sortie 3/3. Le terme de budget vaut ici ce qu'il
+                    // vaut au bloc du verdict ci-dessus : cet EndTurn est forcé,
+                    // donc la garde a pu firer à un step antérieur. Un tour qui
+                    // n'a jamais produit d'EndTurn n'a pas dépensé ce budget et ne
+                    // dit rien — c'est le re-prompt qui le couvre, pas le filet.
+                    crate::qa_reviewed_head::emit_turn_ended_without_record(
+                        qa_verdict_due,
+                        &intent_guard_retries,
+                        &all_tool_summaries,
+                        tool_ctx.trace_id,
+                        db.agent_id(),
+                    );
+
                     apply_nudge_turn_end(tool_use_occurred);
                     return Ok(LoopResult::Done {
                         text: None,
@@ -4589,6 +5656,17 @@ async fn run_loop(
         label = mode.label(),
         max_steps, "agent exceeded max tool steps"
     );
+    // mika#2877 — le décompte par outil du tour coupé. Inconditionnel : une carte
+    // vide est la mesure « le budget a brûlé hors outils », pas une absence de
+    // mesure. Doit précéder le déplacement de `all_tool_summaries` ci-dessous.
+    crate::agent_loop::max_steps_census::emit_max_steps_tool_census(
+        &all_tool_summaries,
+        db.agent_id(),
+        session_id,
+        tool_ctx.trace_id,
+        mode.label(),
+        max_steps,
+    );
     // mika#2515 — chemin de coupure 2/2. Cette sortie est l'**expression finale**
     // de `run_loop`, sans `return` : un scan de sites ancré sur `return
     // Ok(LoopResult::` n'en trouve que cinq et laisserait celle-ci muette.
@@ -4606,6 +5684,9 @@ async fn run_loop(
         run_usage,
         tool_call_summaries: all_tool_summaries,
         system_prompt_original_len: system_prompt_len,
+        // Le plafond servi, pris sur le local déjà résolu — jamais relu depuis
+        // une constante ni depuis le déclencheur (mika#2926 R1b).
+        max_steps,
     })
 }
 
@@ -4967,6 +6048,10 @@ pub struct AgentParams<'a> {
     /// Emission is fire-and-forget: broadcast errors are `debug!`-logged and
     /// never fail the tool call.
     pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    /// Texte de l'événement webhook d'**avant** les handlers de `server/` ;
+    /// `None` hors de ce chemin. Seul alimenteur : `server/handlers.rs`.
+    /// Pourquoi un second texte : [`pr_review_groom`] (mika#3004).
+    pub webhook_event_text: Option<&'a str>,
 }
 
 /// Run the agent loop for a single inbound message.
@@ -5144,6 +6229,86 @@ async fn run_agent_inner(
     // would let the two disagree about what "evening" means.
     let turn_utc = chrono::Utc::now();
     let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
+    // mika#1747 — le site UNIQUE des deux moitiés du rituel de transmission, et
+    // il est ici par nécessité, pas par commodité : `load_agent_context`
+    // ci-dessus est l'entonnoir habituel, mais il ne reçoit que
+    // `(db, home_dir)` et ne voit pas `llm` — il ne peut donc pas répondre
+    // « quel modèle suis-je », qui désigne le sortant d'un côté (D2 du vol 1) et
+    // le destinataire de l'autre (D2 du vol 2). Le couple consommé est celui de
+    // `runtime_provider` / `runtime_model` au-dessus : même source que
+    // `ToolContext` et `get_active_llm`, donc le bloc ne peut pas annoncer une
+    // transition depuis un modèle que le process ne sert pas, ni servir le
+    // courrier d'un autre.
+    //
+    // Fail-open par construction : `resolve` ne rend pas de `Result`, un signal
+    // ou un répertoire illisible ferme la fenêtre et ne coûte pas le tour.
+    let pending_transmission =
+        crate::model_transmission::resolve(params.home_dir, runtime_provider, runtime_model).await;
+    match &pending_transmission {
+        // Chaque sonde est sur sa branche `Some` SEULEMENT : la question que cet
+        // instrument règle est « la cérémonie a-t-elle eu lieu ? », pas « le
+        // prédicat tourne-t-il ? » — une ligne par tour et par agent sur la
+        // branche nominale noierait la seule qui compte.
+        Some(crate::model_transmission::Transmission::Outgoing(transmission)) => {
+            info!(
+                target: "mika::otel",
+                event = "model_transmission_window_open",
+                agent = %db.agent_id(),
+                outgoing = %transmission.outgoing,
+                incoming = %transmission.incoming,
+                letter_path = %transmission.letter_path,
+                "fenêtre de transmission ouverte — la lettre au successeur est demandée à ce tour"
+            );
+        }
+        // mika#2807 D5 — le reçu est posé ICI, au tour qui rend le bloc, et
+        // jamais dans `prompt.rs` : la construction du prompt est une fonction
+        // pure et ses ~51 tests de forme en dépendent. C'est ce qui fait de la
+        // relecture un **événement** et non un bloc permanent.
+        //
+        // Pose avant la sonde, pour que `receipt_written` dise ce qui s'est
+        // réellement passé et non ce qu'on allait tenter.
+        Some(crate::model_transmission::Transmission::Incoming(letter)) => {
+            crate::read_receipt::mark_read(params.home_dir, &letter.letter_path).await;
+            let receipt_written =
+                crate::read_receipt::is_read(params.home_dir, &letter.letter_path).await;
+            info!(
+                target: "mika::otel",
+                event = "incoming_transmission_served",
+                agent = %db.agent_id(),
+                outgoing = %letter.outgoing,
+                letter_path = %letter.letter_path,
+                response_path = %letter.response_path,
+                receipt_written,
+                "lettre du prédécesseur servie à ce tour — une seule fois, le reçu la referme"
+            );
+        }
+        None => {}
+    }
+    // mika#2805 — le site UNIQUE du rituel post-compaction, et il résout **en
+    // même temps** qu'il consomme (D8) : « quelle déposition servir » et « elle
+    // est servie » sont une seule opération, et lui donner deux implémentations
+    // serait lui donner deux réponses.
+    //
+    // Ici et nulle part ailleurs, pour la même raison que le reçu existe : le
+    // rituel est un événement à usage unique, donc un second site de
+    // consommation serait un second endroit où cet usage unique peut être
+    // mangé. La surface silencieuse reçoit la cérémonie seule (AC5), et c'est
+    // le type de son champ qui le tient.
+    //
+    // L'argument `agent` est un **écart déclaré** au plan, qui écrit
+    // `resolve(imminent, home_dir)` : la sonde et le WARN portent tous deux
+    // `agent`, et le dériver du dernier segment de `home_dir` donnerait le nom
+    // aléatoire d'un `TempDir` en test — exactement le proxy que D2 condamne.
+    // `db.agent_id()` est la source que le vol 1 consomme déjà.
+    //
+    // Fail-open par construction : `resolve` ne rend pas de `Result`, un
+    // répertoire illisible saute le rituel et ne coûte pas le tour.
+    let ceremony = crate::compaction_handsoff::resolve(
+        ctx.compaction_imminent,
+        params.home_dir,
+        db.agent_id(),
+    )
+    .await;
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -5170,6 +6335,16 @@ async fn run_agent_inner(
         // mika#2247 AC2 — `None` renders no line at all, which is today's
         // behaviour for every agent that declares nothing.
         tenant_language: ctx.language,
+        pending_transmission: pending_transmission.as_ref(),
+        // mika#1748 — le prédicat a été évalué une fois, dans
+        // `load_agent_context` ; ici on ne fait que le porter. Le champ reste
+        // `None` quand le seuil n'est pas franchi, et le bloc ne rend rien.
+        //
+        // Noter qu'il est porté même sur la branche `is_compact_provider`
+        // ci-dessous : `build_compact_system_prompt` ignore le champ (D6), et
+        // c'est une propriété de ce builder-là, pas de ce littéral — un test
+        // (`mika1748_le_builder_compact_ne_rend_pas_le_bloc`) la tient.
+        compaction_imminent: ceremony.as_ref(),
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -5219,6 +6394,15 @@ async fn run_agent_inner(
         settings.resolve_github_token(params.github_app).await
     } else {
         params.github_token.map(String::from)
+    };
+
+    // Le jumeau non identitaire du précédent, pour les **lectures** de CI
+    // (mika#2963) : App d'abord, PAT en repli. Symétrique et séparé, parce que
+    // la priorité dépend de la classe d'opération et non de l'appelant.
+    let resolved_ci_read_token = if let Some(settings) = params.settings {
+        settings.resolve_ci_read_token(params.github_app).await
+    } else {
+        None
     };
 
     // Match skills and resolve tool definitions
@@ -5273,7 +6457,9 @@ async fn run_agent_inner(
         provider,
         model,
         &resolved_context,
+        db.agent_id(),
         &effective_disabled,
+        ctx.identity.tools.allowed.as_deref(),
         is_compact_provider,
     );
     // mika#2517 U4 — the measurement AND the positive control, in one line.
@@ -5295,7 +6481,9 @@ async fn run_agent_inner(
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     // mika#1798 Layer 4: build the per-tool data_grade lookup alongside the
     // tool map so both stay consistent under the same last-write-wins rule.
-    let skill_data_grades = build_skill_data_grades(&matched_entries);
+    // mika#1959 / mika#2814 — ensemencé plus bas avec les grades des outils MCP
+    // par l'appel même qui les publie au modèle (`publier_outils_mcp`).
+    let mut skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     // mika#2276 M1 (conversation mode) — 1 of the 3 fan-out sites.
     let skill_tool_timeouts = build_skill_tool_timeouts(&matched_entries, provider, model);
@@ -5333,10 +6521,13 @@ async fn run_agent_inner(
         })
         .collect();
 
-    // Append MCP tool definitions (if any MCP servers are connected)
-    if let Some(mcp) = params.mcp_manager {
-        skill_tool_defs.extend_from_slice(mcp.tool_definitions());
-    }
+    // Publie les outils MCP au modèle et les verse dans la map L4 — un seul
+    // appel, parce qu'il n'existe pas de raison d'en faire une moitié (mika#2814).
+    publier_outils_mcp(
+        &mut skill_tool_defs,
+        &mut skill_data_grades,
+        params.mcp_manager,
+    );
 
     // mika#1324 — Structural tool filter for CI webhook events. Extracted to a
     // helper so the predicate + filter are unit-testable without standing up the
@@ -5450,6 +6641,27 @@ async fn run_agent_inner(
         trace_id,
         "conversation",
         &context_window_fields,
+        // mika#2884 — the same expression `report_brief_size_overrun` is handed
+        // a few lines below, deliberately: the two calls must be comparable at a
+        // glance, and the comment there on why `system.len()` is in scope covers
+        // both.
+        system.len(),
+    );
+
+    // mika#2783 — the detail `tool_defs_bytes` throws away. The sum exists on the
+    // line above; what nobody could read is what ONE name costs, which is the only
+    // question mika#2748's allowlist of 19 names ever asks. Same array, same turn,
+    // and deliberately the SAME number for the total — `context_window_fields.tool_defs_bytes`
+    // rather than a second call to `tool_defs_byte_weight`, so the reconciliation
+    // below compares the census against what the neighbour actually published and
+    // not against a recomputation free to agree with itself.
+    emit_tool_defs_census(
+        &db.agent_id,
+        session_id,
+        trace_id,
+        "conversation",
+        &tool_defs_census(&skill_tool_defs),
+        context_window_fields.tool_defs_bytes,
     );
 
     // mika#2474 — the tail of the brief-size distribution becomes a greppable,
@@ -5549,6 +6761,7 @@ async fn run_agent_inner(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: resolved_github_token.as_deref(),
+        ci_read_token: resolved_ci_read_token.as_ref(),
         gateway_url: params.gateway_url,
         internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
@@ -5682,6 +6895,7 @@ async fn run_agent_inner(
             trace_id: trace_id.to_string(),
             dispatch_count: std::sync::atomic::AtomicU32::new(0),
             originating_message: originating_msg,
+            tool_constraint_forced: AtomicBool::new(false),
         })
     };
     // Store loaded skills in session metadata for observability
@@ -5736,6 +6950,10 @@ async fn run_agent_inner(
 
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    // mika#2867 — `is_some_and`, pas `is_none_or` comme les deux lignes
+    // ci-dessus : leur défaut est « activé », celui-ci est « désarmé ». Un
+    // appelant sans `Settings` n'arme aucune classe P0.
+    let fabrication_p0 = params.settings.is_some_and(|s| s.fabrication_p0_notify);
     let is_verdict_producer = has_verdict_producer_skill(params.skills.skills());
     // mika#2355 — the turn's skill set, for the QA build-callback verdict guard.
     let loaded_skill_names = skill_names_of(&matched_entries);
@@ -5783,6 +7001,7 @@ async fn run_agent_inner(
         None,
         store_llm,
         store_tools,
+        fabrication_p0,
         prompt_variant.as_deref(),
         params.internal,
         deadline,
@@ -5790,6 +7009,7 @@ async fn run_agent_inner(
         skill_nudge_ctx.as_ref(),
         params.stream_ctx.as_ref(),
         &mut delivery_log,
+        params.webhook_event_text, // mika#3004
     )
     .await?;
 
@@ -5821,6 +7041,7 @@ async fn run_agent_inner(
             usage,
             run_usage,
             deadline_exceeded: None,
+            max_steps_exceeded: None,
             undelivered_sends: undelivered,
             effective_model: effective_model_attestation,
         }),
@@ -5830,6 +7051,7 @@ async fn run_agent_inner(
             run_usage,
             tool_call_summaries,
             system_prompt_original_len,
+            max_steps,
         } => {
             // Continuation entry gate (mika#848 F3a) — skip continuation when its 60s
             // ceiling would push us past the agent total deadline.
@@ -5851,8 +7073,12 @@ async fn run_agent_inner(
                     scope_task_id,
                     // Reached from the MaxStepsExceeded arm: the loop ran its
                     // full step budget, then the deadline was too close for a
-                    // continuation turn.
-                    crate::planning::policy::MAX_TOOL_STEPS,
+                    // continuation turn. Le budget **servi**, transporté par la
+                    // variante (mika#2926 R1b) : relire `MAX_TOOL_STEPS` ici
+                    // annoncerait 20 pour un tour de mika-qa qui en a consommé
+                    // 30, sur le chemin `synchronize` où la mesure du ticket a
+                    // justement eu lieu (tour 4f94fbc8).
+                    max_steps,
                     undelivered,
                     effective_model_attestation,
                     // mika#1883: the full step budget was spent, so the turn has
@@ -5860,6 +7086,27 @@ async fn run_agent_inner(
                     run_usage,
                 )
                 .await;
+            }
+            // mika#2943 — le fait que mika#2276 ne pouvait pas voir : un tour
+            // coupé au plafond de pas produit un texte de continuation, donc
+            // indiscernable d'une réponse pour le call-site. Évalué AVANT la
+            // continuation, qui emprunte les summaries — exactement comme le
+            // fait `classify_delegation_from_summaries` dans le bras jumeau du
+            // team agent (mika#1671 D1/D2).
+            let build_callback_pending =
+                crate::qa_build_callback::build_callback_dispatched_in_turn(&tool_call_summaries);
+            if build_callback_pending {
+                info!(
+                    target: "mika::otel",
+                    event = "qa_max_steps_verdict_withheld",
+                    trace_id = %trace_id,
+                    session_id,
+                    max_steps,
+                    cause = "build_callback_pending",
+                    "mika#2943 : tour coupé au plafond de pas avec un dispatch de build QA \
+                     en vol — le filet de ce callback portera le verdict, aucun fait de \
+                     coupure n'est posé ici"
+                );
             }
             let cont = attempt_continuation_turn(
                 &mut request,
@@ -5906,6 +7153,11 @@ async fn run_agent_inner(
                 // Max-steps continuation, not a deadline overrun: the turn
                 // produced a summary. mika#2276's net must not fire here.
                 deadline_exceeded: None,
+                // …mais mika#2943's does, and this is its one posing site. Le
+                // plafond **servi** (`max_steps`), jamais une constante relue.
+                max_steps_exceeded: (!build_callback_pending).then_some(MaxStepsCutOff {
+                    steps_completed: max_steps,
+                }),
                 // A dead send is a dead send whether the turn concluded or ran
                 // out of steps — the continuation summary says nothing about
                 // delivery.
@@ -5994,6 +7246,10 @@ async fn persist_deadline_fallback(
         run_usage,
         // mika#2276 M2: the one place that says "cut off, not concluded".
         deadline_exceeded: Some(DeadlineOverrun { steps_completed }),
+        // The "continuation skipped" exit of the max-steps arm lands here too,
+        // and poses the field above rather than this one: mutually exclusive by
+        // construction (mika#2943 R2b).
+        max_steps_exceeded: None,
         undelivered_sends,
         effective_model,
     })
@@ -6523,6 +7779,11 @@ async fn run_silent_inner(
         // mika#2247 AC2 — a proactive turn opens the exchange, so it is the one
         // that most needs to know which language to open it in (R3b).
         tenant_language: ctx.language,
+        // mika#2805 AC5 — le prédicat est déjà calculé une fois, au seul site
+        // légal (`load_agent_context`) ; il ne manquait que le fil jusqu'ici.
+        // La **cérémonie seule** : le rituel de relecture n'a pas de
+        // représentation sur cette surface, et le type du champ le tient (D4).
+        compaction_imminent: ctx.compaction_imminent,
     };
     let mut system = prompt::build_silent_prompt(&silent_ctx);
 
@@ -6569,7 +7830,9 @@ async fn run_silent_inner(
         provider,
         model,
         &no_context,
+        db.agent_id(),
         &ctx.identity.tools.disabled,
+        ctx.identity.tools.allowed.as_deref(),
         false, // Silent mode: never compact (engine-driven triggers, not MikaModel targets)
     );
 
@@ -6683,6 +7946,13 @@ async fn run_silent_inner(
         params.github_token.map(String::from)
     };
 
+    // Le jumeau non identitaire, pour les **lectures** de CI (mika#2963).
+    let resolved_ci_read_token = if let Some(settings) = params.settings {
+        settings.resolve_ci_read_token(params.github_app).await
+    } else {
+        None
+    };
+
     // Extract callback_task_id from the trigger for deferred dispatch registration
     // (mika#1058). Callback AND DeferredDispatch triggers carry a task_id needed for
     // cycle detection. DeferredDispatch must also be able to re-defer if it hits
@@ -6727,6 +7997,7 @@ async fn run_silent_inner(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: resolved_github_token.as_deref(),
+        ci_read_token: resolved_ci_read_token.as_ref(),
         gateway_url: params.gateway_url,
         internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
@@ -6809,6 +8080,9 @@ async fn run_silent_inner(
     let no_required_tools = HashSet::new();
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    // mika#2867 — voir la note du point de résolution conversationnel :
+    // `is_some_and`, parce que le défaut de cette porte est « fermée ».
+    let fabrication_p0 = params.settings.is_some_and(|s| s.fabrication_p0_notify);
     let trigger_label = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
@@ -6872,6 +8146,7 @@ async fn run_silent_inner(
             trace_id: trace_id.clone(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         })
     } else {
         None
@@ -6923,6 +8198,7 @@ async fn run_silent_inner(
         Some(&verdict_signal), // mika#2368: le seul mode où le filet a une population
         store_llm,
         store_tools,
+        fabrication_p0,
         prompt_variant.as_deref(),
         false, // silent mode messages are never internal
         deadline,
@@ -6930,6 +8206,7 @@ async fn run_silent_inner(
         None,              // mika#1583: silent-mode turns do not nudge
         None,              // mika#1757: silent turns have no A2A streaming subscriber
         &mut delivery_log, // mika#2136
+        None,              // mika#3004 — un tour silencieux ne naît pas d'un webhook
     )
     .await?;
 
@@ -6950,11 +8227,17 @@ async fn run_silent_inner(
         LoopResult::MaxStepsExceeded {
             tool_call_summaries,
             system_prompt_original_len,
+            max_steps,
             ..
         } => {
             warn!(
                 trigger = trigger_label,
-                max_steps = params.trigger.max_steps(),
+                // Le plafond **servi**, transporté par la variante
+                // (mika#2926 R1b). `params.trigger.max_steps()` rend ce que le
+                // déclencheur *déclare* — 20 pour un `Callback` — et divergeait
+                // du plafond que la boucle sert depuis que celui-ci est résolu
+                // par agent.
+                max_steps,
                 session_id = params.session_id,
                 "silent agent exceeded max tool steps"
             );
@@ -7135,6 +8418,19 @@ pub struct TeamAgentParams<'a> {
     /// When `Some`, the agent reuses this trace_id instead of generating a fresh one,
     /// enabling correlation of delegate agent events with the parent team run.
     pub trace_id: Option<String>,
+    /// `agent_id` of the **conversational** parent — the agent whose DB carries
+    /// the conversation the user is reading (mika#1926). This is
+    /// `team_db.agent_id()` on the team-engine paths and `ctx.db.agent_id()` on
+    /// the `delegate_task` path, **not** `TeamDefinition.team.orchestrator`:
+    /// that field names a team *member* (e.g. `"planner"`), which has no
+    /// `preferences` rows of the user's own.
+    ///
+    /// Carries a fact, not a policy: the decision of what to do with it lives in
+    /// [`resolve_team_stop_topics`], which reads the parent's `stop_topic_*`
+    /// preferences so a child cannot re-raise a subject the user asked the
+    /// parent to drop. `None` means "no parent declared" — the child then sees
+    /// its own rows only.
+    pub parent_agent_id: Option<&'a str>,
 }
 
 /// Run an agent within a team execution context.
@@ -7235,6 +8531,17 @@ async fn run_team_agent_inner_impl(
     // mika#2247 AC3 — same single read as the two sibling paths.
     let turn_utc = chrono::Utc::now();
     let local_part_of_day = prompt::resolve_local_part_of_day(turn_utc, ctx.timezone.as_deref());
+    // mika#1926 decision A — the child's own stop-topics, union the
+    // conversational parent's. `ctx.stopped_topics` alone was the pre-decision
+    // behaviour; the parent read is what makes « arrête sur X » hold across a
+    // delegation.
+    let stopped_topics = resolve_team_stop_topics(
+        params.db,
+        params.agent_name,
+        params.parent_agent_id,
+        ctx.stopped_topics,
+    )
+    .await;
     let prompt_ctx = prompt::PromptContext {
         soul_content: &ctx.soul_content,
         identity: &ctx.identity,
@@ -7249,15 +8556,30 @@ async fn run_team_agent_inner_impl(
         telegram_configured: params.message_sender.is_some(),
         home_dir: Some(params.home_dir),
         callback_context: None,
-        stopped_topics: &ctx.stopped_topics,
+        stopped_topics: &stopped_topics,
         runtime_provider: team_runtime_provider,
         runtime_model: team_runtime_model,
         deployment: params.deployment,
         persona_profile: params.tier.persona_profile(),
-        // mika#2247 AC2 — the team child reads its OWN agent's declaration, the
-        // same rule mika#1926 settled for `stopped_topics`: `ctx` here is the
-        // child's context, not the orchestrator's.
+        // mika#2247 AC2 — the team child reads its OWN agent's declaration:
+        // `ctx` here is the child's context, not the parent's. Note this is NOT
+        // the rule mika#1926 settled for `stopped_topics` one field above —
+        // that axis propagates from the parent, this one does not. A stop-signal
+        // is the user's will; the register language is a tenant setting the
+        // child's own row already carries.
         tenant_language: ctx.language,
+        // mika#1747 vol 1 — `None` ici, et c'est une décision (D6). Un enfant
+        // d'équipe est un tour de travail qui vit le temps d'une délégation ;
+        // la lettre au successeur est le témoignage d'une tenure, que porte
+        // l'instance conversationnelle. Le vol 1 n'ouvre la fenêtre que là.
+        pending_transmission: None,
+        // mika#1748 D6 — `None`, et c'est une décision, pas un oubli. La
+        // boucle d'équipe est une troisième boucle, aussi distincte de la
+        // conversation que la silencieuse : un enfant d'équipe tourne dans son
+        // propre périmètre de messages, et la cérémonie n'a pas de
+        // destinataire là-bas (le successeur qui relit au premier boot est le
+        // vol 2, senara-solutions/mika#2805). Le vol 1 livre une boucle.
+        compaction_imminent: None,
     };
     let is_compact_provider = llm.provider_name() == ProviderKind::MikaModel.config_prefix();
     let mut system = if is_compact_provider {
@@ -7291,6 +8613,13 @@ async fn run_team_agent_inner_impl(
         params.session_id,
         stage_prev,
     );
+
+    // Le jumeau non identitaire, pour les **lectures** de CI (mika#2963).
+    let team_resolved_ci_read_token = if let Some(settings) = params.settings {
+        settings.resolve_ci_read_token(params.github_app).await
+    } else {
+        None
+    };
 
     // Match skills and resolve tool definitions
     let mut matched = params.skills.match_message(params.task_message);
@@ -7349,13 +8678,17 @@ async fn run_team_agent_inner_impl(
         provider,
         model,
         &resolved_context,
+        params.db.agent_id(),
         &ctx.identity.tools.disabled,
+        ctx.identity.tools.allowed.as_deref(),
         false, // Team mode: never compact (engine-driven, not MikaModel targets)
     );
     let skill_tool_map = build_skill_tool_map(&matched_entries);
     // mika#1798 Layer 4: build the per-tool data_grade lookup alongside the
     // tool map so both stay consistent under the same last-write-wins rule.
-    let skill_data_grades = build_skill_data_grades(&matched_entries);
+    // mika#1959 / mika#2814 — ensemencé plus bas avec les grades des outils MCP
+    // par l'appel même qui les publie au modèle (`publier_outils_mcp`).
+    let mut skill_data_grades = build_skill_data_grades(&matched_entries);
     let skill_timeout = max_skill_timeout(&matched_entries, provider, model);
     // mika#2276 M1 (team mode) — 3 of the 3 fan-out sites.
     let skill_tool_timeouts = build_skill_tool_timeouts(&matched_entries, provider, model);
@@ -7366,10 +8699,13 @@ async fn run_team_agent_inner_impl(
     let required_tool_arg_suffixes_team = collect_required_tool_arg_suffixes(&matched);
     let tool_arg_suffix_rejected_team = AtomicBool::new(false);
 
-    // Append MCP tool definitions (if any MCP servers are connected)
-    if let Some(mcp) = params.mcp_manager {
-        skill_tool_defs.extend_from_slice(mcp.tool_definitions());
-    }
+    // Publie les outils MCP au modèle et les verse dans la map L4 — un seul
+    // appel, parce qu'il n'existe pas de raison d'en faire une moitié (mika#2814).
+    publier_outils_mcp(
+        &mut skill_tool_defs,
+        &mut skill_data_grades,
+        params.mcp_manager,
+    );
 
     // #862 — Turn-start snapshot of enabled tool names (team mode).
     let enabled_tool_names: HashSet<String> =
@@ -7411,6 +8747,7 @@ async fn run_team_agent_inner_impl(
         embedding_client: params.embedding_client,
         brave_api_key: params.brave_api_key,
         github_token: team_resolved_github_token.as_deref(),
+        ci_read_token: team_resolved_ci_read_token.as_ref(),
         gateway_url: params.gateway_url,
         internal_token: params.internal_token,
         skills_dirty: params.skills_dirty,
@@ -7465,6 +8802,9 @@ async fn run_team_agent_inner_impl(
     let mode = LoopMode::Team;
     let store_llm = params.settings.is_none_or(|s| s.store_llm_calls);
     let store_tools = params.settings.is_none_or(|s| s.store_tool_calls);
+    // mika#2867 — voir la note du point de résolution conversationnel :
+    // `is_some_and`, parce que le défaut de cette porte est « fermée ».
+    let fabrication_p0 = params.settings.is_some_and(|s| s.fabrication_p0_notify);
 
     // Prelude deadline check (mika#848 F3b).
     if Instant::now() >= deadline {
@@ -7514,6 +8854,7 @@ async fn run_team_agent_inner_impl(
         None,                              // mika#2368 : pas de callback de build en mode équipe
         store_llm,
         store_tools,
+        fabrication_p0,
         prompt_variant.as_deref(),
         false, // team mode messages are never internal
         deadline,
@@ -7521,6 +8862,7 @@ async fn run_team_agent_inner_impl(
         None,              // mika#1583: team-mode turns do not nudge
         None,              // mika#1757: team turns have no A2A streaming subscriber
         &mut delivery_log, // mika#2136
+        None,              // mika#3004 — aucun webhook n'ouvre un tour d'équipe
     )
     .await?;
 
@@ -7667,6 +9009,97 @@ fn build_skill_data_grades(
         }
     }
     map
+}
+
+/// Publie les outils MCP au modèle **et** ensemence la map L4 (mika#2814 vol 2).
+///
+/// C'est le **seul** chemin par lequel `mcp.tool_definitions()` entre dans le
+/// lot d'outils envoyé au modèle. Les deux gestes sont soudés dans un appel
+/// unique parce que l'appariement doit être une propriété de l'**appel** et non
+/// de son orthographe : avant ce vol, les deux sites écrivaient
+/// `extend_from_slice(mcp.tool_definitions())` puis [`seed_mcp_data_grades`],
+/// et ce qui les appariait était une garde comparant ces deux **chaînes** —
+/// qu'une publication écrite autrement (une boucle, un `chain`, un `clone()`
+/// intermédiaire) laissait verte tout en rouvrant le contournement F5 de
+/// mika#1798. Il n'existe plus d'appel qui ne fasse qu'une moitié.
+///
+/// `None` (mode silencieux / callback / heartbeat) est **hors population par
+/// construction** : il ne publie ni n'ensemence rien, et les deux arguments
+/// ressortent intacts.
+///
+/// # Ce que la garde ajoute par-dessus, et pourquoi elle reste nécessaire
+///
+/// Ce helper rend la faute inécrivable *dans le chemin qui passe par lui*, pas
+/// en dehors : un troisième site qui publierait en écrivant directement
+/// `defs.extend_from_slice(mcp.tool_definitions())` laisserait le compte
+/// d'appels à deux. C'est pourquoi
+/// [`mika2814_publier_des_outils_mcp_passe_par_le_helper_qui_ensemence`] porte
+/// **deux** assertions : le compte d'appels, et l'absence de toute lecture nue
+/// de `tool_definitions()` hors de ce corps et hors des lecteurs non-publiants
+/// déclarés par `LECTEURS_NON_PUBLIANTS_MCP`. Avant le helper cette seconde
+/// moitié était inécrivable — il n'existait aucun site unique où la lecture
+/// était légitime, donc l'aiguille devait viser la forme plutôt que l'inventaire.
+///
+/// # La porte que ce helper tient est une porte, pas une trace
+///
+/// Le vol 1 de mika#2814 avait écrit, ici même et dans le doc-comment du test
+/// de garde, qu'un site non ensemencé ne coûtait qu'une dégradation
+/// d'observabilité — « un appel halluciné rend *outil inconnu* au lieu de
+/// *banni* ». **C'est faux, et mesuré faux** (§ Cas 1 de
+/// `todos/2814-vol2-rouge-mesure.md`). `tool_routing` est resté intact : à
+/// l'étage 3 de `tool_execution::dispatch::execute_tool`,
+/// `mcp.is_mcp_tool(name)` répond vrai sans consulter la map L4, et
+/// `mcp.call_tool` part. Un site publiant sans ensemencer **laisse donc l'appel
+/// distant partir** sur un outil testimony, pour tout nom obtenu autrement que
+/// par l'inventaire publié : hallucination, mention en prose par l'utilisateur,
+/// historique d'avant la connexion du serveur, résumé de conversation. C'est le
+/// contournement F5 entier. Un lecteur qui croit « outil inconnu » sous-estime
+/// ce que cet appel unique protège.
+fn publier_outils_mcp(
+    defs: &mut Vec<mika_common::claude::ToolDefinition>,
+    grades: &mut HashMap<String, crate::skills::manifest::DataGrade>,
+    mcp: Option<&McpManager>,
+) {
+    if let Some(mcp) = mcp {
+        defs.extend_from_slice(mcp.tool_definitions());
+    }
+    seed_mcp_data_grades(grades, mcp);
+}
+
+/// Ensemence la map L4 avec les grades des outils MCP (mika#1959, F5 de mika#1798).
+///
+/// Les outils MCP ne sont pas des `skill_tools`, donc `build_skill_data_grades`
+/// ne les voit pas et L4 ne tirait jamais sur eux. La map est indexée par nom
+/// d'outil Claude-facing, ce qu'un outil MCP possède (`mcp__<serveur>__<outil>`),
+/// donc l'ensemencement suffit : `execute_tool` n'est pas modifié.
+///
+/// **Auxiliaire de [`publier_outils_mcp`], son seul appelant** (mika#2814 vol 2).
+/// Elle n'y est pas fondue parce que son test
+/// (`mika1959_lensemencement_verse_les_grades_mcp_sans_ecraser_les_skills`)
+/// prouve la règle de collision ci-dessous, qui est une propriété de
+/// l'ensemencement et non de la publication ; les fondre rendrait ce test plus
+/// gros pour prouver la même chose. Le mode silencieux reçoit `None` et reste
+/// hors population par construction.
+///
+/// Collision : rien n'empêche une skill de déclarer un outil `mcp__<s>__<t>`
+/// (le préfixe n'est réservé qu'à la résolution des `required_tools`). Sur une
+/// collision, **le grade le plus strict l'emporte** : un `Testimony` déjà posé
+/// par la skill n'est jamais rabattu à `Operational` par un serveur MCP qui n'a
+/// rien déclaré — sinon l'étage skills du dispatch, qui passe avant l'étage
+/// MCP, exécuterait l'outil testimony sans refus L4.
+fn seed_mcp_data_grades(
+    grades: &mut HashMap<String, crate::skills::manifest::DataGrade>,
+    mcp: Option<&McpManager>,
+) {
+    use crate::skills::manifest::DataGrade;
+    if let Some(mcp) = mcp {
+        for (tool, grade) in mcp.tool_data_grades() {
+            let entree = grades.entry(tool.clone()).or_insert(*grade);
+            if *grade == DataGrade::Testimony {
+                *entree = DataGrade::Testimony;
+            }
+        }
+    }
 }
 
 /// Build a lookup map from tool name → ResolvedSkillTool for matched skills.
@@ -8090,6 +9523,13 @@ const TERMINAL_DISPOSITIONS: &[&str] = &[
 /// line — never by `[mika-engine]` alone, which every corrective re-prompt also begins with
 /// and which the model recopies into its own prose. Keep in sync with the tier-0b pattern in
 /// `skills/bundled/_shared/dispatch-lib.sh`; `test-dispatch-lib.sh` compares the two.
+///
+/// **Module-private, and it stays that way (mika#3027).** The anchor brake in
+/// `skills::executor` used to count withheld attestations by this fragment through a
+/// `pub(crate)` alias; it now delegates to `arch_disposition::is_engine_escalation_line`,
+/// which matches the complete tier-0b shape instead of this fragment. One reader fewer, and
+/// the declaration above stays on one line — `test-dispatch-lib.sh` reads it with a one-line
+/// `grep`, and a longer declaration would wrap under rustfmt and blind it.
 const REVIEW_ANCHOR_ENGINE_FINDING_MARKER: &str = "(BLOCKING) [mika-engine] review-anchor:";
 
 /// The `ESCALATE` line of the same family as a declared disposition line
@@ -8198,6 +9638,24 @@ fn escalate_unattested_disposition(
     ))
 }
 
+/// The two log fields of mika#2794's instrument: the accepted and refused labels, `,`-joined.
+///
+/// **An empty set is an empty string, never an absent field.** The ratio the ticket asks for —
+/// withholds after re-prompt over re-prompts — is read by pairing `guard.review_anchor` with
+/// `guard.review_anchor_withheld`, so a field that disappears when nothing was refused would
+/// read as "no refusal" where the truth is "pre-mika#2794 binary" (mika#2340, mika#2331).
+fn anchor_label_fields(per_anchor: &[review_anchor::AnchorOutcome]) -> (String, String) {
+    let join = |refused: bool| {
+        per_anchor
+            .iter()
+            .filter(|outcome| outcome.refused.is_some() == refused)
+            .map(|outcome| outcome.label.trim_end_matches(':'))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    (join(false), join(true))
+}
+
 /// Withhold an unattested disposition from the final text (mika#2037).
 ///
 /// Replaces the disposition line with `DISPOSITION_WITHHELD_MARKER` and leaves the rest of
@@ -8238,7 +9696,7 @@ fn withhold_disposition(text: &str, required_suffix_lines: &[String]) -> String 
 /// matches paraphrases (`proceed`, `good to go`) anywhere in the text, so a response whose
 /// disposition line was merely deleted could still yield READY from its own body. Keep this
 /// literal in sync with the tier-0 check in `skills/bundled/_shared/dispatch-lib.sh`.
-const DISPOSITION_WITHHELD_MARKER: &str = "Disposition-Withheld: REVIEW-ANCHOR-MISSING";
+pub(crate) const DISPOSITION_WITHHELD_MARKER: &str = "Disposition-Withheld: REVIEW-ANCHOR-MISSING";
 
 /// Collect tool-argument suffix constraints from keyword-matched and always-on skills'
 /// `[output]` sections. Returns the union of all declared `required_tool_arg_suffixes`
@@ -8284,32 +9742,274 @@ fn is_terminal_disposition(text: &str, required_suffix_lines: &[String]) -> bool
     })
 }
 
-/// Filter required tools to only those available in the current tool set.
+/// Pourquoi une exigence `required_tools` est retirée du lot (mika#2814 vol 4).
+///
+/// **L'enum ne porte aucune méthode de conversion, et c'est la décision.** Les
+/// littéraux `reason = "not_served"`, `reason = "turn_forbids_dispatch"` et
+/// `reason = "mcp_testimony_banned"` restent écrits dans leurs bras respectifs
+/// du `match` de journalisation de [`filter_available_required_tools`]. Un
+/// `as_str()` ferait exister chaque chaîne deux fois — dans la méthode et dans
+/// l'attente d'un test — ou ferait épingler la méthode au lieu de la décision.
+/// Ici la chaîne existe une fois, à son seul site d'émission, et **la variante
+/// est le contrat** que les tests lisent.
+///
+/// C'est aussi ce qui rend la propriété testable du tout : la branche
+/// `NonServi` et la branche `BanTestimony` retirent le **même** outil, donc
+/// rendent le **même** `HashSet`. Aucune assertion sur la valeur rendue par
+/// [`filter_available_required_tools`] ne peut les distinguer, et le dépôt n'a
+/// pas de harnais de capture `tracing` (aucun `tracing-test`, aucun
+/// `TestWriter` dans l'arbre).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum RaisonDesarmement {
+    /// L'outil n'existe dans aucune source — registre, skills, MCP (#516/#517).
+    Inexistant,
+    /// Son serveur MCP déclare `data_grade = "testimony"` (mika#1798/mika#2814).
+    BanTestimony,
+    /// Il existe, mais ce tour-ci ne le sert pas (mika#2757).
+    NonServi,
+    /// Il est servi, mais le tour interdit qu'il réussisse (mika#2757).
+    TourInterditDispatch,
+    /// Territoire d'un handler ayant **déjà traité** l'événement : il n'y reste
+    /// rien à groomer (mika#3004 — [`pr_review_groom`]).
+    TerritoireSansGroom,
+}
+
+/// La décision de désarmement, **pure** et sans journalisation.
+///
+/// Seul consommateur : [`filter_available_required_tools`], qui `match` sur le
+/// résultat pour journaliser puis filtrer. La séparation existe pour que les
+/// tests interrogent la fonction qui **décide** plutôt que la fonction qui
+/// **journalise** — une assertion sur des lignes de log capturées épinglerait
+/// la formulation, une assertion sur la variante épingle la propriété (voir
+/// [`RaisonDesarmement`]).
+///
+/// ## L'ordre des branches est load-bearing, et c'est la propriété du vol
+///
+/// **1** l'outil n'existe pas → **2** son serveur déclare `testimony` → **3**
+/// le tour ne le sert pas → **4** le tour interdit le dispatch → **5** c'est un
+/// territoire de handler.
+///
+/// Ce n'est pas une préférence de lisibilité. Un outil MCP testimony **n'est
+/// jamais servi** — `mcp::retain_publiables` l'a retiré du lot publié, donc de
+/// `enabled_tool_names`, bâti sur `skill_tool_defs` — si bien qu'une branche
+/// `BanTestimony` posée **après** `NonServi` serait inatteignable à 100 %, pour
+/// toujours, **avec tous les tests verts**. C'est
+/// `mika2814_un_outil_mcp_testimony_non_servi_est_desarme_sous_le_ban` qui
+/// l'empêche : il mesure l'état *testimony **et** non servi*, le seul que la
+/// production produise, et il rougit sur l'ordre inverse (rouge constaté avant
+/// le câblage : `left: Some(NonServi)`, `right: Some(BanTestimony)`).
+///
+/// `BanTestimony` se pose **après** `Inexistant` parce qu'un outil qui n'existe
+/// pas n'a pas de grade, et parce que la branche 1 accuse une configuration de
+/// skill cassée — un diagnostic plus élémentaire, qui doit rester premier.
+///
+/// [`ProprietesDuTour`] entre **déjà calculé**, et non en `&str` : évalué une
+/// fois pour toutes les exigences (mika#2757 — « le domaine est une propriété du
+/// tour »), là où un texte inviterait à le réévaluer par outil. Sa forme et la
+/// cinquième position de la branche 5 sont argumentées dans [`pr_review_groom`].
+fn raison_de_desarmement(
+    outil: &str,
+    tools: &ToolRegistry,
+    skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
+    mcp_manager: Option<&McpManager>,
+    served: &HashSet<String>,
+    proprietes: ProprietesDuTour,
+) -> Option<RaisonDesarmement> {
+    // Branche 1 — l'outil n'existe pas (#516/#517).
+    let available = tools.get(outil).is_some()
+        || skill_tool_map.contains_key(outil)
+        || mcp_manager.is_some_and(|m| m.is_mcp_tool(outil));
+    if !available {
+        return Some(RaisonDesarmement::Inexistant);
+    }
+
+    // Branche 2 — son serveur déclare `testimony`. AVANT `NonServi`, sans quoi
+    // cette branche est morte : voir le doc-comment ci-dessus.
+    if mcp_manager.is_some_and(|m| m.is_testimony_tool(outil)) {
+        return Some(RaisonDesarmement::BanTestimony);
+    }
+
+    // Branche 3 — l'outil existe mais ce tour-ci ne le sert pas.
+    if !served.contains(outil) {
+        return Some(RaisonDesarmement::NonServi);
+    }
+
+    // Branche 4 — l'outil est servi, mais le tour interdit qu'il réussisse.
+    if proprietes.interdit_dispatch && is_dispatch_tool(outil) {
+        return Some(RaisonDesarmement::TourInterditDispatch);
+    }
+
+    // Branche 5 — territoire de handler : rien à groomer. Ne porte QUE l'outil
+    // de groom, et pas [`is_dispatch_tool`] — argumenté dans [`pr_review_groom`].
+    if proprietes.territoire_handler && outil == "run_claude_pilot_groom" {
+        return Some(RaisonDesarmement::TerritoireSansGroom);
+    }
+
+    None
+}
+
+/// Filter required tools to only those the turn can actually satisfy.
 ///
 /// Checks builtins (ToolRegistry), skill-defined tools, and MCP tools. Tools not found
 /// in any source are excluded with a warning — this prevents the required_tools gate from
 /// retrying for tools that can't possibly be called (e.g., stale config referencing a
 /// removed tool). See #516, #517.
+///
+/// ## Désarmement : une exigence que le tour rend impossible n'est pas une exigence (mika#2757)
+///
+/// Le 2026-10-17 ≈ 01:01Z, un tour webhook en fallthrough a reçu deux ordres
+/// contraires : `match_skills` avait armé `required_tools =
+/// ["run_claude_pilot_groom"]` sur un `groom` cité dans le corps du ticket,
+/// tandis que `webhook_no_unauthorized_dispatch` interdisait à cet outil même de
+/// réussir. Le modèle a pris le re-prompt `agent responded without calling
+/// required tools`, créé puis annulé trois tâches `Placeholder…`, et conclu à un
+/// `create_task` manquant — une fausse piste : le défaut était la contradiction.
+///
+/// La même contradiction a un second chemin — trace `3b771914`, un tour
+/// `pr_review` sur une PR ouverte : [`pr_review_groom`] (mika#3004).
+///
+/// **Le principe (plan § 2.1).** Une exigence que le tour lui-même rend
+/// impossible à satisfaire est une contradiction, et le moteur la désarme **en la
+/// nommant**. Cinq raisons de retrait, dans cet ordre :
+///
+/// 1. **l'outil n'existe pas** — comportement d'origine, `WARN` inchangé
+///    (#516/#517) ;
+/// 2. **son serveur MCP déclare `data_grade = "testimony"`** — la doctrine
+///    non-transit interdit l'accès *et la proposition d'accès* (mika#1798) —
+///    `WARN event = "required_tool_disarmed", reason = "mcp_testimony_banned"`
+///    (mika#2814 vol 4) ;
+/// 3. **l'outil existe mais n'est pas servi sur ce tour** —
+///    `INFO event = "required_tool_disarmed", reason = "not_served"` ;
+/// 4. **l'outil est servi mais le tour interdit qu'il réussisse** — un outil de
+///    dispatch sur un message du domaine Webhook Fallthrough —
+///    `INFO event = "required_tool_disarmed", reason = "turn_forbids_dispatch"` ;
+/// 5. **c'est le territoire d'un handler qui a déjà traité l'événement** —
+///    `INFO … reason = "handler_territory_forbids_groom"` ; `INFO` parce que sa
+///    population est mesurément non vide (mika#3004 — [`pr_review_groom`]).
+///
+/// **Cet ordre est la propriété, pas une préférence de lecture.** Un outil MCP
+/// testimony n'est jamais servi — [`crate::mcp::retain_publiables`] l'a retiré du lot
+/// publié — si bien que la branche 2 posée **après** la branche 3 serait
+/// inatteignable à 100 %, pour toujours, avec tous les tests verts. La décision
+/// vit dans [`raison_de_desarmement`], qui porte le détail ; ce `match`-ci ne
+/// fait que la journaliser.
+///
+/// **Les branches 1 et 2 ne sont pas redondantes**, et confondre les deux ferait
+/// lire une restriction normale comme une erreur de configuration. `served` est
+/// un sous-ensemble **strict** de ce que `tools.get()` connaît : la denylist
+/// d'identité, `FALLTHROUGH_WITHHELD_TOOLS` (mika#2517 U2),
+/// [`filter_ci_excluded_tools`] (mika#1324) et le filtre provider compact
+/// (mika#1491) retirent du tableau servi des outils que le registre possède
+/// toujours. Les deux messages ne disent donc pas la même chose — « corrige la
+/// config de la skill » contre « ce tour-ci ne sert pas cet outil ».
+///
+/// **`INFO`, et c'est une décision (§ 2.4).** Le désarmement est *nominal* sur ce
+/// domaine : il tirera des dizaines de fois par jour pour un comportement
+/// correct, et un `WARN` à ce volume est un `WARN` qu'on apprend à ignorer —
+/// la leçon des « 25+ documented misfires » de mika#1469. Le champ `reason`
+/// sépare les deux formes par `GROUP BY`. Le `WARN` de la branche 1 reste un
+/// `WARN` : celui-là accuse une configuration, pas un tour.
+///
+/// **La branche 2 est un `WARN`, et pour la raison inverse (mika#2814 vol 4).**
+/// Sa population est *mesurément vide* aujourd'hui : les onze déclarations
+/// `required_tools` de `skills/bundled/` ne portent aucun préfixe `mcp__`. Elle
+/// ne tirera donc pas des dizaines de fois par jour — elle ne tirera pas du
+/// tout, et le jour où elle tire, une skill exige nommément un outil que la
+/// doctrine bannit. C'est une configuration à corriger, comme la branche 1, pas
+/// un tour qui restreint.
+///
+/// **Aucune capacité n'est retirée.** La valeur rendue n'est lue que par le
+/// re-prompt `required_tools` et par `has_terminal_required_tool_failure` ; rien
+/// d'autre ne la voit. L'outil reste dans le tableau servi quand il y était, le
+/// prompt de la skill reste injecté, et l'interdit de
+/// `webhook_no_unauthorized_dispatch` reste entier. Ce qui disparaît est
+/// l'injonction d'appeler — exactement la forme du geste de mika#2517 U3.
+///
+/// `served` est le tableau d'outils réellement servi au modèle (#862) et
+/// `turn_message` la chaîne sur laquelle les `INTENT_GUARDS` sont évalués ; voir
+/// le site d'appel pour ce que le partage de ce binding garantit.
+/// `webhook_event_text` est le texte d'AVANT les handlers, et c'est lui qui est
+/// jugé quand il existe (mika#3004).
 fn filter_available_required_tools(
     required: &HashSet<String>,
     tools: &ToolRegistry,
     skill_tool_map: &HashMap<String, &ResolvedSkillTool>,
     mcp_manager: Option<&McpManager>,
+    served: &HashSet<String>,
+    turn_message: &str,
+    webhook_event_text: Option<&str>,
 ) -> HashSet<String> {
+    // mika#2757 / mika#3004 — évaluées une fois pour l'ensemble des exigences :
+    // la classe d'un tour est une propriété du tour, pas de l'outil.
+    let proprietes = ProprietesDuTour::depuis(webhook_event_text, turn_message);
+
     required
         .iter()
         .filter(|t| {
-            let available = tools.get(t).is_some()
-                || skill_tool_map.contains_key(t.as_str())
-                || mcp_manager.is_some_and(|m| m.is_mcp_tool(t));
-            if !available {
-                warn!(
-                    tool = %t,
-                    "required_tools references unavailable tool — skipping enforcement \
-                     (fix the skill's [constraints] required_tools config)"
-                );
+            match raison_de_desarmement(t, tools, skill_tool_map, mcp_manager, served, proprietes) {
+                // Branche 1 — l'outil n'existe pas (#516/#517).
+                Some(RaisonDesarmement::Inexistant) => {
+                    warn!(
+                        tool = %t,
+                        "required_tools references unavailable tool — skipping enforcement \
+                         (fix the skill's [constraints] required_tools config)"
+                    );
+                    false
+                }
+
+                // Branche 2 — son serveur MCP déclare `testimony` (mika#2814 vol 4).
+                Some(RaisonDesarmement::BanTestimony) => {
+                    warn!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        server = crate::mcp::serveur_du_nom_namespace(t).unwrap_or("?"),
+                        reason = "mcp_testimony_banned",
+                        "required tool belongs to an MCP server declaring \
+                         data_grade = \"testimony\" — the non-transit doctrine forbids \
+                         accessing it and forbids proposing to (mika#1798), so it cannot be \
+                         required — disarming the requirement (mika#2814)"
+                    );
+                    false
+                }
+
+                // Branche 3 — l'outil existe mais ce tour-ci ne le sert pas.
+                Some(RaisonDesarmement::NonServi) => {
+                    info!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        reason = "not_served",
+                        "required tool is not in this turn's served tool set — disarming the \
+                         requirement (mika#2757)"
+                    );
+                    false
+                }
+
+                // Branche 4 — l'outil est servi, mais le tour interdit qu'il réussisse.
+                Some(RaisonDesarmement::TourInterditDispatch) => {
+                    info!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        reason = "turn_forbids_dispatch",
+                        "this turn forbids dispatch (Webhook Fallthrough domain), so a dispatch \
+                         tool cannot be required — disarming the requirement (mika#2757)"
+                    );
+                    false
+                }
+
+                // Branche 5 — rien à groomer sur ce territoire (mika#3004).
+                Some(RaisonDesarmement::TerritoireSansGroom) => {
+                    info!(
+                        event = "required_tool_disarmed",
+                        tool = %t,
+                        reason = "handler_territory_forbids_groom",
+                        "a server/ handler already processed this event (PR / check-suite): \
+                         nothing left to groom (mika#3004)"
+                    );
+                    false
+                }
+
+                None => true,
             }
-            available
         })
         .cloned()
         .collect()
@@ -8418,48 +10118,161 @@ fn has_successful_pr_review(summaries: &[ToolCallSummary]) -> bool {
 /// `provider_name` and `model_name` select variant-specific prompts when available.
 /// Two-level fallback for prompts: model-specific > root.
 /// Three-level fallback for timeouts: model > provider > root.
-/// Filter built-in tool definitions against an agent's identity-driven denylist.
+/// Filter built-in tool definitions against an agent's identity-driven tool
+/// visibility — **both** shapes, at one site (mika#2748).
 ///
 /// Applied at the LLM-presentation layer (this function is called inside
 /// `inject_skills_and_resolve_tools`), before the tool array reaches the
-/// LLM API call. Disabled tools are *not* presented to the model — the
+/// LLM API call. Filtered-out tools are *not* presented to the model — the
 /// model never sees them, cannot call them, cannot be prompt-injected into
 /// trying. The shared `Arc<ToolRegistry>` is unchanged.
 ///
-/// `disabled` is the agent's `Identity.tools.disabled` list, sourced from
-/// `identity.toml` `[tools].disabled` at agent context load time.
+/// `disabled` is the agent's `Identity.tools.disabled` denylist and `allowed`
+/// its `Identity.tools.allowed` allowlist, both sourced from `identity.toml`
+/// `[tools]` at agent context load time.
 ///
-/// Future migration (when well-known agents move from denylist to allowlist
-/// for tools): extend this hook to handle both shapes — same call site,
-/// different predicate, no caller changes.
+/// # The predicate, and why it is an intersection
+///
+/// ```text
+/// keep(d) ⇔ (allowed.is_none() || allowed contains d.name) && !(disabled contains d.name)
+/// ```
+///
+/// - **`Option` carries the three states.** `None` is "no allowlist, prior
+///   behaviour"; `Some([])` is "admit no builtin at all"; `Some([…])` is the
+///   explicit roster. The early return covers `None` *and* an empty denylist,
+///   never `Some([])` — an agent admitting nothing must be served nothing.
+/// - **The denylist subtracts on top of the allowlist.** This is what preserves
+///   the Webhook Fallthrough widening of mika#2517 (`FALLTHROUGH_WITHHELD_TOOLS`
+///   via `effective_disabled_tools`) with zero change here: that turn adds
+///   `create_task` to the *effective* denylist, and the intersection stays the
+///   right answer even on an allowlist agent.
+/// - **Order does not matter** (it is an intersection), but a name written on
+///   both sides is a decision written twice, not a contradiction to arbitrate in
+///   silence. For mika-arch that case is asserted away by
+///   `mika2748_lallowlist_de_mika_arch_est_le_roster` (assertion C).
+///
+/// # Hard bound — this governs builtins only
+///
+/// The call site is **before** skill tools and MCP tools are appended, so
+/// neither list reaches them. `gh_read` — mika-arch's most-used tool — is served
+/// without being named in `allowed`, and that is deliberate: naming a skill tool
+/// there would be an inert entry that *reads* as an authorisation, and the day
+/// this application point moved, the agent would lose its main tool in silence.
+/// Same invariant as the "`[tools].disabled` cannot deny an MCP tool" caveat
+/// already written in `docs/mcp.md` and `docs/architecture.md`.
+///
+/// # Reading the event it emits (mika#2593)
+///
+/// `applied identity tool-visibility filter` carries both halves of the
+/// subtraction — `hidden_count` and `kept_count` — plus `kept_bytes`, the
+/// weight of what remains, and `agent`. Each of the three later fields answers
+/// a question the earlier shape could not:
+///
+/// - **`kept_count`** — `hidden_count` alone says how much was removed, never
+///   how much is left. A denylist that grows while the registry grows faster
+///   reads as progress on `hidden_count` and as a regression on the served
+///   array; only the pair separates them.
+/// - **`kept_bytes`** — the count is not the cost. Tool definitions differ by
+///   an order of magnitude in schema size, so nine names removed may be 1 KB or
+///   6 KB. Computed by [`tool_defs_byte_weight`], the *same* function
+///   `context_window_assembled.tool_defs_bytes` goes through, so the two
+///   numbers are comparable by construction rather than by coincidence —
+///   `kept_bytes` is that turn's `tool_defs_bytes` minus the skill tools added
+///   after this filter.
+/// - **`agent`** — `effective_disabled_tools` widens the list per *turn kind*
+///   (mika#2517 adds `create_task` on Webhook Fallthrough turns), so the same
+///   agent emits two different populations, and several agents emit on the same
+///   log. Without the field, a `jq` over this event averages across agents that
+///   share no denylist (mika#2205).
+///
+/// Two more fields answer the question mika#2748 raised (mika#2293 — a setting
+/// that cannot be observed is not a setting):
+///
+/// - **`filter_shape`** ∈ `{"denylist", "allowlist", "both"}` — the shape that
+///   produced this line. Seeding an allowlist from exactly what the denylist
+///   leaves standing moves **no** number: `hidden_count`, `kept_count` and
+///   `kept_bytes` are all expected to be unchanged, so without this field
+///   "the switch is served" and "the binary is the old one" emit identical
+///   bytes (class mika#2340 / mika#2205). Its **absence** reads as a binary
+///   predating mika#2748, never as "no allowlist".
+/// - **`allowed_size`** — the allowlist's length, emitted beside
+///   `disabled_size` and **absent** (not `0`) when `allowed` is `None`:
+///   absent ≠ zero (mika#2331). `0` is a real, distinct state — `Some([])`.
+///
+/// The emission stays inside `if removed > 0`: an agent with no denylist is not
+/// a filtered agent reading zero, and an event on every turn of every agent
+/// would drown the ones that mean something. An allowlist that removes nothing
+/// (allowlist = whole registry) is possible but is not the served case; leaving
+/// it silent stays consistent with the denylist half.
 pub(crate) fn apply_agent_tool_visibility(
     tool_defs: &mut Vec<mika_common::claude::ToolDefinition>,
     disabled: &[String],
+    allowed: Option<&[String]>,
+    agent: &str,
 ) {
-    if disabled.is_empty() {
+    if disabled.is_empty() && allowed.is_none() {
         return;
     }
     let removed_count = tool_defs.len();
     tool_defs.retain(|d| {
-        let blocked = disabled
+        let admitted =
+            allowed.is_none_or(|list| list.iter().any(|name| name.eq_ignore_ascii_case(&d.name)));
+        let denied = disabled
             .iter()
             .any(|name| name.eq_ignore_ascii_case(&d.name));
-        if blocked {
+        let keep = admitted && !denied;
+        if !keep {
             tracing::debug!(
                 tool = %d.name,
-                "tool hidden from agent's LLM tool array (identity [tools].disabled)"
+                reason = if denied { "denylist" } else { "not in allowlist" },
+                "tool hidden from agent's LLM tool array (identity [tools])"
             );
         }
-        !blocked
+        keep
     });
     let removed = removed_count - tool_defs.len();
     if removed > 0 {
+        let filter_shape = match (disabled.is_empty(), allowed.is_some()) {
+            (false, true) => "both",
+            (false, false) => "denylist",
+            (true, true) => "allowlist",
+            // Unreachable: the early return above covers it.
+            (true, false) => "none",
+        };
         tracing::info!(
+            agent = %agent,
             hidden_count = removed,
             disabled_size = disabled.len(),
+            // Absent rather than `0` when there is no allowlist (mika#2331):
+            // `0` is a real, distinct state (`Some([])`). One call, not the
+            // two-arm `match` of `webhook_prefilter.rs` — `Value for Option<T>`
+            // records *nothing* on `None`, so the key is omitted. What that
+            // site's comment warns against is the `?` sigil, which would go
+            // through `Debug` and write the string `"None"`.
+            allowed_size = allowed.map(<[String]>::len),
+            filter_shape = filter_shape,
+            kept_count = tool_defs.len(),
+            kept_bytes = tool_defs_byte_weight(tool_defs),
             "applied identity tool-visibility filter"
         );
     }
+}
+
+/// The byte weight of a tool array, as the model is billed for it.
+///
+/// Single expression behind both readers — `tool_defs_bytes` on
+/// `context_window_assembled` (mika#2295) and `kept_bytes` on
+/// `applied identity tool-visibility filter` (mika#2593). They are read against
+/// each other by the operator weighing a cut, so "the same expression" must be
+/// a property of the code rather than a thing two call sites happen to agree
+/// on today.
+///
+/// A serialization failure reports `0` rather than refusing: these are
+/// observability fields, and no measurement is worth a turn.
+pub(crate) fn tool_defs_byte_weight(tool_defs: &[mika_common::claude::ToolDefinition]) -> usize {
+    serde_json::to_string(tool_defs)
+        .map(|s| s.len())
+        .unwrap_or(0)
 }
 
 /// The tools a **Webhook Fallthrough** turn must not be handed (mika#2517 U2).
@@ -8728,7 +10541,9 @@ fn inject_skills_and_resolve_tools(
     provider_name: &str,
     model_name: &str,
     resolved_context: &HashMap<String, context::ContextBlock>,
+    agent: &str,
     disabled_tools: &[String],
+    allowed_tools: Option<&[String]>,
     is_compact_provider: bool,
 ) -> (
     Vec<mika_common::claude::ToolDefinition>,
@@ -8737,9 +10552,10 @@ fn inject_skills_and_resolve_tools(
 ) {
     // Always include ALL builtin tools
     let mut tool_defs = tools.definitions().to_vec();
-    // Apply per-agent visibility filter BEFORE skill tools are added — this
-    // is the named hook that future allowlist migration will reuse.
-    apply_agent_tool_visibility(&mut tool_defs, disabled_tools);
+    // Apply per-agent visibility filter BEFORE skill tools are added — the one
+    // hook both shapes go through (mika#2748), and the reason the allowlist
+    // governs builtins only: skill and MCP tools are appended below.
+    apply_agent_tool_visibility(&mut tool_defs, disabled_tools, allowed_tools, agent);
 
     // Compact provider gate (mika#1491): filter tools to core-only allowlist
     // and skip all skill prompts + skill tools.
@@ -8973,9 +10789,7 @@ fn build_context_window_fields(
         message_count: history.len(),
         history_bytes: history_slice.iter().map(|m| m.content.len()).sum(),
         user_message_bytes,
-        tool_defs_bytes: serde_json::to_string(tool_defs)
-            .map(|s| s.len())
-            .unwrap_or(0),
+        tool_defs_bytes: tool_defs_byte_weight(tool_defs),
         distinct_sessions,
         history_scope: history_scope_label(scope),
         oldest_age_secs,
@@ -9091,12 +10905,43 @@ fn truncate_history_to_token_budget(
 /// | `session` | `> 1` | **halt**: the filter is not filtering; the leak is under `rebuild_context`, not in the setting |
 /// | `agent` | `> 1` | the mika#2305 defect, back: the setting never reached the disk (mika#2330 class) |
 /// | `agent` | `1` | permissive scope, thin window by accident — true today, false tomorrow |
+///
+/// # Why `system_prompt_bytes` is the fourth component (mika#2884)
+///
+/// The three byte counts above decompose the *conversation* half of the window;
+/// the heaviest component, and the only one a change to the **repository** moves
+/// without any conversation changing (the 825 KB `CLAUDE.md` of 2026-10-13), was
+/// the one missing. Reading what filled a window therefore meant joining this
+/// line to `system_prompt_assembled` (which carries the same value under the
+/// name `total_bytes`) or to `turn_usage` by `trace_id`. What the field buys is
+/// **one line carrying every component** — not a measurement that did not exist,
+/// and not a second source of truth: it is the same value, at the same instant,
+/// on the line that needs it (`report_brief_size_overrun`'s § *Why
+/// `system_prompt_bytes` rides along*, mika#2474, three lines below the sole
+/// caller of this function).
+///
+/// It arrives as a **parameter** rather than in [`ContextWindowFields`] because
+/// `build_context_window_fields` does not compute it and cannot: the system
+/// prompt is assembled by another path entirely, so widening that pure function
+/// would only make it a conduit for a value it does not produce — and would move
+/// the ~14 unit call sites that construct the struct for a value none of them has
+/// any business producing. Same positional shape as `report_brief_size_overrun`,
+/// fed by the same `system.len()` expression, so the two calls are literally
+/// comparable in a diff.
+///
+/// The value is emitted **without a sigil**, on a bare `usize`: here the system
+/// prompt is a `String` in hand, so "a measurement that did not happen" is
+/// unreachable and the mika#2331 motif (*absent is never zero*) holds by
+/// construction. `turn_usage` — emitted from a path where the prompt may be
+/// absent — keeps its `Option<i64>` and its `?`. Both forms are right where they
+/// are.
 fn emit_context_window_assembled(
     agent_id: &str,
     session_id: &str,
     trace_id: &str,
     mode: &str,
     fields: &ContextWindowFields,
+    system_prompt_bytes: usize,
 ) {
     info!(
         target: "mika::otel",
@@ -9109,12 +10954,205 @@ fn emit_context_window_assembled(
         history_bytes = fields.history_bytes,
         user_message_bytes = fields.user_message_bytes,
         tool_defs_bytes = fields.tool_defs_bytes,
+        // mika#2884 — the fourth component of the window, next to the other
+        // three rather than at the end of the list: the four are read together.
+        system_prompt_bytes = system_prompt_bytes,
         distinct_sessions = fields.distinct_sessions,
         history_scope = fields.history_scope,
         oldest_age_secs = fields.oldest_age_secs,
         truncated_messages = fields.truncated_messages,
         truncated_bytes = fields.truncated_bytes,
         "context window assembled"
+    );
+}
+
+/// Log name of the per-tool census of the served tool array (mika#2783).
+///
+/// **SOLE WRITER**, held by
+/// `canonical_tokens::tests::mika2783_le_nom_de_levenement_a_un_seul_scribe`. A
+/// second site writing this name would publish a second `{name: bytes}` map for
+/// the same turn, and the two would be indistinguishable in the log — the
+/// mika#2205 class, one name over two populations, which is exactly what this
+/// instrument exists to prevent on `tool_defs_bytes`.
+const TOOL_DEFS_CENSUS_EVENT: &str = "tool_defs_census";
+
+/// What one served tool array costs, name by name (mika#2783).
+///
+/// `count` is the number of **definitions**, never `per_tool.len()`: a duplicated
+/// name collapses two entries into one map key, and it is `count` the framing
+/// arithmetic below is a function of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolDefsCensus {
+    /// `{tool name: bytes of its compact JSON serialization}`. A `BTreeMap`
+    /// rather than a `HashMap` so the logged line is stable across turns and two
+    /// readings are diffable; a non-served tool has **no key**, never a `0`
+    /// (mika#2331).
+    per_tool: BTreeMap<String, usize>,
+    /// Σ of the per-tool byte counts, before the array frame.
+    per_tool_sum: usize,
+    /// `tool_defs.len()` — the number of definitions served.
+    count: usize,
+    /// Names served more than once, with their occurrence count. Empty in the
+    /// nominal regime.
+    duplicates: Vec<(String, usize)>,
+}
+
+/// Weigh each definition of a served tool array (mika#2783).
+///
+/// Pure, so the equality `per_tool_sum + framing == tool_defs_bytes` is assertable
+/// without a subscriber, a database or a turn — which is where risk R1 of the plan
+/// shows up: a `cargo test` red, not a WARN in production.
+///
+/// A definition that fails to serialize weighs `0`, like
+/// [`tool_defs_byte_weight`]'s whole-array fallback. That is not a silent loss:
+/// `0` makes `per_tool_sum` fall short of the total and the reconciliation WARN
+/// fires, naming the delta.
+///
+/// A **duplicated** name is summed into one key rather than overwritten, so the
+/// equality holds by construction whatever the array contains; the duplication
+/// itself is reported separately by [`emit_tool_defs_census`].
+fn tool_defs_census(tool_defs: &[mika_common::claude::ToolDefinition]) -> ToolDefsCensus {
+    let mut per_tool: BTreeMap<String, usize> = BTreeMap::new();
+    let mut occurrences: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_tool_sum = 0usize;
+
+    for def in tool_defs {
+        let bytes = serde_json::to_string(def).map(|s| s.len()).unwrap_or(0);
+        per_tool_sum += bytes;
+        *per_tool.entry(def.name.clone()).or_insert(0) += bytes;
+        *occurrences.entry(def.name.clone()).or_insert(0) += 1;
+    }
+
+    let duplicates = occurrences.into_iter().filter(|(_, n)| *n > 1).collect();
+
+    ToolDefsCensus {
+        per_tool,
+        per_tool_sum,
+        count: tool_defs.len(),
+        duplicates,
+    }
+}
+
+/// Bytes `serde_json` spends on the array frame itself, for `count` elements
+/// (mika#2783).
+///
+/// Compact serialization writes `[e₁,e₂,…,eₙ]`: two brackets plus `n − 1` commas.
+/// `[]` is therefore `2`, which is why the subtraction saturates — a count of `0`
+/// must not wrap to `usize::MAX` and turn an empty array into a mismatch.
+fn json_array_framing_bytes(count: usize) -> usize {
+    2 + count.saturating_sub(1)
+}
+
+/// Publish the per-tool census, and reconcile it against the total its neighbour
+/// published (mika#2783).
+///
+/// # Why a distinct event name rather than a field on `context_window_assembled`
+///
+/// It must grep alone (mika#2474, mika#2293): the census is read by someone
+/// arbitrating **one** name of mika#2748's allowlist of 19, and that reading is a
+/// `jq` over one event per turn, not a filter over the busiest line of the stream.
+/// A field on the neighbour would also widen a line every conversation turn
+/// already pays for, to serve a question asked a few times per allowlist change.
+///
+/// # Why one map and not one line per tool
+///
+/// ≈ 50 lines per turn per agent is the volume the ticket named; a single line
+/// carrying `{name: bytes}` answers the same question at 1/50th of the stream. And
+/// **not** "first assembly only" either: the served array is not constant per
+/// agent — matched skills vary by turn, the denylist widens on a Webhook
+/// Fallthrough (mika#2517), MCP tools come and go, and `filter_ci_excluded_tools`
+/// removes names on a CI prefix. A first-assembly-only emission would describe one
+/// turn and be read as describing the agent.
+///
+/// # Why INFO
+///
+/// A census of the nominal case fires on every turn by construction. A WARN on a
+/// nominal regime is what ends up muzzled (the `brief_size_alert_bytes` reasoning,
+/// `mika-common/CLAUDE.md`). The three WARNs below are the non-nominal arms, and
+/// they **add** to the INFO line, never replace it: the line is emitted on every
+/// branch, so its absence means a binary predating this change (mika#2340) and
+/// never an agent serving no tools.
+///
+/// # Why `tool_defs_bytes` rides along
+///
+/// So the reconciliation is checkable **from the log alone**, by one reader
+/// holding one line, instead of requiring a join against the sibling event of the
+/// same `trace_id`. It is the value the sibling published, passed in, not a second
+/// measurement of the same array.
+fn emit_tool_defs_census(
+    agent_id: &str,
+    session_id: &str,
+    trace_id: &str,
+    mode: &str,
+    census: &ToolDefsCensus,
+    tool_defs_bytes: usize,
+) {
+    // Two definitions under one name: the map holds their sum, so the equality
+    // below still holds, but `per_tool["x"]` no longer answers "what does x
+    // cost?" — it answers "what do the x's cost together". Expected regime: zero.
+    // Reachable: the MCP append at the top of the window assembly does not
+    // deduplicate against the builtin and skill names.
+    for (tool, occurrences) in &census.duplicates {
+        warn!(
+            event = "tool_defs_census_duplicate_name",
+            agent_id = %agent_id,
+            tool = %tool,
+            occurrences = *occurrences,
+            "two tool definitions share one name; the census sums them under one key (mika#2783)"
+        );
+    }
+
+    let framing_bytes = json_array_framing_bytes(census.count);
+    let reconciled = census.per_tool_sum + framing_bytes;
+    if reconciled != tool_defs_bytes {
+        // The mika#2205 class, caught in flight: the census and the total would
+        // be two populations under one reading. `delta` is signed because the
+        // sign is the diagnosis — short means a definition failed to serialize,
+        // long means the two sites no longer weigh the same array.
+        warn!(
+            event = "tool_defs_census_mismatch",
+            agent_id = %agent_id,
+            trace_id = %trace_id,
+            tool_defs_bytes = tool_defs_bytes,
+            per_tool_sum = census.per_tool_sum,
+            tool_defs_count = census.count,
+            framing_bytes = framing_bytes,
+            delta = reconciled as i64 - tool_defs_bytes as i64,
+            "per-tool census does not reconcile with tool_defs_bytes (mika#2783)"
+        );
+    }
+
+    // Same form as `emit_system_prompt_assembled`'s `per_skill_bytes`: a JSON
+    // object serialized into one field. Degradation is `"{}"` rather than an
+    // absent field, so `per_tool_bytes` is never missing — the field's *keys*
+    // carry the absence semantics, and a reader must not have to tell "no key for
+    // this tool" from "no map at all" without being told which happened.
+    let per_tool_json = match serde_json::to_string(&census.per_tool) {
+        Ok(json) => json,
+        Err(e) => {
+            warn!(
+                event = "tool_defs_census_unserializable",
+                agent_id = %agent_id,
+                error = %e,
+                tool_defs_count = census.count,
+                "per-tool census map could not be serialized; the field degrades to {{}} (mika#2783)"
+            );
+            "{}".to_string()
+        }
+    };
+
+    info!(
+        target: "mika::otel",
+        event = TOOL_DEFS_CENSUS_EVENT,
+        agent_id = %agent_id,
+        session_id = %session_id,
+        trace_id = %trace_id,
+        mode = %mode,
+        tool_defs_bytes = tool_defs_bytes,
+        tool_defs_count = census.count,
+        per_tool_sum = census.per_tool_sum,
+        per_tool_bytes = per_tool_json.as_str(),
+        "tool definitions censused per tool"
     );
 }
 
@@ -9891,10 +11929,58 @@ struct IntentPrecondition {
     label: &'static str,
     /// Returns `true` when the user message expresses this intent.
     trigger: fn(&str) -> bool,
+    /// mika#3002 — sur quelle région du message `trigger` est évalué.
+    /// `WholeMessage` pour toute entrée dont la prémisse ne dépend pas du
+    /// contrat du skill : c'est le défaut de lecture, pas un défaut de langage
+    /// (il n'y a pas de `Default` ici, et c'est voulu — une nouvelle entrée
+    /// doit nommer sa portée).
+    scope: IntentScope,
     /// Returns `true` when the agent's tool calls satisfy the precondition.
     satisfied: fn(&[ToolCallSummary]) -> bool,
     /// Correction text injected on first rejection.
     correction_message: &'static str,
+}
+
+/// Sur quelle région du message le déclencheur d'une entrée est évalué.
+///
+/// `fn(&str) -> bool` voit le message seul (cf. la doc de `loaded_skill_names`),
+/// donc une entrée qui doit tenir compte d'un fait de tour le DÉCLARE ici, à
+/// côté d'elle, plutôt que de migrer en garde inline.
+#[derive(Clone, Copy)]
+enum IntentScope {
+    /// Le message entier. Portée de toutes les entrées sauf une.
+    WholeMessage,
+    /// mika#3002 — sur un tour de revue d'architecte, la région HORS du plan
+    /// revu ; partout ailleurs, le message entier.
+    OutsideReviewedPlan,
+}
+
+impl IntentScope {
+    /// L'entrée se déclenche-t-elle sur ce message, dans sa portée ?
+    fn triggered(self, trigger: fn(&str) -> bool, msg: &str, is_verdict_producer: bool) -> bool {
+        match self {
+            Self::WholeMessage => trigger(msg),
+            Self::OutsideReviewedPlan if is_verdict_producer => {
+                let (head, tail) = review_anchor::outside_reviewed_plan(msg);
+                trigger(head) || trigger(tail)
+            }
+            Self::OutsideReviewedPlan => trigger(msg),
+        }
+    }
+
+    /// mika#3002 — le contrôle positif de la sonde : le rétrécissement a-t-il
+    /// effectivement changé l'issue sur ce tour ?
+    ///
+    /// Vrai quand le message entier déclenchait et que la région adressée à
+    /// l'agent, elle, ne déclenche pas. Sans cette distinction, « la garde ne
+    /// tire plus » et « aucune revue n'a eu lieu dans la fenêtre » rendent les
+    /// mêmes octets (classe mika#2205).
+    fn stood_down(self, trigger: fn(&str) -> bool, msg: &str, is_verdict_producer: bool) -> bool {
+        matches!(self, Self::OutsideReviewedPlan)
+            && is_verdict_producer
+            && trigger(msg)
+            && !self.triggered(trigger, msg, is_verdict_producer)
+    }
 }
 
 /// Registry of intent-precondition guards.  Evaluated in order; each entry
@@ -9928,6 +12014,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "webhook_ready_label_dispatch",
         trigger: ready_label_dispatch_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: ready_label_dispatch_satisfied,
         correction_message: "[mika-engine] The `ready` label has been removed but neither \
              run_claude_pilot nor run_claude_pilot_groom was called this turn. The \
@@ -9963,6 +12050,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "webhook_no_unauthorized_dispatch",
         trigger: webhook_no_unauthorized_dispatch_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: webhook_no_unauthorized_dispatch_satisfied,
         correction_message: "[mika-engine] The previous response called run_claude_pilot or \
              run_claude_pilot_groom on a [GitHub] webhook turn that was NOT a \
@@ -9987,6 +12075,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "webhook_zero_tools",
         trigger: webhook_zero_tools_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: |summaries| summaries.iter().any(|s| s.success),
         correction_message: "[mika-engine] A GitHub webhook event was received but the \
              response was text-only with zero tool calls. Webhook events require \
@@ -10000,6 +12089,13 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "resume_reconcile",
         trigger: detect_resume_intent,
+        // mika#3002 — la seule entrée du registre dont la prémisse est fausse sur un tour de
+        // revue d'architecte : un plan de groom parle de reprise parce que c'est son sujet, et
+        // cite des jalons. Mesuré le 2026-10-31, trace `3a066c59` : l'architecte, relancé sur
+        // le groom de mika#2995, a répondu en 264 caractères qu'il cherchait des engagements
+        // actifs « comme demandé par l'instruction de reprise » au lieu de rendre une revue —
+        // donc aucune ligne `Disposition:`, donc `UNPARSED`, donc la relance de mika#1823.
+        scope: IntentScope::OutsideReviewedPlan,
         satisfied: resume_reconcile_satisfied,
         correction_message: "[mika-engine] A resume/continue instruction was received for a \
              milestone or project but no reconciliation tools were called. The \
@@ -10026,6 +12122,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: CALLBACK_TERMINAL_ACTION_LABEL,
         trigger: callback_trigger_active,
+        scope: IntentScope::WholeMessage,
         satisfied: callback_terminal_action_satisfied,
         correction_message: CALLBACK_TERMINAL_ACTION_CORRECTION,
     },
@@ -10036,6 +12133,7 @@ const INTENT_GUARDS: &[IntentPrecondition] = &[
     IntentPrecondition {
         label: "deferred_dispatch_action",
         trigger: deferred_dispatch_trigger,
+        scope: IntentScope::WholeMessage,
         satisfied: deferred_dispatch_satisfied,
         correction_message: "[mika-engine] This is a deferred-dispatch retry — the prior \
              run_claude_pilot was rejected with global_dispatch_active. The dispatch \
@@ -10061,7 +12159,9 @@ const CALLBACK_TERMINAL_ACTION_CORRECTION: &str = "[mika-engine] This callback t
 
 /// Re-export from `webhook_dispatch` module — single source of truth for the
 /// ready-label marker prefix (mika#933).
-use crate::webhook_dispatch::{READY_LABEL_DISPATCH_MARKER, is_unauthorized_webhook_dispatch};
+use crate::webhook_dispatch::{
+    DISPATCH_TOOLS, READY_LABEL_DISPATCH_MARKER, is_dispatch_tool, is_unauthorized_webhook_dispatch,
+};
 
 /// Triggers when a webhook turn was initiated by the ready-label dispatch
 /// marker.  Delegates to `webhook_dispatch::is_ready_label_dispatch_marker`
@@ -10100,9 +12200,7 @@ fn ready_label_dispatch_trigger(msg: &str) -> bool {
 /// #1173 — dev-groom owns its own tool (`run_claude_pilot_groom`); both names
 /// satisfy the dispatch contract.
 fn ready_label_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
-    summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+    summaries.iter().any(|s| is_dispatch_tool(&s.name))
 }
 
 /// #696, #1469 — Triggers on `[GitHub]` webhook turns that are potentially
@@ -10180,7 +12278,7 @@ fn webhook_no_unauthorized_dispatch_satisfied(summaries: &[ToolCallSummary]) -> 
     // unauthorized regardless of which claude-pilot tool was called.
     !summaries
         .iter()
-        .any(|s| (s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom") && s.success)
+        .any(|s| is_dispatch_tool(&s.name) && s.success)
 }
 
 /// Parses `<repo>#<n>` from a ready-label dispatch marker.  Used to identify
@@ -10277,9 +12375,7 @@ fn deferred_dispatch_trigger(msg: &str) -> bool {
 /// mika#1011 — Satisfied when `run_claude_pilot` has been attempted (success or failure).
 fn deferred_dispatch_satisfied(summaries: &[ToolCallSummary]) -> bool {
     // mika#1173: deferred replay may target either tool.
-    summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom")
+    summaries.iter().any(|s| is_dispatch_tool(&s.name))
 }
 
 /// #870 — Returns `true` when BOTH `update_task_status` AND `send_message`
@@ -10341,9 +12437,7 @@ fn callback_milestone_advance_satisfied(
 ) -> bool {
     // Path A: any run_claude_pilot or run_claude_pilot_groom call advances the queue
     // (the latter is the milestone-cascade auto-groom path; mika#1173).
-    let has_advance = summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
+    let has_advance = summaries.iter().any(|s| is_dispatch_tool(&s.name));
 
     if has_advance {
         return true;
@@ -10403,9 +12497,7 @@ fn webhook_milestone_advance_satisfied(
     summaries: &[ToolCallSummary],
 ) -> bool {
     // Path A — reuse the same predicate as callback (#991).
-    let has_advance = summaries
-        .iter()
-        .any(|s| s.name == "run_claude_pilot" || s.name == "run_claude_pilot_groom");
+    let has_advance = summaries.iter().any(|s| is_dispatch_tool(&s.name));
     if has_advance {
         return true;
     }
@@ -10450,7851 +12542,22 @@ const WEBHOOK_MILESTONE_ADVANCE_CORRECTION: &str = "[mika-engine] This is a \
 /// `pub(crate)` so callers under `agent::run_agent_inner` can invoke it and
 /// inline `#[cfg(test)] mod tests` can unit-test the predicate + filter
 /// behavior without standing up the full agent loop.
+///
+/// Depuis mika#2757 la paire d'outils retirée n'est plus déclarée ici : elle est
+/// lue depuis [`crate::webhook_dispatch::DISPATCH_TOOLS`], le site unique que les
+/// sept prédicats de la paire partagent. La copie locale `CI_EXCLUDED_TOOLS`
+/// portait la même valeur et a disparu sans changer un octet de comportement.
 pub(crate) fn filter_ci_excluded_tools(
     user_message: &str,
     tools: &mut Vec<mika_common::claude::ToolDefinition>,
 ) {
-    const CI_EXCLUDED_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
     let is_ci_webhook = crate::server::ci_success_handler::parse_check_suite_success(user_message)
         .is_some()
         || crate::server::ci_failure_handler::parse_check_suite_failure(user_message).is_some();
     if is_ci_webhook {
-        tools.retain(|d| !CI_EXCLUDED_TOOLS.contains(&d.name.as_str()));
+        tools.retain(|d| !DISPATCH_TOOLS.contains(&d.name.as_str()));
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::skills::index::{ResolvedSkillTool, SkillEntry};
-    use crate::skills::manifest::{SkillInfo, SkillManifest, ToolHandler, Triggers};
-    use crate::test_utils::test_helpers::test_async_db;
-    use mika_common::claude::ToolDefinition;
-    use std::path::PathBuf;
-
-    // ===========================================================================
-    // mika#2342 — every LLM call of this module carries a safety net
-    // ===========================================================================
-
-    /// How many lines above a call the wrapping `timeout(` may sit.
-    ///
-    /// Three covers both real shapes — the continuation's two-line form and the
-    /// watchdog's `match` form — plus the single-line form (window includes the
-    /// call's own line). Deliberately *not* wider: a `timeout` five lines above
-    /// is more likely to belong to something else, and a gate that accepts an
-    /// unrelated wrapper is a gate that passes the regression it exists to
-    /// catch.
-    const WATCHDOG_GUARD_LOOKBACK_LINES: usize = 3;
-
-    /// The detector behind [`mika2342_every_llm_call_is_wrapped_in_a_timeout`],
-    /// split out so the guard can be exercised on a fabricated string rather
-    /// than by breaking the real source (verification contract item 7).
-    ///
-    /// Lexical, and says so: it looks for the call token and then for a
-    /// `tokio::time::timeout(` within the preceding
-    /// [`WATCHDOG_GUARD_LOOKBACK_LINES`]. It cannot parse Rust, so a
-    /// sufficiently creative formatting could fool it in either direction. That
-    /// is acceptable for what it defends — not a subtle behaviour, but the
-    /// *disappearance* of a wrapper, which is what a hurried refactor does.
-    fn unwrapped_deadline_call_sites(src: &str) -> Vec<String> {
-        // Both tokens in halves: this function's own body is inside the file
-        // the guard scans, so writing either one whole would make the gate its
-        // own first offender (the `policy.rs:no_bare_agent_timeout_constant_remains`
-        // motif).
-        let call_token = concat!("send_message_", "with_deadline");
-        let wrap_token = concat!("tokio::time::", "timeout(");
-
-        let lines: Vec<&str> = src.lines().collect();
-        let mut offenders = Vec::new();
-
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            // Comments are how this ticket explains itself; scanning them would
-            // make the explanation the violation.
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            // The call token appears in a *definition* too (`fn
-            // send_message_with_deadline`), which is not a call site.
-            if !line.contains(call_token) || trimmed.starts_with("async fn") {
-                continue;
-            }
-            let from = i.saturating_sub(WATCHDOG_GUARD_LOOKBACK_LINES);
-            let wrapped = lines[from..=i].iter().any(|l| l.contains(wrap_token));
-            if !wrapped {
-                offenders.push(format!("{}: {}", i + 1, trimmed));
-            }
-        }
-
-        offenders
-    }
-
-    /// Every `send_message_with_deadline` in this module must be the argument
-    /// of a `tokio::time::timeout` (mika#2342 D5).
-    ///
-    /// # Why a source scan and not a behavioural test
-    ///
-    /// Removing the net breaks **no assertion**. The loop keeps working, every
-    /// existing test stays green, and the only change is that the call goes
-    /// unbounded and silent again — which is the entire defect of mika#2342: a
-    /// 27-minute call with no `llm_call completed`, no `turn_usage` and no
-    /// error. A regression that makes nothing false, only something invisible,
-    /// is the class this house guards by scanning source
-    /// (`policy::no_bare_agent_timeout_constant_remains`,
-    /// `scripts/check-loop-select.sh`,
-    /// `grooming_marker::no_grooming_regex_outside_this_module`).
-    ///
-    /// # Scope, and what a third site means
-    ///
-    /// This file only. `investigate.rs` wraps its own call and a future caller
-    /// outside `agent_loop/` is not covered — widening the perimeter would be a
-    /// new decision, not a silent extension.
-    ///
-    /// The inventory is closed at **two** sites: the continuation turn and the
-    /// main `run_loop` call. Per the plan's Fire-Disposition FD1 there is **no
-    /// allowlist** — an allowlist born empty is just a place to put the next
-    /// violation instead of wrapping it. A third site means either the
-    /// inventory was wrong or a call was added: **halt and surface**, do not
-    /// adjust the guard.
-    #[test]
-    fn mika2342_every_llm_call_is_wrapped_in_a_timeout() {
-        // The scan reads the production half only: the test code below writes
-        // both tokens on purpose. The boundary comes from
-        // `mika_common::source_guard` (mika#2398) rather than from a local
-        // `split_once`, so a module-level `#[cfg(test)]` helper added above the
-        // test block can no longer hide the rest of the file from this guard.
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
-
-        let offenders = unwrapped_deadline_call_sites(&production);
-        assert!(
-            offenders.is_empty(),
-            "mika#2342: {} LLM call site(s) in `agent_loop/mod.rs` are no longer wrapped in a \
-             `tokio::time::timeout`.\n{}\n\n\
-             WHY THIS MATTERS: the agent envelope is checked at the TOP of each loop iteration, \
-             so it can never interrupt a call that does not return. Without this wrapper the \
-             provider's own reqwest timeout is the SOLE cancellation mechanism, and when it \
-             failed (mika#2342, n=2) the call ran 27+ minutes leaving no completion, no \
-             turn_usage and no error — the task stayed `in_progress` for ever.\n\
-             FIX: wrap the call as `run_loop` does, sized on \
-             `llm.worst_case_failure_secs() + LLM_WATCHDOG_MARGIN_SECS` — never on the remaining \
-             deadline, which would re-open mika#848.",
-            offenders.len(),
-            offenders.join("\n")
-        );
-    }
-
-    /// The guard's positive control: it must actually fire on a bare call.
-    ///
-    /// Written against a fabricated snippet rather than by editing the real
-    /// source — a guard verified only by its own green is a guard verified by
-    /// nothing.
-    #[test]
-    fn mika2342_guard_fires_on_an_unwrapped_call() {
-        let bare = "        let llm_result = llm\n\
-                    \x20           .send_message_with_deadline(request, Some(deadline.into()))\n\
-                    \x20           .await;\n";
-        assert_eq!(
-            unwrapped_deadline_call_sites(bare).len(),
-            1,
-            "the guard must flag an unwrapped call — it is the exact shape mika#2342 removed"
-        );
-
-        let wrapped = "        let llm_result = match tokio::time::timeout(\n\
-                       \x20           watchdog,\n\
-                       \x20           llm.send_message_with_deadline(request, Some(deadline.into())),\n\
-                       \x20       )\n";
-        assert!(
-            unwrapped_deadline_call_sites(wrapped).is_empty(),
-            "the guard must accept the wrapped shape, or it would forbid the fix"
-        );
-
-        let commented =
-            "        // llm.send_message_with_deadline(request, None) is wrapped below\n";
-        assert!(
-            unwrapped_deadline_call_sites(commented).is_empty(),
-            "prose naming the call must not be a violation, or the guard forbids documenting itself"
-        );
-    }
-
-    // ===========================================================================
-    // mika#1910 — every `turn_usage` emission says what its turn produced
-    // ===========================================================================
-
-    /// The index of the closing paren matching the `(` at `open`.
-    ///
-    /// Depth-counting, string-literal aware. It cannot parse Rust — a `(` inside
-    /// a char literal or a raw string would fool it — and that is acceptable for
-    /// what it bounds: the argument list of one named call, whose real shapes are
-    /// in this file and carry neither.
-    fn matching_paren(src: &str, open: usize) -> Option<usize> {
-        let bytes = src.as_bytes();
-        let mut depth = 0usize;
-        let mut in_str = false;
-        let mut escaped = false;
-        for (i, &b) in bytes.iter().enumerate().skip(open) {
-            if in_str {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'"' {
-                    in_str = false;
-                }
-                continue;
-            }
-            match b {
-                b'"' => in_str = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Split an argument list on its **top-level** commas, dropping the empty
-    /// tail a trailing comma leaves behind.
-    fn top_level_args(list: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut depth = 0i32;
-        let mut in_str = false;
-        let mut escaped = false;
-        let mut cur = String::new();
-        for c in list.chars() {
-            if in_str {
-                cur.push(c);
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_str = false;
-                }
-                continue;
-            }
-            match c {
-                '"' => {
-                    in_str = true;
-                    cur.push(c);
-                }
-                '(' | '[' | '{' | '<' => {
-                    depth += 1;
-                    cur.push(c);
-                }
-                ')' | ']' | '}' | '>' => {
-                    depth -= 1;
-                    cur.push(c);
-                }
-                ',' if depth == 0 => {
-                    out.push(cur.trim().to_string());
-                    cur.clear();
-                }
-                _ => cur.push(c),
-            }
-        }
-        let tail = cur.trim();
-        if !tail.is_empty() {
-            out.push(tail.to_string());
-        }
-        out.retain(|a| !a.is_empty());
-        out
-    }
-
-    /// Every invocation of the `turn_usage` field builder found in `src`, as
-    /// `(1-based line, last argument)`.
-    ///
-    /// The last argument **is** the `response_chars` position: that parameter is
-    /// declared last on `build_turn_usage_fields`, which is the one funnel all
-    /// three emission sites traverse (`save_continuation_llm_call` reaches it
-    /// through its own wrapper). So "did this site declare what it measured?"
-    /// reduces to reading one argument, which a scan can do exactly.
-    fn turn_usage_emitter_sites(src: &str) -> Vec<(usize, String)> {
-        // In halves: this function's body lives inside the file the guard scans,
-        // so writing the token whole would make the gate its own first offender
-        // — the `unwrapped_deadline_call_sites` motif one block up, and the
-        // mika#2201 class (a lint that reddens on its own prose).
-        let emitter = concat!("build_turn_usage", "_fields");
-
-        // Comments are how this ticket explains itself, and the constant's own
-        // doc-comment contains the word `None`. Strip line comments first,
-        // preserving the line structure so reported numbers stay those of `src`.
-        let cleaned: String = src
-            .lines()
-            .map(|l| match l.find("//") {
-                Some(i) => &l[..i],
-                None => l,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let mut sites = Vec::new();
-        let mut from = 0usize;
-
-        while let Some(rel) = cleaned[from..].find(emitter) {
-            let start = from + rel;
-            from = start + emitter.len();
-
-            // A definition (`fn build_turn_usage_fields(`) is not a call site.
-            if cleaned[..start].trim_end().ends_with("fn") {
-                continue;
-            }
-            // Only whitespace may sit between the token and its `(`, or this is
-            // a mention rather than an invocation.
-            let rest = &cleaned[start + emitter.len()..];
-            let Some(open_rel) = rest.find('(') else {
-                continue;
-            };
-            if !rest[..open_rel].trim().is_empty() {
-                continue;
-            }
-
-            let open = start + emitter.len() + open_rel;
-            let Some(close) = matching_paren(&cleaned, open) else {
-                continue;
-            };
-            let args = top_level_args(&cleaned[open + 1..close]);
-            let Some(last) = args.last() else {
-                continue;
-            };
-            let line = cleaned[..start].matches('\n').count() + 1;
-            sites.push((line, last.clone()));
-        }
-
-        sites
-    }
-
-    /// The detector behind [`mika1910_every_unmeasured_site_declares_itself`],
-    /// split out so the guard can be exercised on a fabricated string rather
-    /// than by breaking the real source (mika#1910 verification contract §7).
-    ///
-    /// # Why the criterion is the DECLARATION and not the error arm
-    ///
-    /// The natural predicate — *"is this `None` inside an `Err` arm?"* — is not
-    /// one a grep can settle, and both approximations fail in **both**
-    /// directions: a lookback for `Err(` misses an error site written otherwise
-    /// (`match … { e @ LlmError::… =>`, a `?` bubbling up, a helper), and it
-    /// accepts any `None` that happens to sit under a neighbouring `Err`. So the
-    /// question is moved from the context to the declaration: *"did the author
-    /// write the token that says **I know this site measures nothing**?"* — which
-    /// a scan answers exactly, and which documents the site into the bargain.
-    fn undeclared_unmeasured_sites(src: &str) -> Vec<String> {
-        turn_usage_emitter_sites(src)
-            .into_iter()
-            .filter(|(_, last)| last == "None")
-            .map(|(line, _)| format!("{line}: passes a bare `None` for `response_chars`"))
-            .collect()
-    }
-
-    /// Every `turn_usage` emission site must declare what it measured — either a
-    /// real count, or [`RESPONSE_CHARS_UNMEASURED`] (mika#1910 U1).
-    ///
-    /// # Why a source scan and not a behavioural test
-    ///
-    /// Removing the measure breaks **no assertion**. The loop keeps working,
-    /// every existing test stays green, and the only change is that the line goes
-    /// mute again — which is the entire defect of mika#1910: the continuation
-    /// turn recorded `response_text = NULL` unconditionally, successes included,
-    /// so the one row that carries the class could not distinguish "produced a
-    /// summary" from "produced nothing". A regression that makes nothing false,
-    /// only something invisible, is the class this house guards by scanning
-    /// source (`mika2342_every_llm_call_is_wrapped_in_a_timeout` one block up,
-    /// `policy::no_bare_agent_timeout_constant_remains`,
-    /// `grooming_marker::no_grooming_regex_outside_this_module`).
-    ///
-    /// # Scope, and what a fourth site means
-    ///
-    /// This file only, and the inventory is closed at **three** sites — the loop's
-    /// `Ok` arm, the loop's `Err` arm, and the continuation turn. Per the plan's
-    /// Fire-Disposition there is **no allowlist**: an allowlist born empty is
-    /// just a place to put the next violation instead of measuring it. A fourth
-    /// site is **halt and surface** — whether it has a response to measure is a
-    /// question this guard cannot settle for its author.
-    #[test]
-    fn mika1910_every_unmeasured_site_declares_itself() {
-        // The scan reads the production half only: the test code below writes a
-        // bare `None` on purpose. The boundary comes from
-        // `mika_common::source_guard` (mika#2398) rather than a local
-        // `split_once("#[cfg(test)]")`, whose premise stopped being true at
-        // mika#2310 (an extracted test module carries no such literal).
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
-
-        let offenders = undeclared_unmeasured_sites(&production);
-        assert!(
-            offenders.is_empty(),
-            "mika#1910: {} `turn_usage` emission site(s) in `agent_loop/mod.rs` pass a bare \
-             `None` for `response_chars`.\n{}\n\n\
-             WHY THIS MATTERS: `response_chars` is the ONLY surface on which the mika#1910 class \
-             is countable. `null` there means \"not measured\"; `0` means \"measured, and the \
-             model produced nothing\" — which IS the class. A bare `None` collapses the two, and \
-             the offline analyzer (`scripts/measure-empty-turns`) then classes the turn \
-             `undetermined` instead of `empty_response`: the measurement silently loses exactly \
-             the population the ticket exists to count.\n\
-             FIX: pass the count when the call returned (`Some(0)` on an empty response, never \
-             `None`), or the named constant RESPONSE_CHARS_UNMEASURED when no call returned. \
-             Do NOT pass `0` on an error arm — nothing was measured there, and `0` would be a \
-             readable lie (the mika#2331 rule on `request_bytes`, one struct away).",
-            offenders.len(),
-            offenders.join("\n")
-        );
-    }
-
-    /// The inventory is closed at three emission sites (mika#1910 U1).
-    ///
-    /// Without this, a guard grown too narrow — a renamed builder, a changed
-    /// argument order — would pass by looking at nothing, and a green scan would
-    /// be indistinguishable from a healthy one (the mika#2205 class).
-    #[test]
-    fn mika1910_the_inventory_of_emission_sites_is_closed() {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
-
-        let sites = turn_usage_emitter_sites(&production);
-        assert_eq!(
-            sites.len(),
-            3,
-            "mika#1910: expected exactly 3 `turn_usage` emission sites (loop Ok arm, loop Err \
-             arm, continuation turn), found {}: {:?}.\n\
-             A FOURTH SITE IS HALT-AND-SURFACE, not an allowlist entry: whether it has a \
-             response to measure is a question this guard cannot settle for its author.\n\
-             ZERO SITES means the scan stopped seeing the builder at all — repair the scan \
-             before trusting its sibling's green.",
-            sites.len(),
-            sites
-        );
-    }
-
-    /// The guard's positive and negative controls, on fabricated snippets.
-    ///
-    /// Exercising it by breaking the real source is refused: the guard would
-    /// become untestable without reddening the repository.
-    #[test]
-    fn mika1910_guard_fires_on_a_bare_none() {
-        let emitter = concat!("build_turn_usage", "_fields");
-        let declared = concat!("RESPONSE_CHARS_", "UNMEASURED");
-
-        // Positive control — the named constant is a declaration, not a violation.
-        let good = format!(
-            "            let fields = {emitter}(\n\
-             \x20               step,\n\
-             \x20               usage,\n\
-             \x20               &stop,\n\
-             \x20               false,\n\
-             \x20               \"error\",\n\
-             \x20               latency,\n\
-             \x20               request_bytes,\n\
-             \x20               None,\n\
-             \x20               {declared},\n\
-             \x20           );\n"
-        );
-        assert!(
-            undeclared_unmeasured_sites(&good).is_empty(),
-            "the named constant must be accepted, or the guard forbids the fix itself"
-        );
-
-        // Negative control 1 — a bare `None` at the `response_chars` position.
-        let bare = format!(
-            "            let fields = {emitter}(\n\
-             \x20               step,\n\
-             \x20               usage,\n\
-             \x20               &stop,\n\
-             \x20               false,\n\
-             \x20               \"error\",\n\
-             \x20               latency,\n\
-             \x20               request_bytes,\n\
-             \x20               None,\n\
-             \x20               None,\n\
-             \x20           );\n"
-        );
-        assert_eq!(
-            undeclared_unmeasured_sites(&bare).len(),
-            1,
-            "the guard must flag a bare `None` — it is the exact shape mika#1910 removed"
-        );
-
-        // Negative control 2 — the SAME bare `None`, under a line containing
-        // `Err(`. It must STILL be flagged: this is the control that separates
-        // "the guard reads the declaration" from "the guard reads the
-        // neighbourhood". Without it, a lookback grown by accident would pass.
-        let under_err = format!(
-            "            Err(e) => {{\n\
-             \x20           let fields = {emitter}(\n\
-             \x20               step,\n\
-             \x20               usage,\n\
-             \x20               &stop,\n\
-             \x20               false,\n\
-             \x20               \"error\",\n\
-             \x20               latency,\n\
-             \x20               request_bytes,\n\
-             \x20               None,\n\
-             \x20               None,\n\
-             \x20           );\n\
-             \x20       }}\n"
-        );
-        assert_eq!(
-            undeclared_unmeasured_sites(&under_err).len(),
-            1,
-            "a bare `None` under an `Err(` line must still be flagged — the criterion is the \
-             DECLARATION, never the neighbourhood. A grep cannot decide whether a line sits in \
-             an error arm; it can decide whether its author wrote the token."
-        );
-
-        // Good faith — prose naming the shape must not be a violation, or the
-        // guard forbids documenting itself (mika#2201, mika#2050).
-        let commented = format!("            // {emitter}(.., None) was the pre-fix shape\n");
-        assert!(
-            undeclared_unmeasured_sites(&commented).is_empty(),
-            "prose naming the call must not be a violation, or the guard forbids documenting \
-             itself"
-        );
-    }
-
-    // ===========================================================================
-    // mika#2247 — every user-facing output site normalises its typography
-    // ===========================================================================
-
-    /// How many lines above the tag-strip the normaliser may sit.
-    ///
-    /// Two covers the single-line form and the three-line composition all three
-    /// real sites use. Deliberately *not* wider, for the sibling guard's reason:
-    /// a normaliser five lines up is more likely to belong to something else,
-    /// and a gate that accepts an unrelated wrapper passes the regression it
-    /// exists to catch.
-    const TYPOGRAPHY_GUARD_LOOKBACK_LINES: usize = 2;
-
-    /// The detector behind
-    /// [`mika2247_every_output_site_normalises_its_typography`], split out so
-    /// the guard can be exercised on a fabricated string rather than by
-    /// breaking the real source.
-    ///
-    /// Lexical, and says so: it finds the tag-strip call and then looks for the
-    /// normaliser within the preceding [`TYPOGRAPHY_GUARD_LOOKBACK_LINES`]. It
-    /// cannot parse Rust. That is acceptable for what it defends — not a subtle
-    /// behaviour, but a **new output site** added without the normalisation,
-    /// which is what a hurried feature does.
-    fn unnormalised_output_sites(label: &str, src: &str) -> Vec<String> {
-        // Both tokens in halves: this function lives inside the crate the guard
-        // scans, so writing either one whole would make the gate its own first
-        // offender (the `mika2342_*` motif above).
-        let strip_token = concat!("strip_internal_", "tags(");
-        let normalise_token = concat!("normalize_typography_", "for_persona(");
-
-        let lines: Vec<&str> = src.lines().collect();
-        let mut offenders = Vec::new();
-
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            // Prose naming the call is how this ticket explains itself; scanning
-            // it would make the explanation the violation.
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            if !line.contains(strip_token) {
-                continue;
-            }
-            let from = i.saturating_sub(TYPOGRAPHY_GUARD_LOOKBACK_LINES);
-            if !lines[from..=i].iter().any(|l| l.contains(normalise_token)) {
-                offenders.push(format!("{label}:{}: {trimmed}", i + 1));
-            }
-        }
-
-        offenders
-    }
-
-    /// Every production site of this crate that produces user-facing text must
-    /// compose the tag strip with the mika#2247 normaliser.
-    ///
-    /// # Why a source scan and not a behavioural test
-    ///
-    /// A fourth output site added without the normalisation breaks **no
-    /// assertion**. Every existing test stays green; the only change is that one
-    /// path starts emitting em-dashes to a family tenant again. A regression
-    /// that makes nothing false, only something un-normalised on one path, is
-    /// the class this house guards by scanning source
-    /// (`mika2342_every_llm_call_is_wrapped_in_a_timeout` two blocks up,
-    /// `grooming_marker::no_grooming_regex_outside_this_module`).
-    ///
-    /// # Scope, and what a fourth site means
-    ///
-    /// The whole `mika-agent` crate, production half only. The inventory is
-    /// closed at **three** sites — the EndTurn extraction, the continuation
-    /// turn, and the `send_message` tool — and there is **no allowlist**: an
-    /// allowlist born empty is just a place to put the next violation instead
-    /// of normalising it. A fourth site means either the inventory was wrong or
-    /// an output path was added: **halt and surface**, do not adjust the guard.
-    ///
-    /// `mika-common`'s own `serialize_response_text` is deliberately outside the
-    /// perimeter: it feeds `llm_calls.response_text`, an observability sink, not
-    /// a user channel.
-    #[test]
-    fn mika2247_every_output_site_normalises_its_typography() {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let mut offenders = Vec::new();
-        let mut sites = 0usize;
-        scanner.for_each(|path, production| {
-            let label = path
-                .strip_prefix(scanner.src_root())
-                .unwrap_or(path)
-                .display()
-                .to_string();
-            sites += production
-                .lines()
-                .filter(|l| {
-                    !l.trim_start().starts_with("//")
-                        && l.contains(concat!("strip_internal_", "tags("))
-                })
-                .count();
-            offenders.extend(unnormalised_output_sites(&label, production));
-        });
-
-        assert!(
-            offenders.is_empty(),
-            "mika#2247: {} output site(s) strip internal tags without normalising the \
-             typography.\n{}\n\n\
-             WHY THIS MATTERS: the family persona prescribes simple ASCII punctuation, and \
-             glm-5.2 emits em-dashes by style. An un-normalised site re-opens AC1 on that path \
-             alone, silently — no test goes red, the tenant simply reads « … connaître — tu me \
-             parles » again.\n\
-             FIX: compose as the three existing sites do —\n  \
-             mika_common::text::normalize_typography_for_persona(\n    \
-             mika_common::llm::strip_internal_tags(…),\n    <persona>,\n  )\n\
-             and normalise BEFORE the text is captured, persisted or measured, so the database, \
-             the guards and the delivered message never diverge (mika#2136).",
-            offenders.len(),
-            offenders.join("\n")
-        );
-
-        assert_eq!(
-            sites, 3,
-            "mika#2247: the inventory is closed at three output sites (EndTurn extraction, \
-             continuation turn, `send_message`). Found {sites}. A fourth site is halt-and-surface, \
-             not an allowlist entry — decide whether it produces user-facing text, normalise it if \
-             it does, and update this count with its reason."
-        );
-    }
-
-    /// The guard's positive control: it must actually fire on a bare call.
-    ///
-    /// Written against a fabricated snippet rather than by editing the real
-    /// source — a guard verified only by its own green is a guard verified by
-    /// nothing.
-    #[test]
-    fn mika2247_typography_guard_fires_on_an_unnormalised_site() {
-        let bare = "        let cleaned = mika_common::llm::strip_internal_tags(text);\n";
-        assert_eq!(
-            unnormalised_output_sites("fixture.rs", bare).len(),
-            1,
-            "the guard must flag a bare tag strip — it is the exact shape mika#2247 replaced"
-        );
-
-        let composed = "        let cleaned = mika_common::text::normalize_typography_for_persona(\n\
-                        \x20           mika_common::llm::strip_internal_tags(text),\n\
-                        \x20           ctx.tier.persona_profile(),\n\
-                        \x20       );\n";
-        assert!(
-            unnormalised_output_sites("fixture.rs", composed).is_empty(),
-            "the guard must accept the composed shape, or it would forbid the fix"
-        );
-
-        let commented = "        // strip_internal_tags(text) is normalised just below\n";
-        assert!(
-            unnormalised_output_sites("fixture.rs", commented).is_empty(),
-            "prose naming the call must not be a violation, or the guard forbids documenting itself"
-        );
-    }
-
-    // ===========================================================================
-    // mika#2338 — unattested disposition escalates with its cause
-    // ===========================================================================
-
-    /// What mika-arch sees in production: the three arch skills are `always_on`, so the
-    /// union of all five declared lines is present on every turn.
-    fn arch_suffix_union() -> Vec<String> {
-        [
-            "Disposition: READY",
-            "Disposition: ITERATE",
-            "Disposition: ESCALATE",
-            "Verdict: GROOMED",
-            "Verdict: ESCALATE",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-    }
-
-    fn finding_prefixes() -> Vec<String> {
-        (1..=3).map(|n| format!("F{n}:")).collect()
-    }
-
-    fn escalate_2338(text: &str, suffixes: &[String], prefixes: &[String]) -> Option<String> {
-        escalate_unattested_disposition(
-            text,
-            suffixes,
-            prefixes,
-            3,
-            2,
-            review_anchor::AnchorMissReason::QuoteNotInBrief,
-        )
-    }
-
-    fn last_non_empty_line(text: &str) -> &str {
-        text.lines()
-            .map(str::trim)
-            .rfind(|l| !l.is_empty())
-            .unwrap_or("")
-    }
-
-    #[test]
-    fn mika2338_first_pass_2_of_3_becomes_a_disposition_escalate_naming_the_cause() {
-        let text = "A1: \"une citation\" — ok.\nA2: \"une autre\" — ok.\nA3: paraphrase.\n\nLe plan est sain.\n\nDisposition: READY\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes())
-            .expect("the union declares Disposition: ESCALATE");
-        assert_eq!(last_non_empty_line(&out), "Disposition: ESCALATE");
-        assert!(
-            out.contains("F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld"),
-            "finding line must open with the prefix and the constant marker: {out}"
-        );
-        assert!(out.contains("anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief"));
-        assert!(
-            !out.contains("Disposition: READY"),
-            "no READY may survive: {out}"
-        );
-        assert!(
-            out.contains("Le plan est sain."),
-            "the model's body is kept"
-        );
-    }
-
-    #[test]
-    fn mika2338_second_pass_groomed_becomes_a_verdict_escalate_not_a_disposition() {
-        let text = "A1: \"une citation\" — ok.\nA2: \"une autre\" — ok.\nA3: paraphrase.\n\nVerdict: GROOMED\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
-        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
-        assert!(!out.contains("Verdict: GROOMED"));
-        assert!(
-            !out.contains("Disposition: ESCALATE"),
-            "the family follows the withdrawn line, not the order of the list: {out}"
-        );
-    }
-
-    #[test]
-    fn mika2338_undeclared_family_falls_back_to_none() {
-        let only_dispositions: Vec<String> = [
-            "Disposition: READY",
-            "Disposition: ITERATE",
-            "Disposition: ESCALATE",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let text = "A1: x\n\nVerdict: GROOMED\n";
-        assert_eq!(
-            escalate_2338(text, &only_dispositions, &finding_prefixes()),
-            None,
-            "Verdict: ESCALATE is not declared — the caller withholds instead"
-        );
-
-        let only_ready = vec!["Disposition: READY".to_string()];
-        let text = "A1: x\n\nDisposition: READY\n";
-        assert_eq!(escalate_2338(text, &only_ready, &finding_prefixes()), None);
-    }
-
-    #[test]
-    fn mika2338_no_finding_prefixes_declared_defaults_to_f1() {
-        let text = "A1: x\n\nDisposition: READY\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &[]).unwrap();
-        assert!(
-            out.contains("\nF1: (BLOCKING) [mika-engine] review-anchor:"),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn mika2338_a_disposition_cited_early_on_its_own_line_is_rewritten_too() {
-        let text = "Le contrat dit :\nDisposition: READY\nquand le plan est sain.\n\nA1: x\n\nDisposition: READY\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
-        assert!(!out.contains("Disposition: READY"), "{out}");
-        assert_eq!(out.matches("Disposition: ESCALATE").count(), 3, "{out}");
-    }
-
-    /// The case the withheld marker used to cover at tier 0 and that this path must cover
-    /// itself: `dispatch-lib` reads the FIRST `Disposition:` anywhere in the text.
-    #[test]
-    fn mika2338_an_inline_mention_of_the_disposition_is_rewritten() {
-        let text = "Je confirme que ma réponse se termine par `Disposition: READY` comme demandé.\n\nA1: x\n\nDisposition: READY\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
-        assert!(!out.contains("Disposition: READY"), "{out}");
-        assert!(
-            out.contains("se termine par `Disposition: ESCALATE`"),
-            "{out}"
-        );
-
-        let text = "Mon verdict est bien `Verdict: GROOMED`.\n\nA1: x\n\nVerdict: GROOMED\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
-        assert!(!out.contains("Verdict: GROOMED"), "{out}");
-        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
-    }
-
-    /// A READY quoted inline during a second-review turn is rewritten into ITS family's
-    /// ESCALATE, so `_parse_disposition`'s tier 1a cannot read READY out of it either.
-    #[test]
-    fn mika2338_a_foreign_family_mention_is_rewritten_into_its_own_escalate() {
-        let text = "La première passe disait Disposition: READY.\n\nA1: x\n\nVerdict: GROOMED\n";
-        let out = escalate_2338(text, &arch_suffix_union(), &finding_prefixes()).unwrap();
-        assert!(!out.contains("Disposition: READY"), "{out}");
-        assert!(out.contains("disait Disposition: ESCALATE."), "{out}");
-        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
-    }
-
-    /// The cross-family fallback inside the rewrite loop: a declared non-terminal line whose
-    /// own family has no declared ESCALATE is rewritten into the WITHDRAWN line's ESCALATE,
-    /// so no declared verdict keyword survives. Unreachable with the shipped always_on arch
-    /// manifests (their union always carries both families); live code for a future
-    /// single-family verdict producer.
-    #[test]
-    fn mika2338_a_line_whose_family_has_no_escalate_is_rewritten_into_the_withdrawn_family() {
-        // Verdict family complete; Disposition family declares READY but no ESCALATE.
-        let partial: Vec<String> = [
-            "Disposition: READY",
-            "Verdict: GROOMED",
-            "Verdict: ESCALATE",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let text = "La première passe disait Disposition: READY.\n\nA1: x\n\nVerdict: GROOMED\n";
-        let out = escalate_2338(text, &partial, &finding_prefixes()).unwrap();
-        assert!(!out.contains("Disposition: READY"), "{out}");
-        assert!(
-            out.contains("disait Verdict: ESCALATE."),
-            "the READY mention falls back to the withdrawn line's family: {out}"
-        );
-        assert!(
-            !out.contains("Disposition: ESCALATE"),
-            "undeclared, must not be emitted: {out}"
-        );
-        assert_eq!(last_non_empty_line(&out), "Verdict: ESCALATE");
-    }
-
-    #[test]
-    fn mika2338_the_finding_line_never_carries_a_declared_line_in_clear() {
-        for reason in [
-            review_anchor::AnchorMissReason::NoAnchorLine,
-            review_anchor::AnchorMissReason::QuoteTooShort,
-            review_anchor::AnchorMissReason::QuoteNotInBrief,
-            review_anchor::AnchorMissReason::OverlappingRegions,
-            review_anchor::AnchorMissReason::TooFewAnchors,
-        ] {
-            let out = escalate_unattested_disposition(
-                "A1: x\n\nDisposition: READY\n",
-                &arch_suffix_union(),
-                &finding_prefixes(),
-                1,
-                0,
-                reason,
-            )
-            .unwrap();
-            let finding = out
-                .lines()
-                .find(|l| l.starts_with("F1: "))
-                .expect("finding line present");
-            assert!(
-                !finding.contains("READY") && !finding.contains("GROOMED"),
-                "{finding}"
-            );
-            for req in arch_suffix_union() {
-                assert!(!finding.contains(&req), "{finding} carries {req}");
-            }
-        }
-    }
-
-    // ===========================================================================
-    // mika#2296 — reasoning-budget-exhaustion predicate (M2 / T3)
-    // ===========================================================================
-
-    /// The founding signature: MaxTokens, a full output budget billed, nothing
-    /// visible. This is the arch pass `8b623724` — 123 s, 8192 output tokens,
-    /// empty content, no `Disposition:` for dispatch-lib to parse.
-    #[test]
-    fn mika2296_maxtokens_with_empty_text_and_billed_output_is_budget_exhaustion() {
-        assert!(is_reasoning_budget_exhausted(
-            LlmStopReason::MaxTokens,
-            "",
-            8192
-        ));
-        // Whitespace-only is the same failure wearing a newline.
-        assert!(is_reasoning_budget_exhausted(
-            LlmStopReason::MaxTokens,
-            "\n  \n",
-            8192
-        ));
-    }
-
-    /// A turn that hit the ceiling *while writing* is truncated output, not a
-    /// starved verdict — the operator's remedy differs, so the signal must not
-    /// conflate them.
-    #[test]
-    fn mika2296_maxtokens_with_visible_text_is_not_budget_exhaustion() {
-        assert!(!is_reasoning_budget_exhausted(
-            LlmStopReason::MaxTokens,
-            "Disposition: READY",
-            8192
-        ));
-    }
-
-    /// Without the `output_tokens > 0` term, a provider that returned nothing at
-    /// all would read as a budget problem and send the operator to raise a
-    /// ceiling that was never reached.
-    #[test]
-    fn mika2296_zero_output_tokens_is_an_empty_response_not_a_starved_budget() {
-        assert!(!is_reasoning_budget_exhausted(
-            LlmStopReason::MaxTokens,
-            "",
-            0
-        ));
-    }
-
-    /// The other stop reasons keep their own meanings; an empty `EndTurn` is a
-    /// different defect with a different remedy.
-    #[test]
-    fn mika2296_other_stop_reasons_never_fire_the_budget_signal() {
-        for stop_reason in [
-            LlmStopReason::EndTurn,
-            LlmStopReason::ToolUse,
-            LlmStopReason::ContentFilter,
-        ] {
-            assert!(
-                !is_reasoning_budget_exhausted(stop_reason, "", 8192),
-                "{stop_reason:?} must not be reported as reasoning-budget exhaustion"
-            );
-        }
-    }
-
-    // ===========================================================================
-    // mika#1324 — Structural tool filter (CI webhook → no dispatch tools)
-    // ===========================================================================
-
-    fn tool_def(name: &str) -> ToolDefinition {
-        ToolDefinition {
-            name: name.to_string(),
-            description: format!("test stub for {name}"),
-            input_schema: serde_json::json!({}),
-        }
-    }
-
-    fn full_tool_set() -> Vec<ToolDefinition> {
-        vec![
-            tool_def("run_claude_pilot"),
-            tool_def("run_claude_pilot_groom"),
-            tool_def("send_message"),
-            tool_def("run_gh"),
-            tool_def("update_task_status"),
-        ]
-    }
-
-    // AC1 — unit test on the predicate via filter behavior. check_suite.success
-    // → both dispatch tools removed; benign tools retained.
-    #[test]
-    fn filter_ci_excluded_tools_check_suite_success_removes_dispatch_tools() {
-        let mut tools = full_tool_set();
-        // Canonical check_suite.success message shape from the gateway. Branch
-        // matches the original mika#1324 incident (fix/1318/dev-groom-no-force-push)
-        // to verify the substring contains "dev-groom" yet the dispatch tools
-        // are still removed by the CI prefix check, not by branch substring
-        // matching (the architect's diagnostic correction in the ticket body).
-        let user_message = "[GitHub] Check suite success on senara-solutions/mika \
-                            (branch: fix/1318/dev-groom-no-force-push)";
-        filter_ci_excluded_tools(user_message, &mut tools);
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            !names.contains(&"run_claude_pilot"),
-            "run_claude_pilot must be removed on CI success: {names:?}"
-        );
-        assert!(
-            !names.contains(&"run_claude_pilot_groom"),
-            "run_claude_pilot_groom must be removed on CI success: {names:?}"
-        );
-        assert!(
-            names.contains(&"send_message"),
-            "send_message must be retained: {names:?}"
-        );
-        assert!(
-            names.contains(&"run_gh"),
-            "run_gh must be retained: {names:?}"
-        );
-    }
-
-    // AC2 — integration-style coverage on the failure prefix. check_suite.failure
-    // also removes dispatch tools.
-    #[test]
-    fn filter_ci_excluded_tools_check_suite_failure_removes_dispatch_tools() {
-        let mut tools = full_tool_set();
-        let user_message = "[GitHub] Check suite failure on senara-solutions/mika \
-                            (branch: fix/1318/dev-groom-no-force-push)";
-        filter_ci_excluded_tools(user_message, &mut tools);
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            !names.contains(&"run_claude_pilot"),
-            "run_claude_pilot must be removed on CI failure: {names:?}"
-        );
-        assert!(
-            !names.contains(&"run_claude_pilot_groom"),
-            "run_claude_pilot_groom must be removed on CI failure: {names:?}"
-        );
-    }
-
-    // AC3 — ready-label dispatch flow continues to work. The ready-label
-    // marker is NOT a check_suite event; dispatch tools must remain available
-    // so `webhook_ready_label_dispatch` intent guard can fire and the agent
-    // can call `run_claude_pilot` to actually dispatch.
-    #[test]
-    fn filter_ci_excluded_tools_ready_label_event_retains_dispatch_tools() {
-        let mut tools = full_tool_set();
-        let user_message =
-            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — fix some thing";
-        filter_ci_excluded_tools(user_message, &mut tools);
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&"run_claude_pilot"),
-            "run_claude_pilot must be retained on ready-label dispatch: {names:?}"
-        );
-        assert!(
-            names.contains(&"run_claude_pilot_groom"),
-            "run_claude_pilot_groom must be retained on ready-label dispatch: {names:?}"
-        );
-        assert!(
-            names.contains(&"send_message"),
-            "send_message must be retained: {names:?}"
-        );
-    }
-
-    // Boundary: non-webhook conversational input never trips the filter.
-    #[test]
-    fn filter_ci_excluded_tools_non_webhook_input_retains_all_tools() {
-        let mut tools = full_tool_set();
-        let user_message = "hey can you check the status of the dev-groom dispatch?";
-        filter_ci_excluded_tools(user_message, &mut tools);
-        assert_eq!(
-            tools.len(),
-            5,
-            "non-webhook input must not affect the tool set"
-        );
-    }
-
-    // Boundary: empty tools list is a no-op (defensive).
-    #[test]
-    fn filter_ci_excluded_tools_empty_tools_is_noop() {
-        let mut tools: Vec<ToolDefinition> = Vec::new();
-        let user_message = "[GitHub] Check suite success on senara-solutions/mika (branch: main)";
-        filter_ci_excluded_tools(user_message, &mut tools);
-        assert!(tools.is_empty());
-    }
-
-    // -- LoopMode tests --
-
-    #[test]
-    fn test_loop_mode_conversation_properties() {
-        let mode = LoopMode::Conversation;
-        assert!(mode.is_conversation());
-        assert!(mode.follow_up_on_empty());
-        assert!(mode.saves_to_db());
-        assert_eq!(mode.label(), "agent");
-    }
-
-    #[test]
-    fn test_loop_mode_silent_properties() {
-        let mode = LoopMode::Silent {
-            max_steps: crate::planning::policy::MAX_TOOL_STEPS,
-        };
-        assert!(!mode.is_conversation());
-        assert!(!mode.follow_up_on_empty());
-        assert!(mode.saves_to_db());
-        assert_eq!(mode.label(), "silent agent");
-        assert_eq!(mode.max_steps(), crate::planning::policy::MAX_TOOL_STEPS);
-    }
-
-    // ── mika#2515 U1 — chaque sortie DÉCIDE du signal de verdict ──────────
-
-    /// Sorties de `run_loop` qui ne posent délibérément **aucun** signal de
-    /// verdict.
-    ///
-    /// Ce n'est **pas** une allowlist d'infractions : chaque entrée nomme une
-    /// sortie **structurellement inatteignable** depuis un tour de callback, avec
-    /// le prédicat qui l'établit. Quand le scan tire, on **arme** le site — on
-    /// n'ajoute une entrée QUE si l'inatteignabilité est démontrable comme
-    /// celle-ci (doctrine mika#2201 : on déclare, on n'allowliste pas).
-    const LOOP_EXITS_WITHOUT_SIGNAL: &[(&str, &str)] = &[(
-        "Done — texte vide APRÈS follow-up",
-        "LoopMode::follow_up_on_empty() est false pour Silent : cette sortie est \
-         inatteignable depuis un tour de callback, qui est toujours Silent. \
-         Propriété BOOLÉENNE et épinglée — voir l'assertion auto-nettoyante de \
-         mika2515_the_excluded_loop_exit_is_still_unreachable.",
-    )];
-
-    /// Renvois de `run_silent_agent` qui ne lisent délibérément **aucun** fait de
-    /// verdict.
-    ///
-    /// **Vocabulaire DISTINCT de [`LOOP_EXITS_WITHOUT_SIGNAL`]** : là l'exclusion
-    /// dit « ce site est inatteignable », ici elle dit « ce site n'a pas le
-    /// prédicat sous la main ». Confondre les deux ferait passer une course
-    /// d'horloge pour une impossibilité — et écrirait une fausseté dans la garde
-    /// même qui existe pour empêcher les faussetés.
-    const SILENT_RETURNS_WITHOUT_VERDICT_READ: &[(&str, &str)] = &[(
-        "contrôle de deadline du prélude (mika#848 F3b)",
-        "`qa_verdict_due` dérive de `loaded_skill_names`, calculé APRÈS ce site : \
-         le prédicat n'existe pas encore. Population bornée par le fait que \
-         l'enveloppe ENTIÈRE devrait s'écouler dans `load_agent_context` + \
-         `list_commitments`. NON inatteignable — suivi mika#2515-a, dont la \
-         précondition écrite est que le WARN de ce site soit observé sur un \
-         trigger de callback.",
-    )];
-
-    /// Les lignes de production du fichier, commentaires exclus.
-    ///
-    /// La prose de doc de ce ticket cite ses propres motifs abondamment (« un
-    /// scan ancré sur `return Ok(LoopResult::` n'en trouve que cinq ») ; sans ce
-    /// filtre le scan compterait sa propre explication comme une sortie. C'est le
-    /// faux positif que mika#2050 a mesuré sur le Signal S, une classe plus tôt.
-    fn production_lines_of_this_module() -> Vec<String> {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let production = scanner.production_of(&scanner.src_root().join("agent_loop/mod.rs"));
-        production
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    fn count_in_production(needle: &str) -> usize {
-        production_lines_of_this_module()
-            .iter()
-            .filter(|l| l.contains(needle))
-            .count()
-    }
-
-    /// **V9 — la cardinalité, le seul terme qu'aucune fixture ne peut voir.**
-    ///
-    /// Un prédicat devenu trop étroit passerait en ne regardant rien
-    /// (mika#2205) ; une sortie ajoutée sans pose de signal ne rendrait **aucune
-    /// décision fausse** et laisserait toutes les assertions vertes, la seule
-    /// conséquence étant une population muette. C'est très exactement le défaut
-    /// que ce ticket ferme : `run_loop` posait son signal à **deux sorties sur
-    /// six**.
-    ///
-    /// # Le motif est `Ok(LoopResult::`, jamais `return Ok(LoopResult::`
-    ///
-    /// La sortie `MaxStepsExceeded` est l'**expression finale** de `run_loop` :
-    /// elle n'a pas de `return`. Un prédicat ancré sur `return` en trouve
-    /// **cinq**, et l'implémenteur a alors deux façons de se tromper — faire
-    /// rougir un scan correct, ou « corriger » la cardinalité à 5 et sortir en
-    /// silence la sortie max-steps de la population. Inversement, `LoopResult::`
-    /// nu rend les motifs de `match` des trois boucles, donc un scan
-    /// perpétuellement rouge, c'est-à-dire désarmé.
-    ///
-    /// **Le scan asserte la cardinalité, JAMAIS les numéros de ligne** : ceux-ci
-    /// ont déjà dérivé de +59 entre deux passes du plan de ce ticket, et un scan
-    /// qui les figerait rougirait à chaque réécriture du fichier sans qu'aucune
-    /// sortie ne soit devenue muette — un détecteur qu'on désarme parce qu'il
-    /// crie à tort.
-    #[test]
-    fn mika2515_every_loop_exit_decides_about_the_verdict_signal() {
-        let exits = count_in_production("Ok(LoopResult::");
-        let armed_concluded = count_in_production("mark_unmet_after_retry()");
-        let armed_cut_off = count_in_production("mark_cut_off(");
-        let declared_excluded = LOOP_EXITS_WITHOUT_SIGNAL.len();
-
-        assert_eq!(
-            exits, 6,
-            "cardinalité des sorties de `run_loop` : relevée contre le fichier, \
-             jamais posée de mémoire (le plan de ce ticket l'a écrite 4 avant que \
-             le relevé ne soit fait). Si une sortie a été ajoutée, elle doit \
-             DÉCIDER : poser le signal, ou être déclarée dans \
-             LOOP_EXITS_WITHOUT_SIGNAL avec son prédicat d'inatteignabilité."
-        );
-        assert_eq!(
-            armed_concluded, 3,
-            "trois sorties EndTurn posent la moitié « conclu muet » : texte non \
-             vide, texte vide (miroir Silent), et le « Force EndTurn » de \
-             `send_message` — ce dernier est le trou de mika#2368 que mika#2515 \
-             ferme, et mika#2136 l'avait nommé ici même"
-        );
-        assert_eq!(
-            armed_cut_off, 2,
-            "deux sorties coupées posent la moitié « coupé » : DeadlineExceeded \
-             et MaxStepsExceeded"
-        );
-        assert_eq!(
-            armed_concluded + armed_cut_off + declared_excluded,
-            exits,
-            "chacune des {exits} sorties doit DÉCIDER : {armed_concluded} posent \
-             « conclu », {armed_cut_off} posent « coupé », {declared_excluded} \
-             sont déclarées exclues. Le compte ne boucle pas — une sortie est \
-             muette sans l'avoir dit."
-        );
-    }
-
-    /// **V9 — l'assertion auto-nettoyante de l'exclusion de `run_loop`.**
-    ///
-    /// Le jour où `follow_up_on_empty()` devient vrai pour `Silent`, l'exclusion
-    /// cesse d'être vraie et **ce test rougit** — au lieu de laisser une sortie
-    /// s'ouvrir en silence derrière une raison morte.
-    #[test]
-    fn mika2515_the_excluded_loop_exit_is_still_unreachable() {
-        let silent = LoopMode::Silent {
-            max_steps: crate::planning::policy::MAX_TOOL_STEPS,
-        };
-        assert!(
-            !silent.follow_up_on_empty(),
-            "l'entrée de LOOP_EXITS_WITHOUT_SIGNAL repose sur cette propriété : \
-             si elle change, la sortie « Done après follow-up » devient \
-             atteignable depuis un tour de callback et doit être ARMÉE, pas \
-             laissée déclarée"
-        );
-        assert_eq!(
-            LOOP_EXITS_WITHOUT_SIGNAL.len(),
-            1,
-            "une seule sortie est exclue, et pour une raison booléenne"
-        );
-        assert!(
-            LOOP_EXITS_WITHOUT_SIGNAL[0]
-                .1
-                .contains("follow_up_on_empty"),
-            "l'exclusion doit NOMMER le prédicat qui l'établit — une exclusion \
-             sans prédicat est une exemption déguisée"
-        );
-    }
-
-    /// **V9 / DoD 1b — les quatre renvois de `run_silent_agent` décident aussi.**
-    ///
-    /// Sans cette moitié, le scan couvrirait la fonction qui **pose** le signal
-    /// et laisserait libre celle qui le **lit** — c'est-à-dire exactement la
-    /// moitié par laquelle le fait se perd. Le plan de ce ticket a compté trois
-    /// renvois sur quatre pendant six passes, et le quatrième est précisément
-    /// celui qui lit le drapeau.
-    ///
-    /// `Ok(SilentTurnOutcome` et non `return Ok(...)` : la construction finale
-    /// n'a pas de `return`, et c'est celle dont l'omission coûterait le plus. Un
-    /// scan ancré sur `return` y compterait **trois** — le même compte que les
-    /// versions fautives du plan, donc un instrument qui **confirmerait** la
-    /// mauvaise cardinalité.
-    #[test]
-    fn mika2515_every_silent_return_decides_about_the_verdict_signal() {
-        let returns = count_in_production("Ok(SilentTurnOutcome");
-        let reading = count_in_production("SilentTurnOutcome::from_signal");
-        let declared_excluded = SILENT_RETURNS_WITHOUT_VERDICT_READ.len();
-
-        assert_eq!(
-            returns, 4,
-            "cardinalité des renvois de `run_silent_agent` — relevée contre le \
-             fichier. Trois lisent le fait, un est déclaré exclu."
-        );
-        assert_eq!(
-            reading, 3,
-            "trois renvois LISENT le fait : la sous-branche « deadline trop \
-             proche », le bras DeadlineExceeded (dont mika#2368 jetait le fait \
-             explicitement), et la construction finale"
-        );
-        assert_eq!(
-            reading + declared_excluded,
-            returns,
-            "chacun des {returns} renvois doit décider : {reading} lisent, \
-             {declared_excluded} sont déclarés exclus"
-        );
-        assert_eq!(
-            count_in_production("SilentTurnOutcome::default()"),
-            declared_excluded,
-            "le seul `default()` restant est celui du renvoi déclaré exclu — un \
-             second serait un fait jeté sans l'avoir dit"
-        );
-    }
-
-    /// **V9 — l'assertion auto-nettoyante de l'exclusion de `run_silent_agent`,
-    /// et elle est ORDINALE, pas booléenne.**
-    ///
-    /// Il n'y a pas de propriété à interroger : l'exclusion repose sur le fait
-    /// que le calcul de `loaded_skill_names` vient **après** le prélude de
-    /// deadline. Le jour où quelqu'un remonte la correspondance de skills, cette
-    /// exclusion cesse d'être vraie et ce test rougit en nommant le site devenu
-    /// armable, au lieu de laisser un renvoi muet derrière une raison morte.
-    #[test]
-    fn mika2515_the_excluded_silent_return_still_lacks_its_predicate() {
-        let lines = production_lines_of_this_module();
-        let index_of = |needle: &str| -> usize {
-            let hits: Vec<usize> = lines
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.contains(needle))
-                .map(|(i, _)| i)
-                .collect();
-            assert_eq!(
-                hits.len(),
-                1,
-                "l'ancre {needle:?} doit être UNIQUE pour servir d'adresse ; \
-                 trouvé {} occurrences",
-                hits.len()
-            );
-            hits[0]
-        };
-
-        let prelude = index_of("silent agent deadline exceeded during prelude");
-        let skills = index_of("let loaded_skill_names = skill_names_of(&matched);");
-
-        assert!(
-            prelude < skills,
-            "l'exclusion du prélude repose sur cet ORDRE : `qa_verdict_due` \
-             dérive de `loaded_skill_names`, calculé après le prélude. Si le \
-             calcul a été remonté, le prédicat existe désormais à ce site et le \
-             renvoi doit être ARMÉ — retirer l'entrée de \
-             SILENT_RETURNS_WITHOUT_VERDICT_READ."
-        );
-        assert_eq!(SILENT_RETURNS_WITHOUT_VERDICT_READ.len(), 1);
-        assert!(
-            SILENT_RETURNS_WITHOUT_VERDICT_READ[0]
-                .1
-                .contains("loaded_skill_names"),
-            "l'exclusion doit nommer le prédicat indisponible"
-        );
-        assert!(
-            !SILENT_RETURNS_WITHOUT_VERDICT_READ[0]
-                .1
-                .to_lowercase()
-                .contains("inatteignable\u{20}depuis"),
-            "vocabulaire DISTINCT de LOOP_EXITS_WITHOUT_SIGNAL : ce site n'est \
-             pas inatteignable, son prédicat est indisponible. Les confondre \
-             ferait passer une course d'horloge pour une impossibilité."
-        );
-    }
-
-    /// **mika#2515 — la prémisse de P0 est RÉFUTÉE, et voici sa moitié
-    /// structurelle.**
-    ///
-    /// Le plan de ce ticket écrit que le site « Force EndTurn » est atteignable
-    /// en mode `Silent` parce qu'« aucun garde de mode ne le protège ». Le site
-    /// en porte **deux**, conjonctifs avec `send_message_boundary_active` :
-    ///
-    /// ```text
-    /// if send_message_boundary_active && mode.is_conversation() && !is_automated_trigger
-    /// ```
-    ///
-    /// `mode.is_conversation()` **est** un garde de mode, et il est faux pour
-    /// `Silent` ; `is_automated_trigger` est vrai dès que le message commence par
-    /// `[callback:`. Le commentaire du site le dit d'ailleurs : *« Only fires when
-    /// ALL of: Conversation mode (**silent/callback modes exempt**) »*.
-    ///
-    /// **Conséquence : la population de P0 est vide aujourd'hui.** U1e est livré
-    /// quand même — le site doit *décider* (DoD 1) et se trouve armé d'avance si
-    /// ces gardes s'élargissaient — mais il ne ferme aucun défaut observable, et
-    /// l'écrire ici est ce qui empêche la prochaine lecture de le recompter comme
-    /// un trou fermé. C'est la leçon mika#2272 que le plan cite pour son propre
-    /// prédicat de coupure, appliquée à lui.
-    ///
-    /// Le jour où `is_conversation()` devient vrai pour `Silent`, ce test rougit
-    /// et U1e cesse d'être un filet sans population.
-    #[test]
-    fn mika2515_the_force_endturn_exit_is_mode_guarded() {
-        let silent = LoopMode::Silent {
-            max_steps: crate::planning::policy::MAX_CALLBACK_TOOL_STEPS,
-        };
-        assert!(
-            !silent.is_conversation(),
-            "premier garde de la frontière #771 : un tour de callback n'est pas \
-             conversationnel, donc le « Force EndTurn » ne peut pas y firer. Si \
-             cette propriété change, la population de P0 devient non vide — et \
-             U1e, déjà armé, devient un correctif réel plutôt qu'un filet sans \
-             population."
-        );
-        assert!(
-            LoopMode::Conversation.is_conversation(),
-            "contrôle de bonne foi : le prédicat n'est pas constamment faux"
-        );
-        // Le second garde, et il tiendrait seul : le marqueur d'un callback de
-        // build est reconnu comme déclencheur automatisé. Reconstruit depuis la
-        // grammaire du moteur plutôt que recopié.
-        let marker = format!(
-            "[callback: {}]",
-            crate::qa_build_callback::BUILD_CALLBACK_LABEL
-        );
-        assert!(marker.starts_with("[callback:"));
-    }
-
-    /// **V9 — contrôle de bonne foi du scan de cardinalité.**
-    ///
-    /// Un scan vérifié seulement par son propre vert est un scan vérifié par
-    /// rien. Celui-ci est exercé sur des extraits fabriqués plutôt qu'en éditant
-    /// le vrai fichier : le motif doit compter l'expression finale sans `return`,
-    /// et ne pas compter les motifs de `match`.
-    #[test]
-    fn mika2515_the_cardinality_predicate_counts_what_it_claims() {
-        let count = |src: &str, needle: &str| {
-            src.lines()
-                .filter(|l| !l.trim_start().starts_with("//"))
-                .filter(|l| l.contains(needle))
-                .count()
-        };
-
-        // L'expression finale, sans `return` — celle qu'un prédicat ancré sur
-        // `return` manquerait.
-        let final_expr = "    Ok(LoopResult::MaxStepsExceeded {\n        usage: None,\n    })\n";
-        assert_eq!(count(final_expr, "Ok(LoopResult::"), 1);
-        assert_eq!(
-            count(final_expr, "return Ok(LoopResult::"),
-            0,
-            "c'est la raison pour laquelle le motif du scan omet `return`"
-        );
-
-        // Un motif de `match` n'est pas une sortie.
-        let match_arm = "        LoopResult::Done { text, .. } => text,\n";
-        assert_eq!(
-            count(match_arm, "Ok(LoopResult::"),
-            0,
-            "ancrer sur `LoopResult::` nu rendrait le scan perpétuellement rouge"
-        );
-
-        // Une ligne de commentaire citant le motif n'est pas une sortie — la
-        // prose de ce ticket en écrit plusieurs.
-        let prose = "    // Un scan ancré sur `Ok(LoopResult::` n'en trouve que cinq.\n";
-        assert_eq!(
-            count(prose, "Ok(LoopResult::"),
-            0,
-            "faux positif mesuré par mika#2050 sur le Signal S, une classe plus tôt"
-        );
-    }
-
-    #[test]
-    fn test_loop_mode_team_properties() {
-        let mode = LoopMode::Team;
-        assert!(!mode.is_conversation());
-        assert!(mode.follow_up_on_empty());
-        assert!(!mode.saves_to_db());
-        assert_eq!(mode.label(), "team agent");
-    }
-
-    // -- SilentTrigger::max_steps tests --
-
-    #[test]
-    fn test_silent_trigger_callback_gets_higher_step_limit() {
-        let trigger = SilentTrigger::Callback {
-            task_id: "test-task".to_string(),
-            label: "test".to_string(),
-            result: "done".to_string(),
-            failed: false,
-            parent_task_id: None,
-        };
-        assert_eq!(
-            trigger.max_steps(),
-            crate::planning::policy::MAX_CALLBACK_TOOL_STEPS
-        );
-
-        let reminder = SilentTrigger::Reminder {
-            task_id: "test".to_string(),
-            message: "check CI".to_string(),
-        };
-        assert_eq!(
-            reminder.max_steps(),
-            crate::planning::policy::MAX_CALLBACK_TOOL_STEPS
-        );
-    }
-
-    #[test]
-    fn test_silent_trigger_non_callback_gets_default_step_limit() {
-        assert_eq!(
-            SilentTrigger::Heartbeat.max_steps(),
-            crate::planning::policy::MAX_TOOL_STEPS
-        );
-        assert_eq!(
-            SilentTrigger::Reflection.max_steps(),
-            crate::planning::policy::MAX_TOOL_STEPS
-        );
-        assert_eq!(
-            SilentTrigger::SkillRun {
-                skill_name: "test".to_string()
-            }
-            .max_steps(),
-            crate::planning::policy::MAX_TOOL_STEPS
-        );
-    }
-
-    // -- check_onboarding tests --
-
-    #[tokio::test]
-    async fn test_check_onboarding_true_when_no_core_memory() {
-        let db = test_async_db();
-        // Fresh DB has no core memory — should be onboarding
-        assert!(check_onboarding(&db).await);
-    }
-
-    #[tokio::test]
-    async fn test_check_onboarding_true_when_default_value() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        // Seeded with defaults — still onboarding
-        assert!(check_onboarding(&db).await);
-    }
-
-    #[tokio::test]
-    async fn test_check_onboarding_false_when_customized() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        db.set_core_memory("user_summary", "Sam, software engineer")
-            .await
-            .unwrap();
-        assert!(!check_onboarding(&db).await);
-    }
-
-    #[tokio::test]
-    async fn test_check_onboarding_true_even_when_other_sections_customized() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        db.set_core_memory("self_model", "Custom self model")
-            .await
-            .unwrap();
-        assert!(check_onboarding(&db).await);
-    }
-
-    // -- seed_user_person tests --
-
-    #[tokio::test]
-    async fn test_seed_user_person_after_onboarding() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        db.set_core_memory("user_summary", "Sam, software engineer at Senara Solutions")
-            .await
-            .unwrap();
-
-        seed_user_person(&db).await.unwrap();
-
-        let person = db.get_person("Sam").await.unwrap();
-        assert!(person.is_some());
-        let person = person.unwrap();
-        assert_eq!(person.relationship.as_deref(), Some("The user"));
-    }
-
-    #[tokio::test]
-    async fn test_seed_user_person_skips_when_default() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        // user_summary is still at default
-
-        seed_user_person(&db).await.unwrap();
-
-        let people = db.list_people().await.unwrap();
-        assert!(people.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_seed_user_person_skips_when_already_exists() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        db.set_core_memory("user_summary", "Sam, software engineer")
-            .await
-            .unwrap();
-        // Pre-create the person
-        db.upsert_person("Sam", Some("Friend"), None).await.unwrap();
-
-        seed_user_person(&db).await.unwrap();
-
-        // Relationship should NOT be overwritten
-        let person = db.get_person("Sam").await.unwrap().unwrap();
-        assert_eq!(person.relationship.as_deref(), Some("Friend"));
-    }
-
-    #[tokio::test]
-    async fn test_seed_user_person_extracts_name_before_comma() {
-        let db = test_async_db();
-        db.seed_core_memory(None).await.unwrap();
-        db.set_core_memory("user_summary", "Alice Johnson, product manager")
-            .await
-            .unwrap();
-
-        seed_user_person(&db).await.unwrap();
-
-        let person = db.get_person("Alice Johnson").await.unwrap();
-        assert!(person.is_some());
-    }
-
-    // -- Skill helper tests --
-
-    fn make_skill_entry(name: &str, timeout: u64, tool_names: &[&str]) -> SkillEntry {
-        make_skill_entry_with_constraints(name, timeout, tool_names, &[])
-    }
-
-    fn make_skill_entry_with_constraints(
-        name: &str,
-        timeout: u64,
-        tool_names: &[&str],
-        required_tools: &[&str],
-    ) -> SkillEntry {
-        use crate::skills::manifest::Constraints;
-        SkillEntry {
-            manifest: SkillManifest {
-                skill: SkillInfo {
-                    name: name.to_string(),
-                    description: format!("{name} skill"),
-                    version: "0.1.0".to_string(),
-                    always_on: false,
-                    timeout_secs: timeout,
-                    dependencies: vec![],
-                    max_prompt_size: None,
-                    data_grade: Default::default(),
-                },
-                triggers: Triggers {
-                    keywords: vec![name.to_string()],
-                },
-                llm: Default::default(),
-                constraints: Constraints {
-                    required_tools: required_tools.iter().map(|s| s.to_string()).collect(),
-                    required_fetches_for_quoted_resources: false,
-                },
-                output: Default::default(),
-                context: std::collections::HashMap::new(),
-                variants: Default::default(),
-            },
-            dir: PathBuf::from(format!("/skills/{name}")),
-            keywords_lower: vec![name.to_lowercase()],
-            prompt_snippet: String::new(),
-            skill_tools: tool_names
-                .iter()
-                .map(|tn| ResolvedSkillTool {
-                    definition: ToolDefinition {
-                        name: tn.to_string(),
-                        description: format!("{tn} tool"),
-                        input_schema: serde_json::json!({"type": "object"}),
-                    },
-                    handler: ToolHandler::Builtin {
-                        function: tn.to_string(),
-                    },
-                    skill_dir: PathBuf::from(format!("/skills/{name}")),
-                })
-                .collect(),
-            enabled: true,
-            has_override: false,
-            provider_overrides: std::collections::HashMap::new(),
-            prompt_sources: SkillEntry::empty_prompt_sources(),
-            model_overrides: std::collections::HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn test_build_skill_tool_map_collects_all_tools() {
-        let s1 = make_skill_entry("search", 30, &["web_search"]);
-        let s2 = make_skill_entry("calc", 10, &["calculate", "convert"]);
-        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
-        let map = build_skill_tool_map(&matched);
-
-        assert_eq!(map.len(), 3);
-        assert!(map.contains_key("web_search"));
-        assert!(map.contains_key("calculate"));
-        assert!(map.contains_key("convert"));
-    }
-
-    #[test]
-    fn test_build_skill_tool_map_empty_when_no_skills() {
-        let matched: Vec<&SkillEntry> = vec![];
-        let map = build_skill_tool_map(&matched);
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn test_build_skill_tool_map_last_skill_wins_on_collision() {
-        let s1 = make_skill_entry("alpha", 10, &["shared_tool"]);
-        let s2 = make_skill_entry("beta", 20, &["shared_tool"]);
-        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
-        let map = build_skill_tool_map(&matched);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["shared_tool"].skill_dir, PathBuf::from("/skills/beta"));
-    }
-
-    #[test]
-    fn test_build_skill_tool_map_collision_logs_both_skills() {
-        // AC1 companion: verify the collision path is exercised and
-        // the WARN log names both colliding skills and their handler types.
-        // The codebase does not use a log-capture test harness, so we
-        // verify structurally: the collision path produces a valid map
-        // (last-write-wins preserved), and the `warn!` call is visible
-        // in code review.
-        let s1 = make_skill_entry("alpha", 10, &["shared_tool"]);
-        let s2 = make_skill_entry("beta", 20, &["shared_tool"]);
-        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
-
-        let map = build_skill_tool_map(&matched);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["shared_tool"].skill_dir, PathBuf::from("/skills/beta"));
-    }
-
-    #[test]
-    fn test_max_skill_timeout_returns_largest() {
-        let s1 = make_skill_entry("fast", 10, &[]);
-        let s2 = make_skill_entry("slow", 120, &[]);
-        let matched: Vec<&SkillEntry> = vec![&s1, &s2];
-        assert_eq!(
-            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
-            120
-        );
-    }
-
-    /// mika#2276 AC4 — **contrôle négatif de M1.**
-    ///
-    /// La doctrine QA (`skills/bundled/qa-review/system_prompt.md:194`) raisonne
-    /// sur « `run_shell`'s 30s budget ». Le moteur ne tenait pas ce plancher :
-    /// `max_skill_timeout` prend le MAXIMUM des timeouts de tous les skills du
-    /// tour et l'applique uniformément à chaque appel d'outil. `shell-exec`
-    /// déclare 30 s ; `build-mika`, dépendance déclarée de `qa-review`, déclare
-    /// 300 s. Mesuré sur la trace `921f11f0` : deux `cargo test --release` de
-    /// 237,9 s et 231,1 s, soit 469 s des ~506 s d'enveloppe du tour.
-    ///
-    /// Ce test asserte le contrat inverse : **le budget d'un outil est celui du
-    /// skill qui le définit**, pas celui du skill le plus généreux du tour.
-    ///
-    /// Rouge sur `main` — voir le corps de PR : avant le fix, le seul chemin de
-    /// résolution était `max_skill_timeout`, qui rend 300 pour ce même jeu.
-    #[test]
-    fn mika2276_tool_budget_is_its_own_skills_budget_not_the_turns_maximum() {
-        // Le jeu exact de la trace 921f11f0 : shell-exec (30 s) possède
-        // `run_shell`, build-mika (300 s) est chargé comme dépendance.
-        let shell_exec = make_skill_entry("shell-exec", 30, &["run_shell"]);
-        let build_mika = make_skill_entry("build-mika", 300, &["build_mika"]);
-        let matched: Vec<&SkillEntry> = vec![&shell_exec, &build_mika];
-
-        let timeouts = build_skill_tool_timeouts(&matched, "anthropic", "claude-sonnet-4-6");
-
-        assert_eq!(
-            timeouts.get("run_shell").copied(),
-            Some(30),
-            "run_shell doit être coupé au budget déclaré par shell-exec (30 s), \
-             pas au maximum du tour"
-        );
-        assert_eq!(
-            timeouts.get("build_mika").copied(),
-            Some(300),
-            "build_mika garde son propre budget — le fix n'abaisse personne"
-        );
-
-        // Le défaut lui-même, épinglé : `max_skill_timeout` rend toujours le
-        // maximum. Il survit comme plafond de repli pour les outils absents de
-        // la carte (MCP, builtins non-skill) ; ce qui change est que la valeur
-        // passée à `execute_skill_tool` ne vient plus de lui.
-        assert_eq!(
-            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
-            300,
-            "max_skill_timeout garde sa sémantique de maximum — c'est son usage \
-             comme budget par outil qui est retiré"
-        );
-    }
-
-    /// mika#2276 AC4 — les overrides provider/modèle suivent le skill propriétaire.
-    ///
-    /// `effective_timeout` résout `modèle > provider > racine`. La carte par outil
-    /// doit hériter de cette résolution, sinon un override déclaré chez un skill
-    /// serait perdu au moment où il compte.
-    #[test]
-    fn mika2276_per_tool_budget_honours_provider_overrides() {
-        let mut fast = make_skill_entry("fast", 30, &["quick_tool"]);
-        fast.provider_overrides.insert(
-            "openai".to_string(),
-            crate::skills::manifest::ProviderSkillFields {
-                timeout_secs: Some(90),
-                max_prompt_size: None,
-            },
-        );
-        let slow = make_skill_entry("slow", 600, &["slow_tool"]);
-        let matched: Vec<&SkillEntry> = vec![&fast, &slow];
-
-        let openai = build_skill_tool_timeouts(&matched, "openai", "gpt-4o");
-        assert_eq!(openai.get("quick_tool").copied(), Some(90));
-
-        let anthropic = build_skill_tool_timeouts(&matched, "anthropic", "claude-sonnet-4-6");
-        assert_eq!(anthropic.get("quick_tool").copied(), Some(30));
-    }
-
-    /// mika#2276 AC4 — collision de noms d'outil : même règle que la carte des
-    /// outils et que celle des `data_grade` (dernier écrit gagne).
-    ///
-    /// Les trois cartes sont construites depuis le même `matched` dans le même
-    /// ordre ; si celle-ci divergeait, un outil serait dispatché vers le handler
-    /// d'un skill et coupé au budget d'un autre.
-    #[test]
-    fn mika2276_per_tool_budget_collision_follows_the_tool_map() {
-        let alpha = make_skill_entry("alpha", 10, &["shared_tool"]);
-        let beta = make_skill_entry("beta", 20, &["shared_tool"]);
-        let matched: Vec<&SkillEntry> = vec![&alpha, &beta];
-
-        let tool_map = build_skill_tool_map(&matched);
-        let timeouts = build_skill_tool_timeouts(&matched, "anthropic", "claude-sonnet-4-6");
-
-        assert_eq!(
-            tool_map["shared_tool"].skill_dir,
-            PathBuf::from("/skills/beta")
-        );
-        assert_eq!(
-            timeouts.get("shared_tool").copied(),
-            Some(20),
-            "le budget doit suivre le même gagnant que le handler"
-        );
-    }
-
-    #[test]
-    fn test_max_skill_timeout_fallback_when_empty() {
-        let matched: Vec<&SkillEntry> = vec![];
-        assert_eq!(
-            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
-            crate::planning::policy::TOOL_TIMEOUT_SECS
-        );
-    }
-
-    #[test]
-    fn test_max_skill_timeout_uses_provider_override() {
-        let mut s1 = make_skill_entry("search", 30, &[]);
-        s1.provider_overrides.insert(
-            "openai".to_string(),
-            crate::skills::manifest::ProviderSkillFields {
-                timeout_secs: Some(90),
-                max_prompt_size: None,
-            },
-        );
-        let matched: Vec<&SkillEntry> = vec![&s1];
-        // With openai provider, should use the override
-        assert_eq!(max_skill_timeout(&matched, "openai", "gpt-4o"), 90);
-        // With anthropic provider, should use root
-        assert_eq!(
-            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
-            30
-        );
-    }
-
-    #[test]
-    fn test_inject_skills_appends_prompt_and_tool_defs() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("test", 30, &["test_tool"]);
-        entry.prompt_snippet = "Use this skill to test things.".to_string();
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = "Base prompt.".to_string();
-
-        let no_ctx = HashMap::new();
-        let no_disabled: Vec<String> = vec![];
-        let (defs, variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-            &no_ctx,
-            &no_disabled,
-            false,
-        );
-
-        // Should append skill snippet to system prompt
-        assert!(system.contains("test Skill"));
-        assert!(system.contains("Use this skill to test things."));
-        // Should include the skill tool definition
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].name, "test_tool");
-        // Should record variant info for the non-empty prompt
-        assert!(variant.is_some());
-        let variant_json: HashMap<String, String> =
-            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
-        assert_eq!(variant_json.get("test").unwrap(), "base");
-    }
-
-    #[test]
-    fn test_inject_skills_deduplicates_tool_names() {
-        let mut tools = ToolRegistry::new();
-        // Register a builtin tool named "overlap"
-        struct DummyTool;
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for DummyTool {
-            fn name(&self) -> &str {
-                "overlap"
-            }
-            fn definition(&self) -> ToolDefinition {
-                ToolDefinition {
-                    name: "overlap".to_string(),
-                    description: "builtin overlap".to_string(),
-                    input_schema: serde_json::json!({"type": "object"}),
-                }
-            }
-            async fn execute(
-                &self,
-                _input: serde_json::Value,
-                _ctx: &crate::tools::ToolContext<'_>,
-            ) -> Result<crate::tools::ToolOutput> {
-                Ok(crate::tools::ToolOutput::success("ok"))
-            }
-        }
-        tools.register(Box::new(DummyTool));
-
-        // Skill also defines a tool named "overlap"
-        let entry = make_skill_entry("dupe", 30, &["overlap"]);
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        let no_ctx = HashMap::new();
-        let no_disabled: Vec<String> = vec![];
-        let (defs, _variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-            &no_ctx,
-            &no_disabled,
-            false,
-        );
-
-        // "overlap" should appear exactly once (builtin wins)
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].description, "builtin overlap");
-    }
-
-    #[test]
-    fn test_apply_agent_tool_visibility_evicts_listed_names() {
-        let mut defs = vec![
-            ToolDefinition {
-                name: "pr_merge_with_gate".to_string(),
-                description: "merges PRs".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "search_memory".to_string(),
-                description: "reads memory".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "update_core_memory".to_string(),
-                description: "writes memory".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-        ];
-        let disabled = vec![
-            "pr_merge_with_gate".to_string(),
-            "update_core_memory".to_string(),
-        ];
-        apply_agent_tool_visibility(&mut defs, &disabled);
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].name, "search_memory");
-    }
-
-    #[test]
-    fn test_apply_agent_tool_visibility_no_op_when_disabled_empty() {
-        let mut defs = vec![ToolDefinition {
-            name: "pr_merge_with_gate".to_string(),
-            description: "merges PRs".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }];
-        let disabled: Vec<String> = vec![];
-        apply_agent_tool_visibility(&mut defs, &disabled);
-        assert_eq!(
-            defs.len(),
-            1,
-            "empty denylist should leave tool defs unchanged"
-        );
-    }
-
-    #[test]
-    fn test_apply_agent_tool_visibility_case_insensitive() {
-        let mut defs = vec![ToolDefinition {
-            name: "Pr_Merge_With_Gate".to_string(),
-            description: "case-mixed".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }];
-        let disabled = vec!["pr_merge_with_gate".to_string()];
-        apply_agent_tool_visibility(&mut defs, &disabled);
-        assert!(defs.is_empty(), "filter must match case-insensitively");
-    }
-
-    // -----------------------------------------------------------------------
-    // mika#1952 U4-a — `apply_reflection_evidence_contract`
-    // -----------------------------------------------------------------------
-
-    /// A schema of the shape the three guarded tools actually declare:
-    /// `evidence` present in `properties`, absent from `required`.
-    fn gated_tool_def(name: &str, required: serde_json::Value) -> ToolDefinition {
-        ToolDefinition {
-            name: name.to_string(),
-            description: format!("{name} (mika#1952 fixture)"),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string"},
-                    "evidence": {"type": "string"}
-                },
-                "required": required
-            }),
-        }
-    }
-
-    fn required_of(def: &ToolDefinition) -> Vec<String> {
-        def.input_schema["required"]
-            .as_array()
-            .expect("required is an array")
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .expect("required entries are strings")
-                    .to_string()
-            })
-            .collect()
-    }
-
-    #[test]
-    fn mika1952_the_three_gated_tools_declare_evidence_required() {
-        let mut defs = vec![
-            gated_tool_def(
-                "update_fact",
-                serde_json::json!(["id", "category", "updates"]),
-            ),
-            gated_tool_def("store_fact", serde_json::json!(["category"])),
-            gated_tool_def(
-                "update_core_memory",
-                serde_json::json!(["section", "action", "reasoning"]),
-            ),
-        ];
-
-        apply_reflection_evidence_contract(&mut defs);
-
-        for def in &defs {
-            assert!(
-                required_of(def).contains(&"evidence".to_string()),
-                "mika#1952 — `{}` must declare `evidence` as required in reflection mode",
-                def.name
-            );
-        }
-        // Additive, not replacing: the pre-existing entries survive, in order.
-        assert_eq!(
-            required_of(&defs[0]),
-            vec!["id", "category", "updates", "evidence"],
-            "the filter appends; it must not reorder or drop"
-        );
-    }
-
-    #[test]
-    fn mika1952_applying_the_contract_twice_changes_nothing() {
-        let mut defs = vec![gated_tool_def("update_fact", serde_json::json!(["id"]))];
-        apply_reflection_evidence_contract(&mut defs);
-        let once = defs.clone();
-        apply_reflection_evidence_contract(&mut defs);
-        assert_eq!(
-            defs[0].input_schema, once[0].input_schema,
-            "D3 — the mutation is idempotent; a second pass must add no duplicate"
-        );
-        assert_eq!(required_of(&defs[0]).len(), 2);
-    }
-
-    #[test]
-    fn mika1952_a_schema_already_declaring_evidence_is_left_alone() {
-        let mut defs = vec![gated_tool_def(
-            "store_fact",
-            serde_json::json!(["category", "evidence"]),
-        )];
-        let before = defs[0].input_schema.clone();
-        apply_reflection_evidence_contract(&mut defs);
-        assert_eq!(defs[0].input_schema, before);
-    }
-
-    #[test]
-    fn mika1952_a_tool_outside_the_list_is_untouched() {
-        let mut defs = vec![
-            gated_tool_def("search_memory", serde_json::json!(["query"])),
-            gated_tool_def("send_message", serde_json::json!(["text"])),
-        ];
-        let before: Vec<_> = defs.iter().map(|d| d.input_schema.clone()).collect();
-        apply_reflection_evidence_contract(&mut defs);
-        for (def, was) in defs.iter().zip(before) {
-            assert_eq!(
-                def.input_schema, was,
-                "`{}` does not carry the runtime guard and must not be touched",
-                def.name
-            );
-        }
-    }
-
-    /// D3 — a gated tool absent from the array (evicted by an identity denylist,
-    /// or dropped by the compact-provider filter) is not an error.
-    #[test]
-    fn mika1952_a_partial_tool_array_is_served_not_refused() {
-        let mut defs = vec![gated_tool_def(
-            "store_fact",
-            serde_json::json!(["category"]),
-        )];
-        apply_reflection_evidence_contract(&mut defs);
-        assert_eq!(defs.len(), 1, "no tool is added to cover the missing ones");
-        assert!(required_of(&defs[0]).contains(&"evidence".to_string()));
-    }
-
-    /// D4 — an unexpected shape leaves the schema **intact** rather than
-    /// half-mutated. Each case is asserted separately: a single fixture
-    /// breaking every term at once would pass against a filter that checks
-    /// only one of them.
-    #[test]
-    fn mika1952_an_unexpected_schema_is_left_intact_without_panicking() {
-        // (a) `properties.evidence` absent.
-        let mut no_field = vec![ToolDefinition {
-            name: "update_fact".to_string(),
-            description: "no evidence property".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {"id": {"type": "integer"}},
-                "required": ["id"]
-            }),
-        }];
-        let before = no_field[0].input_schema.clone();
-        apply_reflection_evidence_contract(&mut no_field);
-        assert_eq!(
-            no_field[0].input_schema, before,
-            "a schema with no `evidence` property must be served unchanged"
-        );
-
-        // (b) `required` present but not an array.
-        let mut bad_required = vec![ToolDefinition {
-            name: "store_fact".to_string(),
-            description: "required is a string".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {"evidence": {"type": "string"}},
-                "required": "category"
-            }),
-        }];
-        let before = bad_required[0].input_schema.clone();
-        apply_reflection_evidence_contract(&mut bad_required);
-        assert_eq!(bad_required[0].input_schema, before);
-
-        // (c) `input_schema` is not an object at all.
-        let mut not_object = vec![ToolDefinition {
-            name: "update_core_memory".to_string(),
-            description: "schema is a string".to_string(),
-            input_schema: serde_json::json!("nonsense"),
-        }];
-        apply_reflection_evidence_contract(&mut not_object);
-        assert_eq!(not_object[0].input_schema, serde_json::json!("nonsense"));
-    }
-
-    /// `required` **absent** is a valid schema declaring nothing mandatory, not
-    /// an unexpected shape — so the array is created rather than refused.
-    #[test]
-    fn mika1952_a_schema_without_a_required_array_gains_one() {
-        let mut defs = vec![ToolDefinition {
-            name: "update_fact".to_string(),
-            description: "no required array".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {"evidence": {"type": "string"}}
-            }),
-        }];
-        apply_reflection_evidence_contract(&mut defs);
-        assert_eq!(required_of(&defs[0]), vec!["evidence"]);
-    }
-
-    #[test]
-    fn test_inject_skills_skips_empty_snippets() {
-        let tools = ToolRegistry::new();
-        let entry = make_skill_entry("quiet", 30, &["quiet_tool"]);
-        // prompt_snippet is empty by default from make_skill_entry
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = "Base.".to_string();
-
-        let no_ctx = HashMap::new();
-        let (_defs, variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        // Should NOT add skill context section when snippet is empty
-        assert!(!system.contains("quiet Skill"));
-        assert_eq!(system, "Base.");
-        // No variant info when prompt is empty
-        assert!(variant.is_none());
-    }
-
-    #[test]
-    fn test_inject_skills_falls_back_to_root() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt for search.".to_string();
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        // No model variant — should fall back to root
-        let no_ctx = HashMap::new();
-        let (_defs, _variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "groq",
-            "llama-3.3-70b-versatile",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        assert!(system.contains("Root prompt for search."));
-    }
-
-    #[test]
-    fn test_inject_skills_no_prompt_at_all() {
-        let tools = ToolRegistry::new();
-        let entry = make_skill_entry("quiet", 30, &["quiet_tool"]);
-        // No root prompt, no provider prompts
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = "Base.".to_string();
-
-        let no_ctx = HashMap::new();
-        let (_defs, variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        // Should NOT add any skill context section
-        assert_eq!(system, "Base.");
-        assert!(variant.is_none());
-    }
-
-    #[test]
-    fn test_inject_skills_uses_model_prompt() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt.".to_string();
-        entry.model_prompts_mut().insert(
-            "anthropic/claude-sonnet-4-6".to_string(),
-            "Sonnet-specific prompt.".to_string(),
-        );
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        let no_ctx = HashMap::new();
-        let (_defs, variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        assert!(system.contains("Sonnet-specific prompt."));
-        assert!(!system.contains("Root prompt."));
-        // Should record hand-authored model variant
-        let variant_json: HashMap<String, String> =
-            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            variant_json.get("search").unwrap(),
-            "hand_authored_model:anthropic/claude-sonnet-4-6"
-        );
-    }
-
-    #[test]
-    fn test_inject_skills_model_no_match_falls_back_to_root() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt.".to_string();
-        entry.model_prompts_mut().insert(
-            "anthropic/claude-sonnet-4-6".to_string(),
-            "Sonnet prompt.".to_string(),
-        );
-        // No model variant for claude-opus-4 — should fall back to root
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        let no_ctx = HashMap::new();
-        let (_defs, variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-opus-4",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        assert!(system.contains("Root prompt."));
-        assert!(!system.contains("Sonnet prompt."));
-        let variant_json: HashMap<String, String> =
-            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
-        assert_eq!(variant_json.get("search").unwrap(), "base");
-    }
-
-    #[test]
-    fn test_inject_skills_model_falls_back_to_root() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt.".to_string();
-        // No provider or model variant for groq/llama
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        let no_ctx = HashMap::new();
-        let (_defs, _variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "groq",
-            "llama-3.3-70b-versatile",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        assert!(system.contains("Root prompt."));
-    }
-
-    #[test]
-    fn test_inject_skills_model_with_slash() {
-        let tools = ToolRegistry::new();
-        let mut entry = make_skill_entry("search", 30, &[]);
-        entry.prompt_snippet = "Root prompt.".to_string();
-        entry.model_prompts_mut().insert(
-            "openrouter/anthropic--claude-sonnet-4".to_string(),
-            "OpenRouter model prompt.".to_string(),
-        );
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = String::new();
-
-        // Model name contains a slash — sanitize_model_dir_name should match
-        let no_ctx = HashMap::new();
-        let (_defs, variant, _) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "openrouter",
-            "anthropic/claude-sonnet-4",
-            &no_ctx,
-            &[],
-            false,
-        );
-
-        assert!(system.contains("OpenRouter model prompt."));
-        assert!(!system.contains("Root prompt."));
-        let variant_json: HashMap<String, String> =
-            serde_json::from_str(variant.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            variant_json.get("search").unwrap(),
-            "hand_authored_model:openrouter/anthropic--claude-sonnet-4"
-        );
-    }
-
-    #[test]
-    fn test_max_skill_timeout_uses_model_override() {
-        let mut s1 = make_skill_entry("search", 30, &[]);
-        s1.provider_overrides.insert(
-            "anthropic".to_string(),
-            crate::skills::manifest::ProviderSkillFields {
-                timeout_secs: Some(90),
-                max_prompt_size: None,
-            },
-        );
-        s1.model_overrides.insert(
-            "anthropic/claude-sonnet-4-6".to_string(),
-            crate::skills::manifest::ProviderSkillFields {
-                timeout_secs: Some(120),
-                max_prompt_size: None,
-            },
-        );
-        let matched: Vec<&SkillEntry> = vec![&s1];
-        // With model override, should use model
-        assert_eq!(
-            max_skill_timeout(&matched, "anthropic", "claude-sonnet-4-6"),
-            120
-        );
-        // Without model override, should use provider
-        assert_eq!(
-            max_skill_timeout(&matched, "anthropic", "claude-opus-4"),
-            90
-        );
-        // Without provider or model, should use root
-        assert_eq!(max_skill_timeout(&matched, "groq", "llama"), 30);
-    }
-
-    #[test]
-    fn test_format_step_exceeded_fallback_non_zero_exit_old_format() {
-        // Backward compat: old metadata had success: true with non_zero_exit: true
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "shell_exec".to_string(),
-            input_summary: "grep foo".to_string(),
-            output_summary: "Exit code: 1".to_string(),
-            success: true,
-            non_zero_exit: true,
-        }];
-        let result = format_step_exceeded_fallback(&summaries);
-        assert!(
-            result.contains("- shell_exec (non-zero exit)"),
-            "expected non-zero exit status in: {result}"
-        );
-    }
-
-    #[test]
-    fn test_format_step_exceeded_fallback_non_zero_exit_new_format() {
-        // New format: success is false when non_zero_exit is true
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "shell_exec".to_string(),
-            input_summary: "grep foo".to_string(),
-            output_summary: "Exit code: 1".to_string(),
-            success: false,
-            non_zero_exit: true,
-        }];
-        let result = format_step_exceeded_fallback(&summaries);
-        assert!(
-            result.contains("- shell_exec (non-zero exit)"),
-            "expected non-zero exit status in: {result}"
-        );
-    }
-
-    // -- DB metadata integration tests --
-
-    #[tokio::test]
-    async fn test_save_and_load_message_with_metadata() {
-        let db = test_async_db();
-        let metadata = r#"{"tool_calls":[{"step":0,"name":"search_memory","input_summary":"q","output_summary":"found","success":true}]}"#;
-        db.save_message_with_metadata(
-            "test-session",
-            "assistant",
-            "I searched your memory.",
-            Some(metadata),
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        let messages = db.load_recent_messages(10).await.unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "assistant");
-        assert_eq!(messages[0].content, "I searched your memory.");
-        assert_eq!(messages[0].metadata.as_deref(), Some(metadata));
-    }
-
-    #[tokio::test]
-    async fn test_save_message_without_metadata_loads_as_none() {
-        let db = test_async_db();
-        db.save_message("test-session", "user", "Hello", None)
-            .await
-            .unwrap();
-
-        let messages = db.load_recent_messages(10).await.unwrap();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].metadata.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_save_message_with_null_metadata() {
-        let db = test_async_db();
-        db.save_message_with_metadata(
-            "test-session",
-            "assistant",
-            "No tools used.",
-            None,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        let messages = db.load_recent_messages(10).await.unwrap();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].metadata.is_none());
-    }
-
-    // -- strip_prior_images tests --
-
-    #[test]
-    fn test_strip_prior_images_removes_image_blocks() {
-        let mut messages = vec![
-            // Prior turn: user message with tool results containing images
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
-                    tool_call_id: "tu_1".to_string(),
-                    content: LlmToolResultContent::Blocks(vec![
-                        LlmToolResultBlock::Text("Screenshot taken.".to_string()),
-                        LlmToolResultBlock::Image(LlmImage {
-                            media_type: "image/png".to_string(),
-                            data: "iVBORw0KGgo=".to_string(),
-                        }),
-                    ]),
-                    is_error: false,
-                }]),
-            },
-            // Prior turn: assistant response
-            LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::Text("I see a desktop.".to_string()),
-            },
-            // Current turn: new tool results (should be preserved)
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
-                    tool_call_id: "tu_2".to_string(),
-                    content: LlmToolResultContent::Blocks(vec![
-                        LlmToolResultBlock::Text("New screenshot.".to_string()),
-                        LlmToolResultBlock::Image(LlmImage {
-                            media_type: "image/png".to_string(),
-                            data: "iVBORw0KGgo=".to_string(),
-                        }),
-                    ]),
-                    is_error: false,
-                }]),
-            },
-        ];
-
-        strip_prior_images(&mut messages);
-
-        // First message should have images stripped
-        if let LlmContent::Blocks(blocks) = &messages[0].content {
-            if let LlmContentBlock::ToolResult { content, .. } = &blocks[0] {
-                assert!(
-                    matches!(content, LlmToolResultContent::Text(t) if t.contains("Screenshot taken.") && t.contains("omitted"))
-                );
-            } else {
-                panic!("expected ToolResult");
-            }
-        } else {
-            panic!("expected Blocks");
-        }
-
-        // Last message should still have images
-        if let LlmContent::Blocks(blocks) = &messages[2].content {
-            if let LlmContentBlock::ToolResult { content, .. } = &blocks[0] {
-                assert!(matches!(content, LlmToolResultContent::Blocks(_)));
-            } else {
-                panic!("expected ToolResult");
-            }
-        } else {
-            panic!("expected Blocks");
-        }
-    }
-
-    #[test]
-    fn test_strip_prior_images_preserves_text_only() {
-        let mut messages = vec![
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Blocks(vec![LlmContentBlock::ToolResult {
-                    tool_call_id: "tu_1".to_string(),
-                    content: LlmToolResultContent::Text("just text".to_string()),
-                    is_error: false,
-                }]),
-            },
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Text("current turn".to_string()),
-            },
-        ];
-
-        strip_prior_images(&mut messages);
-
-        // Text-only tool result should be unchanged
-        if let LlmContent::Blocks(blocks) = &messages[0].content
-            && let LlmContentBlock::ToolResult { content, .. } = &blocks[0]
-        {
-            assert!(matches!(content, LlmToolResultContent::Text(t) if t == "just text"));
-        }
-    }
-
-    #[test]
-    fn test_strip_prior_images_removes_user_attached_images() {
-        let mut messages = vec![
-            // Prior turn: user message with text and an attached image
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Blocks(vec![
-                    LlmContentBlock::Text("What is in this picture?".to_string()),
-                    LlmContentBlock::Image(LlmImage {
-                        media_type: "image/png".to_string(),
-                        data: "iVBORw0KGgo=".to_string(),
-                    }),
-                ]),
-            },
-            // Assistant response
-            LlmMessage {
-                role: LlmRole::Assistant,
-                content: LlmContent::Text("I see a cat.".to_string()),
-            },
-            // Current turn: user message with a new image (should be preserved)
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Blocks(vec![
-                    LlmContentBlock::Text("And this one?".to_string()),
-                    LlmContentBlock::Image(LlmImage {
-                        media_type: "image/jpeg".to_string(),
-                        data: "/9j/4AAQ=".to_string(),
-                    }),
-                ]),
-            },
-        ];
-
-        strip_prior_images(&mut messages);
-
-        // First message: image should be replaced with placeholder text
-        if let LlmContent::Blocks(blocks) = &messages[0].content {
-            assert_eq!(blocks.len(), 2);
-            assert!(
-                matches!(&blocks[0], LlmContentBlock::Text(text) if text == "What is in this picture?")
-            );
-            assert!(
-                matches!(&blocks[1], LlmContentBlock::Text(text) if text == "[user image from previous turn omitted]")
-            );
-        } else {
-            panic!("expected Blocks for first message");
-        }
-
-        // Last message: image should still be intact
-        if let LlmContent::Blocks(blocks) = &messages[2].content {
-            assert_eq!(blocks.len(), 2);
-            assert!(matches!(&blocks[0], LlmContentBlock::Text(_)));
-            assert!(matches!(&blocks[1], LlmContentBlock::Image(_)));
-        } else {
-            panic!("expected Blocks for last message");
-        }
-    }
-
-    #[test]
-    fn test_strip_prior_images_no_mutation_without_images() {
-        let mut messages = vec![
-            // Prior turn: user message with only text blocks
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Blocks(vec![LlmContentBlock::Text("Hello".to_string())]),
-            },
-            // Current turn
-            LlmMessage {
-                role: LlmRole::User,
-                content: LlmContent::Text("Current".to_string()),
-            },
-        ];
-
-        strip_prior_images(&mut messages);
-
-        // Text-only blocks should remain unchanged
-        if let LlmContent::Blocks(blocks) = &messages[0].content {
-            assert_eq!(blocks.len(), 1);
-            assert!(matches!(&blocks[0], LlmContentBlock::Text(text) if text == "Hello"));
-        } else {
-            panic!("expected Blocks");
-        }
-    }
-
-    // -- format_step_exceeded_fallback tests --
-
-    #[test]
-    fn test_format_step_exceeded_fallback_empty_summaries() {
-        let result = format_step_exceeded_fallback(&[]);
-        assert!(result.contains("I ran out of steps"));
-        assert!(result.contains("You can ask me to continue"));
-        // No bullet points when empty
-        assert!(!result.contains("- "));
-    }
-
-    #[test]
-    fn test_format_step_exceeded_fallback_few_summaries() {
-        let summaries = vec![
-            ToolCallSummary {
-                step: 0,
-                name: "search_memory".to_string(),
-                input_summary: "query".to_string(),
-                output_summary: "found 3 results".to_string(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 1,
-                name: "run_shell".to_string(),
-                input_summary: "ls".to_string(),
-                output_summary: "error".to_string(),
-                success: false,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 2,
-                name: "read_file".to_string(),
-                input_summary: "/tmp/test".to_string(),
-                output_summary: "contents".to_string(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-        let result = format_step_exceeded_fallback(&summaries);
-        assert!(result.contains("- search_memory (done)"));
-        assert!(result.contains("- run_shell (failed)"));
-        assert!(result.contains("- read_file (done)"));
-        assert!(result.contains("You can ask me to continue"));
-    }
-
-    #[test]
-    fn test_format_step_exceeded_fallback_truncates_to_last_five() {
-        let summaries: Vec<ToolCallSummary> = (0..10)
-            .map(|i| ToolCallSummary {
-                step: i,
-                name: format!("tool_{i}"),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            })
-            .collect();
-        let result = format_step_exceeded_fallback(&summaries);
-        // Should only show last 5 (tool_5 through tool_9)
-        assert!(!result.contains("tool_0"));
-        assert!(!result.contains("tool_4"));
-        assert!(result.contains("tool_5"));
-        assert!(result.contains("tool_9"));
-    }
-
-    // -- format_callback_framing tests --
-
-    #[test]
-    fn test_format_callback_framing_completed() {
-        let result =
-            format_callback_framing("analyze_code", "task-123", None, "Analysis complete", false);
-        assert!(result.contains("A background task has completed."));
-        assert!(result.contains("analyze_code"));
-        assert!(result.contains("task-123"));
-        assert!(result.contains("Analysis complete"));
-        assert!(result.contains("<callback_result trust=\"untrusted\">"));
-        assert!(!result.contains("FAILED"));
-    }
-
-    #[test]
-    fn test_format_callback_framing_failed() {
-        let result = format_callback_framing(
-            "run_pilot",
-            "task-456",
-            None,
-            "Process exited with code 128: fatal error",
-            true,
-        );
-        assert!(result.contains("A background task has FAILED."));
-        assert!(result.contains("run_pilot"));
-        assert!(result.contains("task-456"));
-        assert!(result.contains("Process exited with code 128: fatal error"));
-        assert!(result.contains("<callback_result trust=\"untrusted\">"));
-        assert!(!result.contains("has completed"));
-    }
-
-    #[test]
-    fn test_format_callback_framing_short_result_not_truncated() {
-        let short = "a".repeat(crate::planning::policy::CALLBACK_RESULT_MAX_BYTES);
-        let result = format_callback_framing("task", "id-1", None, &short, false);
-        assert!(result.contains(&short));
-        assert!(!result.contains("[truncated"));
-    }
-
-    #[test]
-    fn test_format_callback_framing_long_result_truncated() {
-        let long = "x".repeat(crate::planning::policy::CALLBACK_RESULT_MAX_BYTES + 5000);
-        let result = format_callback_framing("task", "id-2", None, &long, false);
-        assert!(!result.contains(&long));
-        assert!(result.contains("[truncated — full result available in task logs]"));
-        // The truncated content should be present (up to the cut boundary)
-        let suffix_len = "\n...\n[truncated — full result available in task logs]".len();
-        let prefix = &"x".repeat(crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - suffix_len);
-        assert!(result.contains(prefix));
-    }
-
-    #[test]
-    fn test_format_callback_framing_truncation_utf8_safe() {
-        // Place a 4-byte emoji so it straddles the cut point, forcing the
-        // char-boundary walk-back loop to execute.
-        // cut = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - suffix_len ≈ 10_185
-        // Emoji at byte (cut-1) spans (cut-1)..(cut+2), so cut lands mid-emoji.
-        let suffix_len = "\n...\n[truncated — full result available in task logs]".len();
-        let cut = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - suffix_len;
-        let mut s = "a".repeat(cut - 1); // one byte before the cut point
-        s.push('🦀'); // 4-byte char that straddles the cut boundary
-        // Pad with enough trailing data to exceed crate::planning::policy::CALLBACK_RESULT_MAX_BYTES
-        let pad = crate::planning::policy::CALLBACK_RESULT_MAX_BYTES - s.len() + 1;
-        s.push_str(&"z".repeat(pad));
-        assert!(s.len() > crate::planning::policy::CALLBACK_RESULT_MAX_BYTES);
-        let result = format_callback_framing("task", "id-3", None, &s, true);
-        assert!(result.contains("[truncated"));
-        // The emoji should NOT be in the output (it was at the boundary)
-        assert!(!result.contains('🦀'));
-        // Content up to the emoji should be preserved
-        assert!(result.contains(&"a".repeat(cut - 1)));
-    }
-
-    #[test]
-    fn test_format_callback_framing_includes_grounding_instruction() {
-        let result = format_callback_framing(
-            "build_code",
-            "task-789",
-            None,
-            "Compilation succeeded",
-            false,
-        );
-        assert!(result.contains("Report only what this result explicitly states"));
-        assert!(result.contains("Do not infer the state of any system, artifact, or process"));
-    }
-
-    // -- Callback trigger context tests (#313) --
-
-    #[test]
-    fn test_callback_trigger_generic_framing_for_all_labels() {
-        // All callbacks — including claude-pilot — get the same generic framing.
-        // Workflow-specific behavior is driven by active skill prompts. See #313.
-        for label in [
-            "long_running:run_claude_pilot",
-            "long_running:run_shell",
-            "long_running:custom_task",
-        ] {
-            let ctx = build_callback_trigger_context(label, "task-001", None, "Result text", false);
-            assert!(
-                ctx.contains("Follow the workflow defined by your active skills"),
-                "label={label}: missing generic skill delegation instruction"
-            );
-            assert!(
-                ctx.contains("NEVER extrapolate to downstream states"),
-                "label={label}: missing grounding instruction"
-            );
-        }
-    }
-
-    #[test]
-    fn test_callback_trigger_failed_uses_generic_framing() {
-        let ctx = build_callback_trigger_context(
-            "long_running:run_shell",
-            "task-002",
-            None,
-            "Script failed",
-            true,
-        );
-        // Generic framing for failed callbacks
-        assert!(ctx.contains("Follow the workflow defined by your active skills"));
-        // The base framing indicates FAILED
-        assert!(ctx.contains("FAILED"));
-    }
-
-    #[test]
-    fn test_callback_framing_with_parent_task_id() {
-        let ctx = build_callback_trigger_context(
-            "long_running:run_claude_pilot",
-            "task-003",
-            Some("wi-parent-uuid-123"),
-            "PR created: https://github.com/example/repo/pull/42",
-            false,
-        );
-        assert!(ctx.contains("Parent task: wi-parent-uuid-123"));
-        assert!(ctx.contains("Task: 'long_running:run_claude_pilot' (ID: task-003)"));
-    }
-
-    #[test]
-    fn test_callback_framing_without_parent_task_id() {
-        let ctx = build_callback_trigger_context(
-            "long_running:run_shell",
-            "task-004",
-            None,
-            "Script completed",
-            false,
-        );
-        assert!(!ctx.contains("Parent task"));
-        assert!(ctx.contains("Task: 'long_running:run_shell' (ID: task-004)"));
-    }
-
-    #[test]
-    fn test_callback_framing_parent_task_id_with_failed() {
-        let ctx = build_callback_trigger_context(
-            "long_running:run_claude_pilot",
-            "task-005",
-            Some("wi-parent-uuid-456"),
-            "Error: cargo build failed",
-            true,
-        );
-        // Parent line still present even when the callback failed
-        assert!(ctx.contains("Parent task: wi-parent-uuid-456"));
-        assert!(ctx.contains("FAILED"));
-    }
-
-    // -- Task health injection guard tests (#314) --
-
-    #[test]
-    fn test_task_health_guard_includes_heartbeat() {
-        let trigger = SilentTrigger::Heartbeat;
-        let should_inject = matches!(
-            &trigger,
-            SilentTrigger::Heartbeat
-                | SilentTrigger::Callback { .. }
-                | SilentTrigger::Reminder { .. }
-        );
-        assert!(
-            should_inject,
-            "Heartbeat trigger should receive task health"
-        );
-    }
-
-    #[test]
-    fn test_task_health_guard_includes_callback() {
-        let trigger = SilentTrigger::Callback {
-            task_id: "task-100".to_string(),
-            label: "long_running:run_claude_pilot".to_string(),
-            result: "PR created".to_string(),
-            failed: false,
-            parent_task_id: None,
-        };
-        let should_inject = matches!(
-            &trigger,
-            SilentTrigger::Heartbeat
-                | SilentTrigger::Callback { .. }
-                | SilentTrigger::Reminder { .. }
-        );
-        assert!(should_inject, "Callback trigger should receive task health");
-    }
-
-    #[test]
-    fn test_task_health_guard_includes_failed_callback() {
-        let trigger = SilentTrigger::Callback {
-            task_id: "task-101".to_string(),
-            label: "long_running:run_shell".to_string(),
-            result: "Script failed".to_string(),
-            failed: true,
-            parent_task_id: Some("wi-parent-101".to_string()),
-        };
-        let should_inject = matches!(
-            &trigger,
-            SilentTrigger::Heartbeat
-                | SilentTrigger::Callback { .. }
-                | SilentTrigger::Reminder { .. }
-        );
-        assert!(
-            should_inject,
-            "Failed callback trigger should also receive task health"
-        );
-    }
-
-    #[test]
-    fn test_task_health_guard_excludes_reflection() {
-        let trigger = SilentTrigger::Reflection;
-        let should_inject = matches!(
-            &trigger,
-            SilentTrigger::Heartbeat
-                | SilentTrigger::Callback { .. }
-                | SilentTrigger::Reminder { .. }
-        );
-        assert!(
-            !should_inject,
-            "Reflection trigger should NOT receive task health"
-        );
-    }
-
-    #[test]
-    fn test_task_health_guard_excludes_skill_run() {
-        let trigger = SilentTrigger::SkillRun {
-            skill_name: "web-search".to_string(),
-        };
-        let should_inject = matches!(
-            &trigger,
-            SilentTrigger::Heartbeat
-                | SilentTrigger::Callback { .. }
-                | SilentTrigger::Reminder { .. }
-        );
-        assert!(
-            !should_inject,
-            "SkillRun trigger should NOT receive task health"
-        );
-    }
-
-    #[test]
-    fn test_task_health_guard_includes_reminder() {
-        let trigger = SilentTrigger::Reminder {
-            task_id: "task-200".to_string(),
-            message: "Check CI status".to_string(),
-        };
-        let should_inject = matches!(
-            &trigger,
-            SilentTrigger::Heartbeat
-                | SilentTrigger::Callback { .. }
-                | SilentTrigger::Reminder { .. }
-        );
-        assert!(should_inject, "Reminder trigger should receive task health");
-    }
-
-    // -- collect_required_tools tests (#270, #463) --
-
-    #[test]
-    fn test_collect_required_tools_empty_when_no_constraints() {
-        let s1 = make_skill_entry("search", 30, &["web_search"]);
-        let s2 = make_skill_entry("calc", 10, &["calculate"]);
-        let matched = vec![
-            MatchedSkill {
-                entry: &s1,
-                reason: MatchReason::Keyword,
-            },
-            MatchedSkill {
-                entry: &s2,
-                reason: MatchReason::Keyword,
-            },
-        ];
-        let required = collect_required_tools(&matched, "");
-        assert!(required.is_empty());
-    }
-
-    #[test]
-    fn test_collect_required_tools_union_across_keyword_matched_skills() {
-        // Two keyword-matched skills with different required_tools — result is the union
-        let s1 = make_skill_entry_with_constraints("qa-review", 30, &["run_gh"], &["run_gh"]);
-        let s2 = make_skill_entry_with_constraints(
-            "code-check",
-            30,
-            &["run_lint"],
-            &["run_lint", "run_gh"],
-        );
-        let matched = vec![
-            MatchedSkill {
-                entry: &s1,
-                reason: MatchReason::Keyword,
-            },
-            MatchedSkill {
-                entry: &s2,
-                reason: MatchReason::Keyword,
-            },
-        ];
-        let required = collect_required_tools(&matched, "");
-        assert_eq!(required.len(), 2);
-        assert!(required.contains("run_gh"));
-        assert!(required.contains("run_lint"));
-    }
-
-    #[test]
-    fn test_collect_required_tools_ignores_always_on_matched_skills() {
-        // Skill matched via always_on should NOT contribute required_tools (#463)
-        let s1 = make_skill_entry_with_constraints(
-            "self-dev",
-            30,
-            &["run_claude_pilot"],
-            &["run_claude_pilot"],
-        );
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::AlwaysOn,
-        }];
-        let required = collect_required_tools(&matched, "");
-        assert!(
-            required.is_empty(),
-            "always_on skills should not enforce required_tools"
-        );
-    }
-
-    #[test]
-    fn test_collect_required_tools_ignores_dependency_matched_skills() {
-        // Skill pulled in as a dependency should NOT contribute required_tools
-        let s1 = make_skill_entry_with_constraints(
-            "dev-pilot",
-            30,
-            &["run_claude_pilot"],
-            &["run_claude_pilot"],
-        );
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Dependency,
-        }];
-        let required = collect_required_tools(&matched, "");
-        assert!(
-            required.is_empty(),
-            "dependency skills should not enforce required_tools"
-        );
-    }
-
-    #[test]
-    fn test_collect_required_tools_keyword_match_on_always_on_skill_enforces() {
-        // When an always_on skill is matched via keyword, its required_tools ARE enforced
-        let s1 = make_skill_entry_with_constraints(
-            "self-dev",
-            30,
-            &["run_claude_pilot"],
-            &["run_claude_pilot"],
-        );
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Keyword,
-        }];
-        let required = collect_required_tools(&matched, "");
-        assert_eq!(required.len(), 1);
-        assert!(required.contains("run_claude_pilot"));
-    }
-
-    #[test]
-    fn test_collect_required_tools_mixed_reasons() {
-        // Mix of keyword and always_on matches — only keyword contributes
-        let s1 = make_skill_entry_with_constraints(
-            "self-dev",
-            30,
-            &["run_claude_pilot"],
-            &["run_claude_pilot"],
-        );
-        let s2 = make_skill_entry_with_constraints("qa-check", 30, &["run_tests"], &["run_tests"]);
-        let matched = vec![
-            MatchedSkill {
-                entry: &s1,
-                reason: MatchReason::AlwaysOn,
-            },
-            MatchedSkill {
-                entry: &s2,
-                reason: MatchReason::Keyword,
-            },
-        ];
-        let required = collect_required_tools(&matched, "");
-        assert_eq!(required.len(), 1);
-        assert!(required.contains("run_tests"));
-        assert!(!required.contains("run_claude_pilot"));
-    }
-
-    // -- mika#2363: what the per-turn skill restriction does to the output
-    //    contract (V4 / B2) --
-
-    /// The three mika-arch skills as the registry carries them: all `always_on`,
-    /// each declaring its own pass's suffix lines.
-    fn arch_skill(name: &str, suffix_lines: &[&str]) -> SkillEntry {
-        let mut entry = make_skill_entry(name, 30, &[]);
-        entry.manifest.skill.always_on = true;
-        entry.manifest.output.required_suffix_lines =
-            suffix_lines.iter().map(|s| s.to_string()).collect();
-        entry
-    }
-
-    fn groom_ticket_skill() -> SkillEntry {
-        arch_skill(
-            "mika-arch-groom-ticket",
-            &[
-                "Disposition: READY",
-                "Disposition: ITERATE",
-                "Disposition: ESCALATE",
-            ],
-        )
-    }
-
-    fn second_review_skill() -> SkillEntry {
-        arch_skill(
-            "mika-arch-second-review",
-            &["Verdict: GROOMED", "Verdict: ESCALATE"],
-        )
-    }
-
-    #[test]
-    fn mika2363_unrestricted_arch_turn_accepts_both_verdict_families() {
-        // The pre-mika#2363 state, asserted so the narrowing below is a measured
-        // change and not a coincidence. A first-pass turn could satisfy the
-        // suffix-line guard by emitting `Verdict: GROOMED` — a contract
-        // `_parse_disposition` does not read, which surfaces as UNPARSED.
-        let a = groom_ticket_skill();
-        let b = second_review_skill();
-        let matched = vec![
-            MatchedSkill {
-                entry: &a,
-                reason: MatchReason::AlwaysOn,
-            },
-            MatchedSkill {
-                entry: &b,
-                reason: MatchReason::AlwaysOn,
-            },
-        ];
-
-        let accepted = collect_required_suffix_lines(&matched);
-        assert_eq!(accepted.len(), 5);
-        assert!(accepted.contains(&"Verdict: GROOMED".to_string()));
-        assert!(accepted.contains(&"Disposition: READY".to_string()));
-    }
-
-    #[test]
-    fn mika2363_a_restricted_turn_accepts_only_its_own_pass_contract() {
-        // After the restriction the matched set is the single declared pass —
-        // `skills::tests::mika2363_only_skills_narrows_the_matched_set_to_one`
-        // asserts that half. This is the consequence on the output contract: the
-        // accept-set is the running pass's, and the sister family is gone.
-        //
-        // B2 calls this a **tightening**, and it is the one behaviour change to
-        // watch post-deploy: a model that used to satisfy the guard with the
-        // wrong family now costs one corrective re-prompt instead of passing.
-        let a = groom_ticket_skill();
-        let matched = vec![MatchedSkill {
-            entry: &a,
-            reason: MatchReason::AlwaysOn,
-        }];
-
-        let accepted = collect_required_suffix_lines(&matched);
-        assert_eq!(
-            accepted,
-            vec![
-                "Disposition: READY".to_string(),
-                "Disposition: ITERATE".to_string(),
-                "Disposition: ESCALATE".to_string(),
-            ]
-        );
-        assert!(
-            !accepted.iter().any(|l| l.starts_with("Verdict:")),
-            "the second-pass contract must not be accepted on a first-pass turn"
-        );
-    }
-
-    #[test]
-    fn mika2363_escalation_still_has_a_declared_target_under_restriction() {
-        // `escalate_unattested_disposition` withdraws a non-terminal disposition
-        // into the ESCALATE *of its own family*, and refuses when that line is
-        // not declared. Narrowing the accept-set could have removed the target
-        // and silently disarmed the mika#2037 fail-visible path, so both
-        // restricted shapes are checked here rather than assumed.
-        for (entry, withdrawn, expected) in [
-            (
-                groom_ticket_skill(),
-                "Disposition: READY",
-                "Disposition: ESCALATE",
-            ),
-            (
-                second_review_skill(),
-                "Verdict: GROOMED",
-                "Verdict: ESCALATE",
-            ),
-        ] {
-            let matched = vec![MatchedSkill {
-                entry: &entry,
-                reason: MatchReason::AlwaysOn,
-            }];
-            let accepted = collect_required_suffix_lines(&matched);
-            assert!(
-                accepted.contains(&expected.to_string()),
-                "{withdrawn} must still have a declared ESCALATE target after restriction"
-            );
-        }
-    }
-
-    // -- collect_required_tools pre-fetch augmentation tests (#863) --
-
-    /// Like `make_skill_entry_with_constraints` but also sets the pre-fetch opt-in flag.
-    fn make_skill_entry_with_pre_fetch(
-        name: &str,
-        timeout: u64,
-        tool_names: &[&str],
-        required_tools: &[&str],
-        pre_fetch: bool,
-    ) -> SkillEntry {
-        let mut entry =
-            make_skill_entry_with_constraints(name, timeout, tool_names, required_tools);
-        entry
-            .manifest
-            .constraints
-            .required_fetches_for_quoted_resources = pre_fetch;
-        entry
-    }
-
-    #[test]
-    fn test_collect_required_tools_pre_fetch_augments_on_quoted_issue() {
-        // Skill with pre-fetch opt-in, user message contains quoted issue body
-        let s1 =
-            make_skill_entry_with_pre_fetch("arch-review", 30, &["gh_read"], &["gh_read"], true);
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Keyword,
-        }];
-        let msg = "Review this plan:\n\nissue/788\n```\nThe issue body here.\n```\n";
-        let required = collect_required_tools(&matched, msg);
-        assert!(
-            required.contains("gh_read"),
-            "gh_read should be in required set (static + augmented)"
-        );
-    }
-
-    #[test]
-    fn test_collect_required_tools_pre_fetch_no_augment_on_plain_prose() {
-        // Skill with pre-fetch opt-in, but user message has no fenced content
-        let s1 =
-            make_skill_entry_with_pre_fetch("arch-review", 30, &["gh_read"], &["gh_read"], true);
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Keyword,
-        }];
-        let msg = "Review plan for #788. Check issue #654 too.";
-        let required = collect_required_tools(&matched, msg);
-        // gh_read is still in required set from static required_tools
-        assert!(required.contains("gh_read"));
-        // But the augmentation didn't add anything additional
-        assert_eq!(required.len(), 1);
-    }
-
-    #[test]
-    fn test_collect_required_tools_pre_fetch_skipped_for_always_on() {
-        // AlwaysOn skill with pre-fetch opt-in should NOT trigger augmentation
-        let s1 =
-            make_skill_entry_with_pre_fetch("arch-review", 30, &["gh_read"], &["gh_read"], true);
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::AlwaysOn,
-        }];
-        let msg = "Review this:\n\nissue/788\n```\nThe issue body.\n```\n";
-        let required = collect_required_tools(&matched, msg);
-        // AlwaysOn doesn't contribute any required_tools at all (#463)
-        assert!(
-            required.is_empty(),
-            "AlwaysOn skills should not enforce required_tools or pre-fetch"
-        );
-    }
-
-    #[test]
-    fn test_collect_required_tools_pre_fetch_disabled_by_default() {
-        // Skill WITHOUT pre-fetch opt-in — quoted resources do not augment
-        let s1 = make_skill_entry_with_pre_fetch("qa-review", 30, &["run_gh"], &["run_gh"], false);
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Keyword,
-        }];
-        let msg = "Review this:\n\nissue/788\n```\nThe issue body.\n```\n";
-        let required = collect_required_tools(&matched, msg);
-        // Only static required_tools, no augmentation
-        assert_eq!(required.len(), 1);
-        assert!(required.contains("run_gh"));
-    }
-
-    // -- filter_available_required_tools tests (#516, #517) --
-
-    fn make_resolved_skill_tool(name: &str) -> ResolvedSkillTool {
-        ResolvedSkillTool {
-            definition: ToolDefinition {
-                name: name.to_string(),
-                description: format!("{name} tool"),
-                input_schema: serde_json::json!({"type": "object"}),
-            },
-            handler: ToolHandler::Builtin {
-                function: name.to_string(),
-            },
-            skill_dir: PathBuf::from("/skills/test"),
-        }
-    }
-
-    /// Create a ToolRegistry with a single dummy builtin tool named `name`.
-    fn make_registry_with_tool(name: &'static str) -> ToolRegistry {
-        struct DummyBuiltin(&'static str);
-        #[async_trait::async_trait]
-        impl crate::tools::Tool for DummyBuiltin {
-            fn name(&self) -> &str {
-                self.0
-            }
-            fn definition(&self) -> ToolDefinition {
-                ToolDefinition {
-                    name: self.0.to_string(),
-                    description: format!("{} tool", self.0),
-                    input_schema: serde_json::json!({"type": "object"}),
-                }
-            }
-            async fn execute(
-                &self,
-                _input: serde_json::Value,
-                _ctx: &crate::tools::ToolContext<'_>,
-            ) -> Result<crate::tools::ToolOutput> {
-                Ok(crate::tools::ToolOutput::success("ok"))
-            }
-        }
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(DummyBuiltin(name)));
-        registry
-    }
-
-    #[test]
-    fn test_filter_available_required_tools_keeps_builtin() {
-        let tools = make_registry_with_tool("run_gh");
-        let required: HashSet<String> = ["run_gh".to_string()].into();
-        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
-        assert_eq!(filtered.len(), 1);
-        assert!(filtered.contains("run_gh"));
-    }
-
-    #[test]
-    fn test_filter_available_required_tools_removes_unavailable() {
-        let tools = ToolRegistry::new();
-        let required: HashSet<String> = ["run_shell".to_string(), "nonexistent".to_string()].into();
-        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
-        assert!(
-            filtered.is_empty(),
-            "unavailable tools should be filtered out"
-        );
-    }
-
-    #[test]
-    fn test_filter_available_required_tools_keeps_skill_tools() {
-        let tools = ToolRegistry::new();
-        let skill_tool = make_resolved_skill_tool("qa_pr_review");
-        let mut skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        skill_map.insert("qa_pr_review".to_string(), &skill_tool);
-
-        let required: HashSet<String> = ["qa_pr_review".to_string()].into();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
-        assert_eq!(filtered.len(), 1);
-        assert!(filtered.contains("qa_pr_review"));
-    }
-
-    #[test]
-    fn test_filter_available_required_tools_mixed() {
-        // Mix of available (builtin) and unavailable tools — only available kept
-        let tools = make_registry_with_tool("run_gh");
-        let required: HashSet<String> = ["run_gh".to_string(), "run_shell".to_string()].into();
-        let skill_map: HashMap<String, &ResolvedSkillTool> = HashMap::new();
-        let filtered = filter_available_required_tools(&required, &tools, &skill_map, None);
-        assert_eq!(filtered.len(), 1);
-        assert!(filtered.contains("run_gh"));
-        assert!(
-            !filtered.contains("run_shell"),
-            "unavailable run_shell should be filtered out"
-        );
-    }
-
-    // -- resolve_skill_llm_override tests (#463) --
-
-    fn make_skill_entry_with_llm(
-        name: &str,
-        provider: Option<&str>,
-        model: Option<&str>,
-    ) -> SkillEntry {
-        use crate::skills::manifest::LlmOverride;
-        let mut entry = make_skill_entry(name, 30, &[]);
-        entry.manifest.llm = LlmOverride {
-            provider: provider.map(String::from),
-            model: model.map(String::from),
-            from_db_override: false,
-        };
-        entry
-    }
-
-    /// Like `make_skill_entry_with_llm` but marks the LLM override as DB-sourced
-    /// (simulates `apply_overrides()` having written `skill_overrides` DB rows).
-    fn make_skill_entry_with_db_llm(
-        name: &str,
-        provider: Option<&str>,
-        model: Option<&str>,
-    ) -> SkillEntry {
-        use crate::skills::manifest::LlmOverride;
-        let mut entry = make_skill_entry(name, 30, &[]);
-        entry.manifest.llm = LlmOverride {
-            provider: provider.map(String::from),
-            model: model.map(String::from),
-            from_db_override: true,
-        };
-        entry
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_returns_none_for_empty_matched() {
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("anthropic")
-            .model_name("claude-sonnet-4-6")
-            .build();
-        let matched: Vec<MatchedSkill<'_>> = vec![];
-        assert!(resolve_skill_llm_override(&matched, None, &mock, false).is_none());
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_ignores_always_on_skills() {
-        // always_on skill with [llm] should NOT impose override (#463)
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("x-ai/grok-4.1-fast")
-            .build();
-        let s1 = make_skill_entry_with_llm(
-            "self-dev",
-            Some("openrouter"),
-            Some("qwen/qwen3-coder-plus"),
-        );
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::AlwaysOn,
-        }];
-        assert!(
-            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
-            "always_on skills should not impose [llm] override"
-        );
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_ignores_dependency_skills() {
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("x-ai/grok-4.1-fast")
-            .build();
-        let s1 =
-            make_skill_entry_with_llm("dev-pilot", Some("anthropic"), Some("claude-sonnet-4-6"));
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Dependency,
-        }];
-        assert!(
-            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
-            "dependency skills should not impose [llm] override"
-        );
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_mixed_reasons_only_keyword_considered() {
-        // always_on skill with [llm] + keyword skill without [llm] → no override
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("x-ai/grok-4.1-fast")
-            .build();
-        let s1 = make_skill_entry_with_llm(
-            "self-dev",
-            Some("openrouter"),
-            Some("qwen/qwen3-coder-plus"),
-        );
-        let s2 = make_skill_entry("skill-review", 30, &["review_skill"]);
-        let matched = vec![
-            MatchedSkill {
-                entry: &s1,
-                reason: MatchReason::AlwaysOn,
-            },
-            MatchedSkill {
-                entry: &s2,
-                reason: MatchReason::Keyword,
-            },
-        ];
-        // skill-review has no [llm], self-dev is AlwaysOn → no override
-        assert!(
-            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
-            "only keyword-matched skills with [llm] should produce an override"
-        );
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_keyword_match_on_always_on_skill_applies() {
-        // When an always_on skill is matched via keyword, its [llm] IS considered
-        // (MatchReason is Keyword when keyword hit on an always_on skill)
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("x-ai/grok-4.1-fast")
-            .build();
-        let s1 = make_skill_entry_with_llm(
-            "self-dev",
-            Some("openrouter"),
-            Some("qwen/qwen3-coder-plus"),
-        );
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Keyword, // keyword hit on always_on skill → Keyword wins
-        }];
-        // Should attempt override — will return None because Settings is None,
-        // but the important thing is it doesn't return None at the "no overrides" early exit.
-        // We verify by checking overrides were collected (Settings absence causes the fallback path).
-        let result = resolve_skill_llm_override(&matched, None, &mock, false);
-        // Without Settings, can't construct provider — returns None via the "requires Settings" path.
-        // But the function got past the "overrides.is_empty()" check, proving keyword was considered.
-        assert!(result.is_none()); // Expected: Settings=None means it can't construct
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_same_provider_short_circuit() {
-        // Keyword skill with [llm] matching the active provider → returns None (no-op)
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("qwen/qwen3-coder-plus")
-            .build();
-        let s1 = make_skill_entry_with_llm(
-            "qa-review",
-            Some("openrouter"),
-            Some("qwen/qwen3-coder-plus"),
-        );
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Keyword,
-        }];
-        assert!(
-            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
-            "same provider+model should short-circuit to None"
-        );
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_always_on_with_db_override_applies() {
-        // AlwaysOn skill with DB-sourced LLM override SHOULD impose override (mika#1011).
-        // The operator set this via `mika skills llm set` — it represents explicit intent.
-        // Simulates: mika-dev's self-dev skill with DB override to anthropic/claude-sonnet-4-6
-        // on a webhook turn where self-dev matches as AlwaysOn (no keyword hit).
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("moonshotai")
-            .model_name("kimi-k2.5")
-            .build();
-        let s1 =
-            make_skill_entry_with_db_llm("self-dev", Some("anthropic"), Some("claude-sonnet-4-6"));
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::AlwaysOn,
-        }];
-        // Should attempt override — will return None because Settings is None,
-        // but the important thing is it gets past the "overrides.is_empty()" check.
-        // Without Settings, can't construct provider — returns None via the "requires Settings" path.
-        let result = resolve_skill_llm_override(&matched, None, &mock, false);
-        assert!(result.is_none()); // Expected: Settings=None means it can't construct
-        // The real verification is that this does NOT return None at the early
-        // "overrides.is_empty()" exit — same pattern as the keyword test above.
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_always_on_without_db_override_still_ignored() {
-        // Regression guard for #463: AlwaysOn skill with [llm] from skill.toml
-        // (from_db_override = false) should still NOT impose override.
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("x-ai/grok-4.1-fast")
-            .build();
-        let s1 = make_skill_entry_with_llm(
-            "self-dev",
-            Some("openrouter"),
-            Some("qwen/qwen3-coder-plus"),
-        );
-        // Verify from_db_override is false (developer-time source)
-        assert!(!s1.manifest.llm.from_db_override);
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::AlwaysOn,
-        }];
-        assert!(
-            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
-            "AlwaysOn with non-DB [llm] should not impose override (#463 regression guard)"
-        );
-    }
-
-    #[test]
-    fn test_resolve_skill_llm_override_dependency_with_db_override_still_ignored() {
-        // Dependency-matched skills should NEVER impose override, even with DB source.
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("openrouter")
-            .model_name("x-ai/grok-4.1-fast")
-            .build();
-        let s1 =
-            make_skill_entry_with_db_llm("dev-pilot", Some("anthropic"), Some("claude-sonnet-4-6"));
-        let matched = vec![MatchedSkill {
-            entry: &s1,
-            reason: MatchReason::Dependency,
-        }];
-        assert!(
-            resolve_skill_llm_override(&matched, None, &mock, false).is_none(),
-            "dependency skills with DB override should still not impose [llm] override"
-        );
-    }
-
-    /// mika#1217 / mika#1011 — override-scope contract for SilentTrigger::Callback
-    /// and SilentTrigger::DeferredDispatch.
-    ///
-    /// Silent-mode trigger semantics for AlwaysOn + DB-sourced LLM overrides: the
-    /// matched-skill set returned by `callback_safe_skills()` is wrapped with
-    /// `MatchReason::AlwaysOn`. Under the mika#1011 carve-out, an AlwaysOn skill
-    /// with `from_db_override = true` MUST qualify for override resolution —
-    /// otherwise the autonomous-loop callback turn runs on the agent's base
-    /// model instead of the operator-set per-skill override (e.g., mika-dev
-    /// base = kimi-k2.5, self-dev override = sonnet-4-6).
-    ///
-    /// This test exercises both `SilentTrigger::Callback` and
-    /// `SilentTrigger::DeferredDispatch` shapes via the matched-skill construction
-    /// they share (`callback_safe_skills`). The carve-out fires identically.
-    ///
-    /// Note (mika#1217 F3): `run_silent_inner` does not currently invoke
-    /// `resolve_skill_llm_override` on the silent path. The carve-out shape is
-    /// correct at the function level (this test verifies that); the call-site
-    /// wiring is the residual gap. Tracked in the follow-up ticket cited in the
-    /// mika#1217 PR description.
-    #[test]
-    fn test_resolve_skill_llm_override_silent_callback_and_deferred_dispatch_carve_out() {
-        use mika_common::llm::mock::MockLlmProvider;
-        let mock = MockLlmProvider::builder()
-            .provider_name("moonshotai")
-            .model_name("kimi-k2.5")
-            .build();
-        let self_dev =
-            make_skill_entry_with_db_llm("self-dev", Some("anthropic"), Some("claude-sonnet-4-6"));
-
-        // Shape A — SilentTrigger::Callback: matched set wraps callback_safe_skills
-        // with MatchReason::AlwaysOn. The carve-out must qualify the entry.
-        let matched_callback = vec![MatchedSkill {
-            entry: &self_dev,
-            reason: MatchReason::AlwaysOn,
-        }];
-        let qualifies_callback = matched_callback.iter().any(|ms| match ms.reason {
-            MatchReason::Keyword => true,
-            MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
-            MatchReason::Dependency => false,
-        });
-        assert!(
-            qualifies_callback,
-            "Callback turn: AlwaysOn skill with from_db_override=true must qualify for override"
-        );
-        // Resolution returns None because Settings is None (cannot construct provider),
-        // but the early-exit at overrides.is_empty() is NOT taken — proving the
-        // carve-out lets the entry through.
-        let _ = resolve_skill_llm_override(&matched_callback, None, &mock, false);
-
-        // Shape B — SilentTrigger::DeferredDispatch: identical matched-skill
-        // construction to Callback. Same carve-out behavior expected.
-        let matched_deferred = vec![MatchedSkill {
-            entry: &self_dev,
-            reason: MatchReason::AlwaysOn,
-        }];
-        let qualifies_deferred = matched_deferred.iter().any(|ms| match ms.reason {
-            MatchReason::Keyword => true,
-            MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
-            MatchReason::Dependency => false,
-        });
-        assert!(
-            qualifies_deferred,
-            "DeferredDispatch turn: AlwaysOn skill with from_db_override=true must qualify for override"
-        );
-        let _ = resolve_skill_llm_override(&matched_deferred, None, &mock, false);
-
-        // Negative control — same skill without from_db_override (developer-time
-        // skill.toml [llm] source) must NOT qualify. #463 protection holds for
-        // both Callback and DeferredDispatch shapes.
-        let self_dev_dev_time =
-            make_skill_entry_with_llm("self-dev", Some("anthropic"), Some("claude-sonnet-4-6"));
-        let matched_dev_time = [MatchedSkill {
-            entry: &self_dev_dev_time,
-            reason: MatchReason::AlwaysOn,
-        }];
-        let qualifies_dev_time = matched_dev_time.iter().any(|ms| match ms.reason {
-            MatchReason::Keyword => true,
-            MatchReason::AlwaysOn => ms.entry.manifest.llm.from_db_override,
-            MatchReason::Dependency => false,
-        });
-        assert!(
-            !qualifies_dev_time,
-            "AlwaysOn skill without from_db_override (skill.toml [llm]) must NOT qualify (#463)"
-        );
-    }
-
-    // -- mika#1011: intent guard trigger prefix tests --
-
-    #[test]
-    fn test_callback_trigger_excludes_deferred_dispatch() {
-        // Regular callback should match
-        assert!(callback_trigger_active(
-            "[callback: long_running:run_claude_pilot]"
-        ));
-        // Deferred dispatch should NOT match callback_trigger_active
-        assert!(!callback_trigger_active(
-            "[callback:deferred-dispatch] [parent: task-123]"
-        ));
-    }
-
-    /// mika#2355 AC2 / AC9 — the #870 guard no longer arms on a build
-    /// callback, and still arms on every other `long_running` callback.
-    ///
-    /// `callback_trigger_active` is the ONE predicate both sites read — the
-    /// `INTENT_GUARDS` registry entry (non-empty text) and the inline
-    /// empty-text mirror — so asserting it here asserts both; the eval test
-    /// `test_qa_build_callback_verdict_2355` drives the production silent path
-    /// through each site end to end.
-    #[test]
-    fn mika2355_callback_terminal_action_is_carved_out_of_build_callbacks_only() {
-        assert!(
-            !callback_trigger_active("[callback: long_running:build_mika]"),
-            "a build callback owns no self_dev parent to mark terminal"
-        );
-        // The milestone suffix must not re-arm it either.
-        assert!(!callback_trigger_active(
-            "[callback: long_running:build_mika] [milestone-parent: abc]"
-        ));
-        // The five other long_running tools keep the #870 contract verbatim.
-        for tool in [
-            "run_claude_pilot",
-            "run_claude_pilot_groom",
-            "deploy_mika",
-            "address_pr_comments",
-            "resolve_pr_conflicts",
-        ] {
-            assert!(
-                callback_trigger_active(&format!("[callback: long_running:{tool}]")),
-                "{tool}: the #870 guard must still arm"
-            );
-        }
-        // Registry wiring: the entry's trigger IS this predicate, not a copy.
-        let entry = INTENT_GUARDS
-            .iter()
-            .find(|g| g.label == CALLBACK_TERMINAL_ACTION_LABEL)
-            .expect("the #870 entry exists");
-        assert!(!(entry.trigger)("[callback: long_running:build_mika]"));
-        assert!((entry.trigger)("[callback: long_running:run_claude_pilot]"));
-    }
-
-    /// mika#2355 AC3 / AC9 — the framing prescribes the self_dev terminal
-    /// contract to every callback EXCEPT a build callback, which is told what
-    /// its own contract is (a posted `run_gh pr review`).
-    #[test]
-    fn mika2355_build_callback_framing_does_not_prescribe_the_self_dev_contract() {
-        let build = build_callback_trigger_context(
-            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
-            "task-001",
-            None,
-            "Build succeeded",
-            false,
-        );
-        assert!(
-            !build.contains("This turn MUST end with both of the following"),
-            "build callback framing still prescribes update_task_status + send_message"
-        );
-        assert!(
-            !build.contains("mark the parent self_dev task terminal"),
-            "build callback framing still names a self_dev parent"
-        );
-        assert!(build.contains("`run_gh` call with `pr review`"));
-        assert!(build.contains("`VERDICT:`"));
-        // The grounding and skill-delegation lines are common to all flows.
-        assert!(build.contains("NEVER extrapolate to downstream states"));
-        assert!(build.contains("Follow the workflow defined by your active skills"));
-
-        for tool in [
-            "run_claude_pilot",
-            "run_claude_pilot_groom",
-            "deploy_mika",
-            "address_pr_comments",
-            "resolve_pr_conflicts",
-        ] {
-            let ctx = build_callback_trigger_context(
-                &format!("long_running:{tool}"),
-                "task-001",
-                None,
-                "Result text",
-                false,
-            );
-            assert!(
-                ctx.contains("This turn MUST end with both of the following"),
-                "{tool}: the self_dev terminal contract must be unchanged"
-            );
-            assert!(
-                ctx.contains("1. update_task_status") && ctx.contains("2. send_message"),
-                "{tool}: both terminal actions must still be named"
-            );
-            assert!(
-                !ctx.contains("This is a BUILD callback"),
-                "{tool}: must not receive the build-callback contract"
-            );
-        }
-    }
-
-    /// mika#2355 — the failure-verification instruction (#716) is orthogonal
-    /// to the flow: a FAILED build callback still gets it.
-    #[test]
-    fn mika2355_failed_build_callback_keeps_the_verification_instruction() {
-        let ctx = build_callback_trigger_context(
-            crate::qa_build_callback::BUILD_CALLBACK_LABEL,
-            "task-001",
-            None,
-            "Build failed",
-            true,
-        );
-        assert!(ctx.contains("This callback reported a FAILURE"));
-        assert!(ctx.contains("This is a BUILD callback"));
-    }
-
-    #[test]
-    fn test_deferred_dispatch_trigger_matches_correctly() {
-        assert!(deferred_dispatch_trigger(
-            "[callback:deferred-dispatch] [parent: task-123]"
-        ));
-        assert!(!deferred_dispatch_trigger(
-            "[callback: long_running:run_claude_pilot]"
-        ));
-        assert!(!deferred_dispatch_trigger("[heartbeat trigger]"));
-    }
-
-    #[test]
-    fn test_deferred_dispatch_satisfied_requires_run_claude_pilot() {
-        // No tools → not satisfied
-        assert!(!deferred_dispatch_satisfied(&[]));
-
-        // send_message only → not satisfied
-        assert!(!deferred_dispatch_satisfied(&[ToolCallSummary {
-            name: "send_message".to_string(),
-            input_summary: "".to_string(),
-            output_summary: "".to_string(),
-            success: true,
-            non_zero_exit: false,
-            step: 0,
-        }]));
-
-        // run_claude_pilot → satisfied (even if failed)
-        assert!(deferred_dispatch_satisfied(&[ToolCallSummary {
-            name: "run_claude_pilot".to_string(),
-            input_summary: "".to_string(),
-            output_summary: "".to_string(),
-            success: false,
-            non_zero_exit: false,
-            step: 0,
-        }]));
-    }
-
-    // mika#1173: regression tests asserting intent-guard satisfied predicates
-    // accept both run_claude_pilot AND run_claude_pilot_groom. The structural
-    // revert split grooming onto its own tool; without these guards updated,
-    // the auto-groom path on ready-label/milestone-cascade/deferred-replay
-    // would all fail at the EndTurn guard layer.
-    // (Reuses the `make_summary(name, output, success)` helper defined later in
-    // this test module; passing "" for output as these guards key on name+success.)
-
-    #[test]
-    fn test_ready_label_dispatch_satisfied_accepts_both_tools() {
-        assert!(!ready_label_dispatch_satisfied(&[]));
-        assert!(ready_label_dispatch_satisfied(&[make_summary(
-            "run_claude_pilot",
-            "",
-            true
-        )]));
-        assert!(ready_label_dispatch_satisfied(&[make_summary(
-            "run_claude_pilot_groom",
-            "",
-            true
-        )]));
-        // Failed attempts still count as "attempted" per the guard's contract.
-        assert!(ready_label_dispatch_satisfied(&[make_summary(
-            "run_claude_pilot_groom",
-            "",
-            false
-        )]));
-        assert!(!ready_label_dispatch_satisfied(&[make_summary(
-            "send_message",
-            "",
-            true
-        )]));
-    }
-
-    #[test]
-    fn test_deferred_dispatch_satisfied_accepts_groom_tool() {
-        assert!(deferred_dispatch_satisfied(&[make_summary(
-            "run_claude_pilot_groom",
-            "",
-            true
-        )]));
-        assert!(!deferred_dispatch_satisfied(&[make_summary(
-            "update_task_status",
-            "",
-            true
-        )]));
-    }
-
-    #[test]
-    fn test_callback_milestone_advance_satisfied_path_a_accepts_groom_tool() {
-        let parent_id = "abc-123";
-        // Path A: groom-tool advance.
-        assert!(callback_milestone_advance_satisfied(
-            parent_id,
-            &[make_summary("run_claude_pilot_groom", "", true)]
-        ));
-        // Path A: implement-tool advance still works.
-        assert!(callback_milestone_advance_satisfied(
-            parent_id,
-            &[make_summary("run_claude_pilot", "", true)]
-        ));
-        // Neither path → not satisfied.
-        assert!(!callback_milestone_advance_satisfied(
-            parent_id,
-            &[make_summary("send_message", "", true)]
-        ));
-    }
-
-    #[test]
-    fn test_webhook_no_unauthorized_dispatch_satisfied_rejects_both_tools() {
-        // No tools called → satisfied (no unauthorized dispatch).
-        assert!(webhook_no_unauthorized_dispatch_satisfied(&[]));
-        // Successful run_claude_pilot → unauthorized → NOT satisfied.
-        assert!(!webhook_no_unauthorized_dispatch_satisfied(&[
-            make_summary("run_claude_pilot", "", true)
-        ]));
-        // Successful run_claude_pilot_groom → also unauthorized → NOT satisfied.
-        assert!(!webhook_no_unauthorized_dispatch_satisfied(&[
-            make_summary("run_claude_pilot_groom", "", true)
-        ]));
-        // Failed dispatch attempts don't count (engine guards block them upstream).
-        assert!(webhook_no_unauthorized_dispatch_satisfied(&[make_summary(
-            "run_claude_pilot_groom",
-            "",
-            false
-        )]));
-    }
-
-    // -- detect_text_based_tool_call tests --
-
-    #[test]
-    fn test_detect_text_based_tool_call_function_tag() {
-        assert!(detect_text_based_tool_call(
-            "<function=search_memory>{\"query\":\"test\"}</function>"
-        ));
-    }
-
-    #[test]
-    fn test_detect_text_based_tool_call_tool_call_wrapper() {
-        assert!(detect_text_based_tool_call(
-            "<tool_call><function=search>{}</function></tool_call>"
-        ));
-    }
-
-    #[test]
-    fn test_detect_text_based_tool_call_plain_text() {
-        assert!(!detect_text_based_tool_call(
-            "I found some information about your meetings."
-        ));
-    }
-
-    #[test]
-    fn test_detect_text_based_tool_call_empty() {
-        assert!(!detect_text_based_tool_call(""));
-    }
-
-    #[test]
-    fn test_detect_text_based_tool_call_partial_tag() {
-        // Only opening tag without closing — should NOT trigger.
-        assert!(!detect_text_based_tool_call(
-            "Use <function=search_memory to find things"
-        ));
-    }
-
-    // -- detect_prose_style_tool_call tests (#569) --
-
-    /// Helper: build a tool name set from a slice of names.
-    fn tool_set(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_known_tool() {
-        let tools = tool_set(&["check_work_item"]);
-        assert_eq!(
-            detect_prose_style_tool_call(
-                r#"check_work_item({"task_id": "48cbb025-6d8e-430f-a957-9ce2e32800bb"})"#,
-                &tools,
-            ),
-            Some("check_work_item".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_whitespace_between_parens_and_brace() {
-        let tools = tool_set(&["search_memory"]);
-        assert_eq!(
-            detect_prose_style_tool_call(r#"search_memory( {"query": "test"} )"#, &tools,),
-            Some("search_memory".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_multiline_json() {
-        let tools = tool_set(&["store_fact"]);
-        let text = "store_fact(\n{\"key\": \"val\",\n\"key2\": \"val2\"}\n)";
-        assert_eq!(
-            detect_prose_style_tool_call(text, &tools),
-            Some("store_fact".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_unknown_identifier() {
-        let tools = tool_set(&["search_memory"]);
-        assert_eq!(
-            detect_prose_style_tool_call(r#"my_function({"key": "val"})"#, &tools,),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_empty_text() {
-        let tools = tool_set(&["search_memory"]);
-        assert_eq!(detect_prose_style_tool_call("", &tools), None);
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_parens_but_no_tool_pattern() {
-        let tools = tool_set(&["search_memory"]);
-        assert_eq!(
-            detect_prose_style_tool_call("I found some information (see details).", &tools,),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_tool_name_without_invocation() {
-        let tools = tool_set(&["check_work_item"]);
-        assert_eq!(
-            detect_prose_style_tool_call("Use check_work_item to verify the task status.", &tools,),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_generic_function_not_in_toolset() {
-        let tools = tool_set(&["search_memory"]);
-        assert_eq!(
-            detect_prose_style_tool_call(r#"Run my_func({"x": 1}) to test"#, &tools,),
-            None,
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_returns_first_match() {
-        let tools = tool_set(&["search_memory", "store_fact"]);
-        let text = r#"search_memory({"query": "a"}) and store_fact({"text": "b"})"#;
-        assert_eq!(
-            detect_prose_style_tool_call(text, &tools),
-            Some("search_memory".to_string()),
-        );
-    }
-
-    #[test]
-    fn test_detect_prose_tool_call_underscores_and_digits() {
-        let tools = tool_set(&["tool_v2"]);
-        assert_eq!(
-            detect_prose_style_tool_call(r#"tool_v2({"a": 1})"#, &tools),
-            Some("tool_v2".to_string()),
-        );
-    }
-
-    // -- detect_completion_claim tests (#483) --
-
-    #[test]
-    fn test_detect_completion_claim_merged() {
-        assert_eq!(
-            detect_completion_claim("PR merged successfully"),
-            Some("merged")
-        );
-    }
-
-    #[test]
-    fn test_detect_completion_claim_completed() {
-        assert_eq!(detect_completion_claim("Task completed"), Some("completed"));
-    }
-
-    #[test]
-    fn test_detect_completion_claim_complete() {
-        assert_eq!(
-            detect_completion_claim("The migration is complete"),
-            Some("complete")
-        );
-    }
-
-    #[test]
-    fn test_detect_completion_claim_deployed() {
-        assert_eq!(
-            detect_completion_claim("Successfully deployed to production"),
-            Some("deployed")
-        );
-    }
-
-    #[test]
-    fn test_detect_completion_claim_shipped() {
-        assert_eq!(
-            detect_completion_claim("Feature shipped in v2.1"),
-            Some("shipped")
-        );
-    }
-
-    #[test]
-    fn test_detect_completion_claim_case_insensitive() {
-        assert_eq!(detect_completion_claim("MERGED the PR"), Some("MERGED"));
-        assert_eq!(
-            detect_completion_claim("Successfully Deployed"),
-            Some("Deployed")
-        );
-    }
-
-    #[test]
-    fn test_detect_completion_claim_no_match_on_done() {
-        // "done" intentionally excluded — too many false positives
-        assert!(detect_completion_claim("I'm done analyzing").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_no_match_on_built() {
-        // "built" intentionally excluded — too many false positives
-        assert!(detect_completion_claim("I built a query for you").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_no_match_on_finished() {
-        assert!(detect_completion_claim("I finished the analysis").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_no_match_on_plain_text() {
-        assert!(detect_completion_claim("Here is the analysis result").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_no_match_on_substring() {
-        // "unmerged" should NOT match due to word boundary
-        assert!(detect_completion_claim("the unmerged changes").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_no_match_on_empty() {
-        assert!(detect_completion_claim("").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_word_boundary_redeployed() {
-        // "redeployed" contains "deployed" but word boundary should still match
-        // because "redeployed" has "deployed" at a word boundary after the prefix
-        // Actually regex \b matches between "re" and "deployed"? No — \bdeployed\b
-        // requires a word boundary before "deployed". In "redeployed", there's no
-        // boundary between "re" and "deployed", so it should NOT match.
-        assert!(detect_completion_claim("the service was redeployed").is_none());
-    }
-
-    #[test]
-    fn test_detect_completion_claim_in_sentence() {
-        assert_eq!(
-            detect_completion_claim("I've merged the PR and synced main. Everything looks good."),
-            Some("merged")
-        );
-    }
-
-    // -- detect_milestone_close_claim_without_patch tests (#797, #1207) --
-
-    /// Helper: build a ToolCallSummary for run_gh with the given input.
-    fn run_gh_summary(input: &str) -> ToolCallSummary {
-        ToolCallSummary {
-            step: 1,
-            name: "run_gh".to_string(),
-            input_summary: input.to_string(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_with_patch_passes() {
-        // First-person claim AND matching PATCH → returns None (no violation).
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
-        )];
-        assert!(
-            detect_milestone_close_claim_without_patch(
-                "I closed milestone#17 on GitHub",
-                &summaries,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_without_patch_caught() {
-        // First-person claim AND no PATCH argv → returns the matched keyword.
-        let summaries = vec![];
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed milestone#17, tasks reconciled, memory updated",
-            &summaries,
-        );
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("closed"));
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_case_insensitive() {
-        // "I CLOSED MILESTONE" caught regardless of case.
-        let summaries = vec![];
-        let result = detect_milestone_close_claim_without_patch(
-            "I CLOSED MILESTONE #17 successfully",
-            &summaries,
-        );
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_no_match_on_unrelated_close() {
-        // "PR closed" alone does NOT trigger — no first-person + milestone.
-        let summaries = vec![];
-        assert!(
-            detect_milestone_close_claim_without_patch("PR closed successfully", &summaries)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_readback_alone_not_sufficient() {
-        // Only readback argv (api ... --jq .state), no PATCH → still triggers.
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","/repos/senara-solutions/mika/milestones/17","--jq",".state"]}"#,
-        )];
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed milestone#17 on GitHub",
-            &summaries,
-        );
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_no_match_on_empty_text() {
-        let summaries = vec![];
-        assert!(detect_milestone_close_claim_without_patch("", &summaries).is_none());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_third_person_no_longer_matches() {
-        // #1207: third-person planning prose no longer triggers the guard.
-        // This replaces the old `_future_tense_overmatches_intentionally` test.
-        let summaries = vec![];
-        assert!(
-            detect_milestone_close_claim_without_patch(
-                "The milestone is ready to close now",
-                &summaries,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_planning_prose_no_match() {
-        // #1207: the incident text — mika-arch reviewing a brief about
-        // milestone workflows. Third-person planning shape must not fire.
-        let summaries = vec![];
-        assert!(detect_milestone_close_claim_without_patch(
-            "the plan proposes mika-dev call gh api PATCH /repos/owner/repo/milestones/789 to close the milestone",
-            &summaries,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_planning_prose_no_number_no_match() {
-        // #1207 C3b: third-person without API path or number.
-        let summaries = vec![];
-        assert!(
-            detect_milestone_close_claim_without_patch(
-                "the plan proposes mika-dev close the milestone after merge",
-                &summaries,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn test_dual_trigger_completion_and_milestone_close_both_detect() {
-        // When text contains both "completed" and first-person milestone claim,
-        // both detection functions fire — but the post-condition chain's
-        // sequential ordering means only #4 (completion-claim) fires first.
-        let text = "I completed milestone#17 and closed it";
-        let summaries: Vec<ToolCallSummary> = vec![];
-
-        // Completion-claim detector: fires on "completed".
-        assert!(detect_completion_claim(text).is_some());
-        // Milestone-close detector: fires on first-person "completed...milestone".
-        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
-    }
-
-    #[test]
-    fn test_milestone_close_fires_after_completion_claim_satisfied() {
-        // Agent called update_task_status (satisfies guard #4) but no PATCH.
-        let text = "I completed milestone#17 and closed it";
-        let summaries: Vec<ToolCallSummary> = vec![ToolCallSummary {
-            step: 1,
-            name: "update_task_status".to_string(),
-            input_summary: r#"{"task_id":"abc","status":"completed"}"#.to_string(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }];
-
-        assert!(detect_completion_claim(text).is_some());
-        // Milestone-close: still fires because no PATCH call in summaries.
-        assert!(detect_milestone_close_claim_without_patch(text, &summaries).is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_ive_form() {
-        // "I've closed" should match.
-        let summaries = vec![];
-        let result = detect_milestone_close_claim_without_patch(
-            "I've closed milestone#14 on GitHub",
-            &summaries,
-        );
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_we_form() {
-        // "We completed" should match.
-        let summaries = vec![];
-        let result = detect_milestone_close_claim_without_patch(
-            "We completed milestone#15 today",
-            &summaries,
-        );
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_weve_form() {
-        // "We've closed out" should match.
-        let summaries = vec![];
-        let result =
-            detect_milestone_close_claim_without_patch("We've closed out milestone#20", &summaries);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn test_detect_milestone_close_claim_closed_out_form() {
-        // "I closed out" should match.
-        let summaries = vec![];
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed out the milestone for mika#789",
-            &summaries,
-        );
-        assert!(result.is_some());
-    }
-
-    // -- extract_claimed_milestone_number tests (#1207) --
-
-    #[test]
-    fn test_extract_claimed_milestone_number_with_hash() {
-        assert_eq!(
-            extract_claimed_milestone_number("I closed milestone#14"),
-            Some(14)
-        );
-    }
-
-    #[test]
-    fn test_extract_claimed_milestone_number_without_hash() {
-        assert_eq!(
-            extract_claimed_milestone_number("I closed milestone 14"),
-            Some(14)
-        );
-    }
-
-    #[test]
-    fn test_extract_claimed_milestone_number_with_space_hash() {
-        assert_eq!(extract_claimed_milestone_number("milestone # 14"), Some(14));
-    }
-
-    #[test]
-    fn test_extract_claimed_milestone_number_no_number() {
-        assert_eq!(
-            extract_claimed_milestone_number("I closed the milestone"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_claimed_milestone_number_multiple_takes_first() {
-        assert_eq!(
-            extract_claimed_milestone_number("I closed milestone#14 not milestone#789"),
-            Some(14)
-        );
-    }
-
-    // -- PATCH set extraction tests (#1207) --
-
-    #[test]
-    fn test_patch_set_single_patch() {
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/17","-f","state=closed"]}"#,
-        )];
-        // Claim matches the PATCH number → suppressed.
-        assert!(
-            detect_milestone_close_claim_without_patch("I closed milestone#17", &summaries,)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_patch_set_multiple_patches() {
-        let summaries = vec![
-            run_gh_summary(
-                r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/14","-f","state=closed"]}"#,
-            ),
-            run_gh_summary(
-                r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/789","-f","state=closed"]}"#,
-            ),
-        ];
-        // Claimed #14, #14 is in the PATCH set → suppressed.
-        assert!(
-            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_patch_set_no_patches() {
-        let summaries = vec![];
-        // No patches, first-person claim → fires.
-        assert!(
-            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_patch_set_malformed_url_skipped() {
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/milestones/notanumber","-f","state=closed"]}"#,
-        )];
-        // Malformed URL doesn't contribute to PATCH set → fires.
-        assert!(
-            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_patch_set_non_milestones_path_skipped() {
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/o/r/issues/14","-f","state=closed"]}"#,
-        )];
-        // PATCH to issues, not milestones → fires.
-        assert!(
-            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
-                .is_some()
-        );
-    }
-
-    // -- Cross-milestone discrimination tests (#1207) --
-
-    #[test]
-    fn test_cross_milestone_claim_different_number_fires() {
-        // AC5 from #1207: claim milestone#14 but PATCH milestone#789 → fires.
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/789","-f","state=closed"]}"#,
-        )];
-        assert!(
-            detect_milestone_close_claim_without_patch("I closed milestone#14", &summaries,)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_no_number_claim_with_patch_suppressed() {
-        // Claim without number + any PATCH → suppressed (presence/absence fallback).
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/17","-f","state=closed"]}"#,
-        )];
-        assert!(
-            detect_milestone_close_claim_without_patch(
-                "I closed the milestone on GitHub",
-                &summaries,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn test_no_number_claim_without_patch_fires() {
-        // Claim without number + no PATCH → fires.
-        let summaries = vec![];
-        assert!(
-            detect_milestone_close_claim_without_patch(
-                "I closed the milestone on GitHub",
-                &summaries,
-            )
-            .is_some()
-        );
-    }
-
-    // -- parse_run_gh_milestone_close_argv unit tests (#1182) --
-
-    #[test]
-    fn test_parse_run_gh_milestone_close_argv_valid() {
-        let input =
-            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/42","-f","state=closed"]}"#;
-        assert_eq!(parse_run_gh_milestone_close_argv(input), Some(42));
-    }
-
-    #[test]
-    fn test_parse_run_gh_milestone_close_argv_not_api() {
-        let input = r#"{"command":["pr","comment","--body","text"]}"#;
-        assert_eq!(parse_run_gh_milestone_close_argv(input), None);
-    }
-
-    #[test]
-    fn test_parse_run_gh_milestone_close_argv_no_state_closed() {
-        // PATCH without state=closed should not match.
-        let input =
-            r#"{"command":["api","-X","PATCH","/repos/o/r/milestones/17","-f","title=new name"]}"#;
-        assert_eq!(parse_run_gh_milestone_close_argv(input), None);
-    }
-
-    #[test]
-    fn test_parse_run_gh_milestone_close_argv_truncated_json() {
-        // Truncated JSON should return None (graceful fallback).
-        let input = r#"{"command":["api","-X","PATCH","/repos/o/r/milest"#;
-        assert_eq!(parse_run_gh_milestone_close_argv(input), None);
-    }
-
-    #[test]
-    fn test_parse_run_gh_milestone_close_argv_long_method_flag() {
-        // "--method" is the long form of "-X" in gh api.
-        let input = r#"{"command":["api","--method","PATCH","/repos/o/r/milestones/17","-f","state=closed"]}"#;
-        assert_eq!(parse_run_gh_milestone_close_argv(input), Some(17));
-    }
-
-    // -- milestone-close guard hardening integration tests (#1182) --
-
-    #[test]
-    fn test_milestone_close_guard_substring_spoof_rejected() {
-        // A pr comment whose body contains all four substrings should NOT
-        // satisfy the guard — the PATCH is in the body text, not an actual
-        // api PATCH call.
-        let spoofed = run_gh_summary(
-            r#"{"command":["pr","comment","--body","closed via PATCH /repos/senara-solutions/mika/milestones/17 state=closed"]}"#,
-        );
-        let summaries = vec![spoofed];
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed milestone#17 on GitHub",
-            &summaries,
-        );
-        // Guard should fire — the spoof should not satisfy it.
-        assert!(
-            result.is_some(),
-            "substring spoof should not satisfy the guard"
-        );
-    }
-
-    #[test]
-    fn test_milestone_close_guard_cross_milestone_leakage() {
-        // PATCH for milestone#17 should NOT satisfy a claim about milestone#18.
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","-X","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
-        )];
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed milestone#18 on GitHub",
-            &summaries,
-        );
-        assert!(
-            result.is_some(),
-            "PATCH for #17 should not satisfy claim about #18"
-        );
-    }
-
-    #[test]
-    fn test_milestone_close_guard_truncated_input_still_resolves() {
-        // Build an argv where state=closed is beyond byte 200 (truncation boundary).
-        // The structured parse fails on truncated JSON, but the path and "PATCH"
-        // appear before byte 200, so the substring fallback extracts the number.
-        let long_org = "a".repeat(150); // Push state=closed past byte 200
-        let input = format!(
-            r#"{{"command":["api","-X","PATCH","/repos/{}/mika/milestones/17","-f","state=closed"]}}"#,
-            long_org
-        );
-        // Truncate to crate::planning::policy::INPUT_SUMMARY_MAX to simulate what ToolCallSummary does.
-        let truncated = crate::tool_execution::truncate_summary(
-            &input,
-            crate::planning::policy::INPUT_SUMMARY_MAX,
-        );
-        let summaries = vec![run_gh_summary(&truncated)];
-
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed milestone#17 on GitHub",
-            &summaries,
-        );
-        // If state=closed was truncated, substring fallback also fails →
-        // guard correctly fires (over-fire is the safe direction per the ticket).
-        // The key invariant: the guard does NOT stall — it either suppresses
-        // (if substring fallback finds a match) or fires (if not).
-        // With 150-char org name, state=closed is truncated away, so the guard fires.
-        assert!(
-            result.is_some(),
-            "truncated state=closed should cause guard to fire (safe direction)"
-        );
-    }
-
-    #[test]
-    fn test_milestone_close_guard_long_method_flag() {
-        // "--method" is the long form of "-X" in gh api.
-        let summaries = vec![run_gh_summary(
-            r#"{"command":["api","--method","PATCH","/repos/senara-solutions/mika/milestones/17","-f","state=closed"]}"#,
-        )];
-        assert!(
-            detect_milestone_close_claim_without_patch(
-                "I closed milestone#17 on GitHub",
-                &summaries,
-            )
-            .is_none(),
-            "--method PATCH should satisfy the guard"
-        );
-    }
-
-    #[test]
-    fn test_milestone_close_guard_non_json_fallback() {
-        // If input_summary is not valid JSON (e.g., pre-existing format or
-        // corruption), the substring fallback should still work.
-        let summaries = vec![run_gh_summary(
-            r#"api -X PATCH /repos/senara-solutions/mika/milestones/17 -f state=closed "api" "PATCH""#,
-        )];
-        // This is a non-JSON string that happens to contain the substring markers.
-        // The structured parse fails; the substring fallback should try to extract.
-        let result = detect_milestone_close_claim_without_patch(
-            "I closed milestone#17 on GitHub",
-            &summaries,
-        );
-        // Substring fallback finds "api", "PATCH", and "state=closed" as substrings,
-        // plus the milestone path regex matches. Should suppress the guard.
-        assert!(
-            result.is_none(),
-            "substring fallback should work for non-JSON input"
-        );
-    }
-
-    // -- Persistence evaluation guard detection tests (#648) --
-
-    #[test]
-    fn test_detect_informational_input_fyi() {
-        let result = detect_informational_input("FYI the deploy succeeded");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "FYI");
-    }
-
-    #[test]
-    fn test_detect_informational_input_heads_up() {
-        let result = detect_informational_input("Heads up — the CI pipeline is red");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "Heads up");
-    }
-
-    #[test]
-    fn test_detect_informational_input_diagnostic() {
-        let result = detect_informational_input("Running a diagnostic on the memory system");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "diagnostic");
-    }
-
-    #[test]
-    fn test_detect_informational_input_correction() {
-        let result = detect_informational_input("actually, the timeout is 30s not 60s");
-        assert!(result.is_some());
-        // trim_start() ensures no leading whitespace from the (?:^|\s) anchor
-        assert_eq!(result.unwrap(), "actually,");
-    }
-
-    #[test]
-    fn test_detect_informational_input_no_match() {
-        assert!(detect_informational_input("Can you fix the bug in the parser?").is_none());
-    }
-
-    #[test]
-    fn test_detect_informational_input_empty() {
-        assert!(detect_informational_input("").is_none());
-    }
-
-    #[test]
-    fn test_detect_persistable_output_root_cause() {
-        let result =
-            detect_persistable_output("The root cause was a connection timeout in the retry loop");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "root cause");
-    }
-
-    #[test]
-    fn test_detect_persistable_output_confirms() {
-        let result =
-            detect_persistable_output("This confirms the diagnosis — the issue was in the parser");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "This confirms");
-    }
-
-    #[test]
-    fn test_detect_persistable_output_validated() {
-        let result = detect_persistable_output("I validated that the fix works correctly");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "validated that");
-    }
-
-    #[test]
-    fn test_detect_persistable_output_lesson_learned() {
-        let result = detect_persistable_output("Key lesson learned: always check the return code");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "lesson learned");
-    }
-
-    #[test]
-    fn test_detect_persistable_output_no_match() {
-        assert!(detect_persistable_output("Here's the code change you requested").is_none());
-    }
-
-    #[test]
-    fn test_detect_persistable_output_future_tense_no_match() {
-        // "I'll verify" is future-tense — should not trigger
-        assert!(detect_persistable_output("I'll verify the fix later").is_none());
-    }
-
-    #[test]
-    fn test_detect_persistable_output_empty() {
-        assert!(detect_persistable_output("").is_none());
-    }
-
-    #[test]
-    fn test_detect_informational_input_incident_report() {
-        let result =
-            detect_informational_input("incident report: prod database was down for 5 min");
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), "incident report");
-    }
-
-    // -- is_terminal_tool_error tests --
-
-    #[test]
-    fn test_terminal_error_github_self_approval() {
-        assert!(is_terminal_tool_error(
-            "Exit code: 1\nGraphQL: Can not approve your own pull request"
-        ));
-    }
-
-    #[test]
-    fn test_terminal_error_github_self_review() {
-        assert!(is_terminal_tool_error(
-            "Exit code: 1\nYou can't review your own pull request"
-        ));
-    }
-
-    #[test]
-    fn test_terminal_error_http_404() {
-        assert!(is_terminal_tool_error("HTTP 404: Not Found"));
-    }
-
-    #[test]
-    fn test_terminal_error_http_403() {
-        assert!(is_terminal_tool_error("HTTP 403: Forbidden"));
-    }
-
-    #[test]
-    fn test_terminal_error_http_401() {
-        assert!(is_terminal_tool_error("HTTP 401: Unauthorized"));
-    }
-
-    #[test]
-    fn test_terminal_error_insufficient_permissions() {
-        assert!(is_terminal_tool_error(
-            "Exit code: 1\ninsufficient permissions for this resource"
-        ));
-    }
-
-    #[test]
-    fn test_terminal_error_resource_not_accessible() {
-        assert!(is_terminal_tool_error(
-            "Resource not accessible by integration"
-        ));
-    }
-
-    #[test]
-    fn test_terminal_error_permission_denied() {
-        assert!(is_terminal_tool_error("permission denied"));
-    }
-
-    #[test]
-    fn test_terminal_error_case_insensitive() {
-        assert!(is_terminal_tool_error(
-            "Exit code: 1\nGraphQL: CAN NOT APPROVE YOUR OWN pull request"
-        ));
-    }
-
-    #[test]
-    fn test_retryable_error_http_429() {
-        assert!(!is_terminal_tool_error("HTTP 429: rate limit exceeded"));
-    }
-
-    #[test]
-    fn test_retryable_error_rate_limit() {
-        assert!(!is_terminal_tool_error(
-            "API rate limit exceeded. Please retry after 60 seconds."
-        ));
-    }
-
-    #[test]
-    fn test_retryable_error_http_500() {
-        assert!(!is_terminal_tool_error("HTTP 500: Internal Server Error"));
-    }
-
-    #[test]
-    fn test_retryable_error_http_502() {
-        assert!(!is_terminal_tool_error("HTTP 502: Bad Gateway"));
-    }
-
-    #[test]
-    fn test_retryable_error_http_503() {
-        assert!(!is_terminal_tool_error("HTTP 503: Service Unavailable"));
-    }
-
-    #[test]
-    fn test_retryable_error_http_504() {
-        assert!(!is_terminal_tool_error("HTTP 504: Gateway Timeout"));
-    }
-
-    #[test]
-    fn test_retryable_error_timeout() {
-        assert!(!is_terminal_tool_error("request timed out after 30s"));
-    }
-
-    #[test]
-    fn test_retryable_error_connection_refused() {
-        assert!(!is_terminal_tool_error("connection refused"));
-    }
-
-    #[test]
-    fn test_retryable_overrides_terminal() {
-        // A 429 with "permission denied" text should still be retryable
-        assert!(!is_terminal_tool_error(
-            "HTTP 429: permission denied rate limit exceeded"
-        ));
-    }
-
-    #[test]
-    fn test_not_found_bare_is_not_terminal() {
-        // Bare "not found" should NOT be terminal — too broad, matches search results
-        assert!(!is_terminal_tool_error("No matching records found"));
-        assert!(!is_terminal_tool_error("file not found: /tmp/data"));
-    }
-
-    #[test]
-    fn test_forbidden_bare_is_not_terminal() {
-        // Bare "forbidden" should NOT be terminal — too broad
-        assert!(!is_terminal_tool_error(
-            "some resources are forbidden by default"
-        ));
-    }
-
-    #[test]
-    fn test_unauthorized_bare_is_not_terminal() {
-        // Bare "unauthorized" should NOT be terminal — too broad
-        assert!(!is_terminal_tool_error(
-            "unauthorized access attempt logged"
-        ));
-    }
-
-    #[test]
-    fn test_unknown_error_not_terminal() {
-        assert!(!is_terminal_tool_error("some random error message"));
-    }
-
-    #[test]
-    fn test_empty_output_not_terminal() {
-        assert!(!is_terminal_tool_error(""));
-    }
-
-    #[test]
-    fn test_successful_output_not_terminal() {
-        assert!(!is_terminal_tool_error("PR approved successfully"));
-    }
-
-    // -- has_terminal_required_tool_failure tests --
-
-    fn make_summary(name: &str, output: &str, success: bool) -> ToolCallSummary {
-        ToolCallSummary {
-            step: 0,
-            name: name.to_string(),
-            input_summary: String::new(),
-            output_summary: output.to_string(),
-            success,
-            non_zero_exit: !success,
-        }
-    }
-
-    #[test]
-    fn test_terminal_required_tool_failure_detected() {
-        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
-        let summaries = vec![make_summary(
-            "run_gh",
-            "Exit code: 1\nGraphQL: Can not approve your own pull request",
-            false,
-        )];
-        assert!(has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    #[test]
-    fn test_terminal_failure_non_required_tool_ignored() {
-        let required: HashSet<String> = ["qa_pr_view"].iter().map(|s| s.to_string()).collect();
-        let summaries = vec![make_summary(
-            "run_gh",
-            "Exit code: 1\nGraphQL: Can not approve your own pull request",
-            false,
-        )];
-        assert!(!has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    #[test]
-    fn test_terminal_failure_successful_tool_ignored() {
-        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
-        let summaries = vec![make_summary("run_gh", "PR approved successfully", true)];
-        assert!(!has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    #[test]
-    fn test_terminal_failure_retryable_error_not_terminal() {
-        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
-        let summaries = vec![make_summary(
-            "run_gh",
-            "HTTP 429: rate limit exceeded",
-            false,
-        )];
-        assert!(!has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    #[test]
-    fn test_terminal_failure_unknown_error_not_terminal() {
-        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
-        let summaries = vec![make_summary("run_gh", "some random error", false)];
-        assert!(!has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    #[test]
-    fn test_terminal_failure_empty_summaries() {
-        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
-        assert!(!has_terminal_required_tool_failure(&required, &[]));
-    }
-
-    #[test]
-    fn test_terminal_failure_empty_output_not_terminal() {
-        let required: HashSet<String> = ["run_gh"].iter().map(|s| s.to_string()).collect();
-        let summaries = vec![make_summary("run_gh", "", false)];
-        assert!(!has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    #[test]
-    fn test_terminal_failure_multiple_summaries_one_terminal() {
-        let required: HashSet<String> = ["run_gh", "qa_pr_view"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let summaries = vec![
-            make_summary("qa_pr_view", "PR #42: Fix bug", true),
-            make_summary("run_gh", "Exit code: 1\nHTTP 404: Not Found", false),
-        ];
-        assert!(has_terminal_required_tool_failure(&required, &summaries));
-    }
-
-    // -- has_successful_pr_review tests (#695) --
-
-    #[test]
-    fn pr_review_detected_when_run_gh_pr_review_succeeded() {
-        let summaries = vec![ToolCallSummary {
-            step: 1,
-            name: "run_gh".to_string(),
-            input_summary:
-                r#"{"command":["pr","review","455","--approve","--body","VERDICT: pass"]}"#
-                    .to_string(),
-            output_summary: "Review submitted".to_string(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(has_successful_pr_review(&summaries));
-    }
-
-    #[test]
-    fn pr_review_not_detected_for_failed_review() {
-        let summaries = vec![ToolCallSummary {
-            step: 1,
-            name: "run_gh".to_string(),
-            input_summary: r#"{"command":["pr","review","455","--approve"]}"#.to_string(),
-            output_summary: "Exit code: 1\nHTTP 422: Unprocessable Entity".to_string(),
-            success: false,
-            non_zero_exit: true,
-        }];
-        assert!(!has_successful_pr_review(&summaries));
-    }
-
-    #[test]
-    fn pr_review_not_detected_for_pr_list() {
-        let summaries = vec![ToolCallSummary {
-            step: 1,
-            name: "run_gh".to_string(),
-            input_summary: r#"{"command":["pr","list","--state","open"]}"#.to_string(),
-            output_summary: "PR #1 Fix bug".to_string(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(!has_successful_pr_review(&summaries));
-    }
-
-    #[test]
-    fn pr_review_not_detected_when_empty() {
-        assert!(!has_successful_pr_review(&[]));
-    }
-
-    // -- required-tools gate skipped after PR review success (#821, Fix B) --
-
-    #[test]
-    fn required_tools_gate_skipped_after_pr_review_success() {
-        // Simulate: successful `run_gh pr review` in tool summaries.
-        // Required tools include a tool not called (e.g., qa_pr_view).
-        // has_successful_pr_review should return true, which means the
-        // required-tools gate should skip instead of re-prompting.
-        let summaries = vec![
-            ToolCallSummary {
-                step: 1,
-                name: "run_gh".to_string(),
-                input_summary:
-                    r#"{"command":["pr","review","https://github.com/org/repo/pull/42","--approve","--body","VERDICT: pass"]}"#
-                        .to_string(),
-                output_summary: "Review submitted".to_string(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-
-        // This is the condition checked in the required-tools gate (Fix B).
-        // When true, the gate skips re-prompting.
-        assert!(
-            has_successful_pr_review(&summaries),
-            "should detect successful PR review in tool summaries"
-        );
-
-        // Verify it returns false for the negative case (failed review).
-        let failed_summaries = vec![ToolCallSummary {
-            step: 1,
-            name: "run_gh".to_string(),
-            input_summary: r#"{"command":["pr","review","42","--approve"]}"#.to_string(),
-            output_summary: "Exit code: 1".to_string(),
-            success: false,
-            non_zero_exit: true,
-        }];
-        assert!(
-            !has_successful_pr_review(&failed_summaries),
-            "failed review should not trigger early-accept"
-        );
-    }
-
-    // -- detect_resume_intent tests --
-
-    #[test]
-    fn resume_intent_detected_for_milestone() {
-        assert!(detect_resume_intent("resume mika milestone#8"));
-        assert!(detect_resume_intent("Resume mika milestone#8"));
-        assert!(detect_resume_intent("please resume mika milestone #8"));
-    }
-
-    #[test]
-    fn resume_intent_detected_for_project() {
-        assert!(detect_resume_intent("continue mika project#3"));
-        assert!(detect_resume_intent("Continue mika project #3"));
-    }
-
-    #[test]
-    fn resume_intent_not_detected_without_process_ref() {
-        assert!(!detect_resume_intent("resume the task"));
-        assert!(!detect_resume_intent("continue working on the feature"));
-        assert!(!detect_resume_intent("resume"));
-    }
-
-    #[test]
-    fn resume_intent_not_detected_without_verb() {
-        assert!(!detect_resume_intent("check mika milestone#8"));
-        assert!(!detect_resume_intent("milestone#8 status"));
-    }
-
-    #[test]
-    fn resume_intent_not_detected_on_regular_messages() {
-        assert!(!detect_resume_intent("How's the project going?"));
-        assert!(!detect_resume_intent("Can you explain the architecture?"));
-        assert!(!detect_resume_intent(""));
-    }
-
-    // -- resume_reconcile_satisfied tests --
-
-    #[test]
-    fn resume_satisfied_with_successful_list_tasks() {
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "list_tasks".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(resume_reconcile_satisfied(&summaries));
-    }
-
-    #[test]
-    fn resume_satisfied_with_successful_check_task() {
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "check_task".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(resume_reconcile_satisfied(&summaries));
-    }
-
-    #[test]
-    fn resume_not_satisfied_with_failed_list_tasks() {
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "list_tasks".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: false,
-            non_zero_exit: false,
-        }];
-        assert!(!resume_reconcile_satisfied(&summaries));
-    }
-
-    #[test]
-    fn resume_not_satisfied_with_unrelated_tool() {
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "send_message".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(!resume_reconcile_satisfied(&summaries));
-    }
-
-    #[test]
-    fn resume_not_satisfied_when_empty() {
-        assert!(!resume_reconcile_satisfied(&[]));
-    }
-
-    // -- ready_label_dispatch trigger tests (#846) --
-
-    #[test]
-    fn ready_label_trigger_matches_canonical_marker() {
-        assert!(ready_label_dispatch_trigger(
-            "[GitHub] Issue labeled ready on mika#999"
-        ));
-        assert!(ready_label_dispatch_trigger(
-            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 — title with — em-dashes"
-        ));
-        // Body containing additional text after the marker still matches.
-        assert!(ready_label_dispatch_trigger(
-            "[GitHub] Issue labeled ready on mika#42\n\nIssue body follows."
-        ));
-    }
-
-    #[test]
-    fn ready_label_trigger_rejects_other_labels() {
-        assert!(!ready_label_dispatch_trigger(
-            "[GitHub] Issue labeled bug on mika#999"
-        ));
-        assert!(!ready_label_dispatch_trigger(
-            "[GitHub] Issue labeled p1-important on mika#999"
-        ));
-        assert!(!ready_label_dispatch_trigger(
-            "[GitHub] Issue labeled enhancement on mika#999"
-        ));
-    }
-
-    #[test]
-    fn ready_label_trigger_rejects_other_event_types() {
-        // Other GitHub events that share the `[GitHub]` prefix must not trigger.
-        assert!(!ready_label_dispatch_trigger(
-            "[GitHub] PR comment on mika#999 by samidarko"
-        ));
-        assert!(!ready_label_dispatch_trigger(
-            "[GitHub] Issue comment on mika#999 by samidarko"
-        ));
-        assert!(!ready_label_dispatch_trigger(
-            "[GitHub] Check suite failure on branch fix/foo"
-        ));
-    }
-
-    #[test]
-    fn ready_label_trigger_rejects_direct_prompts() {
-        // Direct `mika ask` prompts with no source-prefix must not trigger.
-        assert!(!ready_label_dispatch_trigger("implement mika issue#999"));
-        assert!(!ready_label_dispatch_trigger(
-            "ready label on mika#999 please"
-        ));
-        assert!(!ready_label_dispatch_trigger(""));
-    }
-
-    // -- ready_label_dispatch_satisfied tests --
-
-    #[test]
-    fn ready_label_satisfied_when_run_claude_pilot_succeeded() {
-        let summaries = vec![
-            ToolCallSummary {
-                step: 0,
-                name: "run_gh".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 1,
-                name: "create_task".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 2,
-                name: "run_claude_pilot".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-        assert!(ready_label_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn ready_label_not_satisfied_when_only_run_gh_succeeded() {
-        // Reproduces the #846 regression: label removal succeeded but
-        // run_claude_pilot was never called.
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "run_gh".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(!ready_label_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn ready_label_satisfied_when_run_claude_pilot_attempted_terminally() {
-        // Attempt with terminal failure (e.g., global_dispatch_active when a
-        // concurrent dispatch is active) still satisfies the guard. Forcing
-        // a retry on terminal failures would produce misleading "never called"
-        // operator notifications.  The LLM handles the failure via send_message
-        // per the prompt's Step 4 (#846 adversarial review).
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "run_claude_pilot".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: false,
-            non_zero_exit: true,
-        }];
-        assert!(ready_label_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn ready_label_not_satisfied_when_empty() {
-        assert!(!ready_label_dispatch_satisfied(&[]));
-    }
-
-    // -- #1089: send_message no longer satisfies the guard --
-    // Post-#996, all legitimate completion paths call run_claude_pilot
-    // (dispatch via dev-pilot, auto-groom via dev-groom). The send_message-only
-    // path was removed after fabricated check_task pre-flights exploited the
-    // over-broad OR-shape to short-circuit dispatch via NoChannel escalation.
-
-    #[test]
-    fn ready_label_not_satisfied_when_only_send_message_called() {
-        // #1089 — send_message alone no longer satisfies the guard.
-        // Previously this was the grooming-rejection path (#907); post-#996
-        // auto-groom replaced it with run_claude_pilot(dev-groom).
-        let summaries = vec![
-            ToolCallSummary {
-                step: 0,
-                name: "run_gh".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 1,
-                name: "send_message".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-        assert!(!ready_label_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn ready_label_satisfied_when_both_dispatch_and_notification() {
-        // Both run_claude_pilot and send_message present (e.g., dispatch
-        // succeeded then operator was notified). Satisfied because
-        // run_claude_pilot is present.
-        let summaries = vec![
-            ToolCallSummary {
-                step: 0,
-                name: "run_claude_pilot".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 1,
-                name: "send_message".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-        assert!(ready_label_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn ready_label_not_satisfied_when_only_send_message_failed() {
-        // #1089 — send_message (even failed) does not satisfy the guard.
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "send_message".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: false,
-            non_zero_exit: false,
-        }];
-        assert!(!ready_label_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn ready_label_not_satisfied_fabricated_check_task_then_send_message() {
-        // #1089 — reproduces the exact fabrication pattern: agent calls
-        // check_task (stale, fails), then send_message (fabricated escalation).
-        // Guard must reject because run_claude_pilot was never called.
-        let summaries = vec![
-            ToolCallSummary {
-                step: 0,
-                name: "run_gh".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 1,
-                name: "check_task".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: false,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 2,
-                name: "send_message".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-        assert!(!ready_label_dispatch_satisfied(&summaries));
-    }
-
-    // -- parse_ready_label_location tests (#846 operator notification) --
-
-    #[test]
-    fn parse_location_from_simple_marker() {
-        let out = parse_ready_label_location("[GitHub] Issue labeled ready on mika#999");
-        assert_eq!(out, Some("mika#999".to_string()));
-    }
-
-    #[test]
-    fn parse_location_from_marker_with_em_dash_title() {
-        let out = parse_ready_label_location(
-            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 \u{2014} title with \u{2014} more dashes",
-        );
-        assert_eq!(out, Some("senara-solutions/mika#1234".to_string()));
-    }
-
-    #[test]
-    fn parse_location_from_marker_with_newline_body() {
-        let out = parse_ready_label_location(
-            "[GitHub] Issue labeled ready on mika#42\n\nIssue body follows.",
-        );
-        assert_eq!(out, Some("mika#42".to_string()));
-    }
-
-    #[test]
-    fn parse_location_returns_none_for_other_markers() {
-        assert!(parse_ready_label_location("[GitHub] Issue labeled bug on mika#999").is_none());
-        assert!(parse_ready_label_location("implement mika issue#999").is_none());
-        assert!(parse_ready_label_location("").is_none());
-    }
-
-    #[test]
-    fn parse_location_returns_none_for_empty_location() {
-        // Marker present but no location text after it.
-        assert!(parse_ready_label_location("[GitHub] Issue labeled ready on ").is_none());
-        assert!(parse_ready_label_location("[GitHub] Issue labeled ready on \n").is_none());
-    }
-
-    #[test]
-    fn ready_label_guard_runs_before_webhook_zero_tools() {
-        // Registry-order invariant: the more specific ready-label guard must
-        // be evaluated before the generic webhook_zero_tools guard. Otherwise
-        // a successful run_gh on the ready-label turn satisfies
-        // webhook_zero_tools and the missing run_claude_pilot is never caught.
-        let labels: Vec<&str> = INTENT_GUARDS.iter().map(|g| g.label).collect();
-        let ready_idx = labels
-            .iter()
-            .position(|l| *l == "webhook_ready_label_dispatch")
-            .expect("webhook_ready_label_dispatch must be registered");
-        let zero_idx = labels
-            .iter()
-            .position(|l| *l == "webhook_zero_tools")
-            .expect("webhook_zero_tools must be registered");
-        assert!(
-            ready_idx < zero_idx,
-            "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
-             webhook_zero_tools (idx={zero_idx}) so the more specific trigger \
-             fires first"
-        );
-    }
-
-    // -- #1469 webhook_zero_tools_trigger prefix-narrowing tests --
-
-    #[test]
-    fn webhook_zero_tools_trigger_skips_check_suite_success() {
-        assert!(!webhook_zero_tools_trigger(
-            "[GitHub] Check suite success on senara-solutions/mika (branch: main)"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_skips_pr_closed() {
-        assert!(!webhook_zero_tools_trigger(
-            "[GitHub] PR closed: senara-solutions/mika#1000 — title (branch: foo)"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_skips_discussion() {
-        assert!(!webhook_zero_tools_trigger(
-            "[GitHub] discussion.created on senara-solutions/mika"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_fires_on_check_suite_failure() {
-        assert!(webhook_zero_tools_trigger(
-            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/foo)"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_fires_on_ready_label() {
-        assert!(webhook_zero_tools_trigger(
-            "[GitHub] Issue labeled ready on senara-solutions/mika#933 — title"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_fires_on_pr_review() {
-        assert!(webhook_zero_tools_trigger(
-            "[GitHub] PR review (approved) on senara-solutions/mika#1000 (title) by @reviewer"
-        ));
-    }
-
-    #[test]
-    fn webhook_zero_tools_trigger_skips_non_github() {
-        assert!(!webhook_zero_tools_trigger("[Slack] message"));
-        assert!(!webhook_zero_tools_trigger(""));
-    }
-
-    // -- mika#2517 U3 — the fallthrough domain no longer arms this guard --
-
-    /// **V4** — the five shapes of the Webhook Fallthrough domain stand the
-    /// guard down; the three shapes outside it still arm it.
-    ///
-    /// **This inverts two assertions mika#1469 shipped.** `fires_on_new_comment`
-    /// and `fires_on_non_ready_label` asserted that a comment and a non-`ready`
-    /// label re-prompt a turn with zero tool calls. On exactly that population
-    /// the guard's premise — *"webhook events require action"* — contradicts the
-    /// `self-dev` HARD GATE, which says the correct action is to acknowledge and
-    /// stop. The old assertions were pinning the conflict, so they are replaced
-    /// here rather than carried: keeping them would mean the suite asserts both
-    /// halves of a contradiction.
-    ///
-    /// The positive half is what makes this non-vacuous. A trigger that returned
-    /// `false` on everything would satisfy the negative half alone — and would
-    /// silently retire the mika#696 guard for the CI, PR-review and ready-label
-    /// paths, where it is still load-bearing.
-    #[test]
-    fn mika2517_the_fallthrough_domain_stands_the_zero_tools_guard_down() {
-        for msg in [
-            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
-            "[GitHub] New comment on senara-solutions/mika#933 (title) by @samidarko",
-            "[GitHub] Issue assigned: senara-solutions/mika#100 — title",
-            "[GitHub] Issue closed: senara-solutions/mika#100 — title",
-            "[GitHub] discussion.created on senara-solutions/mika",
-        ] {
-            assert!(
-                !webhook_zero_tools_trigger(msg),
-                "{msg:?} is Webhook Fallthrough: its prompt contract is to \
-                 acknowledge and stop, so re-prompting it for calling no tool is \
-                 the engine contradicting itself (mika#2517 AC2)"
-            );
-        }
-    }
-
-    /// **V4, positive half** — outside the domain the guard is untouched.
-    #[test]
-    fn mika2517_the_zero_tools_guard_still_fires_outside_the_domain() {
-        for msg in [
-            // Ready-label: the dispatch path, where a turn with zero tools is a
-            // dispatch that did not happen.
-            "[GitHub] Issue labeled ready on senara-solutions/mika#933 — title",
-            // qa skill territory.
-            "[GitHub] PR review (approved) on senara-solutions/mika#1000 (title) by @reviewer",
-            // ci skill territory — and note its *success* sibling is still
-            // excluded by the mika#1469 literal, which is why that literal stays.
-            "[GitHub] Check suite failure on senara-solutions/mika (branch: fix/foo)",
-        ] {
-            assert!(
-                webhook_zero_tools_trigger(msg),
-                "{msg:?} is outside the fallthrough domain — mika#2517 must not \
-                 retire the mika#696 guard there"
-            );
-        }
-    }
-
-    // -- mika#2517 U2 — the tool the fallthrough turn is not handed --
-
-    /// **V3** — the domain widens the denylist; off the domain the slice is
-    /// handed through **identically**.
-    ///
-    /// The `Cow::Borrowed` assertion is the load-bearing half: it is what makes
-    /// "no regression outside the domain" a property of the type rather than of
-    /// a comparison that could pass on a fresh allocation with the same content.
-    #[test]
-    fn mika2517_effective_disabled_tools_widens_only_on_the_domain() {
-        let identity = vec!["run_team".to_string()];
-
-        let off_domain = effective_disabled_tools(&identity, "implement mika#2517");
-        assert!(
-            matches!(off_domain, std::borrow::Cow::Borrowed(_)),
-            "a turn outside the domain must hand the identity slice through \
-             untouched — an owned clone here means the nominal path allocates"
-        );
-        assert_eq!(&*off_domain, identity.as_slice());
-
-        let on_domain = effective_disabled_tools(
-            &identity,
-            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
-        );
-        assert!(
-            on_domain.iter().any(|t| t == "run_team"),
-            "the identity denylist must survive the widening"
-        );
-        assert!(
-            on_domain.iter().any(|t| t == "create_task"),
-            "a fallthrough turn must not be handed create_task (mika#2517 AC1)"
-        );
-    }
-
-    /// mika#2667 AC2 — the `hold[review]` turn handed back with no active task
-    /// withholds `create_task`; a `block[ac]` handed to the LLM does not.
-    #[test]
-    fn mika2667_a_hold_review_without_task_withholds_create_task() {
-        let identity: Vec<String> = Vec::new();
-        let held = format!(
-            "{} on https://github.com/senara-solutions/mika/pull/12. …\n\n\
-             [GitHub] PR review (commented) on senara-solutions/mika#12 (t) by @mika-platform-qa",
-            crate::server::verdict_handler::HOLD_REVIEW_NO_TASK_MARKER
-        );
-        assert!(
-            effective_disabled_tools(&identity, &held)
-                .iter()
-                .any(|t| t == "create_task")
-        );
-
-        // Negative control: the `block[ac]` passthrough and the raw PR review
-        // event keep the nominal, untouched slice.
-        for msg in [
-            "[verdict_handler] VERDICT: block[ac] on https://github.com/senara-solutions/mika/pull/12 \
-             but no active in_progress task found. Passing through to LLM.",
-            "[GitHub] PR review (commented) on senara-solutions/mika#12 (t) by @mika-platform-qa",
-        ] {
-            assert!(
-                matches!(
-                    effective_disabled_tools(&identity, msg),
-                    std::borrow::Cow::Borrowed(_)
-                ),
-                "{msg}"
-            );
-        }
-    }
-
-    /// The widening is idempotent: an identity that already denies the tool
-    /// does not end up denying it twice.
-    #[test]
-    fn mika2517_the_widening_does_not_duplicate_an_existing_entry() {
-        let identity = vec!["Create_Task".to_string()];
-        let widened = effective_disabled_tools(
-            &identity,
-            "[GitHub] New comment on senara-solutions/mika#933 by @samidarko",
-        );
-        assert_eq!(
-            widened.len(),
-            1,
-            "the match is case-insensitive downstream, so re-adding the name \
-             would be a duplicate with no effect and a misleading log line: {widened:?}"
-        );
-    }
-
-    /// The withheld list and the filter agree on the name (mika#2517).
-    ///
-    /// `apply_agent_tool_visibility` matches case-insensitively, so this pins
-    /// the end-to-end path rather than the constant alone: the tool the
-    /// constant names must be the tool the filter removes.
-    #[test]
-    fn mika2517_the_withheld_tool_is_actually_evicted_by_the_filter() {
-        let mut defs = vec![
-            mika_common::claude::ToolDefinition {
-                name: "create_task".to_string(),
-                description: String::new(),
-                input_schema: serde_json::json!({}),
-            },
-            mika_common::claude::ToolDefinition {
-                name: "run_claude_pilot".to_string(),
-                description: String::new(),
-                input_schema: serde_json::json!({}),
-            },
-        ];
-        let disabled = effective_disabled_tools(
-            &[],
-            "[GitHub] Issue labeled bug on senara-solutions/mika#999",
-        );
-        apply_agent_tool_visibility(&mut defs, &disabled);
-
-        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(
-            !names.contains(&"create_task"),
-            "left in the array: {names:?}"
-        );
-        assert!(
-            names.contains(&"run_claude_pilot"),
-            "run_claude_pilot stays SERVED on purpose — its gate 0 refusal is the \
-             measurement that the model tried, and hiding the tool would delete \
-             that signal (mika#2517 § 3.3 (b)): {names:?}"
-        );
-    }
-
-    // -- #910 webhook_no_unauthorized_dispatch trigger tests --
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_matches_comment_events() {
-        assert!(webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] New comment on senara-solutions/mika#906 by @samidarko\nhttps://github.com/senara-solutions/mika/issues/906#issuecomment-123\n\nGroomed end-to-end."
-        ));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_matches_non_ready_labels() {
-        assert!(webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] Issue labeled bug on mika#999"
-        ));
-        assert!(webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] Issue labeled p1-important on mika#999"
-        ));
-        assert!(webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] Issue labeled enhancement on mika#999"
-        ));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_skips_pr_review() {
-        // PR review events are qa skill territory — must NOT trigger (#1102).
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] PR review (approved) on senara-solutions/mika#694 by reviewer"
-        ));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_skips_check_suite() {
-        // Check suite events are ci skill territory — must NOT trigger (#1102).
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] Check suite failure on branch fix/foo"
-        ));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_rejects_ready_label() {
-        // Ready-label events must NOT trigger this guard — the positive-case
-        // guard (webhook_ready_label_dispatch) handles them.
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] Issue labeled ready on mika#999"
-        ));
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "[GitHub] Issue labeled ready on senara-solutions/mika#1234 \u{2014} title"
-        ));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_rejects_direct_prompts() {
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "implement mika issue#999"
-        ));
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "dispatch mika#906"
-        ));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_rejects_empty() {
-        assert!(!webhook_no_unauthorized_dispatch_trigger(""));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_trigger_rejects_callback() {
-        // Callback triggers have a different prefix.
-        assert!(!webhook_no_unauthorized_dispatch_trigger(
-            "[callback: run_claude_pilot]"
-        ));
-    }
-
-    // -- #910 webhook_no_unauthorized_dispatch satisfied tests --
-
-    #[test]
-    fn no_unauthorized_dispatch_satisfied_when_empty() {
-        assert!(webhook_no_unauthorized_dispatch_satisfied(&[]));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_satisfied_when_only_run_gh() {
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "run_gh".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: true,
-            non_zero_exit: false,
-        }];
-        assert!(webhook_no_unauthorized_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_satisfied_when_pilot_failed() {
-        // Failed run_claude_pilot (e.g., task_not_dispatchable) is already
-        // blocked by the dispatch-readiness guard — no double-rejection needed.
-        let summaries = vec![ToolCallSummary {
-            step: 0,
-            name: "run_claude_pilot".to_string(),
-            input_summary: String::new(),
-            output_summary: String::new(),
-            success: false,
-            non_zero_exit: true,
-        }];
-        assert!(webhook_no_unauthorized_dispatch_satisfied(&summaries));
-    }
-
-    #[test]
-    fn no_unauthorized_dispatch_not_satisfied_when_pilot_succeeded() {
-        // This is the unauthorized dispatch case — run_claude_pilot succeeded
-        // on a non-ready webhook turn.
-        let summaries = vec![
-            ToolCallSummary {
-                step: 0,
-                name: "run_gh".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 1,
-                name: "create_task".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-            ToolCallSummary {
-                step: 2,
-                name: "run_claude_pilot".to_string(),
-                input_summary: String::new(),
-                output_summary: String::new(),
-                success: true,
-                non_zero_exit: false,
-            },
-        ];
-        assert!(!webhook_no_unauthorized_dispatch_satisfied(&summaries));
-    }
-
-    // -- #910 ordering invariant --
-
-    #[test]
-    fn no_unauthorized_dispatch_guard_ordering() {
-        // webhook_no_unauthorized_dispatch must appear AFTER
-        // webhook_ready_label_dispatch (which handles the positive case)
-        // and BEFORE webhook_zero_tools (logical grouping of webhook guards).
-        let labels: Vec<&str> = INTENT_GUARDS.iter().map(|g| g.label).collect();
-        let ready_idx = labels
-            .iter()
-            .position(|l| *l == "webhook_ready_label_dispatch")
-            .expect("webhook_ready_label_dispatch must be registered");
-        let no_dispatch_idx = labels
-            .iter()
-            .position(|l| *l == "webhook_no_unauthorized_dispatch")
-            .expect("webhook_no_unauthorized_dispatch must be registered");
-        let zero_idx = labels
-            .iter()
-            .position(|l| *l == "webhook_zero_tools")
-            .expect("webhook_zero_tools must be registered");
-        assert!(
-            ready_idx < no_dispatch_idx,
-            "webhook_ready_label_dispatch (idx={ready_idx}) must precede \
-             webhook_no_unauthorized_dispatch (idx={no_dispatch_idx})"
-        );
-        assert!(
-            no_dispatch_idx < zero_idx,
-            "webhook_no_unauthorized_dispatch (idx={no_dispatch_idx}) must precede \
-             webhook_zero_tools (idx={zero_idx})"
-        );
-    }
-
-    #[test]
-    fn intent_guards_registry_count() {
-        // Six guards after adding deferred_dispatch_action (mika#1011).
-        assert_eq!(
-            INTENT_GUARDS.len(),
-            6,
-            "INTENT_GUARDS should have exactly 6 entries"
-        );
-    }
-
-    // -- load_gated_summary tests (Axis 3 — mika#1021) --
-
-    /// Seed a summary into the async DB by saving enough messages and compacting.
-    async fn seed_summary(db: &AsyncDatabase, content: &str) {
-        // Save enough messages so replace_with_summary has something to compact.
-        for i in 0..5 {
-            db.save_message("test-session", "user", &format!("msg {i}"), None)
-                .await
-                .unwrap();
-        }
-        let old = db.load_messages_before_window(3).await.unwrap();
-        let highest_id = old.last().unwrap().id;
-        db.replace_with_summary(content, highest_id).await.unwrap();
-    }
-
-    fn make_callback_trigger() -> SilentTrigger {
-        SilentTrigger::Callback {
-            task_id: "test-task".to_string(),
-            label: "test".to_string(),
-            result: "done".to_string(),
-            failed: false,
-            parent_task_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn gated_summary_no_cap_silent_returns_full() {
-        // max_tokens = None, silent turn, summary present → returns full summary (regression).
-        let db = test_async_db();
-        seed_summary(&db, "Full summary content here").await;
-
-        let config = prompt::ContextSummaryConfig {
-            inject: true,
-            max_tokens: None,
-        };
-        let trigger = make_callback_trigger();
-        let result = load_gated_summary(&db, &config, Some(&trigger))
-            .await
-            .unwrap();
-        assert_eq!(result, Some("Full summary content here".to_string()));
-    }
-
-    #[tokio::test]
-    async fn gated_summary_zero_sentinel_silent_returns_none() {
-        // max_tokens = Some(0), silent turn → returns None (load-omit sentinel).
-        let db = test_async_db();
-        seed_summary(&db, "Should be omitted").await;
-
-        let config = prompt::ContextSummaryConfig {
-            inject: true,
-            max_tokens: Some(0),
-        };
-        let trigger = make_callback_trigger();
-        let result = load_gated_summary(&db, &config, Some(&trigger))
-            .await
-            .unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn gated_summary_zero_sentinel_non_silent_returns_full() {
-        // max_tokens = Some(0), non-silent turn → returns full (cap gated by mode).
-        let db = test_async_db();
-        seed_summary(&db, "Full content non-silent").await;
-
-        let config = prompt::ContextSummaryConfig {
-            inject: true,
-            max_tokens: Some(0),
-        };
-        let result = load_gated_summary(&db, &config, None).await.unwrap();
-        assert_eq!(result, Some("Full content non-silent".to_string()));
-    }
-
-    #[tokio::test]
-    async fn gated_summary_cap_truncates_in_silent() {
-        // max_tokens = Some(n), silent turn, summary > n tokens → truncated.
-        let db = test_async_db();
-        let long_summary = "word ".repeat(500); // 2500 chars, way over budget
-        seed_summary(&db, &long_summary).await;
-
-        let config = prompt::ContextSummaryConfig {
-            inject: true,
-            max_tokens: Some(100), // 400 char budget
-        };
-        let trigger = make_callback_trigger();
-        let result = load_gated_summary(&db, &config, Some(&trigger))
-            .await
-            .unwrap();
-        let content = result.unwrap();
-        assert!(content.contains("[… summary truncated to fit silent-mode budget …]"));
-        // Total truncated content (before marker) should be ≤ 400 chars
-        let before_marker = content
-            .strip_suffix("\n[… summary truncated to fit silent-mode budget …]")
-            .unwrap();
-        assert!(before_marker.len() <= 400);
-    }
-
-    #[tokio::test]
-    async fn gated_summary_cap_under_budget_returns_full() {
-        // max_tokens = Some(n), silent turn, summary < n tokens → full summary.
-        let db = test_async_db();
-        seed_summary(&db, "Short summary").await;
-
-        let config = prompt::ContextSummaryConfig {
-            inject: true,
-            max_tokens: Some(1000), // 4000 char budget, summary is tiny
-        };
-        let trigger = make_callback_trigger();
-        let result = load_gated_summary(&db, &config, Some(&trigger))
-            .await
-            .unwrap();
-        assert_eq!(result, Some("Short summary".to_string()));
-    }
-
-    #[tokio::test]
-    async fn gated_summary_axis4_wins_over_axis3() {
-        // Axis 4 inject = false + any max_tokens → returns None without DB call.
-        let db = test_async_db();
-        // Don't even seed a summary — Axis 4 should short-circuit before DB call.
-
-        let config = prompt::ContextSummaryConfig {
-            inject: false,
-            max_tokens: Some(500),
-        };
-        let trigger = make_callback_trigger();
-        let result = load_gated_summary(&db, &config, Some(&trigger))
-            .await
-            .unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[tokio::test]
-    async fn gated_summary_no_summary_stored() {
-        // inject = true, max_tokens = None, no summary in DB → returns None.
-        let db = test_async_db();
-        // No summary seeded.
-
-        let config = prompt::ContextSummaryConfig {
-            inject: true,
-            max_tokens: None,
-        };
-        let result = load_gated_summary(&db, &config, None).await.unwrap();
-        assert_eq!(result, None);
-    }
-
-    // -- Compact provider gate tests (mika#1491) --
-
-    #[test]
-    fn test_inject_skills_compact_provider_filters_tools() {
-        // When is_compact_provider = true: no skill prompts appended,
-        // tools filtered to COMPACT_PROVIDER_CORE_TOOLS only, per_skill_bytes empty.
-        let tools = crate::tools::default_tools();
-        let mut entry = make_skill_entry("self-dev", 30, &["run_claude_pilot"]);
-        entry.prompt_snippet = "A very large skill prompt that should NOT appear.".to_string();
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = "Base compact prompt.".to_string();
-
-        let no_ctx = HashMap::new();
-        let no_disabled: Vec<String> = vec![];
-        let (defs, variant, per_skill_bytes) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "mikamodel",
-            "mika",
-            &no_ctx,
-            &no_disabled,
-            true, // compact provider
-        );
-
-        // No skill prompts should be appended
-        assert!(
-            !system.contains("<context type=\"skill\""),
-            "compact provider should skip all skill prompts"
-        );
-        assert!(
-            !system.contains("self-dev Skill"),
-            "compact provider should not inject skill name"
-        );
-
-        // Only core tools should be present
-        let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        for core_tool in COMPACT_PROVIDER_CORE_TOOLS {
-            assert!(
-                tool_names.contains(core_tool),
-                "core tool '{core_tool}' should be in compact tool set"
-            );
-        }
-        assert!(
-            defs.len() <= COMPACT_PROVIDER_CORE_TOOLS.len(),
-            "compact provider should have at most {} tools, got {}",
-            COMPACT_PROVIDER_CORE_TOOLS.len(),
-            defs.len()
-        );
-        // Skill-defined tools should NOT be present
-        assert!(
-            !tool_names.contains(&"run_claude_pilot"),
-            "skill-defined tools should be excluded in compact mode"
-        );
-
-        // No variant info (skills skipped)
-        assert!(variant.is_none());
-        // No per-skill bytes
-        assert!(per_skill_bytes.is_empty());
-    }
-
-    #[test]
-    fn test_inject_skills_non_compact_provider_unchanged() {
-        // When is_compact_provider = false: behavior unchanged — skills appended, all tools present.
-        let tools = crate::tools::default_tools();
-        let mut entry = make_skill_entry("test-skill", 30, &["test_tool"]);
-        entry.prompt_snippet = "Use this skill.".to_string();
-        let matched: Vec<&SkillEntry> = vec![&entry];
-        let mut system = "Base prompt.".to_string();
-
-        let no_ctx = HashMap::new();
-        let no_disabled: Vec<String> = vec![];
-        let (defs, variant, per_skill_bytes) = inject_skills_and_resolve_tools(
-            &matched,
-            &tools,
-            &mut system,
-            "anthropic",
-            "claude-sonnet-4-6",
-            &no_ctx,
-            &no_disabled,
-            false, // non-compact
-        );
-
-        // Skills should be appended
-        assert!(
-            system.contains("<context type=\"skill\""),
-            "non-compact provider should include skill prompts"
-        );
-        assert!(system.contains("test-skill Skill"));
-
-        // All default tools + skill tools should be present
-        assert!(
-            defs.len() > COMPACT_PROVIDER_CORE_TOOLS.len(),
-            "non-compact should have more tools than core set"
-        );
-        let tool_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert!(
-            tool_names.contains(&"test_tool"),
-            "skill tools should be included"
-        );
-
-        // Variant and per_skill_bytes should be populated
-        assert!(variant.is_some());
-        assert!(!per_skill_bytes.is_empty());
-    }
-
-    #[test]
-    fn test_compact_provider_core_tools_are_valid() {
-        // Every name in COMPACT_PROVIDER_CORE_TOOLS must exist in default_tools().
-        // Prevents drift when tools are renamed or removed.
-        let tools = crate::tools::default_tools();
-        let tool_names: std::collections::HashSet<String> =
-            tools.definitions().iter().map(|d| d.name.clone()).collect();
-
-        for &core_tool in COMPACT_PROVIDER_CORE_TOOLS {
-            assert!(
-                tool_names.contains(core_tool),
-                "COMPACT_PROVIDER_CORE_TOOLS entry '{core_tool}' not found in default_tools() — \
-                 was it renamed or removed?"
-            );
-        }
-    }
-
-    // ===========================================================================
-    // mika#1889 — Per-turn usage/token logging (RT-005 brick 4/5)
-    //
-    // Structural coverage of the `build_turn_usage_fields` pure builder. The
-    // token/dimension mapping is tested directly here so we do not depend on a
-    // captured tracing subscriber (D5). The emission site itself is exercised
-    // no-panic by the existing eval harness in `tests/eval/`.
-    // ===========================================================================
-
-    fn usage_with_cache() -> LlmUsage {
-        LlmUsage {
-            input_tokens: 1234,
-            output_tokens: 567,
-            cache_creation_input_tokens: Some(89),
-            cache_read_input_tokens: Some(4321),
-        }
-    }
-
-    fn usage_without_cache() -> LlmUsage {
-        LlmUsage {
-            input_tokens: 10,
-            output_tokens: 20,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
-        }
-    }
-
-    #[test]
-    fn build_turn_usage_success_with_cache_passes_through_tokens() {
-        let u = usage_with_cache();
-        let f = build_turn_usage_fields(
-            3,
-            Some(&u),
-            "ToolUse",
-            true,
-            "success",
-            250,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(f.step, 3);
-        assert_eq!(f.input_tokens, 1234);
-        assert_eq!(f.output_tokens, 567);
-        // Anthropic-only cache fields: `Option<u64>` flattened to `0` when absent —
-        // here `Some(4321)` and `Some(89)` are preserved verbatim.
-        assert_eq!(f.cache_read_tokens, 4321);
-        assert_eq!(f.cache_write_tokens, 89);
-        assert_eq!(f.latency_ms, 250);
-        assert_eq!(f.stop_reason, "ToolUse");
-        assert!(f.tool_use_in_turn);
-        assert_eq!(f.status, "success");
-    }
-
-    #[test]
-    fn build_turn_usage_success_no_cache_flattens_option_to_zero() {
-        // Non-Anthropic providers report None for cache_creation; some
-        // OpenAI-compat providers also report None for cache_read. The log MUST
-        // still be jq-parseable unconditionally — `None` → `0`, never a missing
-        // field. This is the load-bearing analyzer-shape invariant.
-        let u = usage_without_cache();
-        let f = build_turn_usage_fields(
-            0,
-            Some(&u),
-            "EndTurn",
-            false,
-            "success",
-            0,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(f.input_tokens, 10);
-        assert_eq!(f.output_tokens, 20);
-        assert_eq!(f.cache_read_tokens, 0);
-        assert_eq!(f.cache_write_tokens, 0);
-        assert_eq!(f.latency_ms, 0);
-        assert!(!f.tool_use_in_turn);
-    }
-
-    #[test]
-    fn build_turn_usage_error_arm_zeros_all_tokens() {
-        // Error/timeout arms have no `LlmUsage`. R3 mandates the event still
-        // fires so the covariable "turns" count is not silently undercounted —
-        // the tokens roll to zero but the row exists.
-        let f = build_turn_usage_fields(7, None, "error", false, "error", 42, None, None, None);
-        assert_eq!(f.step, 7);
-        assert_eq!(f.input_tokens, 0);
-        assert_eq!(f.output_tokens, 0);
-        assert_eq!(f.cache_read_tokens, 0);
-        assert_eq!(f.cache_write_tokens, 0);
-        // latency_ms is preserved even on the error arm — the transport spent
-        // wall-clock even if it produced no tokens.
-        assert_eq!(f.latency_ms, 42);
-        assert_eq!(f.stop_reason, "error");
-        assert!(!f.tool_use_in_turn);
-        assert_eq!(f.status, "error");
-    }
-
-    #[test]
-    fn build_turn_usage_continuation_step_sentinel_preserved() {
-        // The continuation turn uses `u32::MAX` as the step sentinel in both
-        // the DB path (`save_continuation_llm_call`) and the log surface, so
-        // the offline analyzer (brick 5/5) can distinguish continuation-turn
-        // usage from in-loop step indices without a separate flag.
-        let u = usage_without_cache();
-        let f = build_turn_usage_fields(
-            u32::MAX,
-            Some(&u),
-            "EndTurn",
-            false,
-            "success",
-            100,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(f.step, u32::MAX);
-    }
-
-    #[test]
-    fn build_turn_usage_tool_use_boolean_is_raw_observation() {
-        // Prime hard condition #1 (planning-tokens = SEUL primary outcome):
-        // `tool_use_in_turn` is a RAW mechanical observation — did the model
-        // request tool calls this turn — not a graded planning/execution
-        // classification. Verified here by exercising both truth values with
-        // otherwise-identical inputs.
-        let u = usage_without_cache();
-        let f_true =
-            build_turn_usage_fields(1, Some(&u), "ToolUse", true, "success", 0, None, None, None);
-        let f_false = build_turn_usage_fields(
-            1,
-            Some(&u),
-            "EndTurn",
-            false,
-            "success",
-            0,
-            None,
-            None,
-            None,
-        );
-        assert!(f_true.tool_use_in_turn);
-        assert!(!f_false.tool_use_in_turn);
-        // No `phase`/`is_planning`/`role` field exists on the struct — D1/R5
-        // enforced by absence (the field simply does not exist). This test
-        // documents that invariant structurally.
-    }
-
-    #[test]
-    fn build_turn_usage_latency_ms_is_raw_pass_through() {
-        // latency_ms is R1's turn-cost covariable. It's a raw transport
-        // measurement (wall-clock of the HTTP call), not an estimand
-        // component. Verified here as a pure pass-through.
-        let u = usage_without_cache();
-        let f = build_turn_usage_fields(
-            0,
-            Some(&u),
-            "EndTurn",
-            false,
-            "success",
-            12345,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(f.latency_ms, 12345);
-    }
-
-    // ===========================================================================
-    // mika#2331 (AC1) — the turn says its size, including when it fails
-    // ===========================================================================
-
-    /// The load-bearing distinction of D6: `None` and `Some(0)` are different
-    /// answers. No request is empty, so a `0` would be a readable lie about a
-    /// measurement that did not happen; `null` says "not measured".
-    #[test]
-    fn mika2331_request_bytes_none_and_some_do_not_collapse() {
-        let u = usage_without_cache();
-        let measured = build_turn_usage_fields(
-            0,
-            Some(&u),
-            "EndTurn",
-            false,
-            "success",
-            0,
-            Some(59_812),
-            Some(48_000),
-            None,
-        );
-        assert_eq!(measured.request_bytes, Some(59_812));
-        assert_eq!(measured.system_prompt_bytes, Some(48_000));
-
-        let unmeasured = build_turn_usage_fields(
-            0,
-            Some(&u),
-            "EndTurn",
-            false,
-            "success",
-            0,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(unmeasured.request_bytes, None);
-        assert_eq!(unmeasured.system_prompt_bytes, None);
-        assert_ne!(unmeasured.request_bytes, Some(0));
-    }
-
-    /// The arm the whole of AC1 is about. A hung call returns no `usage`, so
-    /// every token count is zero — and until now that zero was the line's only
-    /// statement about how big the brief was. The two sizes are measured before
-    /// the call and must survive it.
-    #[test]
-    fn mika2331_error_arm_still_carries_the_brief_size() {
-        let f = build_turn_usage_fields(
-            4,
-            None,
-            "error",
-            false,
-            "error",
-            420_000,
-            Some(59_812),
-            Some(48_000),
-            None,
-        );
-        assert_eq!(f.input_tokens, 0, "no usage on the error arm — unchanged");
-        assert_eq!(
-            f.request_bytes,
-            Some(59_812),
-            "the size of a brief that timed out is exactly what a 420 s hang needs to be read"
-        );
-        assert_eq!(f.system_prompt_bytes, Some(48_000));
-    }
-
-    // ===========================================================================
-    // mika#1671 (AC2) — delegation-outcome classifier ruleset
-    //
-    // D2 is strict transport-only. The classifier must qualify: HTTP 503 (founding
-    // incident), transport/connection/dns error substrings, and deadline-exceeded
-    // (mapped from `TeamAgentOutcome::TimedOut`). It must NOT qualify: apologetic
-    // business responses that arrive as a successful `Ok(response)`, and clean
-    // successes — those route to `Completed`/`BusinessLogicFailure` so a mixed
-    // iteration never short-circuits (AC4).
-    // ===========================================================================
-
-    /// Build a `ToolCallSummary` stub for classifier tests. `success == false`
-    /// mirrors a `ToolOutput::error` result (the only shape the classifier inspects).
-    fn summary(name: &str, output: &str, success: bool) -> ToolCallSummary {
-        ToolCallSummary {
-            step: 0,
-            name: name.to_string(),
-            input_summary: String::new(),
-            output_summary: output.to_string(),
-            success,
-            non_zero_exit: false,
-        }
-    }
-
-    #[test]
-    fn classify_503_from_a2a_call_qualifies() {
-        // Founding-incident shape: a2a_call 503 surfaced as a failed tool result.
-        let summaries = vec![summary(
-            "a2a_call",
-            "HTTP status server error (503 Service Unavailable) for url (...)",
-            false,
-        )];
-        assert!(matches!(
-            classify_delegation_from_summaries(&summaries),
-            DelegationOutcome::TransportError { .. }
-        ));
-    }
-
-    #[test]
-    fn classify_transport_error_substring_qualifies() {
-        let summaries = vec![summary("a2a_call", "transport error: broken pipe", false)];
-        assert!(matches!(
-            classify_delegation_from_summaries(&summaries),
-            DelegationOutcome::TransportError { .. }
-        ));
-    }
-
-    #[test]
-    fn classify_connection_refused_and_dns_error_qualify() {
-        for sig in ["connection refused", "dns error while resolving host"] {
-            let summaries = vec![summary("a2a_call", sig, false)];
-            assert!(
-                matches!(
-                    classify_delegation_from_summaries(&summaries),
-                    DelegationOutcome::TransportError { .. }
-                ),
-                "signature {sig:?} must qualify as transport failure"
-            );
-        }
-    }
-
-    #[test]
-    fn classify_deadline_exceeded_qualifies_via_timed_out() {
-        // A hard agent-loop deadline surfaces as `TeamAgentOutcome::TimedOut`, which
-        // maps to a retryable transport error per D2 (deadline-exceeded qualifies).
-        let outcome = TeamAgentOutcome::TimedOut(
-            "Agent timed out while processing team task (deadline exceeded in run_loop)."
-                .to_string(),
-        );
-        assert!(matches!(
-            outcome.delegation_outcome(),
-            DelegationOutcome::TransportError {
-                retryable: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn classify_apologetic_business_response_does_not_qualify() {
-        // The model said "I can't" but every tool call succeeded — a business-logic
-        // apology arrives as `Ok(response)` and must NOT be a transport failure (AC4).
-        let summaries = vec![
-            summary("read_file", "file contents ...", true),
-            summary(
-                "send_message",
-                "I'm sorry, I can't complete this task with the available data.",
-                true,
-            ),
-        ];
-        assert_eq!(
-            classify_delegation_from_summaries(&summaries),
-            DelegationOutcome::Completed
-        );
-    }
-
-    #[test]
-    fn classify_clean_success_does_not_qualify() {
-        let summaries = vec![summary("read_file", "ok", true)];
-        assert_eq!(
-            classify_delegation_from_summaries(&summaries),
-            DelegationOutcome::Completed
-        );
-    }
-
-    #[test]
-    fn classify_empty_summaries_is_completed() {
-        assert_eq!(
-            classify_delegation_from_summaries(&[]),
-            DelegationOutcome::Completed
-        );
-    }
-
-    #[test]
-    fn classify_successful_call_with_503_in_output_does_not_qualify() {
-        // Only FAILED calls are inspected: a successful result that merely mentions
-        // "503" in prose (e.g. the agent describing a status code) is not a transport
-        // failure — guards against false positives on business content.
-        let summaries = vec![summary(
-            "send_message",
-            "The upstream returned 503 earlier but recovered; here is the summary.",
-            true,
-        )];
-        assert_eq!(
-            classify_delegation_from_summaries(&summaries),
-            DelegationOutcome::Completed
-        );
-    }
-
-    #[test]
-    fn classify_error_string_transport_shaped_qualifies() {
-        // Hard agent-loop `Err` with a transport-shaped string still counts.
-        assert!(matches!(
-            classify_delegation_from_error("connection refused by peer"),
-            DelegationOutcome::TransportError { .. }
-        ));
-    }
-
-    #[test]
-    fn classify_error_string_non_transport_is_business_failure() {
-        // A hard `Err` that is not transport-shaped must NOT contribute to the
-        // all-transport short-circuit (AC4) — it maps to BusinessLogicFailure.
-        assert_eq!(
-            classify_delegation_from_error("agent 'foo' not found in team resources"),
-            DelegationOutcome::BusinessLogicFailure
-        );
-    }
-
-    // ===========================================================================
-    // mika#2295 brique 0 — context-window attribution instrument
-    // ===========================================================================
-
-    fn window_msg(session_id: &str, content: &str, created_at: &str) -> crate::db::SessionMessage {
-        crate::db::SessionMessage {
-            id: 0,
-            session_id: session_id.to_string(),
-            agent_id: "mika-arch".to_string(),
-            role: "user".to_string(),
-            content: content.to_string(),
-            channel_type: "cli".to_string(),
-            metadata: None,
-            trace_id: None,
-            created_at: created_at.to_string(),
-            internal: false,
-        }
-    }
-
-    fn at(secs_ago: i64) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now() - chrono::Duration::seconds(secs_ago)
-    }
-
-    #[test]
-    fn mika2295_history_bytes_excludes_the_turn_s_own_user_message() {
-        // The whole point of the split: `history_bytes` must answer "what does
-        // this request carry BEYOND the question?". Folding the turn's own user
-        // message into it would make a large plan look like a large history and
-        // send the correction at the wrong component.
-        let now = chrono::Utc::now();
-        let history = vec![
-            window_msg("s1", "aaaa", &crate::timestamp::format(&at(60))),
-            window_msg("s1", "bbbbbb", &crate::timestamp::format(&at(30))),
-            window_msg(
-                "s1",
-                "the plan under review",
-                &crate::timestamp::format(&at(0)),
-            ),
-        ];
-
-        let f = build_context_window_fields(&history, prompt::HistoryScope::Agent, &[], 0, 0, now);
-
-        assert_eq!(f.message_count, 3);
-        assert_eq!(f.history_bytes, 4 + 6);
-        assert_eq!(f.user_message_bytes, "the plan under review".len());
-    }
-
-    #[test]
-    fn mika2295_distinct_sessions_is_the_cross_ticket_contamination_detector() {
-        // The window is filtered on `m.agent_id`, not `m.session_id`, so it
-        // crosses sessions and therefore tickets. This field is what turns that
-        // property from a code reading into a measurement.
-        let now = chrono::Utc::now();
-        let ts = crate::timestamp::format(&at(10));
-
-        let one_ticket = vec![
-            window_msg("s1", "a", &ts),
-            window_msg("s1", "b", &ts),
-            window_msg("s1", "c", &ts),
-        ];
-        assert_eq!(
-            build_context_window_fields(&one_ticket, prompt::HistoryScope::Agent, &[], 0, 0, now)
-                .distinct_sessions,
-            1,
-            "a window confined to one session must report exactly 1"
-        );
-
-        let three_tickets = vec![
-            window_msg("ticket-a", "plan A", &ts),
-            window_msg("ticket-b", "plan B", &ts),
-            window_msg("ticket-c", "plan C", &ts),
-            window_msg("ticket-a", "review A", &ts),
-        ];
-        assert_eq!(
-            build_context_window_fields(
-                &three_tickets,
-                prompt::HistoryScope::Agent,
-                &[],
-                0,
-                0,
-                now
-            )
-            .distinct_sessions,
-            3,
-            "three distinct sessions in the window is the contamination signal"
-        );
-    }
-
-    #[test]
-    fn mika2295_oldest_age_is_taken_from_the_first_message() {
-        // `rebuild_context` returns oldest-first (the SQL sorts DESC then the
-        // loader reverses), so the age is read off `first()`. If that ordering
-        // ever flips, this assertion is what says so.
-        let now = chrono::Utc::now();
-        let history = vec![
-            window_msg("s1", "old", &crate::timestamp::format(&at(3600))),
-            window_msg("s1", "recent", &crate::timestamp::format(&at(5))),
-        ];
-
-        let f = build_context_window_fields(&history, prompt::HistoryScope::Agent, &[], 0, 0, now);
-        assert!(
-            (3595..=3605).contains(&f.oldest_age_secs),
-            "expected ~3600s, got {}",
-            f.oldest_age_secs
-        );
-    }
-
-    #[test]
-    fn mika2295_unreadable_or_future_timestamp_reports_zero_never_a_negative() {
-        // A negative age would read as a clock claim the instrument cannot back.
-        // Zero is the honest floor, and it is the rule `timestamp::is_older_than`
-        // already applies to the same class of input.
-        let now = chrono::Utc::now();
-
-        let garbled = vec![window_msg("s1", "x", "not-a-timestamp")];
-        assert_eq!(
-            build_context_window_fields(&garbled, prompt::HistoryScope::Agent, &[], 0, 0, now)
-                .oldest_age_secs,
-            0
-        );
-
-        let from_the_future = vec![window_msg(
-            "s1",
-            "x",
-            &crate::timestamp::format(&(now + chrono::Duration::seconds(600))),
-        )];
-        assert_eq!(
-            build_context_window_fields(
-                &from_the_future,
-                prompt::HistoryScope::Agent,
-                &[],
-                0,
-                0,
-                now
-            )
-            .oldest_age_secs,
-            0
-        );
-    }
-
-    #[test]
-    fn mika2295_empty_window_reports_zeroes_rather_than_panicking() {
-        // A fresh session assembles an empty window. The instrument must survive
-        // it: an attribution event that panics on the first turn of a session
-        // would take the turn down with it.
-        let f = build_context_window_fields(
-            &[],
-            prompt::HistoryScope::Agent,
-            &[],
-            0,
-            0,
-            chrono::Utc::now(),
-        );
-
-        assert_eq!(f.message_count, 0);
-        assert_eq!(f.history_bytes, 0);
-        assert_eq!(f.user_message_bytes, 0);
-        assert_eq!(f.distinct_sessions, 0);
-        assert_eq!(f.oldest_age_secs, 0);
-    }
-
-    #[test]
-    fn mika2295_single_message_window_is_all_user_message_and_no_history() {
-        // The first turn of a session: the only message IS the question, so the
-        // history it carries is zero. An off-by-one in `split_last` would show up
-        // here as the question being counted as its own history.
-        let history = vec![window_msg(
-            "s1",
-            "review this plan",
-            &crate::timestamp::format(&at(1)),
-        )];
-
-        let f = build_context_window_fields(
-            &history,
-            prompt::HistoryScope::Agent,
-            &[],
-            0,
-            0,
-            chrono::Utc::now(),
-        );
-
-        assert_eq!(f.history_bytes, 0);
-        assert_eq!(f.user_message_bytes, "review this plan".len());
-    }
-
-    #[test]
-    fn mika2295_tool_defs_bytes_is_the_serialized_size() {
-        // Tool definitions are the third component of the request and grow
-        // independently of the window. Reporting them here is what lets the
-        // analyzer subtract a known quantity instead of attributing its growth to
-        // the history by elimination.
-        let defs = full_tool_set();
-        let expected = serde_json::to_string(&defs).unwrap().len();
-
-        let f = build_context_window_fields(
-            &[],
-            prompt::HistoryScope::Agent,
-            &defs,
-            0,
-            0,
-            chrono::Utc::now(),
-        );
-
-        assert_eq!(f.tool_defs_bytes, expected);
-        assert!(f.tool_defs_bytes > 0);
-    }
-
-    #[test]
-    fn mika2295_truncation_counts_are_passed_through_not_invented() {
-        // They are parameters rather than literals so the byte ceiling could be
-        // lifted without reshaping the event an analyzer has already been written
-        // against. Since brique 2, the production call site passes real counts.
-        let f = build_context_window_fields(
-            &[],
-            prompt::HistoryScope::Agent,
-            &[],
-            7,
-            4096,
-            chrono::Utc::now(),
-        );
-
-        assert_eq!(f.truncated_messages, 7);
-        assert_eq!(f.truncated_bytes, 4096);
-    }
-
-    // ===========================================================================
-    // mika#2305 — the scope travels with the count it explains
-    // ===========================================================================
-
-    /// **T3 (pure half)** — the field reports the scope it was handed, for both
-    /// variants.
-    ///
-    /// The values are a wire format: an operator `jq`s on them and `GROUP BY`s
-    /// them, so a rename silently splits one population in two. Pinning the two
-    /// literals here is what makes that a compile-and-test failure rather than a
-    /// dashboard that quietly stops matching.
-    #[test]
-    fn mika2305_the_field_reports_the_scope_it_was_given() {
-        let now = chrono::Utc::now();
-        let ts = crate::timestamp::format(&at(10));
-        let history = vec![window_msg("s1", "a", &ts)];
-
-        assert_eq!(
-            build_context_window_fields(&history, prompt::HistoryScope::Session, &[], 0, 0, now)
-                .history_scope,
-            "session"
-        );
-        assert_eq!(
-            build_context_window_fields(&history, prompt::HistoryScope::Agent, &[], 0, 0, now)
-                .history_scope,
-            "agent"
-        );
-    }
-
-    /// **T4** — the label match carries no `_ =>` arm.
-    ///
-    /// Rust already forces exhaustiveness; what it does **not** force is that a
-    /// future variant be *decided* rather than absorbed. A `_ => "agent"` would
-    /// compile, keep every assertion above green, and label the new scope with
-    /// somebody else's name — which is the one failure this field exists to
-    /// prevent. Hence a source scan: the defect makes no covered decision wrong.
-    #[test]
-    fn mika2305_the_label_match_has_no_wildcard_arm() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agent_loop/mod.rs"),
-        )
-        .expect("the guard must be able to read agent_loop/mod.rs");
-
-        let sig = "fn history_scope_label(";
-        let start = src
-            .find(sig)
-            .expect("history_scope_label must exist in agent_loop/mod.rs");
-        let rest = &src[start..];
-        let end = rest.find("\n}\n").expect("the function must be closed");
-        let body = &rest[..end];
-
-        assert!(
-            !body.contains("_ =>"),
-            "mika#2305 — `history_scope_label` grew a wildcard arm. A future \
-             `HistoryScope` variant would then inherit an existing label, and \
-             `context_window_assembled` would report a scope that is not the one \
-             in force. Name the new variant explicitly instead.\nbody was:\n{body}"
-        );
-    }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // mika#2474 — the tail of the brief-size distribution.
-    // ─────────────────────────────────────────────────────────────────────
-
-    /// Build a window whose last message — the turn's user message, i.e. the plan
-    /// on an architect pass — weighs exactly `bytes`.
-    fn window_with_brief(bytes: usize) -> ContextWindowFields {
-        let ts = crate::timestamp::format(&at(10));
-        let history = vec![
-            window_msg("s1", "older history", &ts),
-            window_msg("s1", &"p".repeat(bytes), &ts),
-        ];
-        build_context_window_fields(
-            &history,
-            prompt::HistoryScope::Session,
-            &[],
-            0,
-            0,
-            chrono::Utc::now(),
-        )
-    }
-
-    /// The threshold is what decides, **and the boundary is exclusive**.
-    ///
-    /// The `==` case is the negative control that separates "the threshold
-    /// decides" from "anything non-trivial is reported": at exactly p90 a brief is
-    /// still inside the healthy distribution the threshold was calibrated on.
-    #[test]
-    fn mika2474_the_verdict_fires_only_above_the_threshold() {
-        assert_eq!(brief_size_overrun_verdict(48_001, 48_000), Some(48_000));
-        assert_eq!(brief_size_overrun_verdict(48_000, 48_000), None);
-        assert_eq!(brief_size_overrun_verdict(1_260, 48_000), None);
-
-        // The resolved threshold is reported, not the default: a 50 KB brief read
-        // against 48 000 and the same brief read against 20 000 are two different
-        // facts, and the line has to say which.
-        assert_eq!(brief_size_overrun_verdict(50_000, 20_000), Some(20_000));
-
-        // A non-representable threshold reports nothing — silence is the fail-safe
-        // direction for an alert. Unreachable in production (the accessor
-        // guarantees a positive `i64`), asserted rather than assumed.
-        assert_eq!(brief_size_overrun_verdict(usize::MAX, -1), None);
-    }
-
-    /// The crossing writes one audit row, and `after_value` carries the bytes and
-    /// nothing else — it is what the operator averages.
-    #[tokio::test]
-    async fn mika2474_an_oversized_brief_is_reported_and_audited() {
-        let db = test_async_db();
-        let fields = window_with_brief(72_349); // p99 of September 2026.
-
-        report_brief_size_overrun(
-            &db,
-            "test-session",
-            "trace-2474",
-            "conversation",
-            &fields,
-            16_562, // the `mika-arch-groom-ticket` prompt, measured.
-            48_000,
-        )
-        .await;
-
-        let rows = db.get_audit_events("test-session").await.unwrap();
-        let overruns: Vec<_> = rows
-            .iter()
-            .filter(|r| r.tool_name == BRIEF_SIZE_OVERRUN_EVENT)
-            .collect();
-
-        assert_eq!(overruns.len(), 1, "exactly one row per crossing");
-        assert_eq!(overruns[0].target_key, format!("agent:{}", db.agent_id));
-        assert_eq!(
-            overruns[0].after_value.as_deref(),
-            Some("72349"),
-            "after_value is the byte count alone — the `pilot_cost_overrun` motif"
-        );
-        assert_eq!(
-            overruns[0].before_value, None,
-            "a size has no prior state to name"
-        );
-        assert_eq!(overruns[0].trace_id.as_deref(), Some("trace-2474"));
-
-        // The reasoning carries the other three components so the row can be read
-        // without a second query.
-        let reasoning = overruns[0].reasoning.as_deref().unwrap_or_default();
-        for expected in ["trace_id=trace-2474", "system=16562", "threshold=48000"] {
-            assert!(
-                reasoning.contains(expected),
-                "reasoning must carry {expected}; got {reasoning}"
-            );
-        }
-    }
-
-    /// **The negative control, and without it "the threshold decides" is
-    /// indistinguishable from "the threshold always emits".**
-    #[tokio::test]
-    async fn mika2474_a_brief_under_the_threshold_emits_nothing() {
-        let db = test_async_db();
-        let fields = window_with_brief(29_414); // the measured median.
-
-        report_brief_size_overrun(
-            &db,
-            "test-session",
-            "trace-nominal",
-            "conversation",
-            &fields,
-            16_562,
-            48_000,
-        )
-        .await;
-
-        let rows = db.get_audit_events("test-session").await.unwrap();
-        assert!(
-            rows.iter().all(|r| r.tool_name != BRIEF_SIZE_OVERRUN_EVENT),
-            "a median brief must write no row: this is a threshold, not a per-turn event"
-        );
-    }
-
-    /// Groups of `match` arms that **dispatch on** `HistoryScope` — i.e. read the
-    /// scope in order to decide or render something.
-    ///
-    /// The predicate is positional, not lexical, and that is what makes it usable:
-    /// the type name must appear **in the pattern**, left of the `=>`. So
-    /// `deserialize_history_scope`'s arms — which merely *produce* a
-    /// `HistoryScope` on the right of their `=>` — fall out on their own, with no
-    /// name-based allowlist that would have to be widened by hand every time a
-    /// legitimate site appears. Equality assertions (`assert_eq!(…, Scope::Agent)`)
-    /// carry no `=>` and fall out too.
-    ///
-    /// Arms within two lines of each other are one site: a `match` has several
-    /// arms and counting lines would answer a different question from the one
-    /// asked ("how many readers?").
-    fn scope_match_sites(src: &str) -> Vec<Vec<(usize, String)>> {
-        let hits: Vec<(usize, String)> = src
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| match line.find("=>") {
-                Some(arrow) => line[..arrow].contains("HistoryScope::"),
-                None => false,
-            })
-            .map(|(n, line)| (n + 1, line.trim().to_string()))
-            .collect();
-
-        let mut sites: Vec<Vec<(usize, String)>> = Vec::new();
-        for hit in hits {
-            match sites.last_mut() {
-                Some(last) if hit.0.saturating_sub(last[last.len() - 1].0) <= 2 => last.push(hit),
-                _ => sites.push(vec![hit]),
-            }
-        }
-        sites
-    }
-
-    /// `HistoryScope` reader sites in one file, production half only.
-    ///
-    /// Two exclusions compose, in this order: a file whose **path** is test
-    /// code has no production half at all (mika#2321, [`crate::source_scan`]);
-    /// in any other file the test regions are masked by
-    /// [`mika_common::source_guard`] (mika#2398) — never by truncating at the
-    /// first `#[cfg(test)]`, which cut `prompt.rs` at line 142 on a doc comment
-    /// that merely mentions the marker. Masking keeps the file's own line
-    /// numbers, so a site found here is named where it lives.
-    fn scope_reader_sites(path: &std::path::Path, src: &str) -> Vec<Vec<(usize, String)>> {
-        if crate::source_scan::is_test_source_path(path) {
-            return Vec::new();
-        }
-        scope_match_sites(&mika_common::source_guard::mask_test_regions(src))
-    }
-
-    /// Tokens that make a line an *addition* rather than a read.
-    ///
-    /// `+=` and the three checked forms are unambiguous; bare `+` is matched
-    /// with its surrounding spaces so `run_usage` inside a `format!("{a}+{b}")`
-    /// or a doc link is not swept in.
-    const MIKA1883_ADDITION_TOKENS: &[&str] =
-        &[" + ", "+=", "saturating_add", "checked_add", "wrapping_add"];
-
-    /// The four `LlmUsage` fields an open-coded fold would touch.
-    const MIKA1883_USAGE_FIELDS: &[&str] = &[
-        "input_tokens",
-        "output_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_input_tokens",
-    ];
-
-    /// Lines under `agent_loop/` that add usage without going through the
-    /// helper, as `(1-based line, trimmed text)`.
-    fn mika1883_open_coded_fold_sites(src: &str) -> Vec<(usize, String)> {
-        src.lines()
-            .enumerate()
-            .filter(|(_, line)| {
-                let mentions_usage = line.contains("run_usage")
-                    || MIKA1883_USAGE_FIELDS.iter().any(|f| line.contains(f));
-                let adds = MIKA1883_ADDITION_TOKENS.iter().any(|t| line.contains(t));
-                let via_helper = line.contains("LlmUsage::accumulate");
-                mentions_usage && adds && !via_helper
-            })
-            .map(|(i, line)| (i + 1, line.trim().to_string()))
-            .collect()
-    }
-
-    /// **AC9** — the turn total is folded at one place, and only there.
-    ///
-    /// The writer counterpart of
-    /// `mika1883_both_client_surfaces_read_the_one_reader`, and the only one of
-    /// the two that can see a **second fold**. `LlmUsage::accumulate` has its own
-    /// unit test, which attests that `None + Some(n) = Some(n)` is right — it
-    /// attests nothing about whether the two addition sites *use* it. A second
-    /// site that re-wrote the `Option` merge by hand would serve a wrong total
-    /// with every existing test green, which is the silent class this repo closes
-    /// with a scan wherever it has met it (`mika2131_*`, `mika2220_*`).
-    ///
-    /// Shipped with **no allowlist**. That is not optimism: `run_usage` is born
-    /// in this change and its two addition sites are created by it, so the first
-    /// entry anyone would want to add here is exactly the divergence the scan
-    /// exists to refuse. Resolution when it fires: **remove the second site**,
-    /// never allowlist it — the rule `ACTOR_READING_PREDICATES_ALLOWED`
-    /// (mika#2323) states for its own list shipped empty.
-    #[test]
-    fn mika1883_run_usage_accumulates_only_via_the_one_helper() {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let src_root = scanner.src_root().to_path_buf();
-        let agent_loop_root = src_root.join("agent_loop");
-        let mut offenders: Vec<String> = Vec::new();
-
-        scanner.for_each_under(&agent_loop_root, |path, production| {
-            if crate::source_scan::is_test_source_path(path) {
-                return;
-            }
-            let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
-            for (line, text) in mika1883_open_coded_fold_sites(production) {
-                offenders.push(format!("{rel}:{line}: {text}"));
-            }
-        });
-
-        assert!(
-            offenders.is_empty(),
-            "mika#1883 — a second site folds usage by hand instead of calling \
-             `LlmUsage::accumulate`. Remove it; do not allowlist it — two folds \
-             that can disagree produce a wrong total with every test green:\n{}",
-            offenders.join("\n")
-        );
-    }
-
-    /// Good-faith control for the scan above: it really does catch the shape it
-    /// claims to, rather than being a predicate that matches nothing.
-    #[test]
-    fn mika1883_the_fold_scan_catches_an_open_coded_site() {
-        let offending = "fn f() {\n    run_usage.input_tokens += response.usage.input_tokens;\n}\n";
-        assert_eq!(
-            mika1883_open_coded_fold_sites(offending).len(),
-            1,
-            "the scan must catch a hand-written fold"
-        );
-
-        let legal = "fn f() {\n    run_usage = LlmUsage::accumulate(run_usage, Some(&u));\n}\n";
-        assert!(
-            mika1883_open_coded_fold_sites(legal).is_empty(),
-            "a call to the helper is the legal shape and must not be flagged"
-        );
-
-        let a_mere_read = "fn f() {\n    let n = response.usage.input_tokens;\n}\n";
-        assert!(
-            mika1883_open_coded_fold_sites(a_mere_read).is_empty(),
-            "reading a usage field is not folding it — flagging reads would make \
-             the guard fire on `build_turn_usage_fields` and get disarmed"
-        );
-    }
-
-    /// One `detect_config_change(` call site, with everything the AC7 assertion
-    /// needs to name it.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct Mika2473Site {
-        /// Path relative to the crate's `src/`, e.g. `agent_loop/mod.rs`.
-        file: String,
-        /// 1-based line inside that file.
-        line: usize,
-        /// The `fn` the call sits in.
-        enclosing: String,
-        /// The trimmed source line, so a failure reads without opening the file.
-        text: String,
-    }
-
-    impl std::fmt::Display for Mika2473Site {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let Self {
-                file,
-                line,
-                enclosing,
-                text,
-            } = self;
-            write!(f, "{file}:{line} (in `{enclosing}`): {text}")
-        }
-    }
-
-    /// Every `detect_config_change(` call site in one Rust source, tagged with
-    /// the file it was found in.
-    ///
-    /// **Prose is not a call site.** A line whose content starts with `//`
-    /// *names* the primitive without calling it; flagging those would make the
-    /// only way to keep the guard green to stop naming the contract in comments,
-    /// which is how a structural guard gets disarmed by the people it serves.
-    /// `server/mod.rs` names it in exactly that way, one line above
-    /// `note_config_at_boot`.
-    fn mika2473_freshness_check_sites(file: &str, src: &str) -> Vec<Mika2473Site> {
-        let mut enclosing = String::from("<no enclosing fn>");
-        let mut sites = Vec::new();
-        for (i, line) in src.lines().enumerate() {
-            let text = line.trim();
-            if let Some(name) = mika2473_declared_fn_name(text) {
-                enclosing = name;
-            }
-            if text.starts_with("//") {
-                continue;
-            }
-            if text.contains("detect_config_change(") {
-                sites.push(Mika2473Site {
-                    file: file.to_string(),
-                    line: i + 1,
-                    enclosing: enclosing.clone(),
-                    text: text.to_string(),
-                });
-            }
-        }
-        sites
-    }
-
-    /// `fn f(` / `async fn f(` / `pub(crate) async fn f(` → `f`; anything else
-    /// that merely mentions `fn ` (a doc comment, a `let` binding) → `None`.
-    fn mika2473_declared_fn_name(trimmed: &str) -> Option<String> {
-        let (head, rest) = trimmed.split_once("fn ")?;
-        let is_declaration = head.split_whitespace().all(|token| {
-            matches!(
-                token,
-                "pub" | "pub(crate)" | "pub(super)" | "async" | "const" | "unsafe" | "extern"
-            )
-        });
-        if !is_declaration {
-            return None;
-        }
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        (!name.is_empty()).then_some(name)
-    }
-
-    /// **AC7 (mika#2473)** — the config-freshness check has exactly one call
-    /// site **in the whole crate**, and that site is the funnel.
-    ///
-    /// `load_agent_context` is the single entry point of the three loops —
-    /// conversation (`run_agent`), silent, and team (`run_team_agent_inner_impl`)
-    /// — so one call there evaluates every turn that runs on this process
-    /// (KTD5). A second call, added by an author who did not know the funnel
-    /// existed, costs a second `stat` per turn and — the real damage — splits
-    /// the "one report per distinct mtime" contract (R9/KTD4) across two callers
-    /// of a dedup map keyed by `agent_id`, not by call site: whichever site ran
-    /// first would silence the other, and which one that is would depend on the
-    /// loop.
-    ///
-    /// # Why the whole crate and not `agent_loop/mod.rs`
-    ///
-    /// Because the damage does not care which file the second site lives in, and
-    /// a scan of one file is *most* blind exactly where a stranger to this
-    /// contract would write: `server/`, `teams/`, `task_engine/`. A guard that
-    /// green-lights the case it exists to refuse is worse than none — it reads
-    /// as coverage. The one-file form shipped that way and its companion control
-    /// only ever injected a second site into the *same* file, which is the case
-    /// the scan did cover.
-    ///
-    /// Shipped with **no allowlist**, and the population at HEAD is **one**. So
-    /// the first entry anyone would want to add here is exactly the second site
-    /// this scan exists to refuse. Conduct when it fires: **remove the second
-    /// call site**, never allowlist it. The same rule
-    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` states for its
-    /// own empty list, one module over.
-    #[test]
-    fn mika2473_the_freshness_check_sits_in_the_one_funnel() {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let src_root = scanner.src_root().to_path_buf();
-        let mut sites: Vec<Mika2473Site> = Vec::new();
-        scanner.for_each(|path, production| {
-            let label = path
-                .strip_prefix(&src_root)
-                .unwrap_or(path)
-                .display()
-                .to_string();
-            sites.extend(mika2473_freshness_check_sites(&label, production));
-        });
-
-        let rendered = sites
-            .iter()
-            .map(Mika2473Site::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_eq!(
-            sites.len(),
-            1,
-            "mika#2473 AC7 — `detect_config_change` must be called exactly once \
-             in this crate. Remove the extra call site; do not allowlist it — two \
-             sites share one dedup key and silence each other:\n{rendered}"
-        );
-        assert_eq!(
-            sites[0].enclosing, "load_agent_context",
-            "mika#2473 KTD5 — the one call must sit in `load_agent_context`, the \
-             funnel of the three loops. A guard in a single loop is blind to the \
-             other two:\n{rendered}"
-        );
-        assert_eq!(
-            sites[0].file,
-            std::path::Path::new("agent_loop")
-                .join("mod.rs")
-                .display()
-                .to_string(),
-            "mika#2473 KTD5 — and `load_agent_context` lives in `agent_loop/mod.rs`. \
-             A same-named fn elsewhere is not the funnel:\n{rendered}"
-        );
-    }
-
-    /// Good-faith control for the scan above: it catches the shape it claims to,
-    /// rather than being a predicate that matches nothing.
-    ///
-    /// The second site is injected into a **different file**, which is the case
-    /// the one-file form of this guard could not see: it is the whole reason the
-    /// scan became a crate walk.
-    #[test]
-    fn mika2473_the_funnel_scan_catches_a_second_site() {
-        let funnel = "async fn load_agent_context(db: &AsyncDatabase) -> Result<AgentContext> {\n    \
-             if let Some(finding) = mika_common::llm::detect_config_change(db.agent_id()) {}\n}\n";
-        let one = mika2473_freshness_check_sites("agent_loop/mod.rs", funnel);
-        assert_eq!(one.len(), 1, "the legal shape is one site");
-        assert_eq!(
-            one[0].enclosing, "load_agent_context",
-            "and it is attributed to the funnel"
-        );
-        assert_eq!(one[0].file, "agent_loop/mod.rs", "and to its file");
-
-        let same_file = format!(
-            "{funnel}\nasync fn run_team_agent_inner_impl() {{\n    \
-             let _ = mika_common::llm::detect_config_change(\"mika-arch\");\n}}\n"
-        );
-        let both = mika2473_freshness_check_sites("agent_loop/mod.rs", &same_file);
-        assert_eq!(
-            both.len(),
-            2,
-            "a second call site in the same file is caught"
-        );
-        assert_eq!(
-            both[1].enclosing, "run_team_agent_inner_impl",
-            "and named by the fn that added it"
-        );
-
-        // The case the one-file scan was blind to: a stranger to this contract
-        // writes the second call where the turn passes through *their* module.
-        let elsewhere = "pub async fn init_agent(agent_name: &str) {\n    \
-             let _ = mika_common::llm::detect_config_change(agent_name);\n}\n";
-        let mut across = one.clone();
-        across.extend(mika2473_freshness_check_sites("server/mod.rs", elsewhere));
-        assert_eq!(
-            across.len(),
-            2,
-            "a second call site in ANOTHER file must be caught — this is the \
-             population the crate walk exists for"
-        );
-        assert_eq!(across[1].file, "server/mod.rs", "and named by its file");
-        assert_eq!(across[1].enclosing, "init_agent");
-
-        let prose = "/// The funnel calls `detect_config_change(` once.\nfn f() {}\n";
-        assert!(
-            mika2473_freshness_check_sites("server/mod.rs", prose).is_empty(),
-            "naming the primitive in a comment is not calling it — flagging \
-             prose is how this guard would get disarmed"
-        );
-    }
-
-    /// **T5** — the scope has one decisional reader, and it is
-    /// `run_agent`'s `scoped_session_id`.
-    ///
-    /// A second reader would make no decision *wrong* the day it is written; it
-    /// would make two answers to one question able to drift apart — the class
-    /// `grooming_marker` had to engrave once (mika#2158: a copied regex whose own
-    /// comment said "Mirrors …" and then missed two widenings).
-    ///
-    /// Exactly **three** sites are expected, all under `agent_loop/`: the
-    /// cascade (`context_history::resolve`, mika#2425), the decision
-    /// (`scoped_session_id`) and the rendering (`history_scope_label`). A fourth
-    /// is halt-and-surface, not an allowlist entry — whether it is a legitimate
-    /// rendering or a second decision is a question this guard cannot answer for
-    /// you.
-    ///
-    /// **mika#2425 amended this guard rather than excepting itself from it**, and
-    /// the difference matters. What the guard protects is written in its own
-    /// message: *two answers to "which rows may this window draw from?" can drift
-    /// apart without breaking anything visible.* `context_history::resolve` is
-    /// not a second answer — it **produces** the single answer `scoped_session_id`
-    /// consumes, and `mika2425_identity_context_history_has_a_single_reader`
-    /// guarantees that consumer reads nothing else. Two grep-visible gestures:
-    /// the count goes `2 → 3` and names the third site, and the path constraint
-    /// relaxes from `agent_loop/mod.rs` to `agent_loop/` — the invariant as
-    /// written is *the readers live in the loop*, and the resolver is in the loop.
-    /// The constraint is not relaxed beyond that directory.
-    ///
-    /// **The production half is read by [`mika_common::source_guard`]
-    /// (mika#2398).** Truncating at the first `#[cfg(test)]`, as this guard did,
-    /// cut `prompt.rs` at line 142 — a doc comment that merely *mentions* the
-    /// marker — and left 1 886 of its lines unread. The scan was not wrong about
-    /// what it saw; it had stopped seeing.
-    #[test]
-    fn mika2305_the_scope_has_a_single_decisional_reader() {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let src_root = scanner.src_root().to_path_buf();
-        let mut sites: Vec<String> = Vec::new();
-
-        scanner.for_each(|path, production| {
-            let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
-            for site in scope_reader_sites(path, production) {
-                sites.push(format!("{rel}:{}: {}", site[0].0, site[0].1));
-            }
-        });
-
-        assert_eq!(
-            sites.len(),
-            3,
-            "mika#2305 (count amended by mika#2425) — expected exactly three readers of \
-             `HistoryScope` outside deserialization: the cascade in \
-             `context_history::resolve`, the decision in `run_agent` \
-             (`scoped_session_id`) and the rendering in `history_scope_label`. \
-             Found {}:\n{}\n\nIf you added a second *decision*, route it through \
-             `scoped_session_id` instead — two answers to \"which rows may this window \
-             draw from?\" can drift apart without breaking anything visible. If a \
-             rustfmt reflow split the resolver's `match` into two sites, put its arms \
-             back on one line each rather than raising this number.",
-            sites.len(),
-            sites.join("\n")
-        );
-        assert!(
-            sites
-                .iter()
-                .all(|s| s.starts_with("agent_loop/") || s.starts_with("agent_loop\\")),
-            "mika#2305 — a reader of `HistoryScope` lives outside `agent_loop/`:\n{}",
-            sites.join("\n")
-        );
-    }
-
-    /// **T5b — good-faith control for T5.** The predicate must redden on a
-    /// decisional `match` added elsewhere, and must stay silent on the three
-    /// shapes that legitimately name the type.
-    ///
-    /// Without this, T5 could be green because it looks at nothing — which is the
-    /// exact failure mode T5 exists to make visible on the other axis.
-    #[test]
-    fn mika2305_the_scan_reddens_on_a_decisional_match_added_elsewhere() {
-        let offending = r#"
-            fn somewhere_else(scope: HistoryScope) -> usize {
-                match scope {
-                    HistoryScope::Session => 1,
-                    HistoryScope::Agent => 20,
-                }
-            }
-        "#;
-        assert_eq!(
-            scope_match_sites(offending).len(),
-            1,
-            "the scan must see a decisional match added outside the production site"
-        );
-
-        // Deserialization: the type is *produced* on the right of the arrow.
-        let deserialization = r#"
-            Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("agent") => Ok(HistoryScope::Agent),
-            Some(toml::Value::String(s)) if s.eq_ignore_ascii_case("session") => Ok(HistoryScope::Session),
-        "#;
-        assert!(
-            scope_match_sites(deserialization).is_empty(),
-            "deserialization produces the type, it does not read it — it must not count"
-        );
-
-        // Equality assertions carry no arrow.
-        let assertion = "assert_eq!(identity.context.history.scope, HistoryScope::Agent);";
-        assert!(
-            scope_match_sites(assertion).is_empty(),
-            "an equality assertion is not a reader"
-        );
-
-        // A `#[cfg(test)]` tail is not production.
-        let with_test_tail = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    match s { HistoryScope::Agent => 1, HistoryScope::Session => 2 };\n}\n";
-        assert!(
-            scope_match_sites(&mika_common::source_guard::mask_test_regions(
-                with_test_tail
-            ))
-            .is_empty(),
-            "the test tail must be masked before scanning"
-        );
-
-        // mika#2398 — and the shape the previous `split at the first marker`
-        // rule got wrong: a module-level test helper ABOVE the production this
-        // guard must read. Truncating there is what left `prompt.rs` unread
-        // past line 142.
-        let helper_first = "\
-#[cfg(test)]
-fn helper() -> u32 {
-    1
-}
-
-fn prod(scope: HistoryScope) -> usize {
-    match scope {
-        HistoryScope::Session => 1,
-        HistoryScope::Agent => 20,
-    }
-}
-";
-        assert_eq!(
-            scope_match_sites(&mika_common::source_guard::mask_test_regions(helper_first)).len(),
-            1,
-            "a decisional match AFTER a module-level test helper must still be seen — \
-             the truncating rule this guard used to apply would have missed it"
-        );
-    }
-
-    // -- mika#2425: the declared floor has ONE reader -----------------------
-
-    /// Production sites exempted from [`mika2425_identity_context_history_has_a_single_reader`].
-    ///
-    /// **Shipped empty, and the resolution when the scan fires is to REMOVE the
-    /// second reader, never to add an entry here.** Same contract as
-    /// `ACTOR_READING_PREDICATES_ALLOWED` (mika#2323) and the empty allowlist of
-    /// `mika1883_run_usage_accumulates_only_via_the_one_helper` — a list born
-    /// empty is a slot for the next lapse, so its emptiness is itself asserted.
-    ///
-    /// If an exception is ever genuinely warranted, the entry must name its
-    /// follow-up ticket (`mika#NNNN`), which the self-cleaning assertion below
-    /// enforces.
-    const CONTEXT_HISTORY_READERS_ALLOWED: &[&str] = &[];
-
-    /// Production lines reading the declared `[context.history]` block off an
-    /// identity, as `(1-based line, trimmed text)`.
-    ///
-    /// The needle is the **dotted field path** (`.context.history`), not the
-    /// TOML section header `[context.history]`: the second names the block in a
-    /// doc comment, a template literal or a `CODE_OWNED_IDENTITY_SECTIONS`
-    /// entry without reading it, and sweeping those in would make the guard
-    /// unusable on the very files that legitimately describe the section.
-    ///
-    /// A **comment line is not a reader**, and that exclusion is load-bearing
-    /// rather than cosmetic. This guard's own decision site carries three
-    /// paragraphs naming the field to say why it must be read exactly once, and
-    /// an unanchored predicate accused them — the same shape as the mika#2050
-    /// Signal S false positive, where a grep matched prose a pilot had written
-    /// *about* the signal. Anchoring on comments is what keeps the guard
-    /// readable enough to be trusted; an in-line trailing comment does not
-    /// exempt the code preceding it, since the line no longer *starts* with the
-    /// marker.
-    ///
-    /// Two further exclusions compose, in this order and for the reasons
-    /// [`scope_reader_sites`] states: a file whose **path** is test code has no
-    /// production half (mika#2321); anywhere else the test regions are masked
-    /// (mika#2398), which keeps the file's own line numbers.
-    fn identity_history_reader_sites(path: &std::path::Path, src: &str) -> Vec<(usize, String)> {
-        if crate::source_scan::is_test_source_path(path) {
-            return Vec::new();
-        }
-        mika_common::source_guard::mask_test_regions(src)
-            .lines()
-            .enumerate()
-            .map(|(i, line)| (i + 1, line.trim().to_string()))
-            .filter(|(_, line)| {
-                line.contains(".context.history")
-                    && !line.starts_with("//")
-                    && !line.starts_with('*')
-            })
-            .collect()
-    }
-
-    /// **D3** — the identity's declared window has exactly one production reader.
-    ///
-    /// The whole mika#2425 cascade rests on that number being one: the declared
-    /// value is a **floor** that the `customer_config` half may only narrow, and
-    /// a second site reading `identity.context.history` directly would apply the
-    /// floor without the narrowing — silently, with every behavioural assertion
-    /// still green, because both answers are individually plausible. That is the
-    /// class `grooming_marker` had to close once (mika#2158), where promotion
-    /// and dispatch routing answered the same question differently for months.
-    #[test]
-    fn mika2425_identity_context_history_has_a_single_reader() {
-        assert!(
-            CONTEXT_HISTORY_READERS_ALLOWED
-                .iter()
-                .all(|entry| entry.contains("mika#")),
-            "mika#2425 — every entry of CONTEXT_HISTORY_READERS_ALLOWED must name the \
-             follow-up ticket that will remove it. An exemption nobody owns is how a \
-             guard stops guarding. Current list: {CONTEXT_HISTORY_READERS_ALLOWED:?}"
-        );
-
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let src_root = scanner.src_root().to_path_buf();
-        let mut sites: Vec<String> = Vec::new();
-
-        scanner.for_each(|path, production| {
-            let rel = path
-                .strip_prefix(&src_root)
-                .unwrap_or(path)
-                .display()
-                .to_string();
-            if CONTEXT_HISTORY_READERS_ALLOWED
-                .iter()
-                .any(|allowed| rel.contains(allowed))
-            {
-                return;
-            }
-            for (line, text) in identity_history_reader_sites(path, production) {
-                sites.push(format!("{rel}:{line}: {text}"));
-            }
-        });
-
-        assert_eq!(
-            sites.len(),
-            1,
-            "mika#2425 — expected exactly ONE production reader of the identity's \
-             `[context.history]`: the site that feeds `context_history::resolve`. \
-             Found {}:\n{}\n\nIf you added a second one, route it through the resolver \
-             instead of allowlisting it — a site reading the declared value directly \
-             applies the role's floor WITHOUT the per-tenant narrowing, and nothing \
-             visible breaks.",
-            sites.len(),
-            sites.join("\n")
-        );
-        assert!(
-            sites[0].starts_with("agent_loop/mod.rs:")
-                || sites[0].starts_with("agent_loop\\mod.rs:"),
-            "mika#2425 — the one reader must be the decision site in `agent_loop/mod.rs`, \
-             where the resolved scope is consumed:\n{}",
-            sites[0]
-        );
-    }
-
-    /// **D3b — good-faith control for D3.**
-    ///
-    /// D3 could be green because it looks at nothing, which is the exact failure
-    /// mode D3 exists to make visible. So the predicate is shown to redden on a
-    /// reader added elsewhere, and to stay silent on the four shapes that name
-    /// the block without reading it.
-    #[test]
-    fn mika2425_the_reader_scan_reddens_on_a_second_reader() {
-        let prod = std::path::Path::new("src/somewhere.rs");
-
-        let offending = "fn elsewhere(identity: &Identity) -> HistoryScope {\n    \
-             identity.context.history.scope\n}\n";
-        assert_eq!(
-            identity_history_reader_sites(prod, offending).len(),
-            1,
-            "the scan must see a reader added outside the decision site"
-        );
-
-        // 1. The TOML section header in a doc comment or a template literal.
-        let header = "/// `[context.history]` bounds the window.\n\
-             const IDENTITY: &str = \"[context.history]\\nscope = \\\"session\\\"\\n\";\n";
-        assert!(
-            identity_history_reader_sites(prod, header).is_empty(),
-            "naming the TOML section is not reading the field"
-        );
-
-        // 2. The section path as data (CODE_OWNED_IDENTITY_SECTIONS).
-        let as_data = "const CODE_OWNED: &[&str] = &[\"context.history\", \"context.summary\"];\n";
-        assert!(
-            identity_history_reader_sites(prod, as_data).is_empty(),
-            "the section path as a string datum is not a field read"
-        );
-
-        // 3. A read inside a masked test region.
-        let in_tests = "fn prod() {}\n#[cfg(test)]\nmod tests {\n    \
-             assert_eq!(identity.context.history.scope, HistoryScope::Agent);\n}\n";
-        assert!(
-            identity_history_reader_sites(prod, in_tests).is_empty(),
-            "a test region is masked before scanning"
-        );
-
-        // 4. A file whose path is test code has no production half at all.
-        let test_path = std::path::Path::new("src/db/tests/harnais.rs");
-        assert!(
-            identity_history_reader_sites(test_path, offending).is_empty(),
-            "mika#2321 — a file under `tests/` is test code whatever its contents"
-        );
-
-        // 5. Prose ABOUT the field — the shape that accused this guard's own
-        // decision site, and the mika#2050 Signal S class. A comment cannot read.
-        let prose = "\
-// This is the single production reader of `identity.context.history`.
-/// Reading `ctx.identity.context.history.max_tokens` here would drop the narrowing.
- * `identity.context.history` is the role floor.
-";
-        assert!(
-            identity_history_reader_sites(prod, prose).is_empty(),
-            "prose naming the field is not a read — an unanchored predicate accuses \
-             the very comments that explain why the field has one reader"
-        );
-
-        // …but a trailing comment does not exempt the code before it.
-        let trailing = "    let h = &ctx.identity.context.history; // the role floor\n";
-        assert_eq!(
-            identity_history_reader_sites(prod, trailing).len(),
-            1,
-            "only a line that STARTS with a comment marker is prose"
-        );
-    }
-
-    /// **T5c — good-faith control for the mika#2321 path classification.**
-    ///
-    /// Sibling of T5b on the other axis: T5b proves the *predicate* still sees a
-    /// decisional match, this one proves the *file classification* has not been
-    /// widened into uselessness. A classification that exempted too much would
-    /// leave T5 green while it scanned nothing — the same vacuous-guard failure,
-    /// reached from the other side.
-    ///
-    /// The file it exists for is the extracted test module: one carries no
-    /// `#[cfg(test)]` literal, so `production_half` alone returns it whole and
-    /// every legitimate mention in a fixture counts as a production reader.
-    #[test]
-    fn mika2321_scope_reader_sites_keeps_production_and_drops_test_paths() {
-        let offending = r#"
-            fn somewhere_else(scope: HistoryScope) -> usize {
-                match scope {
-                    HistoryScope::Session => 1,
-                    HistoryScope::Agent => 20,
-                }
-            }
-        "#;
-
-        assert_eq!(
-            scope_reader_sites(
-                std::path::Path::new("/repo/crates/mika-agent/src/server/new_path.rs"),
-                offending,
-            )
-            .len(),
-            1,
-            "the guard no longer sees a decisional match in a production file — \
-             it has gone vacuous"
-        );
-
-        for test_path in [
-            // `/tests/` segment — the shape mika#2321 creates in bulk.
-            "/repo/crates/mika-agent/src/db/tests/tasks.rs",
-            // bare `tests.rs` — the shape that was already in the hole.
-            "/repo/crates/mika-agent/src/perimeter/tests.rs",
-        ] {
-            assert!(
-                scope_reader_sites(std::path::Path::new(test_path), offending).is_empty(),
-                "{test_path} is still scanned as production"
-            );
-        }
-    }
-
-    // ===========================================================================
-    // mika#2295 brique 2 — the byte ceiling
-    // ===========================================================================
-
-    /// A window of `n` history messages of `bytes` each, plus the turn's own
-    /// user message last — the shape `rebuild_context` returns.
-    fn window_with_history(sizes: &[usize], user_message: &str) -> Vec<crate::db::SessionMessage> {
-        let mut out: Vec<crate::db::SessionMessage> = sizes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| window_msg("s1", &"x".repeat(*n), &format!("2026-09-15T00:00:{i:02}Z")))
-            .collect();
-        out.push(window_msg("s1", user_message, "2026-09-15T00:01:00Z"));
-        out
-    }
-
-    #[test]
-    fn mika2295_ceiling_elides_oldest_first() {
-        // 4 × 400 bytes of history = 1600, ceiling of 250 tokens = 1000 bytes.
-        // Two of the four must go, and they must be the two oldest.
-        let mut history = window_with_history(&[400, 400, 400, 400], "the question");
-        history[0].content = format!("oldest{}", "x".repeat(394));
-        history[3].content = format!("newest{}", "x".repeat(394));
-
-        let t = truncate_history_to_token_budget(&mut history, 250);
-
-        assert_eq!(t.truncated_messages, 2);
-        assert_eq!(t.truncated_bytes, 800);
-        // marker + 2 surviving history + the user message
-        assert_eq!(history.len(), 4);
-        assert!(history.iter().any(|m| m.content.starts_with("newest")));
-        assert!(
-            !history.iter().any(|m| m.content.starts_with("oldest")),
-            "the oldest message is the first to go, never the newest"
-        );
-    }
-
-    #[test]
-    fn mika2295_the_turn_s_own_question_is_never_elided() {
-        // Even at the tightest ceiling there is, the last message survives:
-        // eliding it would answer a question that was erased.
-        let mut history = window_with_history(&[5_000, 5_000], "what should I do about #2295?");
-
-        let t = truncate_history_to_token_budget(&mut history, 0);
-
-        assert_eq!(t.truncated_messages, 2);
-        assert_eq!(
-            history.last().unwrap().content,
-            "what should I do about #2295?"
-        );
-    }
-
-    #[test]
-    fn mika2295_zero_is_the_omission_sentinel_and_empties_the_history() {
-        // `Some(0)` inherits `ContextSummaryConfig`'s meaning: omit, do not "cap
-        // at zero tokens". What it omits is the history — see the test above for
-        // the half of that sentence the plan left implicit.
-        let mut history = window_with_history(&[100, 100, 100], "q");
-
-        truncate_history_to_token_budget(&mut history, 0);
-
-        assert_eq!(history.len(), 2, "marker + the turn's own message only");
-        assert_eq!(history[0].content, HISTORY_ELISION_MARKER);
-        assert_eq!(history[1].content, "q");
-    }
-
-    #[test]
-    fn mika2295_elision_inserts_a_marker_rather_than_shrinking_in_silence() {
-        let mut history = window_with_history(&[4_000], "q");
-
-        truncate_history_to_token_budget(&mut history, 10);
-
-        assert_eq!(
-            history[0].content, HISTORY_ELISION_MARKER,
-            "a window that shrinks silently teaches the model it has seen everything"
-        );
-        // The marker must not look like another ticket to AC7's detector.
-        assert_eq!(
-            build_context_window_fields(
-                &history,
-                prompt::HistoryScope::Agent,
-                &[],
-                1,
-                4_000,
-                chrono::Utc::now()
-            )
-            .distinct_sessions,
-            1,
-            "the marker carries the turn's own session_id"
-        );
-    }
-
-    #[test]
-    fn mika2295_a_window_already_under_budget_is_left_exactly_alone() {
-        let before = window_with_history(&[10, 10], "q");
-        let mut after = before.clone();
-
-        let t = truncate_history_to_token_budget(&mut after, 1_000);
-
-        assert_eq!(t, HistoryTruncation::default());
-        assert_eq!(after.len(), before.len());
-        assert!(
-            after.iter().all(|m| m.content != HISTORY_ELISION_MARKER),
-            "no marker when nothing was elided"
-        );
-    }
-
-    #[test]
-    fn mika2295_a_window_with_no_history_is_a_no_op_at_any_ceiling() {
-        // Both degenerate shapes: empty, and the turn's own message alone. A
-        // first architect pass under session scope is exactly the second one, so
-        // this is the nominal case, not an edge case.
-        for len in [0usize, 1] {
-            let mut history: Vec<crate::db::SessionMessage> = (0..len)
-                .map(|_| window_msg("s1", &"x".repeat(9_999), "2026-09-15T00:00:00Z"))
-                .collect();
-
-            let t = truncate_history_to_token_budget(&mut history, 0);
-
-            assert_eq!(t, HistoryTruncation::default(), "len = {len}");
-            assert_eq!(history.len(), len, "len = {len}");
-        }
-    }
-
-    #[test]
-    fn mika2295_budget_converts_through_the_one_shared_estimator() {
-        // Not a second estimator beside `truncate_to_token_budget`'s: 4 bytes per
-        // token, the same constant. 100 tokens = 400 bytes, so a 400-byte history
-        // fits and a 401-byte one does not.
-        let mut fits = window_with_history(&[400], "q");
-        assert_eq!(
-            truncate_history_to_token_budget(&mut fits, 100),
-            HistoryTruncation::default()
-        );
-
-        let mut over = window_with_history(&[401], "q");
-        assert_eq!(
-            truncate_history_to_token_budget(&mut over, 100).truncated_messages,
-            1
-        );
-    }
-}
+mod tests;

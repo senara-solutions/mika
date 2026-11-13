@@ -52,12 +52,15 @@ un opérateur peut recopier son fichier à la main d'un rang à l'autre.
 1. **Un serveur écrit dans `~/.config/mika/mcp-servers.json` est chargé pour
    TOUS les agents** — `init_agent` le lit pour chacun, mika de production
    inclus. Il n'y a pas de « le donner à un seul agent » par fichier.
-2. **`[tools].disabled` de l'`identity.toml` ne peut pas le refuser.** Les
-   définitions d'outils MCP sont ajoutées par un `extend_from_slice` **après**
-   `apply_agent_tool_visibility`, qui s'exécute à l'intérieur
-   d'`inject_skills_and_resolve_tools`. Le denylist per-agent ne les voit donc
-   jamais. Le même ordre fait que les outils MCP échappent aussi au gate
-   compact-provider.
+2. **Ni `[tools].disabled` ni `[tools].allowed` de l'`identity.toml` ne peuvent
+   le refuser.** Les définitions d'outils MCP sont ajoutées par un
+   `extend_from_slice` **après** `apply_agent_tool_visibility`, qui s'exécute à
+   l'intérieur d'`inject_skills_and_resolve_tools`. Le filtre per-agent ne les
+   voit donc jamais — et le basculement vers l'allowlist (mika#2748) ne change
+   rien à cette borne : l'allowlist gouverne les **builtins**, pas le tableau
+   assemblé. Un outil MCP atteint l'agent sans être nommé nulle part, exactement
+   comme un outil de skill (`gh_read`). Le même ordre fait que les outils MCP
+   échappent aussi au gate compact-provider.
 3. **Il n'existe aucun allowlist/denylist per-agent des serveurs ni des outils
    MCP.** Ce n'est pas un réglage oublié : c'est une capacité absente.
 
@@ -202,7 +205,69 @@ MCP **générique** et vaut pour tout serveur présent et futur.
 
 ---
 
-## 5. Sonde 1Password Environments — verdict du 2026-09-20 : `BLOQUÉ-AMONT`
+## 5. Déclarer le grade d'un serveur MCP
+
+Chaque entrée de `mcp-servers.json` — le fichier opérateur-global résolu par la
+chaîne du § 1 — accepte un champ `data_grade` :
+
+- `"operational"` — **défaut quand le champ est absent.** Le serveur fonctionne
+  normalement.
+- `"testimony"` — données personnelles, confessionnelles, de confiance
+  déléguée (doctrine non-transit, mika#1798). **Déclaration explicite exigée.**
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"],
+      "enabled": true
+    },
+    "journal-perso": {
+      "command": "/usr/local/bin/journal-mcp",
+      "args": [],
+      "enabled": true,
+      "data_grade": "testimony"
+    }
+  }
+}
+```
+
+Les outils d'un serveur déclaré `testimony` sont **refusés** par la garde L4 à
+l'exécution (`mcp__journal-perso__*` ci-dessus), avant tout appel distant : le
+serveur ne voit pas la requête. Un opérateur qui veut réellement une surface
+testimony doit la déclarer *et* accepter que Mika refuse d'appeler ces outils —
+**la valeur de la déclaration est la traçabilité, pas la permission.**
+
+Le défaut est porteur dans ce sens : un manifeste qui oublie de déclarer son
+grade ne peut pas acquérir par accident un privilège testimony. C'est le
+consentement explicite qui vaut refus.
+
+Le grade vaut pour **tous** les outils du serveur. La granularité par outil est
+une affaire de v2 ; aucun serveur v1 connu n'expose des outils de grades mêlés.
+
+**Un grade inconnu fait échouer le chargement de la configuration** — y compris
+`"reference"`, nommé dans le corps de mika#1959 mais absent de l'enum livré
+(`DataGrade` est binaire ; `reference` se lit `operational`). Un grade n'est
+jamais deviné. Au démarrage, le chargement est *fail-open* (mika#1764) : un
+fichier illisible émet un `warn!` (`operator-shell MCP config failed to load`)
+et Mika démarre **sans aucun serveur MCP** — aucun ne tourne sous un grade
+supposé, mais tous disparaissent, pas seulement le serveur fautif. `mika
+validate` rend l'erreur de parse en diagnostic `Fail`.
+
+**Ce que la déclaration ne fait pas :** l'outil reste **visible du modèle**, qui
+peut le mentionner ou le proposer. Seul l'appel est refusé. La non-publication
+est suivie séparément (mika#2814).
+
+**Sonde.** Un refus émet une ligne `warn!` :
+
+```bash
+grep 'tool_testimony_ban' "$MIKA_SPIRIT_LOG_FILE"
+```
+
+---
+
+## 6. Sonde 1Password Environments — verdict du 2026-09-20 : `BLOQUÉ-AMONT`
 
 mika#2281 demandait qu'un agent Mika puisse lister ses Environments 1Password
 et monter un `.env`. La sonde s'arrête à sa première question.
@@ -309,14 +374,14 @@ La sonde reprend alors à Q2, telle qu'écrite dans le plan
 
 ---
 
-## 6. Limites connues du client MCP
+## 7. Limites connues du client MCP
 
 Réelles, mesurées, et non corrigées ici — chacune a son ticket de suivi :
 
 | Limite | Effet |
 |---|---|
 | Pas de scoping per-agent des serveurs | Un serveur est visible de tous les agents (§ 1) |
-| Outils MCP ajoutés après `apply_agent_tool_visibility` | `[tools].disabled` ne peut pas les refuser ; le gate compact-provider ne les voit pas non plus |
+| Outils MCP ajoutés après `apply_agent_tool_visibility` | Ni `[tools].disabled` ni `[tools].allowed` (mika#2748) ne peuvent les refuser — le filtre gouverne les builtins, pas le tableau assemblé ; le gate compact-provider ne les voit pas non plus |
 | `mika mcp add` n'expose pas `--env` | Toute variable nécessaire impose d'éditer le JSON à la main |
 | Pas d'arrêt gracieux côté serveur | `McpManager::shutdown()` n'est appelé que par `mika chat` ; mika-spirit s'en remet à `kill_on_drop` |
 | Pas de timeout sur `tools/list` | Seul le handshake est borné (30 s) ; un serveur qui accepte puis se tait sur la découverte bloque l'initialisation de l'agent |

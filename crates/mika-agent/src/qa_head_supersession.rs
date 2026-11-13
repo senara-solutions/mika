@@ -272,6 +272,10 @@ where
 mod tests {
     use super::*;
     use crate::qa_build_callback::BUILD_CALLBACK_LABEL;
+    // Les deux prédicats de scan vivent dans `source_scan` depuis mika#2917 :
+    // une quatrième garde pose la même question sur un autre nom d'audit, et
+    // deux copies d'une fenêtre de lecture divergent (mika#2158).
+    use crate::source_scan::{audit_writers, production_files};
     use crate::task_engine::dispatcher::read_qa_review_pr_target;
 
     const META: &str = r#"{"qa_review_pr_target":"senara-solutions/mika#2659"}"#;
@@ -477,62 +481,6 @@ mod tests {
     }
 
     // ---- gardes structurelles ---------------------------------------------
-
-    /// Les fichiers de production de `src/`, coupés au module de test de tête
-    /// de colonne (`\n#[cfg(test)]\nmod tests`) — l'ancre de colonne zéro
-    /// évite de couper sur un `#[cfg(test)]` indenté au milieu d'un fichier.
-    fn production_files() -> Vec<(String, String)> {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut paths = Vec::new();
-        walk(&root, &mut paths);
-        paths
-            .into_iter()
-            .filter(|p| !crate::source_scan::is_test_source_path(p))
-            .map(|p| {
-                let src = std::fs::read_to_string(&p).unwrap();
-                let prod = match src.find("\n#[cfg(test)]\nmod tests") {
-                    Some(i) => src[..i].to_string(),
-                    None => src,
-                };
-                let rel = p
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                (rel, prod)
-            })
-            .collect()
-    }
-
-    /// Fichiers de production où `needle` apparaît dans un appel
-    /// `log_audit_event(` (fenêtre de 4 lignes après l'ouverture de l'appel).
-    fn audit_writers(needle: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        for (rel, prod) in production_files() {
-            let lines: Vec<&str> = prod.lines().collect();
-            let writes = lines.iter().enumerate().any(|(i, l)| {
-                l.contains("log_audit_event(")
-                    && lines[i..(i + 5).min(lines.len())]
-                        .iter()
-                        .any(|w| w.contains(needle))
-            });
-            if writes {
-                out.push(rel);
-            }
-        }
-        out.sort();
-        out
-    }
 
     /// SOLE WRITER — chaque nom d'audit de ce module a un seul site
     /// d'écriture en production. Un second écrivain ne rendrait aucune décision

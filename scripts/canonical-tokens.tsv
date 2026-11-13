@@ -82,8 +82,12 @@
 # reading forms.
 second-pass	A	crates/mika-agent/src/grooming_marker.rs::LATER_PASS_RE	ci+fr:seconde passe,deuxième passe,deuxieme passe
 first-pass	A	crates/mika-agent/src/grooming_marker.rs::FIRST_PASS_READY_RE	ci+fr:première passe,premiere passe
-Disposition:	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition_fuzzy	paraphrase
-Verdict:	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict_fuzzy	paraphrase
+# mika#2194 vol 5 — les deux lignes `_parse_disposition_fuzzy` et
+# `_parse_verdict_fuzzy` sont parties d'ici parce que les deux FONCTIONS sont
+# parties de `dispatch-lib.sh`. Déclarées temporaires au vol 3 (seconde copie de
+# la table du tier 2, le temps que le corpus doré prouve la parité), elles
+# tiennent la promesse. Le lecteur du tier 2 est `arch_paraphrase::paraphrase`,
+# déclaré plus bas, et il est désormais seul.
 rescue-pipeline-verified	A	crates/mika-agent/src/wip_rescue.rs::pipeline_verified	ci+space — the VALUE only; the KEY is class B below
 Closes #N	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
 Tracked in:	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
@@ -105,21 +109,164 @@ Tracked in:	A	scripts/check-pr-body-consistency.sh::<file-scope>	ci
 # column names the READER, as everywhere.
 SURFACE	A	crates/mika-agent/src/evidence/guards.rs::API_SURFACE_LINE_PREFIX	ci:line-anchored
 
-# `_parse_disposition` and `_parse_verdict` ARE produced by the survey — their
-# first tier is a strict `grep -oE` — and they are class A anyway. That is a
-# rectification of the mika#2201 plan, which listed those two literals as class
-# B (§ M1, rows "dispatch-lib.sh:5168,5267" and "5177,5250"). Read at the
-# granularity this file designates — the function — both END on a `Tier 2
-# fallback` calling `_parse_*_fuzzy`, so a reworded disposition IS read.
-# Classing the strict tier B would describe a fast path and call it the reader.
-ESCALATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_disposition	paraphrase
-ESCALATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
-GROOMED	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
-ITERATE	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
-READY	A	skills/bundled/_shared/dispatch-lib.sh::_parse_verdict	paraphrase
+# mika#2687 — the three tokens by which a `block[pipeline]` proves a guard
+# actually refused. Measured cause: on mika#2685, two reviews on the same head
+# carried `block[pipeline]` while `scripts/verify-pipeline.sh` was green, and
+# NEITHER carried a `PIPELINE:` section. The engine now refuses that call before
+# the subprocess, so these three strings became machine tokens the day that
+# guard shipped.
+#
+# The three rows are written as the SURVEY produces them — `PIPELINE`, `REJECT`,
+# `FAILED` — not as a human reads them (`PIPELINE:`, `REJECT:`,
+# `Verification FAILED`). Same shape as `SURFACE` for `API-SURFACE:` above and
+# as `VERDICT` for `DEADLINE_VERDICT_LINE` in class B: the survey's ALL-CAPS
+# rule reports the longest capital run, so it stops before the colon and drops
+# the lower-case `Verification`. Rewriting the rows by hand would make
+# `canonical-tokens-survey.sh --check` red on a correctly declared site, which
+# is the one thing this file may not do.
+#
+# All three class A, and the tolerance column is the whole reason — accusing
+# them of case would refuse forms the reader reads:
+#
+#   `PIPELINE:`           `guards.rs::pipeline_section_present` walks the prefix
+#                         character by character with `eq_ignore_ascii_case`
+#                         after `trim_start` AND after skipping a leading
+#                         markdown-emphasis run, so `**PIPELINE: block (mika)**`
+#                         IS read — the mika#1828 precedent `VERDICT_RE` already
+#                         holds on the neighbouring line. Hence
+#                         `ci+emphasis:line-anchored` rather than
+#                         `ci:line-anchored`.
+#   `REJECT:` and
+#   `Verification FAILED` `guards.rs::body_cites_failing_guard` lowercases the
+#                         whole body and the token, then `contains` — position
+#                         free, case read. `contains` is not a survey form
+#                         (§ HOW EACH HALF IS MAINTAINED), so these two rows
+#                         exist precisely because the survey cannot find them.
+#
+# Both are verbatim from `scripts/verify-pipeline.sh`, which is the PRODUCER:
+# it emits `[pipeline-exempt: none] REJECT: …` and
+# `Verification FAILED: $ERRORS missing artifact(s).` on stderr just before its
+# `exit 1`. The `Verification FAILED` row stops before the colon on purpose —
+# the artifact count varies, the sentence does not. The other producer is
+# `qa-review/system_prompt.md` Step 2B/2E, which prescribes quoting that output
+# verbatim; this column names the READER, as everywhere.
+PIPELINE	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_SECTION_LINE_PREFIX	ci+emphasis:line-anchored
+REJECT	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_REJECT_TOKEN	ci:literal
+FAILED	A	crates/mika-agent/src/evidence/guards.rs::PIPELINE_GUARD_FAILED_TOKEN	ci:literal
+
+# mika#2961 vol 2/2 — the line by which a `pass` names the invariant a negative
+# test asserts. Required by `qa-review/system_prompt.md:406-415` since mika#2264
+# (#2268), consumed downstream by `self-dev-webhook-qa`; it became a MACHINE
+# token the day the engine started refusing an approval that omits it. Measured
+# cause, 2026-10-30, 60 latest PRs per repo: 0 anchored lines out of 260 `pass`
+# reviews.
+#
+# ONE row, and that is the survey's arithmetic rather than a choice: the ALL-CAPS
+# rule captures `/[A-Z][A-Z_]{4,}([ -][A-Z][A-Z_]+)*/`, whose `[ -]` alternative
+# makes `NEGATIVE-TEST` a SINGLE token — not `NEGATIVE` plus `TEST`. Same shape
+# as `PIPELINE` above: written as the survey produces it, stopping before the
+# colon.
+#
+# Class A, same tolerance as `PIPELINE`, and for the same reason — it is the
+# same predicate. `guards.rs::negative_test_line_present` delegates to
+# `line_prefix_present`, which walks the prefix character by character with
+# `eq_ignore_ascii_case` after `trim_start` AND after skipping a leading
+# markdown-emphasis run, so `**NEGATIVE-TEST: satisfied — …**` IS read. Hence
+# `ci+emphasis:line-anchored`. The markdown that also carries the token
+# (`qa-review/system_prompt.md`, `self-dev-webhook-qa/system_prompt.md`) is
+# outside the survey's scan perimeter — `crates/*/src/**/*.rs`, `scripts/*.sh`,
+# `skills/bundled/**/*.sh` — so this row exists because of the Rust const, and
+# the two prompts are the PRODUCER side, as everywhere.
+NEGATIVE-TEST	A	crates/mika-agent/src/evidence/guards.rs::NEGATIVE_TEST_LINE_PREFIX	ci+emphasis:line-anchored
+
+# mika#2194 vol 5 — CES HUIT LIGNES SONT PARTIES, et c'est le livrable.
+#
+# Elles déclaraient `_parse_disposition` et `_parse_verdict` comme sites de match
+# de classe A, avec la note suivante, conservée ici comme constat parce qu'elle
+# explique pourquoi la classe était A et non B :
+#
+#   « `_parse_disposition` and `_parse_verdict` ARE produced by the survey —
+#   their first tier is a strict `grep -oE` — and they are class A anyway. That
+#   is a rectification of the mika#2201 plan, which listed those two literals as
+#   class B (§ M1, rows "dispatch-lib.sh:5168,5267" and "5177,5250"). Read at
+#   the granularity this file designates — the function — both END on a `Tier 2
+#   fallback` calling `_parse_*_fuzzy`, so a reworded disposition IS read. »
+#
+# Ce qui a changé : les deux fonctions ne LISENT plus rien. Elles écrivent la
+# réponse de l'architecte dans un fichier et appellent `mika arch-disposition`.
+# Un site qui délègue n'est pas un site de match, et le garder ici ferait
+# compter deux lecteurs de plus à l'inventaire que l'arbre n'en porte — l'erreur
+# exacte que ce fichier existe pour empêcher, dans l'autre sens.
+#
+# L'inventaire des quatre jetons redescend donc aux deux ports Rust ci-dessous :
+# `arch_paraphrase.rs::paraphrase` (le tier 2, vol 3) et
+# `arch_disposition.rs::decide` (les cinq tiers, vol 4). Les lignes de
+# `_parse_disposition_fuzzy` et `_parse_verdict_fuzzy` sont parties avec elles,
+# en haut de ce fichier : ces deux fonctions n'existent plus du tout.
+
+# mika#2194 vol 3 — le lecteur Rust du tier 2, DÉCLARÉ AVANT D'AVOIR UN
+# APPELANT. C'est volontaire et c'est la moitié « tests dorés » de la méthode
+# strangler du ticket : `arch_paraphrase::paraphrase` porte les deux tables de
+# paraphrase transcrites littéralement de `_parse_disposition_fuzzy` et
+# `_parse_verdict_fuzzy`, et les deux lecteurs sont exercés sur UN corpus doré
+# commun (`crates/mika-agent/tests/fixtures/arch_paraphrase_texts/`). Rien ne
+# bascule : le bash reste le lecteur de production, et ces lignes disent que le
+# jeton a désormais DEUX sites de match dans l'arbre, pas que le second sert.
+#
+# Classe A pour la même raison que les huit lignes ci-dessus, et avec les mêmes
+# octets : le match est en sous-chaîne, insensible à la casse, sur une liste de
+# tournures. B1 interdit de resserrer une tolérance pendant la migration, donc
+# le portage porte la tolérance telle quelle — c'est précisément ce que le
+# corpus épingle, classe `substring-fp` en tête.
+#
+# Une seule fonction pour les deux passes, là où le bash en a deux : la passe
+# est un paramètre (`ArchPass`), pas un site. Le site est donc nommé une fois
+# par jeton. `GROOMED` ne vit que dans la table de la seconde passe et `ITERATE`
+# que dans celle de la première — la même asymétrie que le bash, qui est ici
+# dans les données et non dans le code.
+ESCALATE	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+GROOMED	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+ITERATE	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+READY	A	crates/mika-agent/src/arch_paraphrase.rs::paraphrase	paraphrase
+
+# mika#2194 vol 4 — le TROISIÈME site de match, DEVENU LE SEUL.
+# `arch_disposition::decide` porte les cinq tiers dans l'ordre du bash
+# (0, 0b, 1a, 1b, 2) et sert d'entrée unique. Déclaré au vol 4 sans AUCUN
+# appelant de production, comme `paraphrase` au vol 3, il en a reçu un au
+# vol 5 (#3016).
+#
+# LA COEXISTENCE A PRIS FIN, et c'est elle qui était transitoire — pas ce
+# site-ci, qui est celui qui survit. Ce que le vol 5 a fait, dans l'ordre où ce
+# fichier le lit : les huit lignes de `_parse_disposition` / `_parse_verdict`
+# sont parties avec leurs tables (bloc du vol 5 plus haut), les deux lignes que
+# portaient les fonctions fuzzy sont parties avec ces fonctions, qui n'existent
+# plus du tout, et `decide` est resté. Les quatre lignes
+# d'`arch_paraphrase::paraphrase` ne comptent pas pour un second site —
+# `decide` est son seul appelant, donc le jeton y est lu par délégation et non
+# par une seconde table. L'inventaire est redevenu ce qu'il doit être : UN site
+# par jeton.
+#
+# CE QUE CET INVENTAIRE NE DIT PAS TOUT SEUL. Un site retiré de cette table y
+# reste retiré ; il ne reste pas retiré de `dispatch-lib.sh`. Cette seconde
+# question — qu'aucune COPIE du motif ne revienne dans le bash — est portée par
+# le scan anti-copie, pour le tier 2 comme pour le tier 1 : assertions
+# « mika#2194 (AC4) » de `skills/bundled/_shared/test-dispatch-lib.sh`.
+#
+# Classe A pour la raison écrite au bloc des huit lignes ci-dessus, et à la même
+# granularité : la fonction. `decide` finit sur le tier 2, donc une disposition
+# reformulée EST lue. Classer son tier 1a en B décrirait un chemin rapide et
+# l'appellerait le lecteur.
+#
+# Une seule fonction pour les deux passes, comme `paraphrase` : la passe est un
+# paramètre (`ArchPass`), pas un site, donc le site est nommé une fois par jeton.
+# `ITERATE` ne vit que dans la table de la première passe et `GROOMED` que dans
+# celle de la seconde — l'asymétrie du bash, portée dans les données.
+Disposition:	A	crates/mika-agent/src/arch_disposition.rs::decide	paraphrase
+Verdict:	A	crates/mika-agent/src/arch_disposition.rs::decide	paraphrase
+ESCALATE	A	crates/mika-agent/src/arch_disposition.rs::decide	paraphrase
+GROOMED	A	crates/mika-agent/src/arch_disposition.rs::decide	paraphrase
+ITERATE	A	crates/mika-agent/src/arch_disposition.rs::decide	paraphrase
+READY	A	crates/mika-agent/src/arch_disposition.rs::decide	paraphrase
 
 # ═══ Class B — STRICT readers. The lint's perimeter.
 #
@@ -227,6 +374,37 @@ ESCALATE	B	crates/mika-agent/src/skills/executor.rs::GROOM_ESCALATE_MARKER	exact
 STRUCTURAL VIOLATION	B	skills/bundled/_shared/dispatch-lib.sh::_gate_non_empty_cycle	exact:literal
 PIPELINE FAILURE	B	skills/bundled/_shared/dispatch-lib.sh::_post_flight_recovery	exact:literal
 NO_PR	B	crates/mika-agent/src/task_engine/dispatcher.rs::RE_NO_PR	exact:line-anchored
+# mika#2698 — les deux bannières ont gagné un second lecteur strict, côté
+# moteur : `death_cause` classe un vol mort en lisant `tasks.result`. Le
+# producteur de ces deux lignes est `dispatch-lib.sh` ci-dessus ; le lecteur est
+# ici. Une bannière reformulée ferait retomber la mort en `Unknown`, c'est-à-dire
+# ferait disparaître du rapport du manager la distinction refus / panne de
+# pipeline — exactement ce que l'AC3 demande de distinguer.
+STRUCTURAL VIOLATION	B	crates/mika-agent/src/milestone_manager/evaluator.rs::death_cause	exact:literal
+PIPELINE FAILURE	B	crates/mika-agent/src/milestone_manager/evaluator.rs::death_cause	exact:literal
+# mika#2976 AC5 — les deux bannières de HALTE de dispatch. `dispatch-lib.sh` les
+# pose comme PREMIÈRE ligne du `RESULT` (`_branch_reuse_gate` pour l'une, la
+# porte de rebase pour l'autre) ; `parse_dispatch_halt_status` les y lit par
+# égalité de cette première ligne, après `trim_end` — donc `exact:line-anchored`
+# et non `exact:literal` : la POSITION fait partie de la lecture, exactement
+# comme pour le `exact:suffix` du § tolérances.
+#
+# La table est CLOSE à ces deux valeurs, et c'est load-bearing. Un préfixe
+# `STATUS=` nu avalerait `CANCELLED_BY_OPERATOR` et `CANCELLED_BY_SIGNAL`, qui
+# ont leur propre discriminateur trois blocs plus bas et leur propre issue :
+# confondre un geste opérateur avec une branche inreprenable rend les deux
+# populations non soustractibles (mika#2205).
+#
+# SECOND LECTEUR, HORS DU PÉRIMÈTRE DU LINT : le prompt de `self-dev-callback`
+# discrimine sur les mêmes deux bannières pour rendre la main sans réparer. Il
+# n'est pas de la source Rust, donc ni le survey ni le scan d'exhaustivité ne le
+# voient ; il est nommé ici parce qu'une bannière reformulée côté shell
+# désarmerait les DEUX moitiés — le prompt retomberait sur le handler « On
+# failure » générique, qui a mesurément lancé un `git rebase` dans un worktree le
+# 2026-10-30, et la parente retomberait en zombie `in_progress`. Même forme que
+# le bloc `CANCELLED_BY_*` ci-dessous, dont le second lecteur est le même prompt.
+REBASE_CONFLICT	B	crates/mika-agent/src/task_engine/dispatcher.rs::parse_dispatch_halt_status	exact:line-anchored
+BRANCH_HAS_UNMERGED_WORK	B	crates/mika-agent/src/task_engine/dispatcher.rs::parse_dispatch_halt_status	exact:line-anchored
 
 # ── Cancel-reason discriminators (mika#749, #2249). The shell TERM trap and
 # `self-dev-callback` read these byte-exact; a reworded one makes a reaped pilot
@@ -241,6 +419,25 @@ REAPED_PILOT_SILENT_STALL	B	crates/mika-agent/src/task_engine/process_kill.rs::C
 REVIEW-ANCHOR-MISSING	B	crates/mika-agent/src/agent_loop/mod.rs::DISPOSITION_WITHHELD_MARKER	exact:line-anchored
 BLOCKING	B	crates/mika-agent/src/agent_loop/mod.rs::REVIEW_ANCHOR_ENGINE_FINDING_MARKER	exact:line-anchored
 BLOCKING	B	skills/bundled/_shared/dispatch-lib.sh::_engine_escalation_line	exact:line-anchored
+# mika#2194 vol 4 — le port Rust de la ligne ci-dessus, tier 0b de `decide`. Même
+# ancre à l'octet, `[[:space:]]*` en tête compris, donc même tolérance. Le relevé
+# le DEMANDE (`canonical-tokens-survey.sh --check` le rend MISSING) : l'ancre est
+# une forme de lecture stricte, à la différence du tier 2 qui est classe A.
+BLOCKING	B	crates/mika-agent/src/arch_disposition.rs::ENGINE_ESCALATION_ANCHOR	exact:line-anchored
+# mika#2786 comptait les retenues du frein par le même marqueur, avec un
+# `contains` sur une ligne déjà ancrée par le préfixe `Engine reason: `, et
+# déclarait ici `executor.rs::anchor_withheld_streak` en `exact:literal`.
+# mika#3027 a retiré cette lecture : `anchor_withheld_streak` délègue à
+# `executor.rs::carries_engine_anchor_withholding`, qui ancre la ligne sur le
+# préfixe puis passe le reste à `ENGINE_ESCALATION_ANCHOR` — l'entrée juste
+# au-dessus. Son entrée est donc RETIRÉE, pas conservée : c'est exactement la
+# rot résiduelle que `canonical-tokens-survey.sh` nomme sans pouvoir la voir
+# (« a row whose file and symbol both still exist but which no longer reads the
+# token »), et que `mika2201_every_declared_symbol_still_exists` laisse verte
+# puisque le symbole existe toujours. Le préfixe lui-même n'entre pas dans cette
+# table : les quatre formes de token du relevé ne le reconnaissent pas, et son
+# lecteur unique est épinglé ailleurs — par
+# `canonical_tokens::tests::mika3027_la_retenue_dancrage_a_un_seul_lecteur`.
 
 # ── Architect decision marker (mika#1262), read off written architect text.
 DECISION NEEDED	B	crates/mika-agent/src/operational/write.rs::RE	exact:literal
@@ -252,8 +449,14 @@ DECISION NEEDED	B	crates/mika-agent/src/operational/write.rs::RE	exact:literal
 # `Verdict: pass` in lowercase IS read by the webhook handler and is NOT read by
 # the review-history reader. Declared as measured; unifying them is a decision
 # outside mika#2201, whose perimeter is the text, not the predicates.
+#
+# `milestone_manager/reader.rs::hold_reason_from_body` (mika#2968, vol 2b) joins
+# the byte-exact half: it reads the head review's `VERDICT: hold[<motif>]` line
+# to tell a cut-off QA review from a plain comment. Same `strip_prefix` on a
+# trimmed line as `extract_latest_verdict`, hence the same tolerance.
 VERDICT	B	crates/mika-agent/src/server/verdict.rs::VERDICT_RE	ci+emphasis:line-anchored
 VERDICT	B	crates/mika-agent/src/github_graphql.rs::extract_latest_verdict	exact:prefix
+VERDICT	B	crates/mika-agent/src/milestone_manager/reader.rs::hold_reason_from_body	exact:prefix
 VERDICT	B	crates/mika-agent/src/calibration/roles/mika_qa.rs::run_verdict_format_canonical_shape	exact:literal
 VERDICT	B	crates/mika-agent/src/server/deadline_verdict.rs::DEADLINE_VERDICT_LINE	exact:literal
 DEPTH	B	crates/mika-agent/src/server/verdict.rs::DEPTH_RE	ci:line-anchored
@@ -291,10 +494,48 @@ DEPTH	B	crates/mika-agent/src/skills/builtin_handlers.rs::validate_review_depth_
 # bind a dispatch to the event's target. What leaves one is exactly what must be
 # bound in the other, so the two must read the same byte. Declared, not
 # allowlisted — the resolution the survey prescribes.
-[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::CHECK_SUITE_EVENT_PREFIX	exact:prefix
-[GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::PR_EVENT_PREFIX	exact:prefix
+# mika#2680 moved those two constants OUT of this file and into
+# `mika_common::github_event_format`, so their rows moved with them into the
+# group below. The taxonomy `server::webhook_prefilter::trigger_class` arrived
+# as a fifth consumer of the same domain, in a crate that could only read the
+# two bytes by copying them, and
+# `mika2517_the_fallthrough_domain_has_a_single_definition` refused that second
+# body. `webhook_dispatch` now `use`s them: a `use` line carries no token, so
+# this file is no longer their match site. What stays here is the two READERS,
+# which still `starts_with` on the imported values.
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::fallthrough_marker_class	exact:prefix
 [GitHub]	B	crates/mika-agent/src/webhook_dispatch.rs::is_webhook_fallthrough_domain	exact:prefix
+# ── The gateway's whole event grammar, declared where it is produced-for
+# (mika#2680). `mika_gateway::github::format_event_text` emits every one of
+# these forms and a cross-crate test refuses producer/consumer drift; the
+# taxonomy of mika#2680 reads them through `starts_with(CONST)`, which is how it
+# classes a webhook's original text WITHOUT writing one byte of grammar of its
+# own. Declaring the definition site is therefore the whole cost of that
+# taxonomy on this list.
+#
+# Observability-only — EXCEPT two. `PR_EVENT_PREFIX` and
+# `CHECK_SUITE_EVENT_PREFIX` also carry the definition of the Webhook
+# Fallthrough domain (see the two reader rows above), which DECIDES. Changing
+# either value changes a refusal boundary, not just a name in a log.
+# `READY_LABEL_DISPATCH_MARKER` is the `ready` instance of
+# `ISSUE_LABELED_EVENT_PREFIX`, and it is the one that carries a dispatch.
+# A THIRD one decides, since mika#2755: `GITHUB_EVENT_TEXT_PREFIX`, the common
+# denominator of every form above. It is the first of `mask_cited_branch`'s
+# three refusals, so it is what tells a webhook text from a human one before the
+# cited branch slug is removed from keyword evaluation. Widen its value and
+# human messages start being masked; narrow it and a webhook family stops being.
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::CHECK_SUITE_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::GITHUB_EVENT_TEXT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_CLOSED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_COMMENT_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_LABELED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::ISSUE_OPENED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_CLOSED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_OPENED_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PR_REVIEW_EVENT_PREFIX	exact:prefix
+[GitHub]	B	crates/mika-common/src/github_event_format.rs::PUSH_EVENT_PREFIX	exact:prefix
 [GitHub]	B	crates/mika-common/src/github_event_format.rs::READY_LABEL_DISPATCH_MARKER	exact:prefix
 
 # ── Gateway body-truncation marker (mika#2242 R6). `truncate_body` appends it
@@ -396,6 +637,17 @@ CACHEDIR	B	crates/mika-agent/src/worktree_reaper.rs::CACHEDIR_TAG_MARKER	exact:l
 REFUSED	B	crates/mika-cli/src/commands/plan_callout.rs::REFUSAL_PREFIX	exact:prefix
 REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_plan_callout_refusal	exact:prefix
 
+# mika#2194 vol 5 — LES MÊMES DEUX SITES, pour le lecteur de disposition.
+#
+# `arch-disposition` reprend le canal à trois codes du lecteur de callout, donc
+# il reprend aussi ses deux sites de match, pour les deux mêmes raisons : une
+# constante en `*_PREFIX`, et une garde d'idempotence qui RELIT le préfixe déjà
+# présent dans `$RESULT`. Le motif est `REFUSED (arch-disposition, mika#2194)`
+# et il est distinct de celui du callout — deux refus nommés, deux causes, et un
+# `RESULT` qui peut les porter tous les deux.
+REFUSED	B	crates/mika-cli/src/commands/arch_disposition.rs::REFUSAL_PREFIX	exact:prefix
+REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_arch_disposition_refusal	exact:prefix
+
 # ── mika#2627 — le préfixe du refus doctrinal côté outils.
 #
 # `REFUS (testimony-access, mika#2627)` ouvre le `ToolOutput::error` que rendent
@@ -415,6 +667,16 @@ REFUSED	B	skills/bundled/_shared/dispatch-lib.sh::_annex_plan_callout_refusal	ex
 # renommé pour sortir de la population — le précédent `REFUSAL_PREFIX` ci-dessus
 # a écrit pourquoi ce serait cacher un lecteur réel derrière un nom.
 REFUS	B	crates/mika-agent/src/tools/mod.rs::TESTIMONY_ACCESS_REFUSAL_PREFIX	exact:prefix
+
+# ── mika#2654 — le refus de promotion forcée sur un tour webhook PR.
+#
+# `REFUS (webhook-pr-turn, mika#2654)` ouvre le `ToolOutput::error` que rend
+# `promote_deferred_callback` quand un tour webhook PR demande la promotion
+# forcée d'un wrapper différé. Même forme et même lecteur que le préfixe
+# mika#2627 ci-dessus : les tests de l'outil l'épinglent par `starts_with`, et
+# la requête opérateur sur `tool_calls.output` l'ancre en tête. Constante neuve
+# dans ce ticket, donc créée et déclarée dans la même PR (§ D5/D6).
+REFUS	B	crates/mika-agent/src/tools/promote_deferred_callback.rs::PROMOTE_REFUSAL_PREFIX	exact:prefix
 
 # ═══ Labels. Out of the survey's perimeter (not source), so never compared.
 #

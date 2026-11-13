@@ -15,7 +15,7 @@ use mika_common::llm::LlmImage;
 
 use crate::agent;
 use crate::compaction;
-use crate::messaging::{GatewayMessageSender, MessageSender};
+use crate::messaging::{FlushDelivery, GatewayMessageSender, MessageSender};
 use crate::task_engine::types::{task_status, trigger_type};
 
 use super::ci_failure_handler;
@@ -1557,7 +1557,7 @@ const VERDICT_ERROR_DETAIL_MAX_BYTES: usize = 600;
 /// que l'opérateur agrège.
 fn conclusion_of(run: &anyhow::Result<agent::AgentOutput>) -> TurnConclusion {
     match run {
-        Ok(output) => TurnConclusion::from(output.deadline_exceeded),
+        Ok(output) => TurnConclusion::of_output(output),
         Err(e) => {
             let rendered = format!("{e:#}");
             TurnConclusion::Failed {
@@ -1682,20 +1682,21 @@ pub(super) async fn run_agent_for_message(
         record_pr_sync_observed(&a.db, &req.text, &req.request_id).await;
     }
 
-    // Hot-reload skills if the dirty flag was set by a previous turn
+    // Hot-reload skills if the dirty flag was set by a previous turn. A reload is
+    // an assembly, so it goes through the single assembler (mika#2889).
     let skills = if a.skills_dirty.load(Ordering::Acquire) {
         a.skills_dirty.store(false, Ordering::Release);
-        let mut registry = crate::skills::SkillRegistry::from_dir(&a.home_dir.join("skills"));
         let identity = crate::prompt::load_identity(&a.home_dir);
-        if let Some(ref allowlist) = identity.skills.allowlist {
-            registry.apply_identity_allowlist(allowlist);
-        }
-        if let Ok(overrides) = a.db.get_skill_overrides(a.db.agent_id()).await {
-            registry.apply_overrides(&overrides);
-        }
-        // Phase 2 (mika#1798): testimony-grade ban.
-        registry.apply_testimony_grade_ban();
-        registry.log_summary();
+        let overrides =
+            a.db.get_skill_overrides(a.db.agent_id())
+                .await
+                .unwrap_or_default();
+        let registry = crate::skills::assembly::assemble_agent_registry(
+            &a.home_dir.join("skills"),
+            &identity,
+            &overrides,
+            a.db.agent_id(),
+        );
         let new = Arc::new(registry);
         *a.skills.lock().unwrap() = new.clone();
         new
@@ -1737,13 +1738,34 @@ pub(super) async fn run_agent_for_message(
         Some(a.db.agent_id().to_string()),
         None,
         a.settings.customer_id.clone(),
-    );
+    )
+    // The rail that carries operator notifications — arm the P0 surface on it
+    // (mika#1381). `None` here is the single-channel deployment, not an error.
+    .with_escalation_chat_id(a.settings.operator_escalation_chat_id);
     let sender_arc: Arc<dyn MessageSender> = Arc::new(sender);
 
     // mika#2675 — le texte tel que le gateway l'a délivré, avant que les
     // handlers ne le remplacent ou l'enrichissent : le pré-filtre classe ce
     // texte-là, et ne filtre que si aucun handler n'y a touché.
     let original_github_text = (req.channel == "github").then(|| req.text.clone());
+    // mika#2854 AC4 — l'état du ticket AVANT `upstream_close_handler`.
+    //
+    // Ce handler tourne plus bas (`try_handle_upstream_close`) et marque
+    // terminales les lignes de suivi du ticket qu'il vient de voir fermé. La
+    // porte du pré-filtre, elle, tourne APRÈS lui : une lecture faite là-bas
+    // lirait l'état d'après le nettoyage, et la garde AC7 — « un ticket avec
+    // tâche de boucle garde son tour complet » — serait aveugle exactement sur
+    // la population qu'elle protège.
+    //
+    // La capture est donc ici, au plus tôt, et non « juste avant » le site de
+    // nettoyage : un handler inséré entre les deux rouvrirait la classe en
+    // silence. Elle ne lit rien quand le texte n'est pas une fermeture de (h),
+    // et rien non plus quand le triage est désarmé.
+    let closure_snapshot = super::webhook_prefilter::snapshot_closure_task_state(
+        original_github_text.as_deref(),
+        &a.db,
+    )
+    .await;
     // mika#2675 phase 2 — le texte juste après le `verdict_handler` et le jeton
     // qu'il a résolu : la classe (c) exige un texte intact APRÈS lui, et lit
     // l'état de la PR côté forge avec le même jeton.
@@ -1769,10 +1791,32 @@ pub(super) async fn run_agent_for_message(
             .settings
             .resolve_github_token(a.github_app.as_deref())
             .await;
+        // Jeton de **lecture** de CI (mika#2963 vol 1, câblé ici par mika#2965).
+        //
+        // Résolu une seule fois pour les trois handlers qui lisent
+        // `gh pr checks` — `verdict_handler`, `ci_success_handler`,
+        // `ci_failure_handler` — et App-first, parce que GitHub n'accorde pas
+        // la permission Checks à un PAT fine-grained : `statusCheckRollup`
+        // répond « Resource not accessible by personal access token » (77
+        // échecs mesurés du 2026-10-07 au 2026-10-29).
+        //
+        // Ce n'est **pas** un remplacement de `verdict_github_token` : celui-ci
+        // reste PAT-first (ADR-008) parce qu'il porte les identités de post —
+        // `pr review`, `pr comment`, `pr merge`, là où la forge lit l'auteur de
+        // l'action. Lire des checks n'est identitaire pour personne, donc la
+        // priorité s'y inverse. Les deux jetons descendent côte à côte.
+        //
+        // La résolution unique est tenue par
+        // `tests/eval/test_ci_read_token_handlers_2965.rs`.
+        let ci_read_token = a
+            .settings
+            .resolve_ci_read_token(a.github_app.as_deref())
+            .await;
         let action = try_handle_pr_review_verdict(
             &req.text,
             &a.db,
             verdict_github_token.as_deref(),
+            ci_read_token.as_ref(),
             Some(&sender_arc),
             &session_id,
             &req.request_id,
@@ -1805,6 +1849,7 @@ pub(super) async fn run_agent_for_message(
             &req.text,
             &a.db,
             verdict_github_token.as_deref(),
+            ci_read_token.as_ref(),
             Some(&sender_arc),
             &session_id,
             &req.request_id,
@@ -1863,6 +1908,7 @@ pub(super) async fn run_agent_for_message(
             &req.text,
             &a.db,
             verdict_github_token.as_deref(),
+            ci_read_token.as_ref(),
             Some(&sender_arc),
             &session_id,
             &req.request_id,
@@ -2009,36 +2055,99 @@ pub(super) async fn run_agent_for_message(
                 unreachable!("upstream_close handler never dispatches");
             }
         }
+
+        // Retrait de `ready` au merge (mika#3022) : un `PR closed` portant
+        // `Merged: true` et une branche `<type>/<N>/…` rend le consentement du
+        // ticket #N, ici, en code, AVANT le tour LLM — cinq retraits à la main
+        // mesurés du 2026-10-30 au 2026-11-03, et entre le merge et le retrait
+        // le ticket reste exposé au feeder. Complémentaire de
+        // `draft_pr_opened_handler` ci-dessus et non redondant : celui-là sert
+        // `PR opened` draft et choisit par `closingIssuesReferences`, vide sur
+        // les PR d'un ticket gardé ouvert. Injecteur à effet de bord seul —
+        // jamais Handled/Dispatched, jamais d'enrichissement.
+        let merged_pr_ready_action =
+            super::merged_pr_ready_cleanup_handler::try_handle_merged_pr_ready_cleanup(
+                &req.text,
+                &a.db,
+                verdict_github_token.as_deref(),
+                &session_id,
+                &req.request_id,
+            )
+            .await;
+        match merged_pr_ready_action {
+            VerdictAction::Passthrough { enrichment: None } => {}
+            VerdictAction::Passthrough {
+                enrichment: Some(_),
+            } => {
+                unreachable!("merged_pr_ready_cleanup handler never enriches");
+            }
+            VerdictAction::Handled { .. } => {
+                unreachable!("merged_pr_ready_cleanup handler never handles");
+            }
+            VerdictAction::Dispatched { .. } => {
+                unreachable!("merged_pr_ready_cleanup handler never dispatches");
+            }
+        }
     }
 
     // mika#2675 — pré-filtre déterministe : APRÈS les handlers, qui gardent
     // tous leurs effets, AVANT le tour LLM. Un événement sans suite possible
     // ne paie aucun appel modèle ; tout le reste passe comme avant.
-    if let Some(original) = &original_github_text
-        && super::webhook_prefilter::skip_turn(
+    //
+    // mika#2680 — et quand le tour a lieu, il est NOMMÉ, puis dit POURQUOI. Le
+    // `Gate` que la porte rend porte le terme de relâche ; il n'est ni
+    // re-dérivé ici, ni reconstruit depuis `touched`, parce que seule la porte
+    // sait laquelle de ses dix sorties a été prise. D'où un `match` sans bras
+    // par défaut plutôt qu'un booléen : un onzième terme ne compile pas sans
+    // être transporté jusqu'ici. Les deux bras lisent le même `touched` et le
+    // même `enabled`, et le registre lit `original` — le texte d'AVANT les
+    // handlers — jamais `req.text`.
+    if let Some(original) = &original_github_text {
+        let touched = super::webhook_prefilter::Touched {
+            by_any_handler: req.text != *original,
+            after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
+            outside_ci_success_handler: text_around_ci
+                .as_ref()
+                .is_none_or(|(before, after)| before != original || req.text != *after),
+            outside_ci_failure_handler: text_around_ci_failure
+                .as_ref()
+                .is_none_or(|(before, after)| before != original || req.text != *after),
+        };
+        let enabled = super::webhook_prefilter::prefilter_enabled();
+        match super::webhook_prefilter::skip_turn(
             &a.db,
             &super::webhook_prefilter::LiveState {
                 db: &a.db,
                 github_token: prefilter_github_token.as_deref(),
                 request_id: &req.request_id,
+                // (h) mika#2854 : le fournisseur de l'agent lui-même, le même
+                // que le tour complet aurait utilisé. Pas de modèle dédié —
+                // un second modèle est un second gabarit à calibrer
+                // (mika#1190), pour un brin de 160 tokens sans outils.
+                llm: Some(a.llm.as_ref()),
+                // (h) mika#2854 AC4 — la lecture a DÉJÀ eu lieu, bien avant
+                // `upstream_close_handler` ; la porte ne fait que la consulter.
+                closure_snapshot: &closure_snapshot,
             },
             original,
-            super::webhook_prefilter::Touched {
-                by_any_handler: req.text != *original,
-                after_verdict_handler: text_after_verdict.as_ref().is_none_or(|t| req.text != *t),
-                outside_ci_success_handler: text_around_ci
-                    .as_ref()
-                    .is_none_or(|(before, after)| before != original || req.text != *after),
-                outside_ci_failure_handler: text_around_ci_failure
-                    .as_ref()
-                    .is_none_or(|(before, after)| before != original || req.text != *after),
-            },
+            touched,
             &req.request_id,
-            super::webhook_prefilter::prefilter_enabled(),
+            enabled,
         )
         .await
-    {
-        return;
+        {
+            super::webhook_prefilter::Gate::Skipped => return,
+            super::webhook_prefilter::Gate::Charged(release) => {
+                super::webhook_prefilter::emit_turn_charged(
+                    a.db.agent_id(),
+                    original,
+                    touched,
+                    &req.request_id,
+                    enabled,
+                    release,
+                );
+            }
+        }
     }
 
     let params = agent::AgentParams {
@@ -2082,6 +2191,18 @@ pub(super) async fn run_agent_for_message(
         internal: false,
         pr_reviews_posted: Some(&state.pr_reviews_posted),
         stream_ctx: None,
+        // mika#3004 — **le seul site qui renseigne ce champ**, parce que c'est le
+        // seul qui tient le texte d'avant les handlers. `original_github_text`
+        // est le même binding que le pré-filtre mika#2680 lit vingt lignes plus
+        // haut, et pour la même raison : *« le registre lit `original` — le texte
+        // d'AVANT les handlers — jamais `req.text` »*. Entre sa capture et ici,
+        // `req.text` a pu être entièrement remplacé par un pré-digest de
+        // `verdict_handler`.
+        //
+        // `None` hors du chemin GitHub : le binding est
+        // `(req.channel == "github").then(…)`, donc un tour Telegram n'en porte
+        // aucun — et n'en a pas besoin, `req.text` y étant le texte du tour.
+        webhook_event_text: original_github_text.as_deref(),
     };
 
     // mika#2276 M2 + mika#2289 — le filet. Si le tour n'a pas CONCLU — coupé par
@@ -2100,6 +2221,33 @@ pub(super) async fn run_agent_for_message(
     // Ni l'envoi lui-même ni le `drop(_lock)` plus bas ne bougent.
     let run = agent::run_agent(&params).await;
     post_verdict_if_turn_did_not_conclude(state, a, conclusion_of(&run), &req, &session_id).await;
+
+    // mika#2855 — le second terme du registre des tours webhook. UN SEUL SITE,
+    // et il voit les deux branches : sur `Err` il n'existe aucun `AgentOutput`,
+    // donc aucun texte, donc `outcome_absent` — un tour mort n'a rien attesté,
+    // et c'est vrai. Émettre dans les deux bras du `match` donnerait deux
+    // écrivains pour une ligne, et le prochain éditeur qui ajoute un bras en
+    // oublierait un.
+    //
+    // Après `run_agent`, donc structurellement incapable d'influer sur le
+    // pré-filtre (AC5) : la porte a rendu son `Gate` cent lignes plus haut.
+    // Avant l'envoi sur le canal, comme le filet ci-dessus et pour la même
+    // raison — ce qui est mesuré ne doit pas dépendre de la réussite d'une
+    // délivrance, et un tour webhook est `NoChannel` de toute façon.
+    //
+    // Le périmètre est le même que celui de la ligne d'entrée, donc les deux
+    // moitiés du registre portent sur la même population : c'est la condition
+    // pour que la jointure par `request_id` soit complète. Le texte n'est PAS
+    // nettoyé du marqueur — il n'est délivré à personne, et un strip serait une
+    // mutation du texte que le filet mika#2276 et `undelivered_send_line`
+    // lisent juste après.
+    if original_github_text.is_some() {
+        super::webhook_turn_outcome::emit_turn_outcome(
+            a.db.agent_id(),
+            &req.request_id,
+            run.as_ref().ok().and_then(|o| o.text.as_deref()),
+        );
+    }
 
     match run {
         Ok(mut output) => {
@@ -2308,12 +2456,12 @@ fn classify_failed_send(created_at: &str, now: chrono::DateTime<chrono::Utc>) ->
 ///
 /// The `Drop` branch does NOT call `increment_failed_send_retry` — a dropped
 /// row was never retried, so incrementing would be incorrect accounting.
+///
+/// The delivery rail is [`FlushDelivery`], never `MessageSender` (mika#2935):
+/// this loop **owns** each row it reads, so it decides that row's fate itself —
+/// `delete` or `increment` — and the transport must not park a second one
+/// underneath it.
 async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
-    let sends = match agent_state.db.get_pending_failed_sends(5).await {
-        Ok(s) if !s.is_empty() => s,
-        _ => return,
-    };
-
     let sender = GatewayMessageSender::new(
         state.gateway_url.clone(),
         state.internal_token.clone(),
@@ -2324,6 +2472,26 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
         None,
         agent_state.settings.customer_id.clone(),
     );
+
+    flush_failed_sends_with(&agent_state.db, &sender).await;
+}
+
+/// The flush itself, over an injected delivery rail (mika#2935).
+///
+/// Split out of [`flush_failed_sends`] so the lifecycle of a parked row — who
+/// deletes it, who increments it, and that nobody *adds* one — is testable
+/// against a sender whose outcome the test chooses. The injection point is
+/// [`FlushDelivery`] and not `&dyn MessageSender` on purpose: a `MessageSender`
+/// double does not park, while the real `GatewayMessageSender` does, so a test
+/// written against that trait would stay green above the defect.
+async fn flush_failed_sends_with<D: FlushDelivery + ?Sized>(
+    db: &crate::async_db::AsyncDatabase,
+    delivery: &D,
+) {
+    let sends = match db.get_pending_failed_sends(5).await {
+        Ok(s) if !s.is_empty() => s,
+        _ => return,
+    };
 
     let now = chrono::Utc::now();
     for send in sends {
@@ -2338,7 +2506,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     text_preview = %text_preview,
                     "dropping stale failed_send"
                 );
-                let _ = agent_state.db.delete_failed_send(send.id).await;
+                let _ = db.delete_failed_send(send.id).await;
             }
             FlushAction::Deliver { prefix } => {
                 if prefix == FAILED_SEND_UNPARSEABLE_PREFIX {
@@ -2351,19 +2519,28 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     debug!(id = send.id, "flushing failed_send with stale prefix");
                 }
                 let text_to_send = format!("{}{}", prefix, send.text);
-                match sender.send(&text_to_send).await {
+                match delivery.try_deliver(&text_to_send).await {
                     Ok(crate::messaging::SendOutcome::Delivered) => {
-                        let _ = agent_state.db.delete_failed_send(send.id).await;
-                        info!(id = send.id, "flushed failed send");
+                        let _ = db.delete_failed_send(send.id).await;
+                        // Same `text_preview` as the `Drop` branch, over the
+                        // text actually **sent** — prefix included. That is the
+                        // quantity the mika#2935 post-deploy probe counts, and
+                        // it was only readable on the dropped half until now.
+                        let text_preview: String = text_to_send.chars().take(80).collect();
+                        info!(
+                            id = send.id,
+                            text_preview = %text_preview,
+                            "flushed failed send"
+                        );
                     }
                     Ok(crate::messaging::SendOutcome::Failed { reason }) => {
                         warn!(id = send.id, reason = %reason, "failed send flush: delivery failed again");
-                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                        let _ = db.increment_failed_send_retry(send.id).await;
                     }
                     Ok(crate::messaging::SendOutcome::NoChannel) => {
                         // Permanent condition — delete the entry instead of retrying.
                         // These entries were created before the NoChannel check existed.
-                        let _ = agent_state.db.delete_failed_send(send.id).await;
+                        let _ = db.delete_failed_send(send.id).await;
                         warn!(
                             id = send.id,
                             "failed send flush: no reply channel (chat_id=0), deleting entry"
@@ -2371,7 +2548,7 @@ async fn flush_failed_sends(state: &AppState, agent_state: &AgentState) {
                     }
                     Err(e) => {
                         warn!(id = send.id, error = %e, "failed send flush: sender error");
-                        let _ = agent_state.db.increment_failed_send_retry(send.id).await;
+                        let _ = db.increment_failed_send_retry(send.id).await;
                     }
                 }
             }
@@ -3005,5 +3182,144 @@ mod tests {
         assert!(record_pr_sync_held(&db, KEY_2659, SYNC_2659, "A").await);
         record_pr_sync_observed(&db, SYNC_2659, "Z").await;
         assert!(!skip_superseded_review_turn(&db, SYNC_2659, "A").await);
+    }
+
+    // ---- mika#2935 — le cycle de vie d'une ligne parquée pendant un flush ---
+
+    /// Un rail de livraison dont le test choisit l'issue, et qui mémorise ce
+    /// qu'on lui a demandé d'envoyer (mika#2935).
+    ///
+    /// C'est `FlushDelivery` et non `MessageSender` qu'on double, et la
+    /// différence est le défaut lui-même : un double de `MessageSender` ne
+    /// parque pas, alors que le vrai `GatewayMessageSender` le faisait, donc un
+    /// test écrit contre ce trait serait resté vert au-dessus du bug.
+    struct Mika2935Delivery {
+        outcome: crate::messaging::SendOutcome,
+        recus: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Mika2935Delivery {
+        fn new(outcome: crate::messaging::SendOutcome) -> Self {
+            Self {
+                outcome,
+                recus: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recus(&self) -> Vec<String> {
+            self.recus.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FlushDelivery for Mika2935Delivery {
+        async fn try_deliver(&self, text: &str) -> anyhow::Result<crate::messaging::SendOutcome> {
+            self.recus.lock().unwrap().push(text.to_string());
+            Ok(self.outcome.clone())
+        }
+    }
+
+    /// Combien de fois le préfixe de mika#1751 apparaît dans un texte — la
+    /// grandeur exacte que compte la sonde post-déploiement d'AC3.
+    fn mika2935_prefixes(texte: &str) -> usize {
+        texte.matches(FAILED_SEND_STALE_PREFIX).count()
+    }
+
+    /// AC1 : deux flushs ratés d'affilée laissent **exactement une** ligne, et
+    /// son texte stocké ne porte **jamais** de préfixe (mika#2935).
+    ///
+    /// Deux passes, pas une : avec une seule, « la ligne n'est pas dupliquée »
+    /// et « la seconde ligne n'a pas encore eu lieu » rendent le même compte.
+    /// C'est la deuxième passe qui, avant le correctif, portait le second
+    /// `⏳ from earlier — `.
+    #[tokio::test]
+    async fn mika2935_un_flush_rate_laisse_exactement_une_ligne() {
+        let db = mika2671_db();
+        db.save_failed_send("réponse parquée", None).await.unwrap();
+
+        let origine = db.get_pending_failed_sends(10).await.unwrap();
+        assert_eq!(origine.len(), 1, "la table de départ porte une ligne");
+        assert_eq!(origine[0].text, "réponse parquée");
+        let created_at_origine = origine[0].created_at.clone();
+
+        let double = Mika2935Delivery::new(crate::messaging::SendOutcome::Failed {
+            reason: "point de terminaison mort".to_string(),
+        });
+
+        for passe in 1..=2usize {
+            flush_failed_sends_with(&db, &double).await;
+
+            let lignes = db.get_pending_failed_sends(10).await.unwrap();
+            assert_eq!(
+                lignes.len(),
+                1,
+                "passe {passe} : un flush raté ne crée aucune ligne, or la table \
+                 en porte {} : {:?}",
+                lignes.len(),
+                lignes.iter().map(|l| &l.text).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                lignes[0].text, "réponse parquée",
+                "passe {passe} : le texte stocké reste nu — c'est ce que \
+                 mika#2935 corrige, le préfixe n'entre jamais dans la table"
+            );
+            assert_eq!(
+                mika2935_prefixes(&lignes[0].text),
+                0,
+                "passe {passe} : zéro préfixe dans la table, quel qu'en soit le nombre"
+            );
+            assert_eq!(
+                lignes[0].created_at, created_at_origine,
+                "passe {passe} : une ligne conservée garde son `created_at` \
+                 d'origine — c'est ce dont le seuil de 5 minutes de mika#1751 a besoin"
+            );
+            assert_eq!(
+                lignes[0].retry_count, passe as i32,
+                "passe {passe} : la ligne est incrémentée, pas remplacée"
+            );
+
+            let recus = double.recus();
+            assert_eq!(
+                recus.len(),
+                passe,
+                "passe {passe} : un envoi par passe, pas davantage"
+            );
+            assert_eq!(
+                mika2935_prefixes(&recus[passe - 1]),
+                1,
+                "passe {passe} : le texte envoyé porte un seul préfixe, pas {} : {:?}",
+                mika2935_prefixes(&recus[passe - 1]),
+                recus[passe - 1]
+            );
+        }
+    }
+
+    /// Le contrôle positif du test ci-dessus : avec un rail qui livre, la ligne
+    /// est **supprimée** (mika#2935).
+    ///
+    /// Sans lui, un `flush_failed_sends_with` qui n'aurait jamais rien envoyé
+    /// satisferait les assertions d'AC1 pour la mauvaise raison.
+    #[tokio::test]
+    async fn mika2935_un_flush_reussi_supprime_la_ligne() {
+        let db = mika2671_db();
+        db.save_failed_send("réponse parquée", None).await.unwrap();
+
+        let double = Mika2935Delivery::new(crate::messaging::SendOutcome::Delivered);
+        flush_failed_sends_with(&db, &double).await;
+
+        let lignes = db.get_pending_failed_sends(10).await.unwrap();
+        assert!(
+            lignes.is_empty(),
+            "une livraison réussie supprime la ligne, or la table porte {:?}",
+            lignes.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+
+        let recus = double.recus();
+        assert_eq!(recus.len(), 1, "le rail a bien été emprunté : {recus:?}");
+        assert_eq!(
+            recus[0],
+            format!("{FAILED_SEND_STALE_PREFIX}réponse parquée"),
+            "le texte envoyé porte le préfixe de mika#1751, une seule fois"
+        );
     }
 }

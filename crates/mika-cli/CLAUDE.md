@@ -8,7 +8,31 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 ## Subcommands
 
-`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`.
+`status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`, `arch-disposition`, `flight-verdicts`.
+
+### `mika flight-verdicts judge` (mika#2922, vol 2/3)
+
+`mika flight-verdicts judge --task-id <ID> --issue <TERME> [--cause <TERME>] --recommendation <TERME> [--note <TEXTE>]` — inscrire le jugement de MPC sur un vol, sous la **même clé** (`tasks.id`) que le verdict du manager. C'est le « chemin supporté, jamais du SQL à la main » que le ticket exige ; le contrat de la ligne écrite est dans `crates/mika-agent/CLAUDE.md` § *Audit Log* → `tool_name = 'mpc_flight_judgment'`.
+
+**Adaptateur mince.** `commands/flight_verdicts.rs` analyse les trois termes par `parse_judgment_terms`, inscrit par `record_mpc_judgment`, et rend ce qui s'est passé. Aucune écriture d'audit, aucune recomposition de clé, aucune logique de domaine : l'écrivain unique du `tool_name` vit dans `mika_agent::flight_verdict_ledger`, et la garde d'unicité côté mika-agent est aveugle à ce crate — d'où `mika2922_ladaptateur_nest_pas_un_ecrivain` ici, avec son contrôle négatif.
+
+**Aucune table de graphies côté CLI.** Les termes acceptés sont ceux que serde écrit, et un terme hors contrat est refusé par l'analyseur **en nommant les valeurs acceptées**. Corollaire pour un futur éditeur : `--cause` est un `Option` libre, **sans `requires`** — « exigée avec `dead`, refusée ailleurs » est le contrat de `parse_judgment_terms`, et le redire en clap en ferait une seconde table divergente le jour où une quatrième issue porte une cause (classe mika#2158). `--task-id`, `--issue` et `--recommendation`, eux, sont exigés par clap : un jugement partiel n'a pas à atteindre la base.
+
+**L'analyse passe avant l'ouverture de la base**, donc un terme mal tapé est refusé sans connexion ouverte et sans ligne inscrite.
+
+**Un vol déjà jugé n'est pas rejugé, et la commande sort à 0** — un non-zéro sur une simple reprise casserait un rejeu scripté idempotent. Elle rend le jugement en place et, quand il diffère de celui proposé, le dit sans arbitrer : il n'y a aucun moyen d'écraser, et c'est l'opérateur qui sait lequel est le bon. Pas de `--format` : `judge` est un verbe d'écriture, comme `tasks cancel` et `tasks rearm`.
+
+### `mika flight-verdicts concordance` (mika#2922, vol 3/3)
+
+`mika flight-verdicts concordance [--format text|json|yaml]` — le compte de concordance manager / MPC, en **lecture seule**. C'est la commande que MPC présente à Vincent avant d'ouvrir `MIKA_MANAGER_EVALUATE_WRITE` : elle mesure le seuil de mika#2698 (*les mêmes verdicts que MPC sur 10 vols consécutifs ou 7 jours*), elle ne décide pas de l'ouverture.
+
+**Cinq colonnes, plus un en-tête.** `vol` (`tasks.id`, **non tronqué** : c'est ce que l'opérateur recolle dans `judge --task-id`), `ticket` (lu sur la ligne **du manager** — le `reasoning` de MPC porte une note libre, pas un numéro), `manager`, `MPC`, `accord`. L'en-tête donne le nombre de vols, la fenêtre en jours (`AUDIT_RETENTION_DAYS`) et « N vols consécutifs concordants », compté **du plus récent au plus ancien** : un concordant incrémente, un divergent arrête, un vol non jugé par MPC est sauté, un `after_value` illisible arrête. Les colonnes sont calculées sur le contenu, sans ellipse : une cellule tronquée effacerait précisément ce que la colonne `accord` vient de nommer.
+
+**Rien n'est inventé et rien n'est avalé.** Un vol que MPC n'a pas jugé est « non jugé par MPC » et ne compte ni pour ni contre (motif mika#2331). Un `after_value` illisible est **compté, nommé par un WARN, et rendu comme illisible** — jamais comme un désaccord. Les jugements de MPC orphelins (aucune ligne manager en face) sont **dits** dans l'en-tête, pas jetés.
+
+**L'asymétrie avec `judge` est délibérée, donc attestée par un test.** `concordance` porte `--format` parce qu'un script peut vouloir du JSON ; `judge` n'en porte pas parce que c'est un verbe d'écriture. Et le `Text` de cette commande est un **rendu**, pas une sortie de secours : le tableau *est* la surface humaine du verbe, et son défaut (contraste avec `commands/milestone.rs::emit`, qui rend du JSON joli sur son arm `Text` faute de surface humaine).
+
+**Adaptateur mince, deux gardes.** La lecture est `read_concordance` et le rendu `render_concordance_text`, tous deux dans `mika_agent::flight_verdict_ledger` ; ce crate n'arbitre que la forme de sortie. Aucune des quatre aiguilles de `mika2922_ladaptateur_nest_pas_un_ecrivain` n'apparaît dans l'arm — cette garde interdit à ce crate de **nommer** les deux `tool_name`, donc ni l'écriture ni la lecture ne peut y vivre. C'est la raison pour laquelle le lecteur n'est pas ici : enracinée côté CLI, la garde du lecteur unique (`mika2922_ac3_un_seul_lecteur_du_registre`, côté mika-agent) serait verte par construction (classe mika#2205).
 
 ### `mika plan-callout` (mika#2194, three callers since mika#2608)
 
@@ -16,7 +40,7 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 **Three callers since mika#2608 (phase 2), all of them `dispatch-lib.sh`, all through `_extract_plan_path`:** `_detect_plan_on_branch` (« which file do I open? » — phase 1), `_committed_plan_on_branch` (« which path does this body name? », resolved against the branch tree and bound to the ticket, mika#2034) and the `elif` of `_set_up_worktree` (« does this body carry a callout at all? » — a log line). **No subcommand and no flag was added for the second and third**: the 0/1 distinction *is* the boolean answer, and `--raw` was not needed either (see below). Three process starts per dev-groom dispatch — the arithmetic, and the halt if the S3 probe contradicts it, are in `docs/architecture/dispatch-lib-migration.md` § 2.
 
-**The family stays flat, with its switch criterion written.** Nothing here is namespaced under a `predicate` head, and that is a decision rather than a deferral: the population of predicate subcommands is still **one**, and naming a family for a population of one is the gesture this repo has refused twice in writing (mika#2329's sentinel file parameterized by scan name, shipped with a single use; mika#2201's allowlists shipped empty). **Switch criterion, so phase 3 does not have to re-derive it: the second distinct predicate subcommand.** The cost of the deferral is bounded and legible — a later rename produces "new dispatch-lib + old `mika`" for a deployment window, where `mika` exits non-zero on an unknown subcommand ⇒ code `≥2` ⇒ a **loud, named** refusal (`subcommand_error`), never an empty path. The refused alternative, so it is not re-proposed blind: `mika predicate <name>` would say "this is not for you" on a head namespace that already carries 22 operator subcommands — a real argument, decisive at the **second** predicate, not the first.
+**The family stays flat, and its switch criterion is no longer a count.** Nothing here is namespaced under a `predicate` head. Since mika#2194 vol 5 there are **two** predicate subcommands (`plan-callout`, `arch-disposition`), and they stay at the head on purpose: the old criterion (« the second distinct predicate subcommand ») was **replaced on 2026-11-02** (AC5 of phase 3, landed by #3015 in `docs/architecture/dispatch-lib-migration.md` § 6) by *« group when predicates stop being diagnostic instruments »*. As long as an operator replays each one by hand to diagnose a `≥2` refusal, it belongs beside `token` and `credential-helper`; `mika predicate <name>` becomes worth its cost the day a predicate exists that no operator has a reason to invoke, whatever the count. The doctrine file carries the full reasoning and the old criterion it replaced. A later rename still costs only a deployment window of loud, named refusals (`subcommand_error`), never an empty path.
 
 **The shortest path in the binary, and deliberately shorter than `token`.** It exits in the head `match &cli.command` of `main.rs`, beside `Token` and `CredentialHelper`, and does **strictly less** than either: no `dotenv`, no `Settings`, no `home`, no DB, no network. A pure predicate has no reason to resolve an agent — and that is what makes a process start acceptable on a path called **once per dispatch** (the channel criterion in `docs/architecture/dispatch-lib-migration.md` § 2).
 
@@ -50,6 +74,25 @@ Before the switch, `_extract_plan_path` returned `1` in both of the last two cas
 ```sql
 SELECT id, result FROM tasks
  WHERE result LIKE 'REFUSED (plan-callout, mika#2194)%' ORDER BY created_at DESC;
+```
+
+### `mika arch-disposition` (mika#2194, vol 5)
+
+`mika arch-disposition --pass <first|second> --response-file <path>` reads the disposition of an architect response. It is the channel through which `dispatch-lib.sh::_parse_disposition` and `::_parse_verdict` (now thin wrappers) interrogate the **single** reader of the five tiers, [`mika_agent::arch_disposition::decide`]. `commands/arch_disposition.rs` holds **no tier rule**: it reads the file, calls `decide`, formats. `--pass` takes the engine's own `ArchPass` (`clap::ValueEnum` derived on it), never a CLI twin.
+
+Same shape as `plan-callout`, for the same reasons: shortest path in `main.rs` (no `dotenv`, `Settings`, `home`, DB or network), body by **file** only, no positional variant.
+
+| code | stdout | stderr |
+|---|---|---|
+| `0` | line 1 = token, line 2 = tier (`0b`, `1a`, `1b`, `2`) | tier 2 only: `… (matched: '<fragment>')`, the shape an existing `sed` reads |
+| `1` | line 1 **empty**, line 2 = `0` (engine withheld the disposition) or `-` (nothing matched) | — |
+| `≥2` | empty | `REFUSED (arch-disposition, mika#2194) <reason>: <detail>` |
+
+**Two lines, always**, on `0` and `1`: a `sed -n '2p'` on a one-line output reads empty and cannot tell it from an absent tier. **A refusal reaches `tasks.result`**, never a log only: the wrappers run inside the callers' `$(...)`, so the reason crosses the subshell through the `$$`-suffixed `_ARCH_DISPOSITION_REFUSAL_FILE` and `_annex_arch_disposition_refusal` appends it from `_deliver_callback`. The wrappers return `0` on every path (callers capture under `set -e`, and UNPARSED is their retry path), so to the caller a refusal reads as UNPARSED; the named reason in `RESULT` is what tells them apart.
+
+```sql
+SELECT id, result FROM tasks
+ WHERE result LIKE '%REFUSED (arch-disposition, mika#2194)%' ORDER BY created_at DESC;
 ```
 
 ### Key Commands
@@ -257,7 +300,161 @@ untouched — a follow-up ticket, with a measurement as its precondition.
 
 **Remote mode (R1 ascension architecture, 2026-06-09):** `--remote <URL>` or `MIKA_REMOTE_AGENT_URL` env (flag wins) puts `mika ask` in remote mode — the in-process agent loop is bypassed and the prompt is dispatched to a cloud Mika agent via the gateway's A2A proxy (e.g., `https://gw.example.com/a2a/{customer_id}/{agent}`). Auth uses `MIKA_INTERNAL_TOKEN` as a bearer header (existing gateway internal-token contract). The remote `Task` response is rendered to stdout: text parts emitted verbatim, file parts as `[file: <name>]`, data parts as `[data]`. Errors surface single-line prefixes by `A2aError` variant — `remote error:` (JSON-RPC error) and, for a transport failure, a sentence naming both what failed and what became of the work (mika#2036). The transport half distinguishes unreachable / timed out (naming the budget spent) / HTTP status / unreadable / interrupted; the second half reports whether the answer was reclaimed, is still being generated ("Retry"), was never started, or could not be looked up — and names the `context_id` to query with `tasks/get`. **A generated answer is no longer lost:** when the exchange fails after the request landed, `mika ask` re-reads the task by the `context_id` it minted before sending, and returns the response the server already produced. Conflicts with `--team`. JSON mode adds `metadata.remote_task_id` under `--verbose`; text mode appends a `remote_task_id: <id>` trailer under `--verbose`. Remote mode does not write to the local `~/.mika/data/mika.db` — session state lives on the cloud agent. Implementation: `src/remote_ask.rs` (lib-exposed for integration tests), wired in `src/main.rs` Ask branch.
 
+### `budget_floor` — le budget d'envoi est résolu au moment de l'envoi (mika#2759)
+
+`src/budget_floor.rs` répond à une seule question, pour un seul appelant :
+*quelle enveloppe per-agent l'agent visé par cette URL fait-il tourner ?* La
+réponse devient le troisième candidat du `max` de
+`mika_a2a::client::resolve_send_timeout_with_floor`, appelé à l'unique site
+`remote_ask.rs::send_message_to_agent` — que **les deux portes** de `mika ask`
+traversent (la porte locale par `commands/ask.rs`, la porte `--remote` par
+`run_remote`).
+
+Le plancher `client >= total` de mika#2297 était résolu sur l'environnement du
+**process** ; les enveloppes de mika#2189 vivent dans le `config.toml` de
+**l'agent**. Sur un appel vers mika-arch le client résolvait donc 600 s face à
+une enveloppe de 900, et abandonnait une génération que le moteur avait encore le
+droit de finir. Le raisonnement complet (pourquoi à l'envoi, pourquoi un seul
+site, pourquoi par attestation) est dans `crates/mika-a2a/CLAUDE.md`
+§ *Client transport policy*. Ce qu'un éditeur de ce crate doit savoir :
+
+- **Le prédicat de cible est fermé, et c'est l'inverse de celui de `a2a_call`.**
+  `local_a2a_agent(url)` rend `Some(nom)` pour `http`/`https` + hôte **loopback**
+  (`localhost`, `127.0.0.0/8`, `::1`) + chemin `/a2a/{nom}` à **un seul**
+  segment après `a2a` (un `/` final est accepté). Tout le reste rend `None`.
+  `a2a_call` *refuse* le loopback (SSRF) ; ici on n'accepte **que** lui, parce
+  que le spirit de la cible est la seule autorité sur l'enveloppe de cette cible.
+  Un `/a2a/{customer}/{agent}` de gateway n'est donc jamais interrogé : deux
+  segments, `None`.
+- **Rien n'est résolu localement** (doctrine mika#2457). L'enveloppe est lue dans
+  `GET /api/v1/agents/{id}/budget` — l'URL d'attestation est bâtie sur
+  l'autorité de **l'URL visée**, pas sur une adresse de spirit résolue ici —
+  champ `budget.agent_total_timeout_secs`. Lire le `config.toml` d'ici rendrait
+  un chiffre qui n'est pas celui en vigueur. Le jeton est un **paramètre**, pas
+  une lecture d'environnement, et son absence n'est pas court-circuitée : la
+  requête part sans `Authorization`, le serveur répond `401`, et la cause est
+  nommée — sinon « ton shell n'a pas de jeton » se tairait comme « le daemon est
+  à terre ».
+- **Absent n'est pas zéro** (motif mika#2331). Les quatre populations de `None`
+  sont nommées séparément, parce qu'elles ne demandent pas le même geste :
+
+  | événement | niveau | lecture |
+  |---|---|---|
+  | `a2a_floor_not_local` | DEBUG | cible non-loopback — nominal sur `--remote` |
+  | `a2a_floor_unattested` + `cause = unreachable` | WARN | le daemon ne répond pas |
+  | `a2a_floor_unattested` + `cause = status_<code>` | WARN | 401/403 (mauvais jeton), 404 (agent non servi) |
+  | `a2a_floor_unattested` + `cause = malformed` | WARN | un 2xx que ce miroir ne sait pas lire — écart de version |
+  | `a2a_floor_resolved` | DEBUG | l'enveloppe est entrée au `max` |
+
+  Dans tous les cas de `None`, `resolve_send_timeout_with_floor(None)` rend
+  **octet pour octet** le budget que `A2aClient::new` aurait résolu : le plancher
+  ne peut que relever, jamais plafonner.
+- **`ATTESTATION_TIMEOUT_SECS = 5`** borne la demande d'attestation, et n'est
+  délibérément **pas** un `const … : Duration` (hors population de la règle A2 du
+  lint a2a). Le fichier est **dans** le `PERIMETER` de
+  `scripts/check-a2a-timeout-literals.sh` depuis mika#2759 : sans cette entrée sa
+  conformité était vraie et non vérifiée.
+- **Un second site est refusé, pas listé.** `mika2759_le_plancher_a_un_seul_site`
+  balaie la moitié production du crate avec un `ALLOWED` **vide** (forme
+  mika#2425 / mika#2457), doublé de `mika2759_le_scan_du_plancher_nest_pas_vide`
+  qui atteste que le balayage a réellement vu `remote_ask.rs`. Quand il rougit, le
+  remède est de router le nouvel appelant par celui qui existe (doctrine
+  mika#2201), jamais d'ajouter une ligne.
+
 ## TUI Features
+
+### Un tour de la TUI exige mika-spirit (mika#1727, vol V1 sur 4)
+
+Depuis ce vol, un message tapé dans `mika` / `mika chat` **part sur le fil** :
+`chat::spawn_agent_worker`, bras `AgentRequest::Message`, envoie le tour par
+`commands/chat_turn.rs::send_turn_to_spirit` vers `{spirit_url}/a2a/{agent}`, et
+rend ce que le serveur a produit. La boucle, la session de boucle, les outils,
+les permissions et le dispatch LLM sont chez mika-spirit — qui les possédait
+déjà pour `mika ask` depuis mika#1881. **Sans daemon, la TUI n'a plus de mode
+autonome** : le démarrage le dit (voir plus bas) et le tour échoue en nommant
+l'endpoint, jamais en rendant une réponse vide (mika#2270).
+
+`chat_turn.rs` est l'**unique** site d'envoi, et c'est structurel :
+`mika1727_v1_le_tour_de_la_tui_ne_fait_plus_tourner_la_boucle` balaie la moitié
+production du crate et refuse `agent::run_agent(` comme `AgentParams` partout
+sauf dans `commands/chat.rs`, où `mika1727_v1_le_site_tolere_na_quun_seul_appel_local`
+n'en tolère **qu'un**. Quand l'une rougit, le remède est de router le nouvel
+appelant par l'envoi existant, jamais d'élargir l'allowlist.
+
+**L'unique appel local restant est le bras `CallbackResult`, et il est borné.**
+La porte A2A écrit `is_callback_turn: false` en dur (`server/a2a.rs:343`), donc
+le fil ne sait pas exprimer un tour de callback ; le réparer demande une clé
+dans `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/`. Il part avec le
+poll des callbacks au vol V2b, et l'entrée d'allowlist avec lui ; le
+`TaskEngine`, lui, est déjà parti (vol V2a, voir plus bas). Le périmètre des
+quatre vols est dans le corps de mika#1727.
+
+**Trois entrées de la TUI n'atteignent plus le tour, et se disent à voix haute.**
+`chat_turn::inertia_notice` rend un avis **à chaque tour qui les exerce** — pas
+une fois par session — et chacun nomme le geste qui l'éteint ; c'est la forme de
+`cli_skill_flag_inert` (mika#1883), pour la même raison : un réglage qui ne fait
+plus ce qu'il annonce doit se voir chaque fois qu'on s'en sert.
+
+| entrée | ce qui se passe | cause |
+|---|---|---|
+| `/think <budget>` | le budget ne voyage pas | aucune clé de fil ; le serveur ne lit pas `thinking_level` |
+| bloc `thinking:` en réponse | il n'apparaît plus | un `Task` A2A ne porte pas de part de pensée |
+| image collée (Ctrl+V) | elle est abandonnée | `remote_ask::build_send_params` ne bâtit que des parts texte |
+
+L'avis est émis dans le **worker**, pas à la saisie : c'est l'unique point où
+atterrissent les **deux** expéditeurs d'`AgentRequest::Message` (`tui/app.rs` et
+le coup unique de `/think` dans `tui/commands/handlers.rs`). Il voyage par
+`AgentResponse::Notice`, rendu en `ChatRole::System` **sans toucher au statut** :
+un avis n'est pas un échec et ne doit pas éteindre le spinner du tour qu'il
+annote. L'avis des images nomme ce qui est tombé — types MIME dédupliqués et
+charge base64 transportée pour rien — et c'est aussi ce qui garde un
+consommateur à `ImageAttachment::media_type` et `base64_data`, que le tour texte
+seul n'envoie plus.
+
+**Le démarrage dit un spirit muet avant le premier tour.** `chat::run` lit
+`dashboard::query_dashboard_status()` et non `is_dashboard_running()` : la même
+sonde répond désormais à deux questions, et le `bool` les écrasait — un daemon à
+terre y était indiscernable d'un tableau de bord désactivé. Un `None` pousse un
+message `System` qui nomme l'endpoint et **les deux** causes possibles, parce que
+la sonde rend la même absence pour un daemon injoignable et pour un shell sans
+`MIKA_INTERNAL_TOKEN` ; en désigner une seule serait une fausse provenance
+(motif mika#2331). Le chemin `--team` garde `is_dashboard_running()` — son tour
+ne passe pas par ce bras, et il part au vol V4.
+
+### La TUI ne possède plus de moteur de tâches (mika#1727, vol V2a sur 4)
+
+`commands/chat.rs` construisait un `TaskDispatcher`, un `TaskEngine`, les deux
+paires de récurrentes intégrées (`heartbeat` et `reflection`),
+`startup_recovery`, la purge des tâches anciennes et une boucle de tick. Tout
+cela est parti : **le daemon (`mika-agent/src/server/mod.rs`) est désormais le
+seul enregistreur des récurrentes d'un agent.** Le refus est structurel —
+`mika1727_v2a_la_tui_ne_construit_plus_de_moteur_de_taches` (module `tests` de
+`commands/chat_turn.rs`) balaie la moitié production du crate et refuse
+`TaskEngine::new(`, `TaskDispatcher {`, `spawn_tick_loop(` et
+`startup_recovery(` **partout**, allowlist livrée vide et pinnée vide. Le scan
+porte sur le geste de construction et jamais sur `task_engine::` :
+`commands/tasks.rs` importe légitimement neuf utilitaires de ce module pour lire
+et écrire des tâches par la base. Quand il rougit, le remède est un endpoint de
+mika-spirit, jamais une entrée d'allowlist.
+
+**Effet de lecture, à retenir avant de diagnostiquer `auto_pull`.** Jusqu'à ce
+vol, le moteur de la TUI disputait aux daemons les récurrentes de son agent
+(mika#2351) ; le 2026-11-08 c'était lui qui exécutait `auto_pull` pour mika-dev.
+La course est éteinte par construction, donc **l'absence de lignes `auto_pull_*`
+dans le journal CLI par agent (`~/.mika/agents/<nom>/logs/mika.log.YYYY-MM-DD`)
+est le régime nominal après ce merge, et non une absence d'`auto_pull`** (classe
+mika#2340). Ces lignes se lisent côté daemon, dans
+`$MIKA_SPIRIT_LOG_FILE` (`mika logs paths --agent <a>`), et la récurrente
+elle-même dans `mika tasks list`.
+
+**Les deux entrées de recensement de `canonical_tokens.rs` ont bougé avec le
+code.** `HEARTBEAT_GATE_REGISTRATION_SITES` (mika#2847) et
+`REFLECTION_GATE_REGISTRATION_SITES` (mika#2850) perdent
+`crates/mika-cli/src/commands/chat.rs` — nécessairement dans le même commit,
+leurs boucles `seen == len` visant sinon un nom mort. L'entrée n'est **pas**
+passée dans `*_READER_ALLOWED` : le retrait **durcit** les deux scans, puisque
+toute réapparition d'une lecture de porte sous `crates/mika-cli/` est désormais
+un `strangers`.
 
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)

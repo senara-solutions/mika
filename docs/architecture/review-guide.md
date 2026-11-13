@@ -79,7 +79,6 @@ The plan author's own retractions are the best examples — caught at planning t
 ### What not to flag
 
 - **A feature flag added for a planned migration.** YAGNI applies to speculative work, not to staged rollouts of work that is actually happening (e.g., `MIKA_DISABLE_AGENT_PROVISIONING` for the in-progress identity-toml migration).
-- **Pre-1.0 breaking-change shipping shape.** Mika's convention is to ship breaking changes pre-1.0 without backward-compatibility shims (see `mika/CLAUDE.md` § Versioning). That is not YAGNI in either direction; it is the explicit policy.
 
 ---
 

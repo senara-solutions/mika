@@ -137,9 +137,11 @@ Durable changes to bundled skills must go through the source tree at `skills/bun
 
 **events** — `id INTEGER PK AUTO`, `agent_id FK`, `description TEXT`, `event_date TEXT`, `context TEXT`, `created_at TEXT`
 
-**search_content** — `id INTEGER PK AUTO`, `agent_id FK`, `source_type TEXT`, `source_id INTEGER`, `content TEXT`, `embedding_json TEXT`, `created_at TEXT`, `updated_at TEXT`
+**search_content** — `id INTEGER PK AUTO`, `agent_id FK`, `source_type TEXT`, `source_id INTEGER`, `content TEXT`, `embedding_dims INTEGER`, `created_at TEXT`, `updated_at TEXT`
 
 **Virtual tables:** `fts_search` (FTS5 on search_content), `vec_search` (sqlite-vec, float[512])
+
+`embedding_dims` is a **marker, not a payload** (v56, mika#2658) : il porte le nombre de dimensions du vecteur indexé (`512`), et `NULL` signifie *pas encore embeddé* — c'est le prédicat du backfill de démarrage. Le vecteur durable vit dans `vec_search` (2 Ko/vecteur). Jusqu'en v55 la colonne s'appelait `embedding_json TEXT` et portait le vecteur **une seconde fois** en JSON texte (≈ 7,7 Ko/ligne) ; cette copie n'était jamais relue — 483 Mo des 1 012 Mo mesurés le 2026-10-03. Un `embedding_dims` non nul différent de 512 est le signe d'un vecteur que `vec_search` a refusé en silence.
 
 ### Task Engine
 

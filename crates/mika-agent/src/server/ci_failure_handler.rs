@@ -64,11 +64,12 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    CheckClassification, classify_checks, run_gh_checks, run_gh_subprocess,
+    CheckClassification, ci_read_token_or_pat, classify_checks, run_gh_checks, run_gh_subprocess,
 };
+use mika_common::ci_read::CiReadToken;
 
 use super::ci_success_handler::{PrInfo, find_open_pr};
 use super::verdict_handler::VerdictAction;
@@ -265,11 +266,18 @@ async fn log_no_action(
 /// [`surface_for_adoption`], **after** the dispatchable-repo term, so a
 /// misconfigured value is named on the population that would have been notified
 /// rather than on every CI failure the fleet sees.
+///
+/// `ci_read_token` est le jeton de **lecture** de CI (mika#2963, câblé par
+/// mika#2965), résolu une seule fois dans `server/handlers.rs` et transmis à
+/// [`fetch_failure_context`]. Second jeton à côté de `github_token`, jamais son
+/// remplaçant : App-first, parce qu'un PAT fine-grained ne lit pas
+/// `statusCheckRollup`.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_ci_failure(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -407,12 +415,7 @@ pub async fn try_handle_ci_failure(
             "CI failure but fix already in-flight — enriching passthrough"
         );
         return VerdictAction::Passthrough {
-            enrichment: Some(format!(
-                "[ci_failure_handler] CI {} on {}#{} (branch: {}). \
-                 A fix is already in-flight for task {}. Wait for the callback to finish \
-                 before taking further action.\n\n",
-                event.conclusion, event.repo, pr.number, event.branch, task.id
-            )),
+            enrichment: Some(format_inflight_enrichment(&event, pr.number, &task.id)),
         };
     }
 
@@ -453,7 +456,7 @@ pub async fn try_handle_ci_failure(
                  Escalating for manual intervention. Task: {}",
                 event.conclusion, event.repo, pr.number, event.branch, MAX_CI_FIX_COUNT, task.id
             );
-            send_notification(sender, &notification).await;
+            send_notification(sender, NotificationSeverity::P0, &notification).await;
         }
 
         return VerdictAction::Handled {
@@ -464,7 +467,7 @@ pub async fn try_handle_ci_failure(
     // 8. Fetch failing checks and job logs for context
     //    Done BEFORE incrementing ci_fix_count so transient CI self-healing
     //    doesn't waste a circuit-breaker slot (COR-002).
-    let failure_context = fetch_failure_context(pr.number, &event.repo, token).await;
+    let failure_context = fetch_failure_context(pr.number, &event.repo, token, ci_read_token).await;
 
     // 8b. If CI self-healed between the event and our check, abort without
     //     incrementing the counter — no dispatch needed.
@@ -544,7 +547,7 @@ pub async fn try_handle_ci_failure(
              (attempt {new_count}/{}). Task: {}",
             event.conclusion, event.repo, pr.number, event.branch, MAX_CI_FIX_COUNT, task.id
         );
-        send_notification(sender, &notification).await;
+        send_notification(sender, NotificationSeverity::P2, &notification).await;
     }
 
     info!(
@@ -589,11 +592,11 @@ pub async fn try_handle_ci_failure(
 ///
 /// Two lists exist and they are not the same question. The gateway's
 /// `INTERNAL_REPOS` decides which repositories **route** to mika-dev — it carries
-/// `claude-pilot-py` and `wizzard`. `DISPATCHABLE_REPOS` decides where the loop
+/// `claude-pilot` and `wizzard`. `DISPATCHABLE_REPOS` decides where the loop
 /// may **dispatch**, and the 2026-08-29 operator decision keeps those two out of
 /// it. AC1's "ownership list" is the second one, because it answers the question
 /// the surface actually asks: *is the adoption being proposed executable?*
-/// Surfacing `claude-pilot-py` would propose an action the mika#2046 gate refuses
+/// Surfacing `claude-pilot` would propose an action the mika#2046 gate refuses
 /// structurally — so that repository belongs to AC4 (silent-stop), not AC1. A
 /// third list would be the programmed divergence this repo has already paid for
 /// twice (dispatch seats mika#2092, `DISPATCHABLE_REPOS` ↔ `labels.yml`).
@@ -724,6 +727,7 @@ async fn surface_for_adoption(
     if armed && let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P2,
             &format_surface_notification(event, pr.number, pr_url),
         )
         .await;
@@ -762,6 +766,29 @@ async fn surface_for_adoption(
 /// primitive: there a replay cost the whole queue, here it costs a line.
 fn is_already_surfaced(recent_count: Result<i64, ()>) -> bool {
     matches!(recent_count, Ok(count) if count >= 1)
+}
+
+/// The enrichment for a failure whose fix is already in-flight.
+///
+/// Extracted from the middle of `handle_ci_failure`'s step 6 by mika#2768:
+/// a `format!` inside a `match` arm is only reachable through a full turn, so
+/// nothing could put **this** text through `mask_cited_branch` the way the
+/// founding incident's text went through it. The extraction is the condition of
+/// that testability, and nothing else about the path changed.
+///
+/// Like its two siblings below, it cites the branch — which is why it is one of
+/// the two chemin-3 producers mika#2768 pins against the mask.
+fn format_inflight_enrichment(
+    event: &CheckSuiteFailureEvent,
+    pr_number: u64,
+    task_id: &str,
+) -> String {
+    format!(
+        "[ci_failure_handler] CI {} on {}#{pr_number} (branch: {}). \
+         A fix is already in-flight for task {task_id}. Wait for the callback to finish \
+         before taking further action.\n\n",
+        event.conclusion, event.repo, event.branch
+    )
 }
 
 /// The enrichment the LLM reads, carrying AC2's four elements (a)–(d).
@@ -917,7 +944,12 @@ struct FailureContext {
 /// context for a larger prompt with no measurement asking for it. The follow-up
 /// is conditioned on a measurement showing a repair context whose useful log was
 /// missing because lints occupied the `MAX_FAILING_JOBS` slots.
-async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> FailureContext {
+async fn fetch_failure_context(
+    pr_number: u64,
+    repo: &str,
+    token: &str,
+    ci_read_token: Option<&CiReadToken>,
+) -> FailureContext {
     let mut ctx = FailureContext {
         failing_checks: Vec::new(),
         job_logs: Vec::new(),
@@ -925,9 +957,17 @@ async fn fetch_failure_context(pr_number: u64, repo: &str, token: &str) -> Failu
     };
 
     // Fetch checks with timeout
+    //
+    // mika#2963, câblé par mika#2965 — jeton App-first résolu une seule fois
+    // dans `server/handlers.rs`, descendu par `try_handle_ci_failure`. Le repli
+    // au PAT reste atteignable (pas d'App, ou échange échoué) ; il dégrade vers
+    // le régime d'avant mika#2963 et la ligne `ci_read_token_source` nomme la
+    // source. Ici l'enjeu n'est pas un merge mais le contexte de réparation : au
+    // PAT, `ctx.error` porte l'échec de lecture au lieu des checks rouges.
+    let ci_token = ci_read_token_or_pat(ci_read_token, token);
     let checks = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_gh_checks(pr_number, repo, token),
+        run_gh_checks(pr_number, repo, &ci_token),
     )
     .await
     {
@@ -1039,17 +1079,45 @@ async fn fetch_job_log(check_link: &str, repo: &str, token: &str) -> Option<Stri
 // Notification helper
 // ---------------------------------------------------------------------------
 
-async fn send_notification(sender: &Arc<dyn MessageSender>, message: &str) {
-    match sender.send(message).await {
+/// Send an operator notification, absorbing errors — the **only** way out of
+/// this module towards the operator (mika#1381 vol 2).
+///
+/// `severity` is a parameter, not a choice of helper, and it has no default: a
+/// new notification site cannot compile without naming its tier. `P0` — "the
+/// loop is dead, a human must step in" — is routed to
+/// `MIKA_OPERATOR_ESCALATION_CHAT_ID` when one is configured, and to the normal
+/// chat with a named WARN when not; `P2` goes to the chat the operator may mute.
+///
+/// It sits in **second** position because thirteen of the sixteen sites pass a
+/// multi-line `format!`: at the tail of such a call the tier would be a line a
+/// reviewer scrolls past, here it reads on the line that opens the call.
+async fn send_notification(
+    sender: &Arc<dyn MessageSender>,
+    severity: NotificationSeverity,
+    message: &str,
+) {
+    report_notification_outcome(sender.send_with_severity(message, severity).await, severity);
+}
+
+/// Shared outcome handling for both tiers — one copy, so what gets logged cannot
+/// drift from one tier to the other.
+fn report_notification_outcome(
+    outcome: anyhow::Result<crate::messaging::SendOutcome>,
+    severity: NotificationSeverity,
+) {
+    match outcome {
         Ok(crate::messaging::SendOutcome::Delivered) => {}
         Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-            warn!(reason = %reason, "CI failure handler notification delivery failed");
+            warn!(reason = %reason, severity = severity.as_str(), "CI failure handler notification delivery failed");
         }
         Ok(crate::messaging::SendOutcome::NoChannel) => {
-            warn!("CI failure handler notification skipped — no reply channel (chat_id=0)");
+            warn!(
+                severity = severity.as_str(),
+                "CI failure handler notification skipped — no reply channel (chat_id=0)"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Failed to send CI failure handler notification");
+            warn!(error = %e, severity = severity.as_str(), "Failed to send CI failure handler notification");
         }
     }
 }
@@ -1383,7 +1451,7 @@ mod tests {
     ];
 
     const DISPATCHABLE: &str = "senara-solutions/mika";
-    const NOT_DISPATCHABLE: &str = "senara-solutions/claude-pilot-py";
+    const NOT_DISPATCHABLE: &str = "senara-solutions/claude-pilot";
     const SURFACE_SESSION: &str = "surface-1745-session";
 
     fn surface_event(repo: &str) -> CheckSuiteFailureEvent {
@@ -1412,17 +1480,43 @@ mod tests {
         AsyncDatabase::new(db)
     }
 
+    /// Sentinelle enregistrée quand une notification franchit la frontière par
+    /// l'entrée **sans axe de sévérité**, `MessageSender::send`.
+    ///
+    /// Depuis la fusion des deux aides (mika#1381 vol 2), `send_notification`
+    /// n'appelle plus jamais `send` : cette valeur observée est donc le témoin
+    /// d'une **fuite de sévérité** — un chemin qui l'a perdue en route — et non
+    /// un échafaudage de test. Sur un vrai `GatewayMessageSender`, `send`
+    /// délègue à `send_with_severity(.., P2)` et route vers le chat que
+    /// l'opérateur peut muter.
+    const SEVERITE_ABSENTE: &str = "aucune-severite";
+
     /// A sender that records what it was asked to deliver. `NoopSender` cannot
     /// serve here: T6 has to tell "the notification was withheld" from "no
     /// notification was attempted", and a sender that answers `Delivered` to
     /// everything makes those two indistinguishable.
+    ///
+    /// Surcharge les **deux** entrées du trait, et stocke la paire
+    /// `(texte, sévérité)`. `messages()` reste la projection sur le texte, à
+    /// l'identique : dix assertions de T1 à T8 l'appellent, et changer sa
+    /// signature les ferait rougir sans rapport avec la sévérité (mika#1381
+    /// vol 2, D7). La sévérité se lit par `observe()`.
     #[derive(Default)]
     struct RecordingSender {
-        sent: std::sync::Mutex<Vec<String>>,
+        sent: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl RecordingSender {
         fn messages(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(texte, _)| texte.clone())
+                .collect()
+        }
+
+        fn observe(&self) -> Vec<(String, String)> {
             self.sent.lock().unwrap().clone()
         }
     }
@@ -1430,7 +1524,22 @@ mod tests {
     #[async_trait::async_trait]
     impl MessageSender for RecordingSender {
         async fn send(&self, text: &str) -> Result<crate::messaging::SendOutcome> {
-            self.sent.lock().unwrap().push(text.to_string());
+            self.sent
+                .lock()
+                .unwrap()
+                .push((text.to_string(), SEVERITE_ABSENTE.to_string()));
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+
+        async fn send_with_severity(
+            &self,
+            text: &str,
+            severity: NotificationSeverity,
+        ) -> Result<crate::messaging::SendOutcome> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((text.to_string(), severity.as_str().to_string()));
             Ok(crate::messaging::SendOutcome::Delivered)
         }
     }
@@ -1510,9 +1619,64 @@ mod tests {
         );
     }
 
+    /// **Le seul des seize sites attesté à son point d'appel réel** (mika#1381
+    /// vol 2, AC6). D4 ferme le niveau de l'aide ; ceci ferme un site.
+    ///
+    /// Contrôle négatif de premier intérêt : un accusé de routine — « du travail
+    /// non adopté traîne » — **ne monte pas** en P0, donc ne pollue pas la
+    /// surface jamais-muette. Une surface qui reçoit les dix-sept classes de
+    /// message est une surface qui finira mutée (règle R6 du vol 1), et les deux
+    /// paliers se taisent alors ensemble.
+    ///
+    /// **Borne de couverture déclarée**, pour que l'absence ne se devine pas :
+    /// les sites P0 de ce fichier et de `verdict_handler.rs` sont hors d'atteinte
+    /// d'un test unitaire — `try_handle_ci_failure` exige un `github_token` et
+    /// émet de vrais appels API en amont de son site P0, et `verdict_handler`
+    /// n'a aucun point d'entrée testé. Le site de calage
+    /// `agent_loop/mod.rs:4337` est attesté au vol 3.
+    #[tokio::test]
+    async fn mika1381_un_accuse_de_surface_natteint_pas_la_surface_jamais_muette() {
+        let db = surface_db().await;
+        let recorder = Arc::new(RecordingSender::default());
+        let sender: Arc<dyn MessageSender> = recorder.clone();
+
+        surface_for_adoption(
+            &db,
+            &surface_event(DISPATCHABLE),
+            &pr_info("abc123"),
+            "https://github.com/senara-solutions/mika/pull/1745",
+            Some(&sender),
+            SURFACE_SESSION,
+            "trace-1381",
+            &armed_settings(),
+        )
+        .await;
+
+        let observe = recorder.observe();
+        assert_eq!(
+            observe.len(),
+            1,
+            "le chemin qui notifie doit franchir la frontière exactement une fois"
+        );
+        let (texte, severite) = &observe[0];
+        assert!(
+            texte.contains("Unadopted work"),
+            "c'est bien la notification du site :720 qui est observée : {texte}"
+        );
+
+        assert_eq!(
+            severite,
+            NotificationSeverity::P2.as_str(),
+            "le site passe sa sévérité jusqu'à la frontière : attendu P2, observé \
+             {severite}. `{SEVERITE_ABSENTE}` signifierait que l'aide est repassée \
+             par `MessageSender::send` et a perdu la sévérité en route ; `p0` que \
+             l'accusé de routine escalade sur la surface jamais-muette"
+        );
+    }
+
     /// T2 — **negative control (AC4)**, and it is the one that makes T1 mean
     /// something: without it, "the handler decides" is indistinguishable from
-    /// "the handler surfaces everything". `claude-pilot-py` routes to mika-dev
+    /// "the handler surfaces everything". `claude-pilot` routes to mika-dev
     /// (the gateway's `INTERNAL_REPOS`) and the loop may not dispatch into it
     /// (the 2026-08-29 operator decision), so proposing adoption there would
     /// propose an action the mika#2046 gate refuses structurally.
@@ -1526,7 +1690,7 @@ mod tests {
             &db,
             &surface_event(NOT_DISPATCHABLE),
             &pr_info("abc123"),
-            "https://github.com/senara-solutions/claude-pilot-py/pull/1745",
+            "https://github.com/senara-solutions/claude-pilot/pull/1745",
             Some(&sender),
             SURFACE_SESSION,
             "trace-1745",
@@ -1539,7 +1703,7 @@ mod tests {
             "an undispatchable repo keeps the pre-mika#1745 behaviour byte for byte"
         );
         assert_eq!(
-            audit_count(&db, "pr:senara-solutions/claude-pilot-py#1745@abc123").await,
+            audit_count(&db, "pr:senara-solutions/claude-pilot#1745@abc123").await,
             0
         );
         assert!(
@@ -1908,16 +2072,72 @@ mod tests {
 
     #[test]
     fn in_flight_enrichment_avoids_completion_claim_words() {
-        // Simulate the enrichment text from the in-flight branch
-        let text = format!(
-            "[ci_failure_handler] CI {} on {}#{} (branch: {}). \
-             A fix is already in-flight for task {}. Wait for the callback to finish \
-             before taking further action.\n\n",
-            "failure", "senara-solutions/mika", 592, "feat/ci-fix", "task-123"
-        );
+        // Was a hand-copied simulation of the in-flight branch's `format!`, for
+        // want of anything callable; mika#2768 extracted the producer, so the
+        // test now reads the text that ships.
+        let text = format_inflight_enrichment(&sample_event(), 592, "task-123");
         assert!(
             !COMPLETION_CLAIM_RE.is_match(&text),
             "In-flight enrichment contains completion-claim trigger word: {text}"
         );
+    }
+
+    /// AC3 — le chemin 3 est couvert.
+    ///
+    /// Les deux producteurs d'enrichissement de ce fichier citent la branche sur
+    /// une ligne qui ne commence pas par `[GitHub] `, et l'enrichissement
+    /// **préfixe** le texte du tour (`handlers.rs`, bras
+    /// `Passthrough { enrichment: Some(e) }` : `req.text = format!("{e}{text}")`).
+    /// Deux conséquences que le vol 1 de mika#2755 ne voyait ni l'une ni
+    /// l'autre : le slug de la prose n'est sur aucune ligne `[GitHub] `, et la
+    /// ligne `[GitHub] ` de la passerelle n'est plus la première.
+    ///
+    /// La fixture porte le slug de l'incident fondateur, dont le mot-clé est
+    /// celui de dev-groom — sans lui le test serait vacant.
+    #[test]
+    fn mika2768_les_deux_producteurs_du_chemin_3_traversent_le_masque() {
+        let event = CheckSuiteFailureEvent {
+            repo: "senara-solutions/mika".to_string(),
+            branch: "fix/2762/rollback-reaper-groom".to_string(),
+            conclusion: "failure".to_string(),
+        };
+        // Le texte que la passerelle a produit, mot pour mot son gabarit
+        // (`mika-gateway/src/github.rs`, `check_suite`).
+        let gateway_text = "[GitHub] Check suite failure on senara-solutions/mika \
+                            (branch: fix/2762/rollback-reaper-groom)";
+
+        for enrichment in [
+            format_inflight_enrichment(&event, 2765, "task-2765"),
+            format_surface_enrichment(&event, 2765),
+        ] {
+            assert!(
+                enrichment.contains("groom"),
+                "la fixture ne cite plus le slug : le test serait vacant — {enrichment}"
+            );
+            let turn = format!("{enrichment}{gateway_text}");
+            let masked = mika_common::github_event_format::mask_cited_branch(&turn);
+
+            assert!(
+                !masked.contains("groom"),
+                "un slug cité survit au masque : {masked}"
+            );
+            // Les deux occurrences sont vidées, pas seulement celle de la ligne
+            // `[GitHub] ` : le marqueur reste, son contenu part.
+            assert_eq!(
+                masked.matches("(branch: )").count(),
+                2,
+                "les deux marqueurs ne sont pas vidés tous les deux : {masked}"
+            );
+            // La phrase qui suit le `)` de la prose survit intacte — c'est elle
+            // que le masque mangerait s'il coupait jusqu'au dernier `)`.
+            assert!(
+                masked.contains("Wait for the callback") || masked.contains("Proposed adoption"),
+                "le corps de l'enrichissement a été mangé : {masked}"
+            );
+            assert!(
+                masked.ends_with("(branch: )"),
+                "la fin du texte a été mangée : {masked}"
+            );
+        }
     }
 }

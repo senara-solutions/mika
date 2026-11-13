@@ -50,6 +50,7 @@ fn make_identity() -> Identity {
     Identity {
         name: "Mika".to_string(),
         emoji: "M".to_string(),
+        enabled: None,
         reflection: None,
         heartbeat: None,
         kg: KgIdentityConfig::default(),
@@ -67,6 +68,7 @@ fn make_ctx<'a>(identity: &'a Identity, persona: PersonaProfile) -> PromptContex
         identity,
         core_memory: &[],
         is_onboarding: false,
+        compaction_imminent: None,
         current_utc: Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 0).unwrap(),
         timezone: None,
         global_home_dir: None,
@@ -81,6 +83,7 @@ fn make_ctx<'a>(identity: &'a Identity, persona: PersonaProfile) -> PromptContex
         deployment: Deployment::Cloud,
         persona_profile: persona,
         tenant_language: None,
+        pending_transmission: None,
     }
 }
 
@@ -296,6 +299,7 @@ fn test_ac1_silent_prompt_carries_the_doctrine_section() {
         deployment: Deployment::Cloud,
         persona_profile: PersonaProfile::Family,
         tenant_language: None,
+        compaction_imminent: None,
     };
 
     let out = prompt::build_silent_prompt(&ctx);

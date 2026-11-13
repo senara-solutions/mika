@@ -4,7 +4,7 @@
 // files, creating shared-mutable-state bugs. All skill output goes to stdout/stderr.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -18,8 +18,9 @@ use super::manifest::ToolHandler;
 use crate::async_db::AsyncDatabase;
 use crate::db::{self, NewTask};
 use crate::github_graphql::{fetch_issue_body, fetch_pr_summary, parse_pr_url};
+use crate::ready_label::RearmConsentCensus;
 use crate::task_engine::types::{action_type, trigger_type};
-use crate::task_state::tasks::GroomConvergence;
+use crate::task_state::tasks::{DISPATCH_NO_GROOMING_MARKER, GroomConvergence};
 use crate::tools::{GitHubRef, ImageData, ToolOutput, parse_github_ref};
 
 /// Maximum output size from a skill tool (10,000 characters).
@@ -446,6 +447,33 @@ const ARCH_ASK_RETRY_ENV: &[&str] = &["MIKA_ARCH_ASK_RETRY", "MIKA_ARCH_ASK_RETR
 /// le refuse d'ailleurs comme orphelin.
 const PILOT_DISPATCH_ENV: &[&str] = &["PILOT_MAX_TURNS", "PILOT_LOG_DIR", "PLAN_SIZE_MAX_LOC"];
 
+/// L'interrupteur opérateur de la sentinelle d'egress du pilote (mika#2716).
+///
+/// `_stage_pilot_egress_sentinel` (`dispatch-lib.sh`) le lit sous la forme
+/// `${MIKA_PILOT_EGRESS_SENTINEL:-1}` : `0` / `false` / `no` / `off` /
+/// `disabled` ramènent la sandbox au placeholder statique d'avant le ticket,
+/// tout le reste arme le tirage per-spawn.
+///
+/// **Liste propre, et non une entrée de [`PILOT_DISPATCH_ENV`]**, pour deux
+/// raisons qui se lisent chacune dans le doc-comment de la famille qu'elle
+/// écarte. Ce nom est `MIKA_`-préfixé, donc il n'appartient pas à la population
+/// des « formats de fil » nus du canal pilote ; et son vide **n'est pas un
+/// palier** — `:-` rend `1`, donc vide et absent se confondent — là où le vide
+/// de `PILOT_MAX_TURNS` EST le rollback documenté. Il passe par
+/// [`relayed_env_pairs`] et non par [`relayed_env_pairs_preserving_empty`] :
+/// deux populations, deux helpers, chacun testé pour lui-même.
+///
+/// Même contrat de placement que [`RESCUE_VERIFY_ENV`] — relayé APRÈS
+/// [`sandboxed_pilot_env`] — et **jamais** ajouté à
+/// [`SANDBOX_ENV_CORE_ALLOWLIST`] : mika#2354 AC9(b), tenu ici par
+/// `mika2716_the_egress_sentinel_switch_never_joins_the_sandbox_allowlist`.
+/// Sans ce relais, `MIKA_PILOT_EGRESS_SENTINEL=0` posé sur l'environnement du
+/// service serait absent du child, le staging s'armerait quand même, et
+/// l'interrupteur que le ticket exige serait décoratif (mika#2165) — ce que
+/// `mika2508_every_operator_var_read_by_dispatch_lib_reaches_the_child_or_is_named`
+/// refuse comme orphelin.
+const EGRESS_SENTINEL_ENV: &[&str] = &["MIKA_PILOT_EGRESS_SENTINEL"];
+
 /// Decide which of `keys` to set on the child, given a reader of the spirit
 /// process environment.
 ///
@@ -558,6 +586,20 @@ fn inject_pilot_dispatch_env(cmd: &mut tokio::process::Command) {
     for (key, value) in
         relayed_env_pairs_preserving_empty(PILOT_DISPATCH_ENV, |k| std::env::var(k).ok())
     {
+        cmd.env(key, value);
+    }
+}
+
+/// Relaie l'interrupteur de la sentinelle d'egress à `dispatch-lib.sh`
+/// (mika#2716).
+///
+/// Même contrat de placement que [`inject_rescue_verify_env`] — il DOIT tourner
+/// après [`sandboxed_pilot_env`], dont l'`env_clear()` effacerait sinon la
+/// variable — et même discipline best-effort : un dispatch qui ne porte pas le
+/// réglage retombe sur le défaut du shell (sentinelle armée), jamais un dispatch
+/// bloqué.
+fn inject_egress_sentinel_env(cmd: &mut tokio::process::Command) {
+    for (key, value) in relayed_env_pairs(EGRESS_SENTINEL_ENV, |k| std::env::var(k).ok()) {
         cmd.env(key, value);
     }
 }
@@ -687,6 +729,13 @@ pub struct LongRunningContext {
     /// continuation turns) where there is no fresh user input — those paths
     /// have already passed an upstream gate.
     pub originating_message: Option<String>,
+    /// A-t-on forcé une contrainte d'outil pendant CE tour ? (mika#2772)
+    ///
+    /// Écrit à un seul site — l'arm de re-prompt `required_tools` de `run_loop` —
+    /// et lu à un seul site, `validate_forced_dispatch_consent`. Le re-prompt est
+    /// le forçage : il n'existe aucun autre producteur de « l'outil doit être
+    /// appelé ». Un scan de source refuse un second site des deux côtés.
+    pub tool_constraint_forced: AtomicBool,
 }
 
 /// Validate that all required fields declared in a skill tool's input schema are
@@ -1818,10 +1867,23 @@ fn groom_provenance_verdict(
             "error": "dispatch_grooming_not_verified",
             "task_id": task_id,
             "issue": format!("{}/{}#{}", owner, repo, number),
+            // mika#2981 — la condition du refus s'est ÉLARGIE, donc le prédicat
+            // qui la dit aussi. Depuis ce ticket, une preuve qui existe mais
+            // nomme le plan d'un AUTRE vol est également un refus, comme une
+            // preuve nue qu'une PR ouverte après elle a périmée : sans cette
+            // phrase, un opérateur qui lit « no completed groom callback …
+            // exists » devant un ticket dont il voit trois preuves en base
+            // conclurait à une panne de la porte, et chercherait au mauvais
+            // endroit.
             "predicate": "issue body has grooming markers but no completed groom \
                           callback carrying 'Outcome: PLAN_GROOMED' exists under a \
-                          task for this issue — markers may be pre-stamped by hand, \
-                          or the proof aged past the 30-day task retention",
+                          task for this issue, or the only such callback names a \
+                          different plan than the body's current `Plan:` callout, \
+                          or names no plan and a dev-pilot flight opened a PR for \
+                          this issue after it \
+                          (mika#2981 — proof of an earlier flight) — markers may be \
+                          pre-stamped by hand, or the proof aged past the 30-day \
+                          task retention",
             // mika#2484 — une phrase de ce champ est devenue FAUSSE par l'effet
             // de ce ticket, et la laisser serait livrer la régression que
             // mika#2287 a nommée : un texte de remède qui prescrit une route
@@ -1829,14 +1891,51 @@ fn groom_provenance_verdict(
             // … the handler dispatches dev-pilot and lands here again » — c'est
             // exactement ce que le routage corrigé ne fait plus. Seule cette
             // phrase change ; le reste du payload est inchangé à l'octet près.
-            "recovery": "Groom through the autonomous loop: dispatch dev-groom via \
-                         'mika ask --agent mika-dev \"groom <typed-ref>\"'. Re-applying \
-                         the `ready` label also works since mika#2484 — markers without \
-                         proof now route to dev-groom, not dev-pilot. Either way, if the \
-                         plan already resolves on the dispatch branch (hand-groomed \
-                         ticket), dev-groom answers `already_groomed` and mints no proof \
-                         — remove the plan from the branch first so a fresh loop groom \
-                         can run.",
+            //
+            // mika#2811 — TROISIÈME strate, même mécanique : la dernière phrase
+            // du remède de mika#2484 (« dev-groom answers `already_groomed` and
+            // mints no proof — remove the plan from the branch first ») est à
+            // son tour devenue fausse SUR LE CHEMIN DE LA BOUCLE. Quand c'est
+            // CE refus-ci qui a routé au groom, la provenance part dans l'entrée
+            // de dispatch et désarme l'auto-skip du corps : la passe est réelle
+            // et frappe la preuve. Le geste prescrit — retirer le plan de la
+            // branche — était donc devenu du travail opérateur pour rien, et
+            // c'est précisément la boucle que le ticket ferme.
+            //
+            // La population résiduelle n'est pas « en général » : c'est le groom
+            // demandé par un TOUR LLM (`run_claude_pilot_groom`, flux opérateur
+            // mika#1173), qui ne porte aucune provenance de refus — la porte de
+            // mika#2012 y reste armée, délibérément, et `already_groomed` y est
+            // encore la réponse. Le remède nomme cette population-là, et elle
+            // seule.
+            //
+            // mika#2981 — QUATRIÈME strate, et c'est une vérification d'AC3
+            // plutôt qu'une correction : la route prescrite par les trois
+            // strates ci-dessus reste VIVANTE pour la cause neuve, et c'est ce
+            // qui rend la phrase ajoutée sûre. Un re-groom par la boucle part
+            // avec la provenance du refus (mika#2811), donc l'auto-skip du
+            // corps est désarmé, donc la passe est réelle et frappe une preuve
+            // neuve — qui porte désormais le plan du vol courant
+            // (`GROOM_CALLOUT_PLAN` dans `_write_canonical_callout`), donc
+            // satisfait la porte. La phrase ajoutée ne prescrit donc AUCUNE
+            // route neuve : elle nomme la cause pour que l'opérateur sache
+            // POURQUOI la route marche, là qu'il verrait sinon une preuve en
+            // base et un refus et conclurait à une boucle.
+            "recovery": "Groom through the autonomous loop: re-apply the `ready` label, or \
+                         dispatch dev-groom via 'mika ask --agent mika-dev \"groom \
+                         <typed-ref>\"'. Since mika#2484 markers without proof route to \
+                         dev-groom, not dev-pilot, and since mika#2811 that routing \
+                         carries the reason for the refusal, so the groom runs a real pass \
+                         and mints the proof even when the plan already resolves on the \
+                         dispatch branch — nothing to remove by hand first. The one route \
+                         where a hand-groomed ticket still answers `already_groomed` is a \
+                         groom asked by an LLM turn (run_claude_pilot_groom), which carries \
+                         no refusal provenance: there, remove the plan from the branch \
+                         first, or let the loop route it instead. Since mika#2981 a proof \
+                         is bound to the plan it groomed, so on a multi-flight ticket an \
+                         earlier flight's proof no longer satisfies this gate: the same \
+                         route applies unchanged — the re-groom mints a proof carrying \
+                         the current `Plan:` callout.",
             "reason": format!(
                 "Cannot dispatch dev-pilot on ticket #{number}: grooming markers are \
                  present in the issue body but no completed autonomous groom task was \
@@ -1982,9 +2081,85 @@ pub(crate) async fn groomed_state(
     // not proof — the engine flips it groom→implement
     // (mika#1614) before it is terminal. Read-only.
     let issue_url = format!("https://github.com/{}/{}/issues/{}", owner, repo, number);
-    match db.has_completed_groom_for_issue(&issue_url).await {
+
+    // mika#2981 — la preuve doit porter le plan du vol COURANT.
+    //
+    // Le plan est lu du corps que cette fonction a déjà en main, par le lecteur
+    // unique de mika#2194 (garde `mika2194_aucun_motif_de_callout_hors_de_ce_module`,
+    // allowlist vide) : une seconde regex ici serait la régression de ce ticket.
+    // `Strip` parce que la question est la même que celle d'`auto_pull` — un
+    // callout CITÉ dans un bloc de code ne doit pas armer une porte, et le corps
+    // d'un ticket de ce dépôt cite régulièrement le gabarit (mika#2120).
+    //
+    // `normalized` et non `raw` : c'est la forme repo-relative, celle que
+    // `plan_relpath` publie côté preuve. Comparer les `raw` ferait divergir un
+    // callout préfixé (`mika/docs/plans/…`) de sa propre preuve.
+    //
+    // `None` quand le corps ne porte aucun callout lisible : ce cas-ci est
+    // normalement inatteignable (`check_grooming_markers` ci-dessus a déjà
+    // exigé `docs/plans/`), mais son prédicat est une sous-chaîne quand
+    // celui-ci est une ligne ancrée avec backtick fermant — donc l'écart
+    // existe, et la grâce comptée est le bras honnête : refuser ici
+    // déplacerait un refus de forme sous un nom de provenance.
+    let expected_plan =
+        crate::plan_callout::plan_callout(issue_body, crate::plan_callout::FenceHandling::Strip)
+            .map(|callout| callout.normalized);
+
+    match db
+        .has_completed_groom_for_issue(&issue_url, expected_plan.as_deref())
+        .await
+    {
         Ok(GroomConvergence::Converged) => GroomedState::Groomed,
+        // mika#2981 — ACCEPTÉE, et comptée. La grâce D3 : une preuve dont la
+        // ligne ancrée ne nomme aucun plan, et après laquelle aucun vol
+        // `dev-pilot` n'a ouvert de PR pour ce ticket. La compter est la sonde
+        // d'AC4.
+        Ok(GroomConvergence::ConvergedUnbound) => {
+            note_groom_proof_unbound_to_plan(
+                db,
+                &issue_url,
+                owner,
+                repo,
+                number,
+                expected_plan.as_deref(),
+            )
+            .await;
+            GroomedState::Groomed
+        }
         Ok(GroomConvergence::Absent) => GroomedState::MarkersWithoutProof,
+        // mika#2981 — REFUSÉE : la preuve est celle d'un autre vol. Même
+        // disposition qu'`Absent` (le refus `dispatch_grooming_not_verified`
+        // d'AC2), lecture opérateur différente, donc son propre événement —
+        // sans quoi le trou que ce ticket ferme serait incomptable après sa
+        // fermeture, classe mika#2205 appliquée au correctif lui-même.
+        Ok(GroomConvergence::PlanMismatch) => {
+            note_groom_proof_plan_mismatch(
+                db,
+                &issue_url,
+                owner,
+                repo,
+                number,
+                expected_plan.as_deref(),
+            )
+            .await;
+            GroomedState::MarkersWithoutProof
+        }
+        // mika#2981 — REFUSÉE : la preuve est nue, et un vol `dev-pilot` a
+        // ouvert une PR pour ce ticket après elle (borne de la grâce, décision
+        // de Vincent du 2026-10-31). Même disposition que `PlanMismatch`, son
+        // propre événement : l'un dit un plan, l'autre une date.
+        Ok(GroomConvergence::UnboundSuperseded) => {
+            note_groom_proof_unbound_superseded(
+                db,
+                &issue_url,
+                owner,
+                repo,
+                number,
+                expected_plan.as_deref(),
+            )
+            .await;
+            GroomedState::MarkersWithoutProof
+        }
         // mika#2590 R6 — même disposition que `Absent`, lecture opérateur
         // différente. Sans cette ligne, un ticket refoulé pour preuve polluée se
         // lit **exactement** comme un ticket jamais groomé : la classe mika#2205
@@ -2066,6 +2241,200 @@ async fn note_groom_proof_out_of_position(
     }
 }
 
+/// `audit_events.tool_name` et nom d'événement du **refus** de mika#2981 : la
+/// preuve accepée nommait un autre plan que le callout du corps courant.
+///
+/// **SOLE WRITER** : [`note_groom_proof_plan_mismatch`]. C'est ce qui rend
+/// `SELECT count(*) FROM audit_events WHERE tool_name = '…'` exact — motif
+/// [`GROOM_PROOF_OUT_OF_POSITION_EVENT`].
+///
+/// Délibérément **distinct** de l'événement de grâce ci-dessous : l'un compte
+/// des vols que la porte a arrêtés, l'autre des vols qu'elle a laissés partir
+/// sans liaison. Sous un seul nom les deux populations ne se soustraient pas
+/// (mika#2205), et c'est la seconde qui est la sonde d'AC4.
+pub(crate) const GROOM_PROOF_PLAN_MISMATCH_EVENT: &str = "groom_proof_plan_mismatch";
+
+/// `audit_events.tool_name` et nom d'événement de la **grâce** de mika#2981 :
+/// une preuve acceptée dont la ligne ancrée ne nomme aucun plan.
+///
+/// **SOLE WRITER** : [`note_groom_proof_unbound_to_plan`].
+///
+/// # C'est la sonde d'AC4, et le site de retrait de la grâce
+///
+/// ```sql
+/// SELECT count(*) FROM audit_events
+///  WHERE tool_name = 'groom_proof_unbound_to_plan'
+///    AND created_at > '<10 derniers dispatches>';
+/// ```
+///
+/// La cible est 0. La population et ses trois producteurs légitimes sont
+/// documentés sur [`crate::task_state::tasks::GROOM_PROOF_UNBOUND_GRACE`], dont
+/// ce nom-ci est la forme d'audit ; à 0, le ticket de suivi retire la grâce,
+/// l'arme `ConvergedUnbound` devient un refus, et cette constante part avec
+/// elle.
+pub(crate) const GROOM_PROOF_UNBOUND_EVENT: &str = "groom_proof_unbound_to_plan";
+
+/// `audit_events.tool_name` et nom d'événement du refus de la **borne** de la
+/// grâce (mika#2981, décision de Vincent du 2026-10-31) : une preuve nue après
+/// laquelle un vol `dev-pilot` a ouvert une PR pour le ticket.
+///
+/// **SOLE WRITER** : [`note_groom_proof_unbound_superseded`].
+///
+/// Distinct de [`GROOM_PROOF_PLAN_MISMATCH_EVENT`] : les deux refusent la
+/// preuve d'un vol antérieur, mais l'un le lit sur le plan nommé, l'autre sur
+/// une date. Sous un seul nom, la part de chaque détecteur serait perdue
+/// (mika#2205).
+pub(crate) const GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT: &str = "groom_proof_unbound_superseded";
+
+/// Compte un refus de preuve pour cause de plan étranger (mika#2981).
+///
+/// Fire-and-forget, comme [`note_groom_proof_out_of_position`] : une écriture
+/// d'audit qui échoue est `warn!`ée et ne change pas le verdict. Une garde qui
+/// tomberait parce qu'elle ne peut pas se compter serait une garde qu'on retire.
+async fn note_groom_proof_plan_mismatch(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    expected_plan: Option<&str>,
+) {
+    // Le plan ATTENDU seul est journalisé, jamais celui que la preuve portait :
+    // le second est le plan d'un vol antérieur du même ticket, donc il n'ajoute
+    // rien à la lecture, et le `target_key` porte déjà l'issue.
+    let expected = expected_plan.unwrap_or("<aucun>");
+    warn!(
+        event = GROOM_PROOF_PLAN_MISMATCH_EVENT,
+        issue_url = %issue_url,
+        expected_plan = expected,
+        "groomed_state: la seule preuve de groom de ce ticket nomme un AUTRE \
+         plan que le callout du corps courant — c'est la preuve d'un vol \
+         antérieur, le dispatch implement est refusé (mika#2981)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_PLAN_MISMATCH_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(expected),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_plan_mismatch_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — le compte \
+             du refus de mika#2981 est alors incomplet (non fatal)"
+        );
+    }
+}
+
+/// Compte une preuve **acceptée sur la grâce** de mika#2981 — ligne ancrée sans
+/// suffixe de plan.
+///
+/// Émise à chaque dispatch que la grâce laisse partir, pas une fois par preuve :
+/// c'est le dispatch qui est l'unité d'AC4 (« sur les 10 dispatches suivants »),
+/// et une preuve nue peut en porter plusieurs.
+///
+/// Fire-and-forget pour la même raison que ses deux sœurs — un compteur qui
+/// bloquerait le chemin de succès serait pire que le trou qu'il mesure.
+async fn note_groom_proof_unbound_to_plan(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    expected_plan: Option<&str>,
+) {
+    // Le plan attendu est écrit même quand il est absent, sous un sentinel
+    // nommé : « le corps ne porte aucun callout lisible » et « la preuve est
+    // nue » sont deux producteurs différents de la même grâce, et un champ vide
+    // les confondrait (motif mika#2331 — absent n'est pas zéro).
+    let expected = expected_plan.unwrap_or("<aucun callout lisible>");
+    warn!(
+        event = GROOM_PROOF_UNBOUND_EVENT,
+        issue_url = %issue_url,
+        expected_plan = expected,
+        "groomed_state: la preuve de groom acceptée ne nomme AUCUN plan — \
+         dispatch autorisé par la grâce de mika#2981, qui s'arrête à la \
+         prochaine PR ouverte pour ce ticket (sonde AC4)"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_UNBOUND_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(expected),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_unbound_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — la sonde \
+             d'AC4 est alors incomplète (non fatal)"
+        );
+    }
+}
+
+/// Compte un refus de la borne de la grâce (mika#2981) : la seule preuve est
+/// nue, et un vol `dev-pilot` a ouvert une PR pour le ticket après elle.
+///
+/// Fire-and-forget, comme ses trois sœurs : une écriture d'audit qui échoue est
+/// `warn!`ée et ne change pas le verdict.
+async fn note_groom_proof_unbound_superseded(
+    db: &AsyncDatabase,
+    issue_url: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    expected_plan: Option<&str>,
+) {
+    // Même sentinel que la grâce : les deux événements portent le même champ,
+    // et un vide y serait lu comme un plan absent plutôt que comme un corps
+    // sans callout lisible (mika#2331).
+    let expected = expected_plan.unwrap_or("<aucun callout lisible>");
+    warn!(
+        event = GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT,
+        issue_url = %issue_url,
+        expected_plan = expected,
+        "groomed_state: la seule preuve de groom ne nomme aucun plan, et un vol \
+         dev-pilot a ouvert une PR pour ce ticket après elle — la grâce de \
+         mika#2981 ne la couvre plus, le dispatch implement est refusé"
+    );
+
+    if let Err(e) = db
+        .log_audit_event(
+            GROOM_PROOF_SESSION_ID,
+            GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT,
+            &format!("issue:{}/{}#{}", owner, repo, number),
+            None,
+            Some(expected),
+            Some(&format!("issue_url={issue_url}")),
+            None,
+        )
+        .await
+    {
+        warn!(
+            event = "groom_proof_unbound_superseded_audit_failed",
+            issue_url = %issue_url,
+            error = %e,
+            "groomed_state: le WARN est passé, la ligne d'audit non — le compte \
+             des refus de la borne est alors incomplet (non fatal)"
+        );
+    }
+}
+
 /// Le jeton de refus de la garde d'ESCALATE terminal (mika#2545).
 ///
 /// # FORMAT DE FIL
@@ -2095,6 +2464,23 @@ pub(crate) const GROOM_ESCALATE_REFUSED_EVENT: &str = "groom_escalate_redispatch
 /// dont il est le pendant d'échec.
 pub(crate) const GROOM_ESCALATE_MARKER: &str = "Outcome: ESCALATE";
 
+/// Ce qui fait d'une ligne de `result` une **disposition** plutôt qu'un
+/// événement de plomberie (mika#2795).
+///
+/// Le préfixe de l'enveloppe de callback, dont [`GROOM_ESCALATE_MARKER`] est une
+/// valeur particulière. Un callback de groom terminal qui ne porte **aucune**
+/// ligne commençant par ce préfixe n'a rendu aucun verdict : le lanceur différé
+/// promu par `promote_next_deferred_callback_for_class` en est un
+/// (`result = "deferred dispatch slot freed"`), et sur mika#2762 il a masqué
+/// l'`ESCALATE` posé sept minutes plus tôt parce que le lecteur retenait la
+/// ligne la plus récente sans regarder si elle disait quoi que ce soit.
+///
+/// Même ancrage que le marqueur : `starts_with` sur une **ligne**, jamais un
+/// `contains` sur le texte. La prose d'un pilote cite ces en-têtes en parlant du
+/// mécanisme — c'est le faux positif mesuré sur le Signal S (mika#2050) et les
+/// 651 fausses détections d'`instr` (mika#2105).
+pub(crate) const GROOM_OUTCOME_LINE_PREFIX: &str = "Outcome: ";
+
 /// Le champ `verdict` du refus mika#2545 : un **format de fil**.
 ///
 /// Il atterrit dans `audit_events.after_value` **et** dans le JSON écrit sur
@@ -2120,20 +2506,66 @@ pub const ALL_GROOM_ESCALATE_VERDICTS: &[&str] = &[
     GROOM_ESCALATE_VERDICT_UNREADABLE,
 ];
 
+/// Le troisième mot du champ `verdict` de la **sonde** mika#2795 — et
+/// délibérément **pas** une entrée d'[`ALL_GROOM_ESCALATE_VERDICTS`].
+///
+/// Cette table-là énumère les motifs de **refus**, tels qu'ils atterrissent dans
+/// `audit_events.after_value` et dans le JSON de `tasks.result` ; sa cardinalité
+/// de 2 est un format de fil, assertée par
+/// `mika2545_the_two_refusal_verdicts_are_a_wire_format`. Le cas nominal n'est
+/// pas un refus et n'a jamais rien écrit là. Il a besoin d'un nom quand même,
+/// parce que la sonde ci-dessous parle sur **toutes** ses branches, y compris
+/// celle où rien n'est refusé : une sonde muette dans le cas sain ne distingue
+/// pas « lu, rien à signaler » de « jamais passé ici » (mika#2205).
+pub(crate) const GROOM_VERDICT_NOT_ESCALATED: &str = "not_escalated";
+
+/// Le quatrième mot du champ `verdict` de la sonde, et pour la même raison que
+/// [`GROOM_VERDICT_NOT_ESCALATED`] : **pas** une entrée
+/// d'[`ALL_GROOM_ESCALATE_VERDICTS`] (mika#3027).
+///
+/// Une retenue d'ancrage **traverse** la porte : elle ne refuse rien, donc elle
+/// n'écrit rien dans `audit_events.after_value` et ne fait pas partie des deux
+/// motifs de refus dont la cardinalité est un format de fil. Elle a besoin d'un
+/// nom quand même, parce que `groom_verdict_selected` parle sur toutes ses
+/// branches : les lignes portant cette valeur sont **exactement** le numérateur
+/// de la mesure post-déploiement d'AC5 (les retenues qui ont traversé), et leur
+/// homologue `escalated` reste le contrôle positif qui sépare « la porte a laissé
+/// passer une retenue » de « aucune reprise automatique n'est passée par là »
+/// (classe mika#2205).
+pub(crate) const GROOM_VERDICT_ANCHOR_WITHHELD: &str = "anchor_withheld";
+
+/// La sonde de la sélection de ligne (mika#2795).
+///
+/// Émise à **chaque** lecture du verdict, y compris quand `skipped_neutral`
+/// vaut zéro. Le contrôle positif est le point : le défaut de mika#2762 était
+/// invisible parce que « le dernier groom n'a pas escaladé » et « le dernier
+/// callback ne disait rien » rendaient les mêmes octets. La ligne porte le
+/// compteur, donc elle rend la population des sauts **comptable** ; son absence
+/// signifie un binaire antérieur à ce correctif (classe mika#2340), jamais zéro
+/// saut (classe mika#2331), et un réglage qu'on ne peut pas observer n'est pas
+/// un réglage (mika#2293).
+pub(crate) const GROOM_VERDICT_SELECTED_EVENT: &str = "groom_verdict_selected";
+
 /// Est-ce que le dernier grooming de ce ticket a rendu un verdict de halte ?
 /// (mika#2545)
 ///
-/// Trois états, et **pas un booléen** : « ce ticket n'a pas escaladé » et « on ne
+/// Quatre états, et **pas un booléen** : « ce ticket n'a pas escaladé » et « on ne
 /// peut pas le savoir » appellent la même disposition (refuser) mais deux
 /// lectures opérateur différentes, et fondre les deux rendrait la population du
 /// fail-closed incomptable. Motif [`GroomedState`] (mika#2484 D1) : le
 /// consommateur fait un `match` **exhaustif sans bras `_ =>`**, donc un
-/// quatrième état devra être décidé par le compilateur.
+/// cinquième état devra être décidé par le compilateur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GroomVerdictState {
     /// Le dernier callback de groom porte [`GROOM_ESCALATE_MARKER`]. Un
     /// re-dispatch automatique de groom est refusé.
     Escalated,
+    /// Le dernier callback de groom porte un `Outcome: ESCALATE` que le MOTEUR a
+    /// écrit en retenant l'attestation d'ancrage (mika#2338), pas un jugement de
+    /// l'architecte. Une reprise automatique de groom est **autorisée** : la
+    /// mesure du 2026-11-03 dit que la passe suivante converge, et la dépense est
+    /// bornée par le frein mika#2786 en amont de cette porte.
+    AnchorWithheld,
     /// Aucun groom terminal, ou le dernier n'a pas escaladé. Le cas nominal.
     NotEscalated,
     /// La preuve n'a pas pu être lue (erreur base, ou callback terminal dont le
@@ -2155,16 +2587,26 @@ pub(crate) enum GroomVerdictState {
 /// et un callback terminal sans `result` est anormal — le chemin de complétion
 /// en écrit toujours un. La population est donc quasi vide, et son coût est
 /// convergent (voir le site de la garde).
+///
+/// **Qui a écrit l'escalade (mika#3027).** Un ESCALATE d'architecte et une
+/// retenue d'ancrage du moteur rendent le même octet ici — `Outcome: ESCALATE` —
+/// et ce ne sont pas les mêmes faits. Le reclassement se fait **en raffinement du
+/// bras `Escalated`**, donc seul un `result` déjà reconnu comme escalade peut
+/// l'atteindre : c'est fail-closed par construction, un texte sans ligne
+/// `Outcome: ESCALATE` ancrée ne peut pas rendre [`GroomVerdictState::AnchorWithheld`]
+/// quoi qu'il écrive sur `Engine reason:`.
 pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictState {
     match result {
         Some(text) => {
-            if text
+            if !text
                 .lines()
                 .any(|line| line.starts_with(GROOM_ESCALATE_MARKER))
             {
-                GroomVerdictState::Escalated
-            } else {
                 GroomVerdictState::NotEscalated
+            } else if carries_engine_anchor_withholding(&text) {
+                GroomVerdictState::AnchorWithheld
+            } else {
+                GroomVerdictState::Escalated
             }
         }
         None => GroomVerdictState::Unreadable(
@@ -2173,20 +2615,268 @@ pub(crate) fn groom_escalate_verdict(result: Option<String>) -> GroomVerdictStat
     }
 }
 
+/// Ce `result` porte-t-il une ligne de disposition ? (mika#2795)
+///
+/// **Fonction pure**, ancrée sur la ligne — voir [`GROOM_OUTCOME_LINE_PREFIX`]
+/// pour la raison de l'ancrage. Elle ne dit pas *quelle* disposition : c'est
+/// [`groom_escalate_verdict`] qui tranche, et elle n'est appelée que sur une
+/// ligne dont celle-ci a déjà dit qu'elle en portait une.
+pub(crate) fn carries_groom_outcome_line(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with(GROOM_OUTCOME_LINE_PREFIX))
+}
+
+/// Le résultat de la sélection de ligne : l'état **et** de quoi le rendre
+/// observable (mika#2795).
+///
+/// Les deux compteurs ne sont pas de la décoration : `rows_examined` dit la
+/// taille de la population que la jointure a bornée, `skipped_neutral` dit
+/// combien de ces lignes ne portaient aucune disposition. Sans eux, un verdict
+/// `not_escalated` ne distingue pas « le dernier groom a vraiment convergé » de
+/// « on a marché sur trois lignes de plomberie et il n'y avait rien derrière ».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroomVerdictSelection {
+    /// L'état retenu, à rendre au site de la garde.
+    pub(crate) state: GroomVerdictState,
+    /// Combien de callbacks terminaux ont été sautés faute de ligne de
+    /// disposition.
+    pub(crate) skipped_neutral: usize,
+    /// La taille de la liste rendue par la base, avant toute sélection.
+    pub(crate) rows_examined: usize,
+}
+
+/// La sélection de ligne, **du plus récent au plus ancien** (mika#2795).
+///
+/// **Fonction pure**, testable aux bornes sans base. Quatre cas et pas un
+/// cinquième, dans cet ordre de lecture :
+///
+/// 1. `Some(text)` **sans** ligne de disposition → on **saute**, et on compte le
+///    saut. C'est le lanceur différé, et c'est tout le correctif.
+/// 2. `None` (colonne `result` NULL) → on **s'arrête**, `Unreadable`. Ce cas
+///    ressemble à un saut et n'en est **délibérément pas un** : sauter une
+///    anomalie, ce serait laisser passer un re-dispatch sur une preuve qu'on
+///    n'a pas pu lire, donc rouvrir le trou par l'autre bout. Fail-closed.
+/// 3. `Some(text)` **avec** une ligne de disposition → on **s'arrête**, et on
+///    délègue à [`groom_escalate_verdict`], inchangée : la grammaire du marqueur
+///    reste à un seul site.
+/// 4. Liste vide, ou épuisée par des sauts → [`GroomVerdictState::NotEscalated`].
+///    Le cas nominal du tout premier grooming, et aussi celui d'un ticket dont
+///    tous les callbacks de groom sont de la plomberie.
+///
+/// Le tri vient du SQL (`created_at DESC, id DESC`) et **pas** d'un filtre SQL :
+/// une ligne écartée par la base serait invisible à `skipped_neutral`, donc le
+/// compteur mesurerait zéro sur exactement la population qu'il existe pour voir
+/// (doctrine mika#2590).
+pub(crate) fn groom_verdict_from_rows(rows: Vec<Option<String>>) -> GroomVerdictSelection {
+    let rows_examined = rows.len();
+    let mut skipped_neutral = 0usize;
+
+    for row in rows {
+        match row {
+            // Cas 1 — de la plomberie, pas un verdict.
+            Some(text) if !carries_groom_outcome_line(&text) => skipped_neutral += 1,
+            // Cas 2 et 3 — la première ligne qui tranche, tranche.
+            decisive => {
+                return GroomVerdictSelection {
+                    state: groom_escalate_verdict(decisive),
+                    skipped_neutral,
+                    rows_examined,
+                };
+            }
+        }
+    }
+
+    // Cas 4.
+    GroomVerdictSelection {
+        state: GroomVerdictState::NotEscalated,
+        skipped_neutral,
+        rows_examined,
+    }
+}
+
 /// Le lecteur **unique** du verdict de groom pour la garde mika#2545 : de l'URL
 /// d'issue à l'état, base comprise.
 ///
-/// `Ok(None)` de la base — aucun callback de groom terminal — est traduit en
-/// [`GroomVerdictState::NotEscalated`] **ici et non dans la fonction pure** :
-/// c'est le cas nominal du tout premier grooming, et le fondre avec le `result`
-/// NULL le ferait tomber en `Unreadable`, donc en refus, donc aucun ticket ne
-/// pourrait plus être groomé.
+/// Une liste vide — aucun callback de groom terminal — est traduite en
+/// [`GroomVerdictState::NotEscalated`] par [`groom_verdict_from_rows`] et non
+/// par [`groom_escalate_verdict`] : c'est le cas nominal du tout premier
+/// grooming, et le fondre avec le `result` NULL le ferait tomber en
+/// `Unreadable`, donc en refus, donc aucun ticket ne pourrait plus être groomé.
+///
+/// La signature n'a pas bougé (mika#2795) : le site de la garde appelle la même
+/// fonction et fait le même `match` exhaustif. Ce qui a changé est derrière —
+/// la base rend désormais **toutes** les lignes et la sélection se fait ici,
+/// parce que la plus récente n'est pas toujours celle qui dit quelque chose.
 pub(crate) async fn groom_verdict_state(db: &AsyncDatabase, issue_url: &str) -> GroomVerdictState {
-    match db.latest_groom_verdict_for_issue(issue_url).await {
-        Ok(None) => GroomVerdictState::NotEscalated,
-        Ok(Some(result)) => groom_escalate_verdict(result),
-        Err(e) => GroomVerdictState::Unreadable(format!("DB error: {e}")),
+    let rows = match db.groom_callback_results_newest_first(issue_url).await {
+        Ok(rows) => rows,
+        Err(e) => return GroomVerdictState::Unreadable(format!("DB error: {e}")),
+    };
+
+    let selection = groom_verdict_from_rows(rows);
+    let verdict = match &selection.state {
+        GroomVerdictState::Escalated => GROOM_ESCALATE_VERDICT_ESCALATED,
+        GroomVerdictState::AnchorWithheld => GROOM_VERDICT_ANCHOR_WITHHELD,
+        GroomVerdictState::Unreadable(_) => GROOM_ESCALATE_VERDICT_UNREADABLE,
+        GroomVerdictState::NotEscalated => GROOM_VERDICT_NOT_ESCALATED,
+    };
+
+    // Sur TOUTES les branches, y compris `skipped_neutral == 0` : le contrôle
+    // positif est ce qui rend la population des sauts comptable, et son absence
+    // dit « binaire antérieur », jamais « aucun saut ».
+    info!(
+        target: "mika::otel",
+        event = GROOM_VERDICT_SELECTED_EVENT,
+        issue_url = issue_url,
+        rows_examined = selection.rows_examined,
+        skipped_neutral = selection.skipped_neutral,
+        verdict = verdict,
+        "mika#2795 — groom verdict selected from the terminal groom callbacks, \
+         newest first, skipping those that carry no disposition line"
+    );
+
+    selection.state
+}
+
+// ───────── mika#2786 — le frein sur les retenues d'ancrage ─────────
+
+/// Le jeton de refus du frein mika#2786. Format de fil, même raison que
+/// [`GROOM_ESCALATED_ERROR`].
+pub(crate) const GROOM_ANCHOR_BRAKE_ERROR: &str = "dispatch_groom_anchor_brake";
+
+/// `audit_events.tool_name` et nom d'événement de journal du frein mika#2786.
+/// Un seul site l'écrit : ce module, dans [`validate_dispatch_readiness`].
+pub(crate) const GROOM_ANCHOR_BRAKE_EVENT: &str = "groom_anchor_withheld_brake";
+
+/// `audit_events.tool_name` de la **levée** du frein mika#2786 : une demande
+/// explicite de l'opérateur qui traverse un frein armé. Un seul site l'écrit.
+///
+/// La ligne n'est pas qu'une trace : c'est la **borne** de la série. Le frein ne
+/// compte que les retenues postérieures à la dernière levée du ticket. Sans elle,
+/// la levée ne survivrait pas à la file différée : quand la place de groom est
+/// prise, le dispatch demandé est garé en lanceur différé, et son rejeu part d'un
+/// tour silencieux sans `originating_message` (`SilentTrigger::DeferredDispatch`),
+/// qui relirait les mêmes retenues.
+pub(crate) const GROOM_ANCHOR_BRAKE_LIFTED_EVENT: &str = "groom_anchor_brake_lifted";
+
+/// Levier opérateur : le nombre de retenues consécutives au-delà duquel le frein
+/// mord. `0` désarme, comme `MIKA_AUTO_PULL_MAX_REDRIVES`.
+pub(crate) const GROOM_ANCHOR_BRAKE_ENV: &str = "MIKA_GROOM_ANCHOR_BRAKE_MAX";
+
+/// Trois, mesuré sur toute la base le 2026-10-18 : les séries de retenues
+/// observées font 1 (cinq tickets), 2 (mika#2752, mika#2780) et 3 (mika#2762,
+/// qui a convergé à la quatrième). Trois borne la dépense à trois pilotes de
+/// groom, comme `MAX_REDRIVES_DEFAULT` et `CIRCUIT_BREAKER_THRESHOLD` dans
+/// `auto_pull.rs`. Le coût est nommé : sur l'historique, ce frein aurait arrêté
+/// mika#2762 avant la passe qui a convergé, et un `groom` de l'opérateur l'aurait
+/// relancée.
+pub(crate) const GROOM_ANCHOR_BRAKE_DEFAULT: usize = 3;
+
+/// Préfixe de la ligne que `_escalate_groom` (`dispatch-lib.sh`) ajoute au
+/// `result` d'un callback quand l'ESCALATE vient du moteur, pas de l'architecte.
+const GROOM_ENGINE_REASON_PREFIX: &str = "Engine reason: ";
+
+/// Ce `result` porte-t-il une retenue d'ancrage écrite par le MOTEUR ?
+/// (mika#3027)
+///
+/// **Site unique** de lecture de [`GROOM_ENGINE_REASON_PREFIX`], épinglé par
+/// `canonical_tokens::mika3027_la_retenue_dancrage_a_un_seul_lecteur`. Deux
+/// orthographes de ce prédicat, c'est le frein mika#2786 et la porte mika#2545
+/// qui comptent deux populations différentes sous un seul nom.
+///
+/// Deux termes, et chacun est une décision :
+///
+/// - **`strip_prefix` sur une LIGNE**, jamais un `contains` sur le texte : la
+///   prose d'un pilote cite ce préfixe en parlant du mécanisme — le faux positif
+///   mesuré sur le Signal S (mika#2050) et sur les 651 détections d'`instr`
+///   (mika#2105). `_escalate_groom` écrit la vraie ligne en tête de ligne.
+/// - **La forme fixe est lue chez son propriétaire.** Le reste de la ligne est
+///   passé à [`crate::arch_disposition::is_engine_escalation_line`], la
+///   transcription Rust de `dispatch-lib.sh::_engine_escalation_line` qui sert
+///   déjà le tier 0b. Une prose qui écrit `Engine reason: quelque chose` sans la
+///   numérotation `F<n>:`, `(BLOCKING)`, `[mika-engine]` et `review-anchor:` ne
+///   passe pas.
+pub(crate) fn carries_engine_anchor_withholding(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.strip_prefix(GROOM_ENGINE_REASON_PREFIX)
+            .is_some_and(crate::arch_disposition::is_engine_escalation_line)
+    })
+}
+
+/// Parse pur du seuil du frein (mika#2786). Absent ou vide → défaut ;
+/// illisible → défaut avec un WARN ; `0` → désarmé.
+pub(crate) fn parse_groom_anchor_brake_max(raw: Option<&str>) -> usize {
+    match raw {
+        Some(v) if !v.trim().is_empty() => match v.trim().parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                warn!(
+                    value = %v,
+                    default = GROOM_ANCHOR_BRAKE_DEFAULT,
+                    "invalid {GROOM_ANCHOR_BRAKE_ENV}, using default"
+                );
+                GROOM_ANCHOR_BRAKE_DEFAULT
+            }
+        },
+        _ => GROOM_ANCHOR_BRAKE_DEFAULT,
     }
+}
+
+/// Combien des callbacks de groom les plus récents, d'affilée, sont des
+/// retenues d'ancrage ? (mika#2786) `results` est ordonné du plus récent au plus
+/// ancien, tel que [`AsyncDatabase::recent_groom_results_for_issue`] le rend.
+///
+/// Trois sortes de lignes, et la troisième est celle qui compte :
+///
+/// - **une retenue** : ce que [`carries_engine_anchor_withholding`] reconnaît —
+///   une ligne qui commence par `Engine reason: ` et dont le reste porte la forme
+///   fixe de l'escalade du moteur. Elle allonge la série ;
+/// - **un autre verdict** : une ligne qui commence par `Outcome: ` sans
+///   retenue — un `PLAN_GROOMED`, un ESCALATE d'architecte, un
+///   `PIPELINE_INCOMPLETE`. Elle arrête le compte ;
+/// - **un callback neutre** : ni l'un ni l'autre, ou `result` NULL. Le lanceur
+///   différé (« deferred dispatch slot freed ») en est le cas mesuré, posé entre
+///   deux retenues de mika#2762 à 18:20:02Z. Le compter comme une rupture aurait
+///   lu une série de 2 là où il y en avait 3 — c'est la même ligne qui, en tête de
+///   requête, a caché l'ESCALATE au gate mika#2545 (mika#2795). Le lecteur en
+///   base exclut désormais ces lanceurs à la source ; la règle reste ici pour
+///   toute autre ligne sans verdict.
+///
+/// Les deux prédicats sont ancrés en début de ligne : la prose d'un pilote peut
+/// citer le marqueur au milieu d'une phrase (motif mika#2050).
+pub(crate) fn anchor_withheld_streak(results: &[Option<String>]) -> usize {
+    let mut streak = 0;
+    for result in results {
+        let Some(text) = result else { continue };
+        let withheld = carries_engine_anchor_withholding(text);
+        if withheld {
+            streak += 1;
+        } else if text.lines().any(|line| line.starts_with("Outcome: ")) {
+            break;
+        }
+    }
+    streak
+}
+
+/// Les `result` des callbacks de groom postérieurs à la dernière levée du frein
+/// (mika#2786), du plus récent au plus ancien. `rows` vient de
+/// [`AsyncDatabase::recent_groom_results_for_issue`], `lifted_at` de la dernière
+/// ligne [`GROOM_ANCHOR_BRAKE_LIFTED_EVENT`] du ticket.
+///
+/// Comparaison **stricte**, à la seconde (format ISO fixe, donc l'ordre
+/// lexicographique est chronologique). Le callback du dispatch levé naît dans le
+/// même appel d'outil que la ligne de levée, donc souvent dans la même seconde :
+/// il n'est pas compté, et une nouvelle série après une levée demande une
+/// retenue de plus. Le sens inverse (`>=`) compterait une retenue antérieure
+/// écrite dans la même seconde que la levée, et la levée ne lèverait rien.
+pub(crate) fn groom_results_since_lift(
+    rows: Vec<(String, Option<String>)>,
+    lifted_at: Option<&str>,
+) -> Vec<Option<String>> {
+    rows.into_iter()
+        .take_while(|(at, _)| lifted_at.is_none_or(|lift| at.as_str() > lift))
+        .map(|(_, result)| result)
+        .collect()
 }
 
 /// The grooming gate, from the issue body to the verdict (mika#2310 D1).
@@ -2233,7 +2923,9 @@ pub(crate) async fn evaluate_grooming_gate(
     // par un joker (mika#2484 D1).
     match groomed_state(db, owner, repo, number, issue_body).await {
         GroomedState::MarkersMissing(missing) => Err(serde_json::json!({
-            "error": "dispatch_no_grooming_marker",
+            // Lu par l'évaluateur du milestone manager (mika#2946) : l'identité
+            // des deux bouts est portée par la constante, pas par le littéral.
+            "error": DISPATCH_NO_GROOMING_MARKER,
             "task_id": task_id,
             "issue": format!("{}/{}#{}", owner, repo, number),
             "missing_signals": missing,
@@ -2636,6 +3328,500 @@ async fn report_event_target_binding(
     rejection
 }
 
+// ───────── mika#2772 — le consentement d'un dispatch de groom forcé ─────────
+
+/// Le `tool_name` d'audit et le nom de journal du consentement forcé — **un
+/// seul**, le verdict en colonne (mika#2323, motif `ready_label_outcome`).
+///
+/// Neuf issues, un nom : elles appartiennent au même site et à la même
+/// population, et une sonde opérateur qui doit connaître neuf noms est une sonde
+/// qu'on n'écrit pas. `grep -c 'forced_dispatch_consent'` répond « la garde
+/// tourne-t-elle » ; `grep '"forced":true'` répond « a-t-elle mordu ».
+pub(crate) const FORCED_CONSENT_EVENT: &str = "forced_dispatch_consent";
+
+/// Levier de désarmement opérateur. Armé par défaut ; `0` / `false` désarme.
+/// Documenté dans `docs/operator/environment-variables.md`.
+pub(crate) const FORCED_CONSENT_ENV: &str = "MIKA_FORCED_DISPATCH_CONSENT";
+
+/// Le dispatch n'a pas été forcé — il a été demandé par construction.
+pub(crate) const FORCED_CONSENT_NOT_FORCED: &str = "allowed_not_forced";
+/// Le tour portait une intention de grooming explicite (mika#1173).
+pub(crate) const FORCED_CONSENT_REQUESTED: &str = "allowed_requested";
+/// Le ticket visé porte `ready` : le consentement positif de mika#841 est là.
+pub(crate) const FORCED_CONSENT_CONSENTED: &str = "allowed_consented";
+/// L'opérateur a désarmé la garde.
+pub(crate) const FORCED_CONSENT_DISARMED: &str = "allowed_disarmed";
+/// Aucun numéro de ticket résoluble depuis le prompt de dispatch.
+pub(crate) const FORCED_CONSENT_SUBJECT_UNRESOLVED: &str = "forced_dispatch_subject_unresolved";
+/// Pas de token GitHub : le consentement ne peut pas être lu.
+pub(crate) const FORCED_CONSENT_NO_TOKEN: &str = "forced_dispatch_consent_no_token";
+/// Le lecteur de labels a répondu `Err(_)`.
+pub(crate) const FORCED_CONSENT_UNVERIFIABLE: &str = "forced_dispatch_consent_unverifiable";
+/// La cible est une pull request, pas un ticket.
+pub(crate) const FORCED_CONSENT_SUBJECT_IS_PR: &str = "forced_dispatch_subject_is_pull_request";
+/// Labels lus, `ready` absent — **le refus nominal**.
+pub(crate) const FORCED_CONSENT_WITHOUT_CONSENT: &str = "forced_dispatch_without_consent";
+
+/// Le verdict du gate de consentement (mika#2772).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForcedDispatchConsent {
+    /// Le dispatch peut partir.
+    Allowed,
+    /// Le dispatch est refusé ; la chaîne est le JSON rendu au modèle.
+    Refused(String),
+}
+
+/// Journalise et audite une décision de consentement forcé (D5 de mika#2772).
+///
+/// **Une ligne sur chaque dispatch de groom, y compris la branche saine**
+/// (mika#2293 — *un réglage qu'on ne peut pas observer n'est pas un réglage,
+/// c'est un espoir*). Sans producteur connu de contrainte d'outil depuis
+/// mika#2768, une garde silencieuse rendrait « la classe est vide »
+/// indiscernable de « la garde n'est pas déployée ». L'**absence** de la ligne
+/// signifie donc un binaire antérieur à ce vol (mika#2340), jamais une absence
+/// de dispatch forcé.
+///
+/// `subject` et `has_ready` sont des `Option` et se rendent `null` quand le
+/// sujet n'a pas été résolu ou les labels pas lus — jamais `""`, jamais `false`.
+/// Absent n'est pas zéro (mika#2331) : « pas de `ready` » et « on n'a pas pu
+/// regarder » sont deux verdicts différents et portent déjà deux noms distincts.
+/// C'est l'idiome du champ `event_number` de [`report_event_target_binding`].
+///
+/// Le niveau suit le **régime attendu** de chaque verdict : INFO sur les quatre
+/// passages, WARN sur les cinq refus — un WARN sur une population nominale est
+/// un WARN qu'on finit par museler.
+async fn report_forced_dispatch_consent(
+    ctx: &LongRunningContext,
+    verdict: &'static str,
+    forced: bool,
+    requested: bool,
+    subject: Option<&str>,
+    has_ready: Option<bool>,
+    refused: bool,
+) {
+    if refused {
+        warn!(
+            target: "mika::otel",
+            event = FORCED_CONSENT_EVENT,
+            forced = forced,
+            requested = requested,
+            verdict = verdict,
+            subject = subject,
+            has_ready = has_ready,
+            trace_id = %ctx.trace_id,
+            session_id = %ctx.session_id,
+            "tool-boundary: groom dispatch refused — forced by `required_tools` and the \
+             target's consent could not be established (mika#2772)"
+        );
+    } else {
+        info!(
+            target: "mika::otel",
+            event = FORCED_CONSENT_EVENT,
+            forced = forced,
+            requested = requested,
+            verdict = verdict,
+            subject = subject,
+            has_ready = has_ready,
+            trace_id = %ctx.trace_id,
+            session_id = %ctx.session_id,
+            "tool-boundary: groom dispatch consent checked (mika#2772)"
+        );
+    }
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            // Le session id atteint CETTE garde — contrairement à ses voisines
+            // de la même porte — et c'est le bon identifiant : le forçage est une
+            // propriété du TOUR, pas de la tâche.
+            &ctx.session_id,
+            FORCED_CONSENT_EVENT,
+            subject.unwrap_or("<unresolved>"),
+            None,
+            Some(verdict),
+            Some(&format!(
+                "forced={forced} requested={requested} verdict={verdict} subject={} \
+                 has_ready={}",
+                subject.unwrap_or("none"),
+                has_ready
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            )),
+            Some(&ctx.trace_id),
+        )
+        .await
+    {
+        warn!(
+            event = "forced_dispatch_consent_audit_failed",
+            verdict = verdict,
+            error = %e,
+            "failed to write the mika#2772 audit event (non-fatal)"
+        );
+    }
+}
+
+/// Le JSON de refus de la garde de consentement (mika#2772) — **un seul texte,
+/// un seul site**.
+///
+/// # Pourquoi une fonction libre et non la closure d'origine
+///
+/// Ce corps était une closure locale de [`validate_forced_dispatch_consent`],
+/// et elle ne capturait que `ctx.session_id`. L'étape (5) de la garde est
+/// maintenant [`decide_forced_consent_on_labels`], une fonction sœur : une
+/// closure capturée ne traverse pas cette coupe, et recopier le texte dans les
+/// deux moitiés le ferait diverger en silence — la classe mika#2158, où deux
+/// prédicats dupliqués ont dérivé des mois sans rien casser. Le texte du champ
+/// `recovery` porte l'AC3 de mika#2995 : il a **un** écrivain.
+fn forced_consent_refusal(
+    ctx: &LongRunningContext,
+    verdict: &'static str,
+    subject: Option<String>,
+    reason: String,
+) -> String {
+    serde_json::json!({
+        "error": verdict,
+        "session_id": ctx.session_id,
+        "subject": subject,
+        "reason": reason,
+        // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+        // jugé (mika#2520). Les deux voies de reprise sont donc nommées — mais
+        // la première est ATTRIBUÉE à l'opérateur, elle n'est pas prescrite au
+        // lecteur. C'est l'AC3 de mika#2995, et c'est une correction de
+        // défaut, pas une précaution : le 2026-10-31 à 16:46:32Z ce champ
+        // disait « promote the ticket by posting the `ready` label as
+        // remove→add » ; à 16:51:37Z mika-dev l'a fait, avec le `GH_TOKEN` du
+        // moteur, et le groom est parti. Un remède qui décrit le geste à un
+        // lecteur qui tient l'outil ne décrit pas une levée, il enseigne un
+        // contournement. Le geste `remove` → `add` et le fait de mika#2323 qui
+        // le motive vivent dans la doc opérateur, la surface d'où la promotion
+        // se fait ; ils ont quitté le texte que l'agent lit.
+        "recovery": "This dispatch was not requested — it was demanded by a tool \
+                     constraint this turn, and the ticket it targets has not been \
+                     promoted. Grooming a ticket nobody promoted is what mika#2772 \
+                     refuses. Two things lift it, and only two. Promotion belongs to \
+                     the operator: the `ready` label is their positive consent to \
+                     autonomous dispatch (mika#841), it is not a gesture you perform \
+                     on their behalf, and the engine refuses to write it on any turn \
+                     (mika#2995) — so if this ticket deserves promotion, say so and \
+                     stop. Otherwise, grooming it explicitly traverses this gate \
+                     instead of lifting it: \
+                     `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"` carries a \
+                     grooming intent (mika#1173), and that request is the operator's \
+                     to make."
+    })
+    .to_string()
+}
+
+/// Un dispatch de groom forcé par `required_tools` ne vise jamais un ticket sans
+/// `ready` (mika#2772).
+///
+/// # Ce que la garde répare
+///
+/// Le 2026-10-17 à 08:59:18Z, un `groom` dans le slug de branche
+/// `fix/2762/rollback-reaper-groom` a matché le mot-clé de dev-groom, armé son
+/// `required_tools`, et fait groomer mika#2766 — un ticket sans `ready` et
+/// absent du bassin (48 tours, 3,40 $). Le tour de reprise a ensuite tenté de
+/// dispatcher l'**implémentation** du même ticket non promu ; seule l'occupation
+/// de la place `implement` l'a arrêté. Le consentement positif de mika#841 a
+/// donc été contourné par une contrainte d'outil que personne n'avait demandée.
+///
+/// # Une fonction **sœur**, pas un paramètre de plus
+///
+/// [`validate_dispatch_readiness`] a 43 sites d'appel dans ce fichier, dont ~39
+/// en tests ; un paramètre supplémentaire coûte 43 éditions mécaniques sans rien
+/// dire. Et surtout, le [`LongRunningContext`] n'est pas dans la signature de
+/// cette chaîne, précisément parce que ses deux autres appelants moteur n'en ont
+/// pas. Le seul site où la provenance du forçage est connue est
+/// [`execute_skill_tool`], où `ctx` est déjà en portée.
+///
+/// # Pré-hoc, et après le moins cher
+///
+/// Appelée **après** le verdict d'acceptation de [`validate_dispatch_readiness`]
+/// et **avant** tout spawn : `run_claude_pilot` crée un worktree et lance un
+/// process, et une garde post-hoc observerait la violation sans l'empêcher
+/// (mika#1646). Après, parce qu'elle paie un appel réseau et que le moins cher
+/// passe d'abord — l'idiome de mika#2649.
+///
+/// # Fail-closed, à l'inverse de la porte de place juste au-dessus
+///
+/// La porte de place (mika#2084 D2, ≈ `:3209`) est **fail-open** sur des labels
+/// illisibles, et c'est le bon choix *là* : sa population est **tout** dispatch,
+/// donc un faux positif arrête la boucle entière sur une panne d'API GitHub.
+/// Ici la population est l'intersection « classe groom ∧ forcé ∧ non demandé » —
+/// vide en régime nominal. Un faux positif y fait attendre un ticket que le
+/// réconciliateur `stuck_ready_reconcile` re-pousse ; un faux négatif est
+/// l'incident mesuré, 48 tours et 3,40 $ sur un ticket que personne n'a promu.
+/// L'asymétrie est inversée parce que la population l'est.
+///
+/// Un seul sujet, délibérément, lu depuis le **prompt de dispatch** — ce que
+/// `dispatch-lib.sh` lit lui-même pour bâtir le worktree. La question est « quel
+/// ticket ce dispatch va-t-il groomer », et la réponse est là. Un
+/// `reference_url` qui désignerait un autre ticket est précisément l'accident de
+/// lignée par lequel le dispatch de 08:59 n'a *pas* été refusé : le rouvrir ici
+/// rouvrirait le trou mesuré.
+pub(crate) async fn validate_forced_dispatch_consent(
+    ctx: &LongRunningContext,
+    github_token: Option<&str>,
+    tool_input: Option<&serde_json::Value>,
+) -> ForcedDispatchConsent {
+    // (1) La classe, à coût nul — l'idiome exact du gate mika#2545 ci-dessous.
+    // Un `implement` forcé relève d'une autre question (mika#2757) et sort de la
+    // population avant toute ligne de journal : la sonde de D5 compte des
+    // dispatchs de groom, pas des tours.
+    let class = derive_dispatch_class(tool_input.and_then(extract_skill_from_input));
+    if class != "groom" {
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    let forced = ctx.tool_constraint_forced.load(Ordering::Relaxed);
+
+    // (2) « Demandé », lu sur le texte **masqué** — le point load-bearing de ce
+    // vol. Le texte qui a armé le forçage contenait `fix/2762/rollback-reaper-groom`.
+    // Le masque de mika#2755/#2768 retire tout slug cité avant qu'on lise une
+    // intention ; sans lui, le prédicat d'intention regarderait un slug et non
+    // une demande. `mika2772_le_texte_devenement_de_lincident_nest_pas_une_demande_de_groom`
+    // (`webhook_dispatch.rs`) tient les deux moitiés de cette décision.
+    let masked = ctx
+        .originating_message
+        .as_deref()
+        .map(mika_common::github_event_format::mask_cited_branch);
+    let intent = masked.as_deref();
+    let requested = intent.is_some_and(crate::webhook_dispatch::is_grooming_intent_message);
+
+    if !crate::webhook_dispatch::forced_dispatch_needs_consent(class, forced, intent) {
+        let verdict = if forced {
+            FORCED_CONSENT_REQUESTED
+        } else {
+            FORCED_CONSENT_NOT_FORCED
+        };
+        report_forced_dispatch_consent(ctx, verdict, forced, requested, None, None, false).await;
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    // Le levier opérateur. Il émet quand même sa ligne : un désarmement muet
+    // serait indiscernable d'une garde absente.
+    let armed = std::env::var(FORCED_CONSENT_ENV)
+        .map(|v| !(v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if !armed {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_DISARMED,
+            forced,
+            requested,
+            None,
+            None,
+            false,
+        )
+        .await;
+        return ForcedDispatchConsent::Allowed;
+    }
+
+    // (3) Le sujet, depuis le prompt de dispatch seul.
+    let Some((repo_ref, number)) = tool_input
+        .and_then(|input| input.get("prompt"))
+        .and_then(|v| v.as_str())
+        .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+    else {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_SUBJECT_UNRESOLVED,
+            forced,
+            requested,
+            None,
+            None,
+            true,
+        )
+        .await;
+        return ForcedDispatchConsent::Refused(forced_consent_refusal(
+            ctx,
+            FORCED_CONSENT_SUBJECT_UNRESOLVED,
+            None,
+            "The dispatch prompt names no readable `<repo>#<number>`, so the ticket whose \
+             consent would have to be proven cannot be identified. This gate refuses when \
+             it cannot read its proof: its population is empty in nominal operation, so a \
+             wrongful refusal costs a wait the stuck-ready reconciler re-drives, while a \
+             wrongful pass is the measured incident (mika#2772)."
+                .to_string(),
+        ));
+    };
+    let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+    let subject = format!("{owner_repo}#{number}");
+
+    // (4) Le token.
+    let Some(token) = github_token else {
+        report_forced_dispatch_consent(
+            ctx,
+            FORCED_CONSENT_NO_TOKEN,
+            forced,
+            requested,
+            Some(&subject),
+            None,
+            true,
+        )
+        .await;
+        return ForcedDispatchConsent::Refused(forced_consent_refusal(
+            ctx,
+            FORCED_CONSENT_NO_TOKEN,
+            Some(subject.clone()),
+            format!(
+                "No GitHub token reached this gate, so whether `{subject}` carries the \
+                 `ready` label could not be read. Fail-closed by the asymmetry written at \
+                 this site (mika#2772)."
+            ),
+        ));
+    };
+
+    let (subject_owner, subject_repo) = match owner_repo.split_once('/') {
+        Some(pair) => pair,
+        // `normalize_owner_repo` garantit le `/` ; l'arm existe pour que le
+        // compilateur n'ait pas à être cru sur parole.
+        None => (crate::webhook_dispatch::DEFAULT_DISPATCH_OWNER, "mika"),
+    };
+
+    // (5) Les labels — déjà le lecteur de la porte de place, déjà porteur de la
+    // distinction PR/issue dans son type de retour.
+    //
+    // Le fetch reste ici ; la décision qu'il alimente est la fonction sœur
+    // ci-dessous, et reçoit son résultat **tel quel**. En production la donnée
+    // vient du réseau, en test d'une fixture : le seul lien resté hors du test
+    // est le transport HTTP.
+    let labels = crate::github_graphql::fetch_issue_labels_unless_pull_request(
+        token,
+        subject_owner,
+        subject_repo,
+        number,
+    )
+    .await;
+
+    decide_forced_consent_on_labels(ctx, &subject, forced, requested, labels).await
+}
+
+/// L'étape (5) de la garde de mika#2772 : **la décision, les labels donnés**.
+///
+/// # Pourquoi les labels sont un paramètre
+///
+/// Les sept tests de `mod mika2772_consentement_force` passent tous
+/// `github_token = None` et s'arrêtent donc à [`FORCED_CONSENT_NO_TOKEN`] :
+/// **aucun** n'atteignait cette étape, parce que
+/// `fetch_issue_labels_unless_pull_request` écrit `https://api.github.com/…` en
+/// clair et qu'aucun réglage ne donne un parcours hors réseau. Les deux puces de
+/// l'AC2 de mika#2995 — « un `ready` humain laisse passer », « son absence
+/// refuse » — portent exactement sur ces quatre arms.
+///
+/// La coupe prend donc **la donnée récupérée en paramètre**, qui est la doctrine
+/// écrite au doc-comment d'[`evaluate_grooming_gate`] pour cette forme exacte :
+/// une URL de base configurable serait « a production configuration point nobody
+/// needs, for the benefit of a test ». Le fetch reste chez l'appelant.
+///
+/// # Ce que cette fonction ne lit pas
+///
+/// `crate::webhook_dispatch::labels_carry_ready(&labels)`, **et rien d'autre** —
+/// aucun acteur, aucune identité, aucune provenance. La voie B du vol 1 retire au
+/// moteur la *capacité* d'écrire `ready` ; elle n'apprend pas à la garde à
+/// reconnaître qui l'a posé. Un filtre d'identité ici serait un prédicat de gate
+/// qui lit l'acteur, que la doctrine mika#2323 refuse, et
+/// `ACTOR_READING_PREDICATES_ALLOWED` reste `&[]`. Pour cette garde, un `ready`
+/// moteur et un `ready` humain sont le même octet ; ce qui tient la propriété,
+/// c'est qu'aucune route atteignable depuis un tour LLM ne produit cet octet
+/// (détecteurs D1 et D2 de `ready_label.rs`).
+pub(crate) async fn decide_forced_consent_on_labels(
+    ctx: &LongRunningContext,
+    subject: &str,
+    forced: bool,
+    requested: bool,
+    labels: Result<Option<Vec<String>>, String>,
+) -> ForcedDispatchConsent {
+    match labels {
+        Ok(Some(labels)) if crate::webhook_dispatch::labels_carry_ready(&labels) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_CONSENTED,
+                forced,
+                requested,
+                Some(subject),
+                Some(true),
+                false,
+            )
+            .await;
+            ForcedDispatchConsent::Allowed
+        }
+        Ok(Some(_)) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_WITHOUT_CONSENT,
+                forced,
+                requested,
+                Some(subject),
+                Some(false),
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
+                FORCED_CONSENT_WITHOUT_CONSENT,
+                Some(subject.to_string()),
+                format!(
+                    "`{subject}` does not carry the `ready` label, and this groom dispatch \
+                     was forced by a `required_tools` constraint rather than requested. The \
+                     `ready` label is the canonical positive consent for autonomous \
+                     dispatch (mika#841); a tool constraint is not a promotion. On \
+                     2026-10-17 this exact shape groomed a ticket nobody had promoted for \
+                     48 turns and $3.40 (mika#2772)."
+                ),
+            ))
+        }
+        Ok(None) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_SUBJECT_IS_PR,
+                forced,
+                requested,
+                Some(subject),
+                None,
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
+                FORCED_CONSENT_SUBJECT_IS_PR,
+                Some(subject.to_string()),
+                format!(
+                    "`{subject}` resolves to a pull request, not an issue. A PR's label set \
+                     never carries `ready`, so reading it as consent would be a confident \
+                     wrong answer in one direction or the other — and a forced groom whose \
+                     own target is a PR is not a shape this engine produces on purpose \
+                     (mika#2772)."
+                ),
+            ))
+        }
+        Err(e) => {
+            report_forced_dispatch_consent(
+                ctx,
+                FORCED_CONSENT_UNVERIFIABLE,
+                forced,
+                requested,
+                Some(subject),
+                None,
+                true,
+            )
+            .await;
+            ForcedDispatchConsent::Refused(forced_consent_refusal(
+                ctx,
+                FORCED_CONSENT_UNVERIFIABLE,
+                Some(subject.to_string()),
+                format!(
+                    "Could not read the labels of `{subject}` ({e}), so its consent could \
+                     not be established. Unlike the seat gate on this same door — which is \
+                     fail-OPEN because its population is every dispatch — this gate refuses: \
+                     its population is empty in nominal operation, so the cost of a wrongful \
+                     refusal is a wait, convergent under `stuck_ready_reconcile` (mika#2772)."
+                ),
+            ))
+        }
+    }
+}
+
 /// Validate that a task is in a dispatchable state for long-running execution.
 ///
 /// Stricter than `validate_task()` (which also allows `blocked` for delegation).
@@ -2868,21 +4054,43 @@ pub(crate) async fn validate_dispatch_readiness(
     };
 
     // Only pending and in_progress are dispatchable
+    //
+    // mika#3044 — un état terminal n'est plus toujours le dernier mot. Une
+    // parente `self_dev` que le reaper de groom a fauchée, et qu'un groom
+    // convergé dément ensuite, est réhabilitée `failed` → `in_progress` puis
+    // dispatchée. Le prédicat est évalué **ici**, dans la branche de la garde,
+    // et non avant elle : c'est le seul endroit d'où une décision peut
+    // *empêcher* le `return Err` plutôt que le constater après coup (doctrine
+    // mika#1646). L'écriture, elle, n'a pas lieu ici — voir `rehab_pending`.
+    let mut rehab_pending: Option<crate::parent_rehabilitation::RehabPending> = None;
     if !matches!(task.status.as_str(), "pending" | "in_progress") {
-        let pr_url = extract_pr_url(&task.metadata);
-        let rejection = serde_json::json!({
-            "error": "task_not_dispatchable",
-            "task_id": task_id,
-            "current_status": task.status,
-            "pr_url": pr_url,
-            "reason": format!(
-                "Task is in '{}' state and cannot be dispatched. \
-                 Only 'pending' and 'in_progress' tasks can be dispatched.",
-                task.status
-            )
-        });
-        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
-        return Err(rejection.to_string());
+        match crate::parent_rehabilitation::decide(db, &task).await {
+            crate::parent_rehabilitation::RehabDecision::Eligible(pending) => {
+                // (a), (b) et (c) tiennent. Reste (d) : tout le reste de cette
+                // fonction. Le jeton voyage jusqu'après la claim mika#1948 et
+                // n'est écrit que là — si une garde en aval refuse, la parente
+                // reste `failed`, ce qu'AC1(d) exige.
+                rehab_pending = Some(pending);
+            }
+            crate::parent_rehabilitation::RehabDecision::Refused(refusal) => {
+                crate::parent_rehabilitation::refuse(db, task_id, refusal).await;
+
+                let pr_url = extract_pr_url(&task.metadata);
+                let rejection = serde_json::json!({
+                    "error": "task_not_dispatchable",
+                    "task_id": task_id,
+                    "current_status": task.status,
+                    "pr_url": pr_url,
+                    "reason": format!(
+                        "Task is in '{}' state and cannot be dispatched. \
+                         Only 'pending' and 'in_progress' tasks can be dispatched.",
+                        task.status
+                    )
+                });
+                record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                return Err(rejection.to_string());
+            }
+        }
     }
 
     // Check for active callback children (double-dispatch prevention)
@@ -2977,6 +4185,161 @@ pub(crate) async fn validate_dispatch_readiness(
         }
     }
 
+    // mika#2786 — Tool-boundary brake: after N consecutive review-anchor
+    // withholdings on one ticket, no automatic groom dispatch goes out for it.
+    //
+    // WHY HERE, and not in the auto-pull. On mika#2762 (2026-10-18) two of the
+    // three withheld passes were dispatched by mika-dev itself, from a callback
+    // turn that read the ESCALATE as a success — 18:30:55Z and 18:49:57Z in
+    // `tool_calls`. The mika#2020 re-drive budget counts only Phase 2 re-drives,
+    // and the mika#2545 gate above lets through any turn that carries an
+    // originating message. This is the one door all those paths go through.
+    //
+    // THE LIFT is an explicit grooming request from the operator
+    // (`mika ask --agent mika-dev "groom <ref>"`), read with the predicate and
+    // the branch mask of the mika#2772 consent gate. Re-posting `ready` does not
+    // lift it: the engine cannot tell an operator's `ready` from one mika-dev
+    // re-posted, and the measured loop is mika-dev's. A groom that converges ends
+    // the streak with no gesture at all.
+    //
+    // NO LABEL, NO COMMENT. The ticket keeps `ready`; Phase 2 keeps re-driving
+    // it, each re-drive is refused here without a pilot, and the mika#2020
+    // budget then parks it behind `operator-review` with a comment. The visible
+    // arrest already exists, and writing labels from here would need the
+    // mika#2228 write token this context does not carry.
+    //
+    // AHEAD OF mika#2545, because it names the more precise cause: every
+    // withheld pass is also an ESCALATE, and a refusal under the general name
+    // would hide the population this brake exists to count.
+    //
+    // FAIL-OPEN on an unreadable history, with a named WARN. This bounds a
+    // spend; it is not a safety gate, and a term that cannot be read is not a
+    // satisfied term (mika#2277).
+    if derive_dispatch_class(tool_input.and_then(extract_skill_from_input)) == "groom"
+        && let Some((repo_ref, number)) = tool_input
+            .and_then(|input| input.get("prompt"))
+            .and_then(|v| v.as_str())
+            .and_then(crate::webhook_dispatch::parse_issue_ref_from_dispatch_prompt)
+    {
+        let requested = originating_message
+            .map(mika_common::github_event_format::mask_cited_branch)
+            .is_some_and(|m| crate::webhook_dispatch::is_grooming_intent_message(&m));
+        let max =
+            parse_groom_anchor_brake_max(std::env::var(GROOM_ANCHOR_BRAKE_ENV).ok().as_deref());
+        if max > 0 {
+            let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
+            let issue_url = format!("https://github.com/{owner_repo}/issues/{number}");
+            let target_key = format!("{owner_repo}#{number}");
+            // The series is bounded by the last lift: withholdings older than an
+            // operator's explicit `groom` no longer count. Neutral rows do not
+            // count toward the limit, so read a margin past it.
+            let history = async {
+                let lifted_at = db
+                    .latest_audit_event_for_target(GROOM_ANCHOR_BRAKE_LIFTED_EVENT, &target_key, "")
+                    .await?
+                    .map(|(_, _, created_at)| created_at);
+                let rows = db
+                    .recent_groom_results_for_issue(&issue_url, max.saturating_mul(2))
+                    .await?;
+                anyhow::Ok(groom_results_since_lift(rows, lifted_at.as_deref()))
+            }
+            .await;
+            match history {
+                Err(e) => warn!(
+                    event = "groom_anchor_brake_unreadable",
+                    task_id = task_id,
+                    repo = %owner_repo,
+                    issue = number,
+                    error = %e,
+                    "tool-boundary: anchor brake could not read the groom history — not braking (mika#2786)"
+                ),
+                Ok(results) => {
+                    let streak = anchor_withheld_streak(&results);
+                    if streak >= max && requested {
+                        // The lift, written where it happens, so that the deferred
+                        // replay of this very dispatch finds it.
+                        info!(
+                            event = GROOM_ANCHOR_BRAKE_LIFTED_EVENT,
+                            task_id = task_id,
+                            repo = %owner_repo,
+                            issue = number,
+                            withheld_in_a_row = streak,
+                            "tool-boundary: anchor brake lifted by an explicit groom request (mika#2786)"
+                        );
+                        if let Err(e) = db
+                            .log_audit_event(
+                                task_id,
+                                GROOM_ANCHOR_BRAKE_LIFTED_EVENT,
+                                &target_key,
+                                None,
+                                Some(&streak.to_string()),
+                                Some(&format!("issue={target_key} withheld_in_a_row={streak}")),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(
+                                event = "groom_anchor_brake_lift_audit_failed",
+                                error = %e,
+                                "failed to write the mika#2786 lift row; a deferred replay of \
+                                 this dispatch will be braked again (non-fatal)"
+                            );
+                        }
+                    } else if streak >= max {
+                        let rejection = serde_json::json!({
+                            "error": GROOM_ANCHOR_BRAKE_ERROR,
+                            "task_id": task_id,
+                            "issue": format!("{owner_repo}#{number}"),
+                            "withheld_in_a_row": streak,
+                            "max": max,
+                            "reason": format!(
+                                "The last {streak} groomings of `{owner_repo}#{number}` were \
+                                 withheld by the review-anchor guard (mika#2037): the \
+                                 architect's anchors did not quote the brief. Another \
+                                 automatic groom would spend a pilot and an architect turn \
+                                 on the same failure (mika#2786)."
+                            ),
+                            "recovery": "This brake is lifted by an operator, not by a retry. \
+                                         Run `mika ask --agent mika-dev \"groom <owner/repo>#<n>\"`. \
+                                         Re-posting the `ready` label does not lift it."
+                        });
+                        warn!(
+                            event = GROOM_ANCHOR_BRAKE_EVENT,
+                            task_id = task_id,
+                            repo = %owner_repo,
+                            issue = number,
+                            withheld_in_a_row = streak,
+                            max,
+                            "tool-boundary: groom dispatch refused — consecutive review-anchor withholdings (mika#2786)"
+                        );
+                        if let Err(e) = db
+                            .log_audit_event(
+                                task_id,
+                                GROOM_ANCHOR_BRAKE_EVENT,
+                                &target_key,
+                                None,
+                                Some(&streak.to_string()),
+                                Some(&format!(
+                                    "issue={owner_repo}#{number} withheld_in_a_row={streak} max={max}"
+                                )),
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(
+                                event = "groom_anchor_brake_audit_failed",
+                                error = %e,
+                                "failed to write the mika#2786 audit event (non-fatal)"
+                            );
+                        }
+                        record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+                        return Err(rejection.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     // mika#2545 — Tool-boundary gate: an ESCALATE of grooming is TERMINAL, so no
     // automatic re-dispatch of grooming goes out for that ticket.
     //
@@ -3038,10 +4401,30 @@ pub(crate) async fn validate_dispatch_readiness(
         let owner_repo = crate::webhook_dispatch::normalize_owner_repo(repo_ref);
         let issue_url = format!("https://github.com/{owner_repo}/issues/{number}");
         let verdict = groom_verdict_state(db, &issue_url).await;
-        // `match` exhaustif, aucun bras `_ =>` : un quatrième état de
+        // `match` exhaustif, aucun bras `_ =>` : un cinquième état de
         // `GroomVerdictState` doit être décidé ici par le compilateur.
         let refusal = match verdict {
             GroomVerdictState::NotEscalated => None,
+            // mika#3027 — une retenue d'ancrage du MOTEUR n'est pas un jugement
+            // de l'architecte, et la porte ne doit pas les confondre.
+            //
+            // POURQUOI LAISSER PASSER. mika#2545 refuse le rejeu parce qu'« il ne
+            // change pas le verdict » : un ESCALATE d'architecte est un jugement
+            // sur le plan, et huit rejeux mesurés le 2026-09-26 n'en ont pas
+            // déplacé un. Une retenue d'ancrage est l'inverse — le moteur a
+            // retiré une disposition qu'il n'a pas pu attester, et les deux
+            // reprises humaines du 2026-11-03 (#2996, #3022) ont convergé dès le
+            // groom SUIVANT. Refuser ici, c'est facturer à l'opérateur un
+            // retrait/repose de `ready` pour obtenir ce que la passe suivante
+            // aurait rendu.
+            //
+            // LA DÉPENSE RESTE BORNÉE, et pas par ce bras : le frein mika#2786,
+            // en amont de cette porte dans cette même fonction, refuse à la 3e
+            // retenue d'affilée sous `dispatch_groom_anchor_brake`. Ce bras est
+            // ce qui rend ce frein ATTEIGNABLE — la série ne pouvait pas dépasser
+            // 1 tant que cette porte refusait la première retenue (0 ligne de
+            // frein mesurée depuis le 2026-10-18).
+            GroomVerdictState::AnchorWithheld => None,
             GroomVerdictState::Escalated => Some((
                 GROOM_ESCALATE_VERDICT_ESCALATED,
                 format!(
@@ -3716,6 +5099,22 @@ pub(crate) async fn validate_dispatch_readiness(
     // release one. The only thing between this claim and the callback row is
     // the caller's own dispatch.
     //
+    // mika#3044 amends that last paragraph, and does not pretend otherwise. A
+    // parent rehabilitation (`failed` → `in_progress`) is written AFTER this
+    // claim, and it is fallible twice over: the guarded UPDATE can match no row
+    // (someone else moved the parent meanwhile) and it can error. So there is
+    // now exactly one error path that leaves here holding a lease. It is
+    // deliberately **not** released: releasing it would mean a second writer
+    // could claim the slot while this dispatch is still unwinding, which is the
+    // very property this claim exists to deny. The cost is bounded by the lease
+    // TTL — the class stalls for one TTL, exactly as it does when a dispatcher
+    // dies mid-claim, and the deferred wrapper re-drives the dispatch.
+    //
+    // Why after the claim and not before it: AC1(d) requires the rehabilitation
+    // to be written only once every other guard has passed. The claim IS one of
+    // those guards — the last one — so "after all the guards" and "after the
+    // claim" are the same instant.
+    //
     // Fail-closed on contention, per the ticket: a missed dispatch is
     // recoverable (the deferred wrapper re-drives it), two writers on one
     // branch are not. The bounded TTL is what keeps fail-closed from becoming
@@ -3829,6 +5228,35 @@ pub(crate) async fn validate_dispatch_readiness(
         }
     }
 
+    // mika#3044 — la dernière étape avant le `Ok`. Toutes les gardes ont passé,
+    // la claim est tenue : (d) est satisfaite, la réhabilitation peut s'écrire.
+    if let Some(pending) = rehab_pending.as_ref() {
+        if let Err(refusal) = crate::parent_rehabilitation::commit(db, task_id, pending).await {
+            let rejection = serde_json::json!({
+                "error": "parent_rehabilitation_failed",
+                "task_id": task_id,
+                "current_status": task.status,
+                "refusal": refusal.as_reason(),
+                "reason": format!(
+                    "The parent was eligible for rehabilitation (a groom reap overturned by a \
+                     converged plan, mika#3044) but the guarded 'failed' -> 'in_progress' \
+                     transition did not happen ({}). The parent stays in its terminal state \
+                     and is not dispatched.",
+                    refusal.as_reason()
+                )
+            });
+            record_dispatch_rejection(db, task_id, &rejection.to_string()).await;
+            return Err(rejection.to_string());
+        }
+        // `task` a été relu avant la garde d'état : son `status` y est figé à
+        // `"failed"`. Rendre `task.status` dirait l'état d'avant la transition
+        // qu'on vient d'écrire, et `wi_status` (plus bas dans ce fichier) lit
+        // cette valeur pour décider s'il faut appeler `mark_parent_dispatched` —
+        // sur `"in_progress"` il ne l'appelle pas, ce qui est l'issue voulue pour
+        // une parente déjà dispatchée une fois.
+        return Ok(crate::parent_rehabilitation::REHABILITATED_STATUS.to_string());
+    }
+
     Ok(task.status.clone())
 }
 
@@ -3844,6 +5272,24 @@ pub(crate) async fn validate_dispatch_readiness(
 /// advertise this field; correctness depends on the schema's permissive
 /// `additionalProperties` mode (see plan Anchor F).
 pub(crate) const INTERNAL_DEFERRED_DISPATCH_FIELD: &str = "__internal_deferred_dispatch";
+
+/// Engine-internal sentinel field name (mika#2811).
+///
+/// Posé dans l'entrée de dispatch par `ready_label_handler` quand le routage
+/// envoie au groom faute de preuve en base, et lu par `dispatch-lib.sh` pour
+/// désarmer le seul auto-skip `already_groomed` de mika#2012.
+///
+/// # Le `tools.json` de dev-groom NE DOIT PAS le déclarer
+///
+/// Un LLM qui pourrait poser ce champ désarmerait la porte de mika#2012 sur
+/// n'importe quel ticket — or cette porte existe contre une boucle qu'un LLM a
+/// produite. L'omission de la surface d'outil EST le refus (mika#2425) ; la
+/// justesse repose sur le mode `additionalProperties` permissif, comme pour
+/// [`INTERNAL_DEFERRED_DISPATCH_FIELD`]. Épinglé des deux côtés par
+/// `canonical_tokens` (parité du littéral avec la déclaration
+/// `GROOM_FORCE_CAUSE_FIELD` du shell) et par un test de lecture de
+/// `skills/bundled/dev-groom/tools.json`.
+pub(crate) const INTERNAL_GROOM_CAUSE_FIELD: &str = "__internal_groom_cause";
 
 /// Build the `dispatch_task_has_open_pr` rejection (mika#920) if all guard
 /// conditions are met, otherwise return `None` to allow dispatch.
@@ -4374,9 +5820,312 @@ pub(crate) enum RearmOutcome {
     /// non-`NotNow` outcome as grounds to expire the parent, so a variant the
     /// compiler forces them to name is the only safe way to add one here.
     AlreadyRepresented,
+    /// Refusé parce que le ticket ne consent plus : il ne porte plus `ready`, ou
+    /// il a été fermé depuis la mise en file (mika#3050 D5). Le terminal et la
+    /// ligne d'audit sont **déjà écrits** quand cette variante est rendue ;
+    /// `reason` est le littéral qu'AC1 exige, pour le log de l'appelant.
+    ///
+    /// Pas une réutilisation d'[`RearmOutcome::Unrepairable`] : les trois
+    /// appelants y expirent déjà la parente sous
+    /// `stuck_pending_no_deferred_wrapper`, et fusionner les deux populations
+    /// les rend non-soustractibles (mika#2205) alors que la cible d'AC4 est un
+    /// compte. Le `match` des trois appelants est exhaustif et sans bras
+    /// `_ =>` (mika#2290, mika#2413) : cette variante ne compile pas sans que
+    /// chacun des trois la nomme.
+    ConsentWithdrawn { reason: &'static str },
     /// Refused for good: the repair budget is spent, or the dispatch cannot be
     /// reconstructed. Only this warrants expiring the task.
     Unrepairable,
+}
+
+/// La relecture du ticket avant un ré-armement — position 3 de
+/// [`rearm_deferred_callback`] (mika#3050 D1).
+///
+/// Rend `None` quand le ré-armement doit suivre son cours, pour l'une des deux
+/// raisons qui ne se ressemblent pas : la parente n'est pas de la classe
+/// `ready-label` (AC3), ou son ticket est ouvert et porte encore `ready` — le
+/// contrôle positif d'AC2, c'est-à-dire la forme des quatre premiers cas du
+/// tableau de mesure du ticket. Rend `Some(outcome)` dans tous les autres cas,
+/// et c'est **ici, une seule fois, au site de la garde** que le terminal et la
+/// ligne d'audit d'AC1 sont écrits (D6).
+///
+/// La décision elle-même vit dans [`reread_consent_verdict`], qui rend en plus
+/// le verdict de recensement ; cette fonction-ci en est l'enveloppe, et sa
+/// signature est celle d'avant mika#3050 D2 — ses trois appelants n'ont pas
+/// bougé.
+///
+/// # L'écrivain unique du recensement (D3)
+///
+/// Cette enveloppe est **le seul site** qui émet `rearm_consent_checked`, et
+/// elle l'émet **inconditionnellement** : son corps n'a ni `if` ni `match`, donc
+/// les huit branches de la garde passent par cette ligne, branche saine
+/// comprise. C'est ce qui donne au recensement son dénominateur — un compte
+/// d'anomalies seules n'en a pas (mika#1833, mika#1926), et deux sites
+/// émetteurs doubleraient celui-ci en silence. Les deux propriétés sont
+/// gardées : l'unicité par le scan de source
+/// `mika3050_levenement_de_recensement_a_un_ecrivain_unique`, l'absence
+/// d'embranchement par `mika3050_lenveloppe_emet_sans_condition`.
+async fn reread_consent_before_rearm(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    github_token: Option<&str>,
+    cause: &str,
+) -> Option<RearmOutcome> {
+    let (census, outcome) = reread_consent_verdict(db, parent_task_id, github_token, cause).await;
+    info!(
+        target: "mika::otel",
+        event = "rearm_consent_checked",
+        parent_task_id,
+        cause,
+        verdict = census.as_str(),
+        // `Option` et non une valeur de repli : sur les trois branches sans
+        // coordonnées le champ doit être **absent** du log, pas vide. `""` et
+        // `0` ont la forme d'une réponse sans en être une, et un `jq` qui les
+        // agrège ne s'en aperçoit pas (mika#2331).
+        repo = census.repo(),
+        issue = census.issue(),
+    );
+    outcome
+}
+
+/// La décision de la garde, **et le verdict qui la décrit** (mika#3050 D2).
+///
+/// Le corps de [`reread_consent_before_rearm`] d'avant la scission, à ceci près
+/// que chacune de ses sorties rend aussi le [`RearmConsentCensus`] qui la nomme.
+/// La logique de décision est inchangée — mêmes verdicts, mêmes terminaux,
+/// mêmes raisons d'audit qu'au merge de #3052 — et les treize tests qui la
+/// tiennent le vérifient sans modification.
+///
+/// # Diagnostic et recensement ne sont pas le même log
+///
+/// Les trois `warn!` ci-dessous (`rearm_parent_unreadable`,
+/// `rearm_reread_no_token`, `rearm_reread_failed`) et l'`info!`
+/// `rearm_refused_consent_withdrawn` de [`write_rearm_consent_terminal`]
+/// **restent où ils sont** : ils portent `error`, `detail` et le texte de remède
+/// qu'un opérateur lit quand quelque chose a mal tourné. Ce sont des lignes de
+/// *diagnostic*, et elles ne sont émises que sur les branches anormales — donc
+/// elles n'ont pas de dénominateur et ne peuvent pas servir de compte.
+///
+/// La ligne de *recensement* `rearm_consent_checked`, émise par l'enveloppe sur
+/// **les huit** branches, branche saine comprise, est l'autre question : elle
+/// répond à AC4, pas à « qu'est-ce qui a échoué ? ». Ce n'est donc pas un
+/// doublon, et les deux ne se remplacent pas (mika#1833, mika#1926).
+///
+/// # Pourquoi un prédicat d'état et pas celui de mika#2995
+///
+/// mika#2995 garde la **promotion** d'un lanceur différé avec le prédicat de
+/// *parc de la timeline* : « le dernier événement sur `ready` est un `unlabeled`
+/// par un acteur non machine ». Le retrait de mika#3022
+/// (`merged_pr_ready_label_cleaned`) est fait par une identité **machine**, donc
+/// ce prédicat rend « non parqué » et le tour part : c'est exactement le cas
+/// `0529ed9b`/#3044. La question d'AC1 est « le consentement tient-il à cet
+/// instant ? », pas « qui l'a retiré ? » — un prédicat d'état, donc, et des
+/// raisons terminales distinctes de celles de mika#2995.
+async fn reread_consent_verdict(
+    db: &AsyncDatabase,
+    parent_task_id: &str,
+    github_token: Option<&str>,
+    cause: &str,
+) -> (RearmConsentCensus, Option<RearmOutcome>) {
+    use crate::ready_label::{
+        ISSUE_CLOSED_AT_REARM_REASON, READY_ABSENT_AT_REARM_REASON, RearmConsent,
+        parse_ready_label_task_label, reread_issue_consent_via_gh,
+    };
+
+    let parent = match db.get_task_unscoped(parent_task_id).await {
+        Ok(Some(p)) => p,
+        // Aucune parente, donc aucune classe à discriminer : rien à relire. Le
+        // ré-armement qui suit insérera un lanceur sans parente vivante, ce
+        // qu'il faisait déjà — ce vol ne change pas cette population.
+        Ok(None) => return (RearmConsentCensus::ParentAbsent, None),
+        Err(e) => {
+            // Fail-closed, et ce choix ne coûte rien de neuf : les deux gardes
+            // suivantes (`get_stuck_rearm_count`,
+            // `count_pending_deferred_callbacks`) rendent déjà `NotNow` sur la
+            // même base en erreur, donc aucune classe ne perd un ré-armement
+            // qu'elle aurait obtenu sans cette garde. Lire « ce n'est pas une
+            // parente `ready-label` » dans une erreur de lecture, en revanche,
+            // serait précisément le faux positif que ce ticket ferme.
+            warn!(
+                event = "rearm_parent_unreadable",
+                parent_task_id,
+                cause,
+                error = %e,
+                "mika#3050 : parente illisible — pas de ré-armement à ce tick"
+            );
+            return (
+                RearmConsentCensus::ParentUnreadable,
+                Some(RearmOutcome::NotNow),
+            );
+        }
+    };
+
+    // Le discriminant d'AC3, et il est local : une parente hors classe
+    // `ready-label` sort d'ici sans qu'un jeton soit lu ni qu'un appel `gh` soit
+    // émis. C'est ce que T6 atteste par un `recorded_calls()` vide — l'issue
+    // rendue seule ne le dirait pas.
+    //
+    // La sortie rend `None` comme la branche saine — « ré-armer comme avant » —
+    // mais son verdict la distingue : `other_class` est la population d'AC3, et
+    // la confondre avec un `held` absent est ce que le § 1 du plan reproche aux
+    // trois lignes `*_rearmed`.
+    let Some((owner_repo, issue)) = parse_ready_label_task_label(&parent.label) else {
+        return (RearmConsentCensus::OtherClass, None);
+    };
+
+    let Some(token) = github_token else {
+        warn!(
+            event = "rearm_reread_no_token",
+            parent_task_id,
+            repo = %owner_repo,
+            issue,
+            cause,
+            "mika#3050 : aucun jeton GitHub résolu — pas de ré-armement à ce tick"
+        );
+        return (
+            RearmConsentCensus::NoToken {
+                repo: owner_repo,
+                issue,
+            },
+            Some(RearmOutcome::NotNow),
+        );
+    };
+
+    match reread_issue_consent_via_gh(token, &owner_repo, issue).await {
+        // La forme des quatre premiers cas du tableau : on ré-arme comme avant.
+        // Son verdict est le **dénominateur d'AC4**, et c'est la seule branche
+        // que le vol précédent ne rendait pas comptable.
+        Ok(RearmConsent::Held) => (
+            RearmConsentCensus::Held {
+                repo: owner_repo,
+                issue,
+            },
+            None,
+        ),
+        Ok(RearmConsent::ReadyAbsent) => (
+            RearmConsentCensus::ReadyAbsent {
+                repo: owner_repo.clone(),
+                issue,
+            },
+            Some(
+                write_rearm_consent_terminal(
+                    db,
+                    &parent,
+                    &owner_repo,
+                    issue,
+                    READY_ABSENT_AT_REARM_REASON,
+                )
+                .await,
+            ),
+        ),
+        Ok(RearmConsent::Closed) => (
+            RearmConsentCensus::IssueClosed {
+                repo: owner_repo.clone(),
+                issue,
+            },
+            Some(
+                write_rearm_consent_terminal(
+                    db,
+                    &parent,
+                    &owner_repo,
+                    issue,
+                    ISSUE_CLOSED_AT_REARM_REASON,
+                )
+                .await,
+            ),
+        ),
+        // AC2 — une relecture qui échoue ne ré-arme pas à ce tick, et ne pose
+        // aucun terminal. L'asymétrie est chiffrée : un faux négatif coûte un
+        // tick de 10 minutes, un faux positif ~600 k tokens Opus et, dans le cas
+        // `74130014`/#3002, la fermeture d'un ticket gardé ouvert pour une sonde.
+        Err(detail) => {
+            warn!(
+                event = "rearm_reread_failed",
+                parent_task_id,
+                repo = %owner_repo,
+                issue,
+                cause,
+                detail = %detail,
+                "mika#3050 : relecture du ticket impossible — pas de ré-armement à ce tick"
+            );
+            (
+                RearmConsentCensus::RereadFailed {
+                    repo: owner_repo,
+                    issue,
+                },
+                Some(RearmOutcome::NotNow),
+            )
+        }
+    }
+}
+
+/// Le terminal et l'audit de la garde de ré-armement (mika#3050 D6).
+///
+/// **Le terminal n'est pas un verrou sur le ticket, il est la condition pour que
+/// le prochain « oui » soit pris** : `failed` est dans
+/// `TERMINAL_PARENT_STATUSES` et exclu de `idx_tasks_manual_active_ref_url`, donc
+/// une parente laissée `pending` garderait le créneau de l'issue occupé et un
+/// `labeled ready` reposé ensuite échouerait à créer sa tâche. C'est la troisième
+/// clause d'AC1, obtenue par un statut qui existe déjà — sans nouveau statut et
+/// sans migration.
+async fn write_rearm_consent_terminal(
+    db: &AsyncDatabase,
+    parent: &db::Task,
+    owner_repo: &str,
+    issue: u64,
+    reason: &'static str,
+) -> RearmOutcome {
+    use crate::ready_label::REARM_CONSENT_RECHECK_TOOL_NAME;
+
+    info!(
+        event = "rearm_refused_consent_withdrawn",
+        agent_id = %parent.agent_id,
+        parent_task_id = %parent.id,
+        repo = %owner_repo,
+        issue,
+        reason,
+        "mika#3050 : le ticket ne consent plus au ré-armement — aucun lanceur, \
+         aucun tour mika-dev. Reposez `ready` pour relancer le ticket."
+    );
+
+    match db.update_task_failed(&parent.id, reason).await {
+        Ok(true) => {
+            let trace_id = mika_common::trace::generate_trace_id();
+            if let Err(e) = db
+                .log_audit_event(
+                    &format!("system-{}", parent.agent_id),
+                    REARM_CONSENT_RECHECK_TOOL_NAME,
+                    &parent.id,
+                    Some("pending"),
+                    Some("failed"),
+                    Some(reason),
+                    Some(&trace_id),
+                )
+                .await
+            {
+                warn!(
+                    parent_task_id = %parent.id,
+                    error = %e,
+                    "mika#3050 : ligne d'audit de la relecture de ré-armement non écrite"
+                );
+            }
+        }
+        Ok(false) => {
+            debug!(
+                parent_task_id = %parent.id,
+                "mika#3050 : parente déjà terminale — terminal de relecture sauté"
+            );
+        }
+        Err(e) => {
+            warn!(
+                parent_task_id = %parent.id,
+                error = %e,
+                "mika#3050 : terminal de la parente non écrit"
+            );
+        }
+    }
+
+    RearmOutcome::ConsentWithdrawn { reason }
 }
 
 /// Re-arm a parent whose deferred wrapper was consumed without dispatching
@@ -4414,6 +6163,20 @@ pub(crate) enum RearmOutcome {
 /// construction, is counted as a no-op by R9, and re-arms again. Three rounds,
 /// budget gone, parent `failed`, while the only thing that ever happened was
 /// another groom holding the slot.
+///
+/// # Invariant (mika#3050)
+///
+/// Une parente de la classe `ready-label` n'est ré-armée que si son ticket est
+/// **relu à la forge** : ouvert, et portant `ready`. La garde vit ici, en
+/// position 3, et non aux trois sites appelants — doctrine du lecteur unique
+/// (mika#2158, mika#2205, mika#3049) : trois copies d'un prédicat de
+/// consentement, c'est trois endroits où un futur éditeur peut en oublier un,
+/// avec toutes les assertions vertes.
+///
+/// `github_token` est résolu **une fois par passe** par l'appelant, pas par
+/// candidate : la résolution d'un jeton d'App fait un appel réseau et le reaper
+/// boucle sur N candidates. `None` est un refus fail-closed, pas une permission
+/// (D7).
 pub(crate) async fn rearm_deferred_callback(
     db: &AsyncDatabase,
     parent_task_id: &str,
@@ -4421,6 +6184,7 @@ pub(crate) async fn rearm_deferred_callback(
     dispatch_class: &str,
     cause: &str,
     consumed_wrapper_id: Option<&str>,
+    github_token: Option<&str>,
 ) -> RearmOutcome {
     // Guard: if the parent already has an active non-deferred callback, the
     // turn did dispatch and there is nothing to repair. Fail-closed on a query
@@ -4490,6 +6254,20 @@ pub(crate) async fn rearm_deferred_callback(
                 "failed to check for a live deferred wrapper — repairing on the nominal path"
             );
         }
+    }
+
+    // mika#3050 — le ticket consent-il encore ?
+    //
+    // Placement imposé, et il est symétrique de celui de mika#2413 juste
+    // au-dessus. APRÈS les deux gardes locales : il est inutile de payer un
+    // appel réseau pour une parente déjà représentée. AVANT
+    // `get_stuck_rearm_count` : un consentement retiré doit sortir la parente en
+    // terminal **immédiatement** — la faire d'abord épuiser son quota de
+    // ré-armements lui coûterait les tours mika-dev que ce ticket supprime.
+    if let Some(outcome) =
+        reread_consent_before_rearm(db, parent_task_id, github_token, cause).await
+    {
+        return outcome;
     }
 
     match db.get_stuck_rearm_count(parent_task_id).await {
@@ -4867,6 +6645,19 @@ async fn execute_long_running(
         Err(err) => return ToolOutput::error(err),
     };
 
+    // mika#2772 — un dispatch de groom forcé par `required_tools` ne vise jamais
+    // un ticket sans `ready`. Fonction SŒUR de la garde ci-dessus, et non un
+    // paramètre de plus : c'est ici que la provenance du forçage est connue, et
+    // `validate_dispatch_readiness` a 43 sites d'appel. Après son verdict
+    // d'acceptation (le moins cher passe d'abord) et avant tout spawn (pré-hoc,
+    // jamais post-hoc — mika#1646).
+    if let ForcedDispatchConsent::Refused(rejection) =
+        validate_forced_dispatch_consent(ctx, github_token, Some(&input)).await
+    {
+        record_dispatch_rejection(&ctx.db, task_id, &rejection).await;
+        return ToolOutput::error(rejection);
+    }
+
     // Per-turn dispatch cap (#583): only one long-running dispatch per agent turn.
     // Check first without incrementing — the actual increment happens right before
     // spawn to avoid leaving the counter stuck at 1 if create_task or path validation fails.
@@ -5052,6 +6843,17 @@ async fn execute_long_running(
 /// The subprocess runs with `kill_on_drop(false)` so it survives if the
 /// parent agent task ends. A monitor task records the PID and handles
 /// failure (non-zero exit → task marked failed).
+///
+/// # mika#2677 — le handle est rendu
+///
+/// Le `JoinHandle` du task de surveillance est retourné pour qu'un test puisse
+/// le **joindre** au lieu de deviner une échéance murale : les trois écritures
+/// observables (`set_task_handler_failure`, la ligne d'audit
+/// `pilot_launcher_health`, `record_launcher_recovery`) sont toutes `await`ées
+/// dans ce corps, et il n'y a aucun `tokio::spawn` imbriqué — donc le join est
+/// une barrière complète. Laisser tomber le handle **détache** (il n'annule
+/// pas), donc aucun appelant n'a à changer : les quatre sites de production le
+/// laissent tomber comme avant.
 pub(crate) fn spawn_long_running_exec(
     cmd_path: PathBuf,
     skill_dir: PathBuf,
@@ -5059,7 +6861,7 @@ pub(crate) fn spawn_long_running_exec(
     task_id: String,
     db: AsyncDatabase,
     github_token: Option<String>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut cmd = tokio::process::Command::new(&cmd_path);
         cmd.current_dir(&skill_dir)
@@ -5098,6 +6900,12 @@ pub(crate) fn spawn_long_running_exec(
         // Same placement rationale as the four lines above: naming them
         // unprefixed never made them traverse, the explicit relay does.
         inject_pilot_dispatch_env(&mut cmd);
+        // mika#2716: relay the egress-sentinel switch the staging step reads.
+        // Same placement rationale as the lines above. Without it,
+        // `MIKA_PILOT_EGRESS_SENTINEL=0` would be a switch only its reader
+        // honours — the shell would arm the per-spawn draw regardless, and the
+        // rollback the ticket requires would be decorative (mika#2165).
+        inject_egress_sentinel_env(&mut cmd);
         // mika#2536: relay the platform root the four long-running handlers and
         // `dispatch-lib.sh` read. Same placement rationale as the five lines
         // above — and this one TRANSLATES the name (`MIKA_PLATFORM_DIR` spirit
@@ -5440,7 +7248,7 @@ pub(crate) fn spawn_long_running_exec(
         }
         // If success, the script called `mika ask --task-id` which completes the task.
         // If the script didn't call it, the task will eventually expire via timeout_at.
-    });
+    })
 }
 
 #[cfg(test)]
@@ -5833,6 +7641,125 @@ mod tests {
         );
     }
 
+    /// mika#2716 : l'interrupteur de la sentinelle atteint `dispatch-lib.sh`
+    /// par injection explicite, et JAMAIS par héritage.
+    ///
+    /// Même population et même refus que ses deux voisines ci-dessus. Le remède
+    /// tentant est ici doublement interdit : `MIKA_PILOT_EGRESS_SENTINEL` est
+    /// `MIKA_`-préfixé, donc l'ajouter à [`SANDBOX_ENV_CORE_ALLOWLIST`]
+    /// percerait la garde anti-fuite de secret **et** heurterait le
+    /// `debug_assert` qui existe pour empêcher ce geste précis.
+    #[test]
+    fn mika2716_the_egress_sentinel_switch_never_joins_the_sandbox_allowlist() {
+        for key in EGRESS_SENTINEL_ENV {
+            assert!(
+                !is_sandbox_env_allowed(key),
+                "{key} must reach dispatch-lib by explicit injection, never by \
+                 inheritance — it is not the allowlist's job to carry it"
+            );
+            assert!(
+                !SANDBOX_ENV_CORE_ALLOWLIST.contains(key),
+                "{key} must not be added to SANDBOX_ENV_CORE_ALLOWLIST"
+            );
+            assert!(
+                !SANDBOX_ENV_ALLOWED_PREFIXES
+                    .iter()
+                    .any(|p| key.starts_with(p)),
+                "{key} must not be covered by SANDBOX_ENV_ALLOWED_PREFIXES"
+            );
+        }
+    }
+
+    /// mika#2716 : le réglage posé traverse, l'absent et le vide ne traversent
+    /// pas.
+    ///
+    /// Le vide est un no-op **parce que le lecteur en décide ainsi** :
+    /// `_stage_pilot_egress_sentinel` lit
+    /// `${MIKA_PILOT_EGRESS_SENTINEL:-1}`, où vide et absent rendent tous deux
+    /// `1`. Poser le vide ne changerait donc rien au child tout en rendant
+    /// « réglage absent » et « réglage posé vide » indistinguables côté spirit.
+    /// C'est ce qui range ce relais du côté de [`relayed_env_pairs`] et non de
+    /// `relayed_env_pairs_preserving_empty`, dont le vide EST le rollback de
+    /// `PILOT_MAX_TURNS` (mika#2508).
+    #[test]
+    fn mika2716_the_egress_sentinel_switch_is_relayed_when_posed() {
+        let off = relayed_env_pairs(EGRESS_SENTINEL_ENV, |k| {
+            assert_eq!(
+                k, "MIKA_PILOT_EGRESS_SENTINEL",
+                "le relais doit lire le nom que l'OPÉRATEUR pose, et le child \
+                 doit recevoir le MÊME nom : c'est celui que \
+                 `_stage_pilot_egress_sentinel` lit"
+            );
+            Some("0".to_string())
+        });
+        assert_eq!(
+            off,
+            vec![("MIKA_PILOT_EGRESS_SENTINEL", "0".to_string())],
+            "sans ce relais, `MIKA_PILOT_EGRESS_SENTINEL=0` posé sur le service \
+             serait absent du child et le staging s'armerait quand même : \
+             l'interrupteur que le ticket exige serait décoratif (mika#2165)"
+        );
+
+        assert!(
+            relayed_env_pairs(EGRESS_SENTINEL_ENV, |_| None).is_empty(),
+            "absence ⇒ no-op : le shell garde son défaut (sentinelle armée)"
+        );
+        assert!(
+            relayed_env_pairs(EGRESS_SENTINEL_ENV, |_| Some(String::new())).is_empty(),
+            "valeur vide ⇒ no-op : `${{MIKA_PILOT_EGRESS_SENTINEL:-1}}` rend `1` \
+             pour le vide comme pour l'absent"
+        );
+    }
+
+    /// mika#2716 : le relais est appelé APRÈS [`sandboxed_pilot_env`].
+    ///
+    /// Scan de source, et il n'est pas décoratif, pour la raison de
+    /// `mika2536_the_relay_runs_after_the_env_sandbox` : un appel déplacé
+    /// au-dessus de l'`env_clear()` ne casse **aucune** assertion de
+    /// comportement — le dispatch continue, l'interrupteur retombe simplement
+    /// sur son défaut, en silence.
+    #[test]
+    fn mika2716_the_egress_sentinel_relay_runs_after_the_env_sandbox() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("skills")
+            .join("executor.rs");
+        let whole = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("le scan doit lire {}: {e}", path.display()));
+
+        // Tronqué au premier `#[cfg(test)]` — motif `production_sources`
+        // (mika#2201) : sans ça le scan se compte lui-même, les deux aiguilles
+        // étant des littéraux de CE test.
+        let cut = whole
+            .find("#[cfg(test)]")
+            .expect("executor.rs porte un module de test : sans lui, le scan se compte lui-même");
+        let src = &whole[..cut];
+
+        let sandbox = "sandboxed_pilot_env(&mut cmd);";
+        let relay = "inject_egress_sentinel_env(&mut cmd);";
+
+        // Anti-vacuité AVANT l'ordre (mika#2103, mika#2205).
+        assert_eq!(
+            src.matches(sandbox).count(),
+            1,
+            "un seul site doit appeler `{sandbox}` — si ce compte bouge, l'ordre \
+             ci-dessous ne décide plus de rien"
+        );
+        assert_eq!(
+            src.matches(relay).count(),
+            1,
+            "un seul site doit appeler `{relay}` ; s'il a disparu, \
+             `MIKA_PILOT_EGRESS_SENTINEL` est redevenue inerte et RIEN ne le dirait"
+        );
+
+        assert!(
+            src.find(sandbox) < src.find(relay),
+            "`{relay}` doit venir APRÈS `{sandbox}` : l'`env_clear()` du bac à \
+             sable efface toute injection antérieure, et le dispatch resterait \
+             vert en retombant sur le défaut du shell"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // mika#2508 R4/R5 — le scan de classe.
     //
@@ -6004,7 +7931,8 @@ mod tests {
     /// mécanisme : l'allowlist positive, ou l'un des relais explicites.
     ///
     /// Les trois formes doivent être agrégées explicitement : `PILOT_DISPATCH_ENV`,
-    /// `RESCUE_VERIFY_ENV` et `ARCH_ASK_RETRY_ENV` sont des `&[&str]`,
+    /// `RESCUE_VERIFY_ENV`, `ARCH_ASK_RETRY_ENV` et `EGRESS_SENTINEL_ENV`
+    /// (mika#2716) sont des `&[&str]`,
     /// `DISPATCH_WORKTREE_ENV`, `PILOT_TRANSCRIPT_ENV` et
     /// `PLATFORM_DIR_RELAY_KEY` sont des **scalaires**, et `GH_TOKEN` est un
     /// littéral injecté en clair dans [`spawn_long_running_exec`]. Un
@@ -6022,6 +7950,7 @@ mod tests {
         PILOT_DISPATCH_ENV.contains(&name)
             || RESCUE_VERIFY_ENV.contains(&name)
             || ARCH_ASK_RETRY_ENV.contains(&name)
+            || EGRESS_SENTINEL_ENV.contains(&name)
             || name == DISPATCH_WORKTREE_ENV
             || name == PILOT_TRANSCRIPT_ENV
             || name == PLATFORM_DIR_RELAY_KEY
@@ -7499,6 +9428,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7556,6 +9486,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7626,6 +9557,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
         let output = execute_skill_tool(
             &tool,
@@ -7674,6 +9606,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(1),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
         let output = execute_skill_tool(
             &tool,
@@ -7731,6 +9664,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7771,6 +9705,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         };
 
         let output = execute_skill_tool(
@@ -7949,6 +9884,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message: None,
+            tool_constraint_forced: AtomicBool::new(false),
         }
     }
 
@@ -9869,7 +11805,16 @@ mod tests {
     }
 
     /// Bypass via skill: `dev-groom` is fresh grooming, not implementation re-run.
+    ///
+    /// `#[serial_test::serial]` depuis mika#2795, et pour une raison qui n'est
+    /// pas la sienne : ce test traverse tout le gate, donc atteint le callsite
+    /// `groom_verdict_selected` de `groom_verdict_state`. S'il y arrive le
+    /// premier sans abonné, il éteint ce callsite **globalement** et la capture
+    /// de `mod mika2545_escalate_terminal` ne voit plus rien (mika#2646). Le
+    /// raisonnement complet, et la clôture par lecture de la population, sont au
+    /// § *La sonde* de ce module-là.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_open_pr_guard_bypasses_dev_groom_skill() {
         let db = crate::db::Database::open_in_memory().unwrap();
         let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
@@ -9951,6 +11896,7 @@ mod tests {
             trace_id: "00000000000000000000000000000000".to_string(),
             dispatch_count: AtomicU32::new(0),
             originating_message,
+            tool_constraint_forced: AtomicBool::new(false),
         }
     }
 
@@ -10606,9 +12552,56 @@ mod tests {
 
     // -- rearm_deferred_callback tests (mika#2045) --
 
+    /// Le ticket de [`rearm_fixture`], dans la bande de la couture d'appel `gh`
+    /// (mika#2713) : sous `FIXTURE_ISSUE_FLOOR`, le double panique plutôt que
+    /// de laisser une fixture désigner un vrai ticket du dépôt. Il n'y a pas
+    /// d'allowlist — le remède est le numéro, jamais une exemption (D8).
+    const REARM_FIXTURE_ISSUE: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 2045;
+
+    /// Le jeton que ces tests passent à la garde de relecture (mika#3050 D7).
+    /// `None` est un refus fail-closed, pas une permission, donc un test qui
+    /// décrit un ré-armement doit en poser un — sinon il ne mesure plus que sa
+    /// propre absence de configuration.
+    const REARM_FIXTURE_TOKEN: Option<&str> = Some("fake-token");
+
     /// A `pending` self_dev issue parent plus a consumed deferred wrapper —
     /// the shape left behind when promotion fires and the turn never dispatches.
+    ///
+    /// La relecture canée est posée ici — ouvert, portant `ready` : c'est la
+    /// forme des quatre premiers cas du tableau de mesure de mika#3050, donc
+    /// exactement ce que ces tests décrivaient déjà avant la garde.
     async fn rearm_fixture() -> (crate::async_db::AsyncDatabase, String, String) {
+        rearm_fixture_with_issue(REARM_FIXTURE_ISSUE).await
+    }
+
+    /// [`rearm_fixture`] sur un numéro de ticket choisi.
+    ///
+    /// Les tables de charges cannées sont **globales au processus** : deux
+    /// tests qui décrivent deux réponses de la forge pour un même numéro se
+    /// marcheraient dessus sous `cargo test` parallèle. Chaque variante prend
+    /// donc son propre numéro, et c'est aussi ce qui rend `recorded_calls()`
+    /// filtrable par test.
+    async fn rearm_fixture_with_issue(
+        issue: u64,
+    ) -> (crate::async_db::AsyncDatabase, String, String) {
+        crate::gh_process::assert_fixture_issue(issue);
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(issue),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#,
+        );
+        rearm_fixture_labelled(issue, format!("ready-label: x/y#{issue}")).await
+    }
+
+    /// [`rearm_fixture_with_issue`] sans sa charge cannée et sous un label
+    /// choisi — le corps commun, pour que la classe de la parente soit un
+    /// paramètre du test plutôt qu'une copie de la fixture.
+    async fn rearm_fixture_labelled(
+        issue: u64,
+        label: String,
+    ) -> (crate::async_db::AsyncDatabase, String, String) {
+        crate::gh_process::assert_fixture_issue(issue);
+
         let db = crate::db::Database::open_in_memory().unwrap();
         db.create_session("test-session", "mika", "cli").unwrap();
         let async_db = crate::async_db::AsyncDatabase::new(db);
@@ -10618,7 +12611,7 @@ mod tests {
             team_run_id: None,
             parent_task_id: None,
             depth: 0,
-            label: "ready-label: x/y#2045".to_string(),
+            label,
             trigger_type: "manual".to_string(),
             cron_expr: None,
             event_source: None,
@@ -10631,7 +12624,7 @@ mod tests {
             input_context: None,
             created_by_session: None,
             created_trace_id: None,
-            reference_url: Some("https://github.com/x/y/issues/2045".to_string()),
+            reference_url: Some(format!("https://github.com/x/y/issues/{issue}")),
             source: Some("self_dev".to_string()),
             metadata: None,
             r#type: Some("issue".to_string()),
@@ -10663,7 +12656,14 @@ mod tests {
             .count()
     }
 
+    // `#[serial_test::serial]` sur les quatre tests de ré-armement qui suivent, et
+    // sur les six de #3050 plus bas : ils traversent `rearm_deferred_callback`,
+    // donc le callsite de `rearm_consent_checked`. Ce ne sont pas des capturants,
+    // ce sont des **poisonneurs** — le premier thread à atteindre un callsite y
+    // fixe son `Interest`, et sans abonné il l'éteint globalement. Voir la
+    // doctrine mika#2646 au sous-module `mika3050_recensement`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_registers_replacement_wrapper() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -10674,6 +12674,7 @@ mod tests {
             "implement",
             "noop_completion",
             None,
+            REARM_FIXTURE_TOKEN,
         )
         .await;
 
@@ -10689,6 +12690,7 @@ mod tests {
     /// The replacement replays the same dispatch — including the sentinel that
     /// keeps the open-PR guard (mika#920) from livelocking the replay.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_preserves_action_config_and_class() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -10699,7 +12701,8 @@ mod tests {
                 &action_config,
                 "groom",
                 "silent_turn_error",
-                None
+                None,
+                REARM_FIXTURE_TOKEN,
             )
             .await,
             RearmOutcome::Rearmed
@@ -10738,13 +12741,22 @@ mod tests {
     /// ever does on the `silent_turn_error` path — and the new guard is
     /// deliberately meant to refuse a re-arm in that state.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_refuses_once_budget_is_exhausted() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
         for _ in 0..MAX_STUCK_REARMS {
             assert_eq!(
-                rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                    .await,
+                rearm_deferred_callback(
+                    &db,
+                    &parent_id,
+                    &action_config,
+                    "implement",
+                    "noop",
+                    None,
+                    REARM_FIXTURE_TOKEN,
+                )
+                .await,
                 RearmOutcome::Rearmed
             );
             // Consume the wrapper the way the engine does: promotion writes
@@ -10763,8 +12775,16 @@ mod tests {
             MAX_STUCK_REARMS
         );
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                .await,
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await,
             RearmOutcome::Unrepairable,
             "budget exhausted is terminal — the reaper may expire the task"
         );
@@ -10775,6 +12795,7 @@ mod tests {
     /// this task. Reporting it as terminal would let the reaper destroy a task
     /// that still had repair budget left.
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_rearm_reports_flood_cap_as_transient_not_terminal() {
         let (db, parent_id, action_config) = rearm_fixture().await;
 
@@ -10807,8 +12828,16 @@ mod tests {
         }
 
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                .await,
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await,
             RearmOutcome::NotNow,
             "a full queue clears on its own — the task must survive to be retried"
         );
@@ -10851,13 +12880,760 @@ mod tests {
         db.create_task(real_callback).await.unwrap();
 
         assert_eq!(
-            rearm_deferred_callback(&db, &parent_id, &action_config, "implement", "noop", None)
-                .await,
+            rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await,
             RearmOutcome::NotNow,
             "a live dispatch means nothing to repair — and nothing to expire either"
         );
         assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
         assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+    }
+
+    // -- la relecture du ticket avant un ré-armement (mika#3050) --
+    //
+    // Un numéro de fixture par cas, et c'est structurel : les tables de charges
+    // cannées et le journal d'appels de la couture `gh` sont **globaux au
+    // processus**, donc deux tests qui décrivent deux réponses de la forge pour
+    // un même numéro se marcheraient dessus sous `cargo test` parallèle. C'est
+    // aussi ce qui rend `recorded_calls()` filtrable par test.
+
+    const ISSUE_T1_CONSENT_HELD: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3050;
+    const ISSUE_T2_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3051;
+    const ISSUE_T3_CLOSED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3052;
+    const ISSUE_T4_REREAD_FAILED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3053;
+    const ISSUE_T5_NO_TOKEN: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3054;
+    const ISSUE_T6_OTHER_CLASS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3055;
+
+    /// Les appels `gh` que le double a vus **sur ce numéro de fixture**.
+    fn gh_calls_on(issue: u64) -> Vec<String> {
+        crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(issue))
+            .map(|c| c.args)
+            .collect()
+    }
+
+    /// Les lignes d'audit de la relecture.
+    ///
+    /// Le scope de lecture est celui de la **poignée**, et c'est la seule
+    /// lecture juste : `log_audit_event` prend un `session_id` en premier
+    /// argument — la garde y passe `system-<agent>`, le marqueur de session
+    /// système — tandis que l'`agent_id` de la ligne vient de
+    /// `AsyncDatabase::agent_id`. Lire sous `system-mika` rendrait `0`, ce qui se
+    /// lirait comme « aucune ligne écrite ».
+    async fn rearm_recheck_audit_rows(db: &crate::async_db::AsyncDatabase) -> i64 {
+        db.count_audit_events_by_tool_name(crate::ready_label::REARM_CONSENT_RECHECK_TOOL_NAME)
+            .await
+            .unwrap()
+    }
+
+    /// **T1 — contrôle positif d'AC2.** Ticket ouvert, `ready` encore posé : la
+    /// forme des quatre premiers cas du tableau de mesure du ticket, qui
+    /// ré-arment comme avant le vol.
+    ///
+    /// L'issue seule ne suffirait pas : `test_rearm_registers_replacement_wrapper`
+    /// la vérifiait déjà *avant* la garde. Ce qui est neuf ici est que la forge
+    /// a bel et bien été **relue** — sans cette assertion, une garde court-circuitée
+    /// (un `None` rendu trop tôt) laisserait le test vert.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3050_a_held_consent_rearms_and_the_forge_was_reread() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T1_CONSENT_HELD).await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(outcome, RearmOutcome::Rearmed);
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
+
+        let calls = gh_calls_on(ISSUE_T1_CONSENT_HELD);
+        assert_eq!(
+            calls.len(),
+            1,
+            "une relecture, et une seule, par ré-armement : {calls:?}"
+        );
+        assert!(
+            calls[0].contains("issue view") && calls[0].contains("state,labels"),
+            "la relecture lit l'état ET les labels — les deux clauses d'AC1 : {calls:?}"
+        );
+    }
+
+    /// **T2 — `ready` retiré (AC1).** Le cas `0529ed9b`/#3044, et celui que
+    /// mika#3022 rend structurel : aucun lanceur, un terminal qui libère le
+    /// créneau de l'issue, et une ligne d'audit qui nomme la raison.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3050_a_withdrawn_ready_label_refuses_the_rearm() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T2_READY_ABSENT).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(ISSUE_T2_READY_ABSENT),
+            "issue view",
+            r#"{"state":"OPEN","labels":[{"name":"type:bug"}]}"#,
+        );
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::ConsentWithdrawn {
+                reason: crate::ready_label::READY_ABSENT_AT_REARM_REASON
+            }
+        );
+        assert_eq!(
+            pending_wrappers_of(&db, &parent_id).await,
+            0,
+            "aucun lanceur créé, donc aucun tour mika-dev"
+        );
+
+        let parent = db
+            .get_task_unscoped(&parent_id)
+            .await
+            .unwrap()
+            .expect("la parente");
+        assert_eq!(
+            parent.status, "failed",
+            "un terminal, parce qu'une parente laissée `pending` garderait le \
+             créneau de l'issue occupé et le prochain `ready` échouerait"
+        );
+        assert_eq!(
+            parent.result.as_deref(),
+            Some(crate::ready_label::READY_ABSENT_AT_REARM_REASON),
+            "la raison est lisible sur la tâche, pas seulement dans un log"
+        );
+        assert_eq!(rearm_recheck_audit_rows(&db).await, 1);
+        assert_eq!(
+            db.get_stuck_rearm_count(&parent_id).await.unwrap(),
+            0,
+            "un refus de consentement n'est pas une réparation : il ne dépense \
+             pas le budget de ré-armement"
+        );
+    }
+
+    /// **T3 — ticket fermé (AC1).** Même forme que T2, autre raison : les deux
+    /// populations doivent rester soustractibles (mika#2205), parce que la cible
+    /// d'AC4 est un compte.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3050_a_closed_issue_refuses_the_rearm_under_its_own_reason() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T3_CLOSED).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(ISSUE_T3_CLOSED),
+            "issue view",
+            r#"{"state":"CLOSED","labels":[{"name":"ready"}]}"#,
+        );
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::ConsentWithdrawn {
+                reason: crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON
+            },
+            "`ready` est encore posé ici — c'est l'état du ticket qui refuse, \
+             et il le dit sous son propre nom"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+
+        let parent = db
+            .get_task_unscoped(&parent_id)
+            .await
+            .unwrap()
+            .expect("la parente");
+        assert_eq!(parent.status, "failed");
+        assert_eq!(
+            parent.result.as_deref(),
+            Some(crate::ready_label::ISSUE_CLOSED_AT_REARM_REASON)
+        );
+        assert_eq!(rearm_recheck_audit_rows(&db).await, 1);
+    }
+
+    /// **T4 — relecture en erreur (AC2).** Fail-closed : pas de ré-armement à ce
+    /// tick, et **aucun terminal** — l'asymétrie est chiffrée, un faux négatif
+    /// coûte un tick de 10 minutes, un faux positif ~600 k tokens Opus et, dans
+    /// le cas `74130014`/#3002, la fermeture d'un ticket gardé ouvert pour une
+    /// sonde.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3050_an_unreadable_forge_defers_without_writing_a_terminal() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T4_REREAD_FAILED).await;
+        crate::gh_process::set_canned_failure(
+            crate::gh_process::GhSubject::Issue(ISSUE_T4_REREAD_FAILED),
+            "issue view",
+            "gh: could not resolve to an Issue (HTTP 502)",
+        );
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(outcome, RearmOutcome::NotNow);
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+
+        let parent = db
+            .get_task_unscoped(&parent_id)
+            .await
+            .unwrap()
+            .expect("la parente");
+        assert_eq!(
+            parent.status, "pending",
+            "une relecture illisible n'est pas un refus du ticket : la parente \
+             reste en file et le tick suivant relira"
+        );
+        assert_eq!(
+            rearm_recheck_audit_rows(&db).await,
+            0,
+            "aucune raison d'AC1 n'est vraie ici — une ligne d'audit la nommerait \
+             à tort et fausserait le compte d'AC4"
+        );
+        assert_eq!(db.get_stuck_rearm_count(&parent_id).await.unwrap(), 0);
+    }
+
+    /// **T5 — aucun jeton résolu (AC2, D7).** `None` n'est pas une permission.
+    /// Et la garde refuse **avant** le réseau : le journal d'appels de ce numéro
+    /// reste vide, ce qu'une assertion sur la seule issue ne dirait pas.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3050_a_missing_token_defers_before_any_network_call() {
+        let (db, parent_id, action_config) = rearm_fixture_with_issue(ISSUE_T5_NO_TOKEN).await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RearmOutcome::NotNow);
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 0);
+        assert_eq!(
+            db.get_task_unscoped(&parent_id)
+                .await
+                .unwrap()
+                .expect("la parente")
+                .status,
+            "pending"
+        );
+        assert_eq!(rearm_recheck_audit_rows(&db).await, 0);
+        assert!(
+            gh_calls_on(ISSUE_T5_NO_TOKEN).is_empty(),
+            "la garde sort avant l'appel : {:?}",
+            gh_calls_on(ISSUE_T5_NO_TOKEN)
+        );
+    }
+
+    /// **T6 — une autre classe garde son comportement (AC3).** Le label est
+    /// celui du dispatch opérateur (`operator-iterate:`,
+    /// `server/iterate_dispatch.rs`) et non un label inventé : il porte les
+    /// **mêmes** coordonnées `owner/repo#numéro` que celui du feeder
+    /// `ready-label`, donc ce test atteste que le discriminant est le préfixe et
+    /// jamais la présence de coordonnées lisibles.
+    ///
+    /// Aucune charge cannée n'est posée, exprès. Deux filets, donc : l'issue
+    /// (`Rearmed`) et le journal d'appels vide. Si la garde relisait ici, le
+    /// double rendrait `b"[]"`, la relecture échouerait et l'issue serait
+    /// `NotNow` — les deux assertions tombent ensemble, et aucune ne peut passer
+    /// seule.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3050_a_parent_of_another_class_rearms_without_reading_the_forge() {
+        let (db, parent_id, action_config) = rearm_fixture_labelled(
+            ISSUE_T6_OTHER_CLASS,
+            format!("operator-iterate: x/y#{ISSUE_T6_OTHER_CLASS}"),
+        )
+        .await;
+
+        let outcome = rearm_deferred_callback(
+            &db,
+            &parent_id,
+            &action_config,
+            "implement",
+            "noop_completion",
+            None,
+            REARM_FIXTURE_TOKEN,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            RearmOutcome::Rearmed,
+            "hors classe `ready-label`, le comportement d'avant le vol"
+        );
+        assert_eq!(pending_wrappers_of(&db, &parent_id).await, 1);
+        assert!(
+            gh_calls_on(ISSUE_T6_OTHER_CLASS).is_empty(),
+            "aucun appel `gh` pour une parente hors classe : {:?}",
+            gh_calls_on(ISSUE_T6_OTHER_CLASS)
+        );
+    }
+
+    /// Le recensement de la garde — la ligne qui donne à AC4 son dénominateur
+    /// (mika#3050 D3).
+    ///
+    /// Ce que ces tests ajoutent aux treize de #3052 : ceux-là assèrent le
+    /// `RearmOutcome`, et **resteraient tous verts si la ligne n'était pas
+    /// émise**. Ici c'est le couple `(verdict, repo, issue)` qui est lu, sur
+    /// chacune des huit branches.
+    ///
+    /// # La sonde, et pourquoi `#[serial]` déborde ce module (mika#2646)
+    ///
+    /// L'installation passe par `test_helpers::install_capturing_subscriber`, le
+    /// site unique permis par mika#2646. Mais **`#[serial_test::serial]` est la
+    /// moitié porteuse**, et elle doit couvrir les *poisonneurs* autant que les
+    /// capturants : un callsite `tracing` ne s'enregistre qu'à sa **première**
+    /// atteinte, et son `Interest` est alors décidé par le défaut du thread qui
+    /// l'enregistre — un voisin qui y arrive d'abord sans abonné l'éteint
+    /// **globalement**, y compris pour un abonné déjà installé ailleurs. Annoter
+    /// les seuls capturants laisserait la course entière ouverte (défaut
+    /// fondateur : PR #2643).
+    ///
+    /// La population est close par **mesure**, pas par prudence : un
+    /// `panic!` posé dans l'enveloppe, puis `cargo test -p mika-agent --lib`,
+    /// a nommé **29** tests — dix dans ce module, dix-huit dans
+    /// `task_engine::engine::tests`, un dans `task_engine::dispatcher::tests` —
+    /// tous annotés. C'est la traversée de `rearm_deferred_callback` qui les
+    /// qualifie, et rien d'autre : un test qui l'appellerait depuis un
+    /// `tokio::spawn` n'aurait pas paniqué visiblement, donc un futur appelant
+    /// *détaché* est le seul angle mort de cette liste.
+    mod mika3050_recensement {
+        use super::*;
+
+        /// Le nom de l'événement, tel que l'enveloppe l'écrit et tel que le scan
+        /// d'écrivain unique le cherche.
+        const CENSUS_EVENT: &str = "rearm_consent_checked";
+
+        /// Un numéro par branche : les charges cannées **et** le journal
+        /// d'appels de la couture `gh` sont globaux au processus, et T1 de #3052
+        /// assère une **égalité** à 1 sur son propre numéro — la réutiliser ici
+        /// la ferait rougir pour une raison qui n'est pas la sienne.
+        const CENSUS_HELD: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3060;
+        const CENSUS_OTHER_CLASS: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3061;
+        const CENSUS_READY_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3062;
+        const CENSUS_CLOSED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3063;
+        const CENSUS_NO_TOKEN: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3064;
+        const CENSUS_REREAD_FAILED: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3065;
+        const CENSUS_PARENT_UNREADABLE: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3066;
+        const CENSUS_PARENT_ABSENT: u64 = crate::gh_process::FIXTURE_ISSUE_FLOOR + 3067;
+
+        type CapturedEvents =
+            std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+        struct CapturingLayer(CapturedEvents);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut std::collections::HashMap<String, String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut fields = std::collections::HashMap::new();
+                event.record(&mut V(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        fn capture_events() -> (tracing::subscriber::DefaultGuard, CapturedEvents) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+            let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            (guard, events)
+        }
+
+        /// Les lignes de recensement, dans l'ordre d'émission, filtrées sur leur
+        /// champ `event` — jamais sur le niveau ni sur le message, qu'une des
+        /// quatre lignes de diagnostic voisines pourrait partager.
+        fn census_lines(events: &CapturedEvents) -> Vec<std::collections::HashMap<String, String>> {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("event").map(String::as_str) == Some(CENSUS_EVENT))
+                .cloned()
+                .collect()
+        }
+
+        /// Le triplet qu'AC4 lit. Les coordonnées rendent `None` quand le champ
+        /// est **absent** de la ligne, ce qui est le cas testé : `tracing`
+        /// n'enregistre rien pour un `Option::None`, donc l'absence est
+        /// observable et ne se confond pas avec `""` ni `0` (mika#2331).
+        fn triplet(
+            line: &std::collections::HashMap<String, String>,
+        ) -> (&str, Option<&str>, Option<&str>) {
+            (
+                line.get("verdict")
+                    .map(String::as_str)
+                    .unwrap_or("<absent>"),
+                line.get("repo").map(String::as_str),
+                line.get("issue").map(String::as_str),
+            )
+        }
+
+        /// La ligne unique d'un passage — l'unicité est une assertion, pas une
+        /// commodité : deux lignes pour un passage doubleraient le dénominateur
+        /// d'AC4 aussi sûrement que deux sites émetteurs.
+        fn only_census_line(events: &CapturedEvents) -> std::collections::HashMap<String, String> {
+            let lines = census_lines(events);
+            assert_eq!(
+                lines.len(),
+                1,
+                "un passage, une ligne de recensement : {lines:?}"
+            );
+            lines.into_iter().next().unwrap()
+        }
+
+        /// **La branche saine est recensée** — le défaut que ce vol ferme. Sans
+        /// cette ligne, AC4 n'a qu'un numérateur, et un compte nul ne se
+        /// distingue pas d'une absence de ré-armements (mika#1833, mika#1926).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_nomme_held_sur_la_branche_saine() {
+            let (db, parent_id, action_config) = rearm_fixture_with_issue(CENSUS_HELD).await;
+            let (_guard, events) = capture_events();
+
+            let outcome = rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop_completion",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await;
+
+            assert_eq!(outcome, RearmOutcome::Rearmed);
+            let line = only_census_line(&events);
+            assert_eq!(
+                triplet(&line),
+                ("held", Some("x/y"), Some(CENSUS_HELD.to_string().as_str())),
+                "le dénominateur d'AC4 porte ses coordonnées : {line:?}"
+            );
+            assert_eq!(
+                line.get("parent_task_id").map(String::as_str),
+                Some(parent_id.as_str()),
+                "la ligne se joint à la parente, sinon elle ne se restreint à \
+                 aucune population : {line:?}"
+            );
+            assert_eq!(
+                line.get("cause").map(String::as_str),
+                Some("noop_completion"),
+                "et elle nomme le chemin de ré-armement : {line:?}"
+            );
+        }
+
+        /// **AC3 n'est pas un `held` absent.** Les deux branches rendent `None`
+        /// — « ré-armer comme avant » — et c'est exactement la confusion que le
+        /// plan reproche aux trois lignes `*_rearmed`. Le label est celui du
+        /// dispatch opérateur, réel, et il porte les **mêmes** coordonnées que
+        /// celui du feeder `ready-label`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_nomme_other_class_hors_ready_label() {
+            let (db, parent_id, action_config) = rearm_fixture_labelled(
+                CENSUS_OTHER_CLASS,
+                format!("operator-iterate: x/y#{CENSUS_OTHER_CLASS}"),
+            )
+            .await;
+            let (_guard, events) = capture_events();
+
+            let outcome = rearm_deferred_callback(
+                &db,
+                &parent_id,
+                &action_config,
+                "implement",
+                "noop_completion",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await;
+
+            assert_eq!(outcome, RearmOutcome::Rearmed);
+            assert_eq!(
+                triplet(&only_census_line(&events)),
+                ("other_class", None, None),
+                "hors classe, la garde n'a lu aucune coordonnée : elle ne peut \
+                 donc pas en déclarer"
+            );
+        }
+
+        /// **Les deux refus d'AC1 gardent chacun son verdict.** Fusionnés, leurs
+        /// comptes ne se soustraient plus (mika#2205), et la cible d'AC4 est un
+        /// compte. Deux passages dans un seul test : c'est leur **différence**
+        /// qui est la propriété.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_le_recensement_distingue_ready_absent_de_issue_closed() {
+            let (db_a, parent_a, config_a) = rearm_fixture_with_issue(CENSUS_READY_ABSENT).await;
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(CENSUS_READY_ABSENT),
+                "issue view",
+                r#"{"state":"OPEN","labels":[{"name":"type:bug"}]}"#,
+            );
+            let (db_b, parent_b, config_b) = rearm_fixture_with_issue(CENSUS_CLOSED).await;
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(CENSUS_CLOSED),
+                "issue view",
+                r#"{"state":"CLOSED","labels":[{"name":"ready"}]}"#,
+            );
+
+            let (_guard, events) = capture_events();
+            for (db, parent, config) in
+                [(&db_a, &parent_a, &config_a), (&db_b, &parent_b, &config_b)]
+            {
+                let outcome = rearm_deferred_callback(
+                    db,
+                    parent,
+                    config,
+                    "implement",
+                    "noop_completion",
+                    None,
+                    REARM_FIXTURE_TOKEN,
+                )
+                .await;
+                assert!(matches!(outcome, RearmOutcome::ConsentWithdrawn { .. }));
+            }
+
+            let lines = census_lines(&events);
+            assert_eq!(lines.len(), 2, "un passage, une ligne : {lines:?}");
+            assert_eq!(
+                triplet(&lines[0]),
+                (
+                    "ready_absent",
+                    Some("x/y"),
+                    Some(CENSUS_READY_ABSENT.to_string().as_str())
+                )
+            );
+            assert_eq!(
+                triplet(&lines[1]),
+                (
+                    "issue_closed",
+                    Some("x/y"),
+                    Some(CENSUS_CLOSED.to_string().as_str())
+                ),
+                "`ready` est encore posé ici : c'est l'état du ticket qui refuse, \
+                 et le verdict le dit sous son propre nom"
+            );
+        }
+
+        /// **Les trois fail-closed d'AC2 ne tiennent pas sous un nom commun.**
+        /// Elles rendent le même `RearmOutcome::NotNow`, donc les treize tests de
+        /// #3052 ne peuvent pas les distinguer ; leurs causes sont une
+        /// configuration absente, une forge en panne et une base illisible —
+        /// trois remèdes différents pour un opérateur.
+        ///
+        /// Les deux premières passent par `rearm_deferred_callback`, le chemin
+        /// réel. La troisième appelle l'enveloppe **directement**, et ce n'est
+        /// pas un raccourci de confort : la position 1 de
+        /// `rearm_deferred_callback` lit déjà la base
+        /// (`has_non_deferred_active_callback_child`) et rend `NotNow` avant la
+        /// garde, donc une base morte n'atteint jamais la position 3 par ce
+        /// chemin. Que les trois sites appelants traversent bien l'enveloppe est
+        /// tenu ailleurs, par les treize tests de #3052.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_les_trois_fail_closed_portent_chacun_son_verdict() {
+            let (db_t, parent_t, config_t) = rearm_fixture_with_issue(CENSUS_NO_TOKEN).await;
+            let (db_f, parent_f, config_f) = rearm_fixture_with_issue(CENSUS_REREAD_FAILED).await;
+            crate::gh_process::set_canned_failure(
+                crate::gh_process::GhSubject::Issue(CENSUS_REREAD_FAILED),
+                "issue view",
+                "gh: could not resolve to an Issue (HTTP 502)",
+            );
+            let (db_u, parent_u, _) = rearm_fixture_labelled(
+                CENSUS_PARENT_UNREADABLE,
+                format!("ready-label: x/y#{CENSUS_PARENT_UNREADABLE}"),
+            )
+            .await;
+
+            let (_guard, events) = capture_events();
+            // `None` n'est pas une permission (D7).
+            assert_eq!(
+                rearm_deferred_callback(
+                    &db_t,
+                    &parent_t,
+                    &config_t,
+                    "implement",
+                    "noop_completion",
+                    None,
+                    None,
+                )
+                .await,
+                RearmOutcome::NotNow
+            );
+            assert_eq!(
+                rearm_deferred_callback(
+                    &db_f,
+                    &parent_f,
+                    &config_f,
+                    "implement",
+                    "noop_completion",
+                    None,
+                    REARM_FIXTURE_TOKEN,
+                )
+                .await,
+                RearmOutcome::NotNow
+            );
+            db_u.shutdown();
+            assert_eq!(
+                reread_consent_before_rearm(
+                    &db_u,
+                    &parent_u,
+                    REARM_FIXTURE_TOKEN,
+                    "noop_completion"
+                )
+                .await,
+                Some(RearmOutcome::NotNow),
+                "une base illisible ne se lit pas « ce n'est pas une parente \
+                 `ready-label` »"
+            );
+
+            let lines = census_lines(&events);
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|l| triplet(l).0.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["no_token", "reread_failed", "parent_unreadable"],
+                "trois passages, trois verdicts, dans l'ordre : {lines:?}"
+            );
+            assert_eq!(
+                triplet(&lines[0]).1,
+                Some("x/y"),
+                "les deux premières ont lu le label, donc elles portent leurs \
+                 coordonnées : {lines:?}"
+            );
+            assert_eq!(triplet(&lines[1]).1, Some("x/y"));
+        }
+
+        /// **Hors classe, une coordonnée absente reste absente.** Les trois
+        /// branches qui sortent avant d'avoir lu un label n'ont pas de
+        /// coordonnées à déclarer, et `""`/`0` ont la forme d'une réponse sans
+        /// en être une : un `jq` qui agrège par `repo` compterait un dépôt nommé
+        /// `""`, et un `select(.issue == 0)` ne trouverait rien à redire
+        /// (mika#2331). L'assertion porte donc sur la **présence de la clé**,
+        /// jamais sur sa valeur.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3050_les_coordonnees_sont_absentes_et_jamais_vides_hors_classe() {
+            let (db_a, _, _) = rearm_fixture_labelled(
+                CENSUS_PARENT_ABSENT,
+                format!("ready-label: x/y#{CENSUS_PARENT_ABSENT}"),
+            )
+            .await;
+            let (db_u, parent_u, _) = rearm_fixture_labelled(
+                CENSUS_PARENT_UNREADABLE,
+                format!("ready-label: x/y#{CENSUS_PARENT_UNREADABLE}"),
+            )
+            .await;
+            let (db_o, parent_o, config_o) = rearm_fixture_labelled(
+                CENSUS_OTHER_CLASS,
+                format!("operator-iterate: x/y#{CENSUS_OTHER_CLASS}"),
+            )
+            .await;
+
+            let (_guard, events) = capture_events();
+            assert_eq!(
+                reread_consent_before_rearm(
+                    &db_a,
+                    "une-parente-qui-nexiste-pas",
+                    REARM_FIXTURE_TOKEN,
+                    "stuck_pending"
+                )
+                .await,
+                None,
+                "aucune parente, donc aucune classe à discriminer : le \
+                 ré-armement suit son cours, comme avant le vol"
+            );
+            db_u.shutdown();
+            let _ =
+                reread_consent_before_rearm(&db_u, &parent_u, REARM_FIXTURE_TOKEN, "stuck_pending")
+                    .await;
+            let _ = rearm_deferred_callback(
+                &db_o,
+                &parent_o,
+                &config_o,
+                "implement",
+                "stuck_pending",
+                None,
+                REARM_FIXTURE_TOKEN,
+            )
+            .await;
+
+            let lines = census_lines(&events);
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|l| triplet(l).0.to_string())
+                    .collect::<Vec<_>>(),
+                vec!["parent_absent", "parent_unreadable", "other_class"]
+            );
+            for line in &lines {
+                assert!(
+                    !line.contains_key("repo") && !line.contains_key("issue"),
+                    "la clé elle-même doit manquer, pas valoir du vide : {line:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -11438,6 +14214,26 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
             !recovery.contains("MIKA_DISPATCH_BYPASS_GROOMING_CHECK"),
             "the removed bypass must not be offered as recovery"
         );
+
+        // mika#2811 — l'`already_groomed` nommé ci-dessus doit l'être pour la
+        // population QUI L'OBTIENT ENCORE, le groom demandé par un tour LLM, et
+        // non comme la fatalité du chemin de boucle : ce chemin-là porte
+        // désormais la provenance du refus et frappe la preuve. Sans cette
+        // paire, le texte peut redevenir « retirez le plan de la branche
+        // d'abord » — du travail opérateur pour rien, et la boucle de mika#2811
+        // réécrite en prose.
+        assert!(
+            recovery.contains("run_claude_pilot_groom"),
+            "the residual auto-skip population must be NAMED, not implied: {recovery}"
+        );
+        assert!(
+            recovery.contains("mika#2811"),
+            "the recovery must cite the ticket that made the loop path mint proof: {recovery}"
+        );
+        assert!(
+            recovery.contains("nothing to remove by hand first"),
+            "the loop path must no longer prescribe removing the plan: {recovery}"
+        );
     }
 
     /// DB error → FAIL-CLOSED. This is the one behavioural change of
@@ -11472,7 +14268,10 @@ Discussion: this one was a single-pass GROOMED case, unlike the others.
     mod harnais_porte {
         use super::*;
         use crate::async_db::AsyncDatabase;
-        use crate::db::tests::{GROOM_CALLBACK_PLAN_GROOMED, completed_groom_pair, db};
+        use crate::db::tests::{
+            GROOM_CALLBACK_PLAN_GROOMED, GROOM_PLAN_VOL_1, GROOM_PLAN_VOL_2, completed_groom_pair,
+            db, groom_callback, groom_callback_liee_au_plan, set_completed_at,
+        };
 
         /// Owner / repo / number that `evaluate_grooming_gate` folds into the
         /// issue URL — they MUST reproduce `db::tests::GROOM_ISSUE_URL`
@@ -11660,6 +14459,615 @@ Harness ticket.
                     .contains("shut down"),
                 "le message d'erreur original traverse `ProofUnreadable` sans être \
                  réécrit — c'est ce qui rend le JSON identique à l'octet près : {unreadable}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // mika#2981 AC2 — la preuve est liée à SON vol, et les quatre cas le
+        // disent dans le même appel
+        // -------------------------------------------------------------------
+        //
+        // **Ce que la fixture d'AC2 porte, et ce qu'elle ne porte pas.** Le
+        // critère écrit « une preuve de groom du vol 1 (plan A), **un merge**,
+        // puis un callout de corps qui nomme un plan B ». Il n'y a aucun merge
+        // ici, et c'est la décision D1 du plan : le terme retenu est le **plan**
+        // que la preuve nomme, pas l'instant du dernier merge. Un merge est un
+        // proxy de « un vol s'est terminé » ; le plan est l'objet même du groom.
+        // Le terme temporel aurait exigé un lecteur « issue → PR liée → dernier
+        // merge » qui n'existe pas (`github_graphql.rs` n'a que
+        // `gh_merged_pr_for_branch`, clé de branche) et aurait mis une
+        // dépendance réseau sur un chemin qui échoue-ouvert sans jeton — donc
+        // une porte que l'absence d'un jeton désarme. Sans merge dans la
+        // fixture, les quatre cas tournent **hors réseau, dans le même appel**,
+        // ce qu'AC2 demande littéralement.
+        //
+        // **La grâce d'une preuve nue a, elle, une borne datée** (décision de
+        // Vincent du 2026-10-31) : la première PR ouverte par un vol après la
+        // preuve. Elle se lit en base, sur la ligne `PR:` du callback
+        // d'implémentation, donc elle aussi sans réseau ; les quatre derniers
+        // cas de ce module la mesurent.
+        //
+        // Le corps est un **paramètre** de `evaluate_grooming_gate` : c'est ce
+        // qui rend ces quatre cas constructibles sans GitHub.
+
+        /// Un corps de ticket groomé nommant `plan` — la seule chose qui varie
+        /// d'un vol au suivant.
+        ///
+        /// Dérivé de [`GROOMED_ISSUE_BODY`] à la forme près : les trois
+        /// marqueurs canoniques doivent rester présents, sinon le refus rendu
+        /// serait `dispatch_no_grooming_marker` et aucun de ces tests ne
+        /// parlerait plus de la provenance.
+        fn corps_nommant(plan: &str) -> String {
+            format!(
+                "\
+## Summary
+
+Harness ticket.
+
+> - **Branch:** `feat/123/harnais-porte`
+> - **Plan:** `{plan}`
+> - **Grooming history:** /ce:plan → mika-arch first-pass (ITERATE) → revisions → mika-arch second-pass (GROOMED)
+"
+            )
+        }
+
+        /// **AC2, cas 1 — la preuve du vol 1 ne fait pas partir le vol 2.**
+        ///
+        /// C'est le défaut que mika#2981 ferme, dans sa forme minimale : la base
+        /// porte UNE preuve de groom, convergée, terminale, sous une parente qui
+        /// porte bien l'URL du ticket — tout ce que mika#2287 exigeait — et elle
+        /// nomme le plan du vol 1. Le corps courant nomme le plan du vol 2.
+        /// Avant ce ticket la porte rendait `Ok` : la preuve d'un vol laissait
+        /// partir tous les suivants, dont les callouts auraient pu être posés à
+        /// la main. C'est la classe même que mika#2287 existe pour refuser.
+        ///
+        /// Le refus attendu est exactement `dispatch_grooming_not_verified` —
+        /// ni `dispatch_no_grooming_marker` (les trois marqueurs SONT là), ni
+        /// `dispatch_check_failed` (la base est lisible).
+        #[tokio::test]
+        async fn mika2981_la_preuve_du_vol_1_ne_fait_pas_partir_le_vol_2() {
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let rejection = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await
+            .expect_err(
+                "la preuve du vol 1 nomme le plan du vol 1 ; le corps courant nomme \
+                 celui du vol 2 — la porte doit refuser (mika#2981)",
+            );
+
+            assert_eq!(
+                rejection["error"], "dispatch_grooming_not_verified",
+                "les marqueurs sont présents et la base est lisible : le seul refus \
+                 admissible est celui de provenance ; {rejection}"
+            );
+
+            // AC3 — le texte de remède reste vrai POUR LA CAUSE NEUVE. La route
+            // qu'il prescrit est celle des trois strates antérieures, et elle
+            // reste vivante ici : un re-groom par la boucle frappe une preuve
+            // qui porte le callout du corps courant.
+            let recovery = rejection["recovery"].as_str().expect("recovery présent");
+            assert!(
+                recovery.contains("route to dev-groom, not dev-pilot"),
+                "le remède doit continuer de nommer la route qui marche : {recovery}"
+            );
+            assert!(
+                !recovery.contains("does NOT help"),
+                "aucune strate ne doit ressusciter la route morte de mika#2484 : {recovery}"
+            );
+            assert!(
+                rejection["predicate"]
+                    .as_str()
+                    .expect("predicate présent")
+                    .contains("different plan"),
+                "le prédicat doit nommer la cause neuve, sinon un opérateur qui voit \
+                 une preuve en base conclut à une panne de la porte : {rejection}"
+            );
+
+            // La ligne d'audit du refus — sans elle le refus n'est pas comptable.
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                lignes
+                    .iter()
+                    .filter(|l| l.tool_name == GROOM_PROOF_PLAN_MISMATCH_EVENT)
+                    .count(),
+                1,
+                "un refus pour plan étranger écrit exactement une ligne d'audit sous \
+                 son propre nom d'événement (mika#2205 : deux populations sous un nom \
+                 ne se soustraient pas) ; lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                lignes[0].after_value.as_deref(),
+                Some(GROOM_PLAN_VOL_2),
+                "la ligne porte le plan ATTENDU — celui du corps courant — et c'est \
+                 par lui que l'opérateur retrouve le vol qui a été arrêté"
+            );
+        }
+
+        /// **AC2, cas 2 — le contrôle positif, sur la MÊME fixture.**
+        ///
+        /// Même base que le cas 1, plus la preuve du vol 2. Sans ce test, « le
+        /// vol 2 est refusé » serait indistinguable de « plus rien ne part
+        /// jamais » — un prédicat qui refuse tout satisferait le cas 1 en entier
+        /// tout en cassant la boucle d'un bout à l'autre.
+        ///
+        /// La preuve du vol 1 est **toujours là** : c'est ce qui fait de ce test
+        /// une mesure de l'agrégation (`Converged` bat `PlanMismatch`) et pas
+        /// seulement du cas à une ligne.
+        ///
+        /// **Pourquoi la parente du vol 1 est terminée avant que celle du vol 2
+        /// naisse.** `idx_tasks_manual_active_ref_url` (schéma v17) est un index
+        /// unique PARTIEL : deux tâches `manual` **actives** ne peuvent pas
+        /// porter la même `reference_url` pour un agent. Un ticket à plusieurs
+        /// vols a donc toujours ses parentes antérieures terminales — c'est la
+        /// forme réelle, celle mesurée le 2026-10-30 sur mika#2968, et non une
+        /// commodité de fixture. La preuve du vol 1 survit malgré ça parce que
+        /// le prédicat ne filtre le statut que de l'**enfant** ; c'est
+        /// exactement ce qui rend le trou atteignable.
+        #[tokio::test]
+        async fn mika2981_la_preuve_du_vol_2_fait_partir_le_vol_2() {
+            let sync_db = db();
+            let (parente_vol_1, _) = completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+            );
+            sync_db
+                .update_task_status(&parente_vol_1, "completed")
+                .expect("terminer la parente du vol 1 passe par l'API d'écriture");
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_2),
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "le vol 2 a sa propre preuve, portant son propre plan : la porte doit \
+                 le laisser partir, et la preuve étrangère du vol 1 ne doit pas peser \
+                 dans l'agrégation ; {outcome:?}"
+            );
+
+            // Rien n'est écrit : l'acceptation est LIÉE, pas gracieuse. C'est ce
+            // qui sépare ce cas du cas 4 — sans cette assertion les deux
+            // rendraient `Ok` et la grâce serait invisible (mika#2205 appliqué à
+            // la sonde du correctif lui-même).
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert!(
+                lignes.is_empty(),
+                "une acceptation liée n'écrit aucune ligne : ni refus, ni grâce ; \
+                 lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **AC2, cas 3 — le vol unique part toujours.**
+        ///
+        /// Le critère exige que ce cas « ne change pas ». Il porte une preuve
+        /// liée et aucun merge, et le corps nomme le plan que cette preuve
+        /// nomme : c'est la configuration nominale d'après mika#2981, celle que
+        /// `_write_canonical_callout` produit depuis ce ticket.
+        ///
+        /// Ce qu'AC1 demande de dire explicitement — **ce que rend la porte pour
+        /// un ticket sans merge antérieur** — est répondu par construction : la
+        /// porte ne lit aucun merge. Une preuve liée est jugée sur le seul terme
+        /// du plan, et la borne datée ne touche que la grâce d'une preuve nue.
+        /// Un vol unique dont la preuve porte son plan est accepté, et c'est ici
+        /// que ça se lit.
+        ///
+        /// Son frère de forme nue est le cas 4 ci-dessous ; les deux ensemble
+        /// couvrent les deux populations de vol unique que la porte voit
+        /// aujourd'hui.
+        #[tokio::test]
+        async fn mika2981_le_vol_unique_part_toujours() {
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_1),
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_1),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "un vol unique dont la preuve porte le plan du corps est le cas \
+                 nominal : mika#2981 ne doit RIEN y changer ; {outcome:?}"
+            );
+        }
+
+        /// **AC2, cas 4 — la grâce D3 laisse partir une preuve nue, et elle est
+        /// comptée.**
+        ///
+        /// La preuve est la forme d'**avant** mika#2981 : ligne ancrée, aucun
+        /// suffixe de plan. Trois producteurs légitimes la frappent encore —
+        /// toutes les preuves déjà en base, la fenêtre de déploiement
+        /// (`skills/bundled/` est lu au build, donc le producteur corrigé
+        /// n'atteint aucun agent avant `make deploy`), et le flux opérateur
+        /// `/mika-groom-ticket`, qui écrit son propre callout. Les refuser
+        /// aurait arrêté la boucle le jour du merge.
+        ///
+        /// Elle part donc, et **la sonde d'AC4 est l'autre moitié du test** : un
+        /// dispatch laissé partir sans liaison écrit une ligne sous son propre
+        /// nom d'événement. C'est le compte que le ticket de suivi lit pour
+        /// retirer la grâce. Sans la ligne, « accepté sur la grâce » et
+        /// « accepté avec une preuve liée » rendent les mêmes octets et le
+        /// correctif n'a pas de sonde.
+        ///
+        /// Le compte attendu est **1** : la grâce est émise par dispatch, pas
+        /// par preuve, parce que le dispatch est l'unité d'AC4.
+        #[tokio::test]
+        async fn mika2981_une_preuve_nue_part_sur_la_grace_et_elle_est_comptee() {
+            let sync_db = db();
+            completed_groom_pair(
+                &sync_db,
+                "mika",
+                crate::db::tests::GROOM_ISSUE_URL,
+                GROOM_CALLBACK_PLAN_GROOMED,
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_1),
+            )
+            .await;
+
+            assert!(
+                outcome.is_ok(),
+                "une preuve nue reste acceptée : la refuser aurait arrêté la boucle \
+                 sur toutes les preuves déjà en base, le jour du merge (grâce D3) ; \
+                 {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                lignes
+                    .iter()
+                    .filter(|l| l.tool_name == GROOM_PROOF_UNBOUND_EVENT)
+                    .count(),
+                1,
+                "chaque dispatch que la grâce laisse partir est compté une fois sous \
+                 son propre nom d'événement — c'est la sonde d'AC4, et le compte que \
+                 le ticket de suivi lit pour retirer la grâce ; lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                lignes[0].after_value.as_deref(),
+                Some(GROOM_PLAN_VOL_1),
+                "la ligne porte le plan attendu, lisible ici — le sentinel \
+                 `<aucun callout lisible>` est réservé au corps sans callout, et \
+                 confondre les deux producteurs de la grâce rendrait le compte \
+                 d'AC4 inutilisable (mika#2331)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // mika#2981 — la borne de la grâce : la première PR ouverte après la
+        // preuve nue (décision de Vincent du 2026-10-31)
+        // -------------------------------------------------------------------
+
+        /// Pose sous `parente` le callback d'implémentation d'un vol qui a
+        /// ouvert la PR `pr`, terminé à l'instant `a`.
+        ///
+        /// La ligne `PR: <url>` est celle que `dev-pilot/handlers/run.sh` écrit
+        /// et que lit `extract_callback_fields` ; la ligne `Outcome:` suit la
+        /// forme relevée sur mika#2968.
+        fn vol_qui_ouvre_une_pr(db: &crate::db::Database, parente: &str, pr: u64, a: &str) {
+            let enfant = db
+                .create_task(&groom_callback("mika", parente, "implement"))
+                .expect("le callback d'implémentation doit être créé");
+            let resultat = format!(
+                "claude-pilot completed (status: done).\n\
+                 PR: https://github.com/senara-solutions/mika/pull/{pr}\n\
+                 Outcome: PR_OPENED — https://github.com/senara-solutions/mika/pull/{pr}"
+            );
+            assert!(
+                db.update_task_completed(&enfant, "mika", Some(&resultat))
+                    .expect("la complétion passe par l'API d'écriture"),
+                "le callback doit se terminer par le chemin de production"
+            );
+            set_completed_at(db, &enfant, a);
+        }
+
+        /// Une preuve terminée à l'instant `a`, sous une parente que l'appelant
+        /// termine quand il en a fini (index unique partiel, schéma v17).
+        fn preuve_a(db: &crate::db::Database, result: &str, a: &str) -> String {
+            let (parente, preuve) =
+                completed_groom_pair(db, "mika", crate::db::tests::GROOM_ISSUE_URL, result);
+            set_completed_at(db, &preuve, a);
+            parente
+        }
+
+        fn compte(lignes: &[crate::db::AuditEvent], evenement: &str) -> usize {
+            lignes.iter().filter(|l| l.tool_name == evenement).count()
+        }
+
+        /// **Contrôle négatif, le cas mesuré de mika#2968.** Vol 1 : une preuve
+        /// nue, puis sa PR (#2971). Vol 2a : une preuve nue, puis sa PR (#2977).
+        /// Vol N : le corps nomme un plan B, et aucune preuve ne le porte.
+        ///
+        /// Avant la borne, les deux preuves nues rendaient `ConvergedUnbound` et
+        /// la porte laissait partir le vol N sur la grâce. Chacune est
+        /// maintenant suivie d'une PR ouverte, donc la grâce ne couvre plus
+        /// aucune des deux : refus `dispatch_grooming_not_verified`, compté sous
+        /// son propre événement, et l'événement de grâce ne tire pas.
+        #[tokio::test]
+        async fn mika2981_une_preuve_nue_suivie_dune_pr_ne_fait_pas_partir_le_vol_n() {
+            let sync_db = db();
+            let vol_1 = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_1, 2971, "2026-10-29T22:24:20Z");
+            sync_db.update_task_status(&vol_1, "completed").unwrap();
+            let vol_2a = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-30T10:02:32Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_2a, 2977, "2026-10-30T10:57:25Z");
+            sync_db.update_task_status(&vol_2a, "completed").unwrap();
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let rejection = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await
+            .expect_err(
+                "les deux preuves nues sont suivies d'une PR ouverte : la grâce ne \
+                 les couvre plus, la porte doit refuser le vol N (mika#2981)",
+            );
+            assert_eq!(
+                rejection["error"], "dispatch_grooming_not_verified",
+                "les marqueurs sont présents et la base est lisible : le seul refus \
+                 admissible est celui de provenance ; {rejection}"
+            );
+            assert!(
+                rejection["predicate"]
+                    .as_str()
+                    .expect("predicate présent")
+                    .contains("opened a PR for this issue after it"),
+                "le prédicat doit nommer la borne, sinon un opérateur qui voit deux \
+                 preuves en base conclut à une panne de la porte : {rejection}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT),
+                1,
+                "le refus de la borne écrit une ligne sous son propre nom ; \
+                 lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_EVENT),
+                0,
+                "rien n'est parti sur la grâce ; lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **Cas positif, le vol unique.** Une preuve nue, aucune PR ouverte :
+        /// la porte accepte sur la grâce, et la grâce est comptée.
+        ///
+        /// Le ticket porte aussi un callback d'implémentation **sans** ligne
+        /// `PR:`, un vol qui a échoué avant d'ouvrir sa PR : il ne doit pas
+        /// couper la grâce. C'est le contrôle du prédicat de la seconde
+        /// requête, qui sans lui pourrait dater n'importe quel callback.
+        #[tokio::test]
+        async fn mika2981_le_vol_unique_garde_la_grace_sans_pr_ouverte() {
+            let sync_db = db();
+            let vol = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            let echoue = sync_db
+                .create_task(&groom_callback("mika", &vol, "implement"))
+                .unwrap();
+            assert!(
+                sync_db
+                    .update_task_completed(
+                        &echoue,
+                        "mika",
+                        Some("claude-pilot completed (status: error).\nNO_PR: no_pr_on_branch")
+                    )
+                    .unwrap()
+            );
+            set_completed_at(&sync_db, &echoue, "2026-10-29T22:24:20Z");
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_1),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "sans PR ouverte après elle, une preuve nue reste dans sa grâce ; \
+                 {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_EVENT),
+                1,
+                "le dispatch parti sur la grâce est compté ; lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT),
+                0,
+                "un callback sans ligne `PR:` ne coupe pas la grâce ; \
+                 lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **Cas lié.** Même histoire que le contrôle négatif, plus une preuve
+        /// liée au plan B frappée avant la dernière PR ouverte. La borne ne
+        /// touche que la grâce : la preuve liée est acceptée (`Converged`), et
+        /// aucun des deux événements ne tire.
+        #[tokio::test]
+        async fn mika2981_une_preuve_liee_part_meme_apres_une_pr() {
+            let sync_db = db();
+            let vol_1 = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_1, 2971, "2026-10-29T22:24:20Z");
+            sync_db.update_task_status(&vol_1, "completed").unwrap();
+            let vol_2 = preuve_a(
+                &sync_db,
+                &groom_callback_liee_au_plan(GROOM_PLAN_VOL_2),
+                "2026-10-30T10:02:32Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_2, 2977, "2026-10-30T10:57:25Z");
+            sync_db.update_task_status(&vol_2, "completed").unwrap();
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "une preuve liée au plan du corps est acceptée quelle que soit sa \
+                 date ; {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert!(
+                lignes.is_empty(),
+                "une acceptation liée n'écrit rien : ni grâce, ni refus de borne ; \
+                 lignes vues : {lignes:?}"
+            );
+        }
+
+        /// **Contrôle de la borne elle-même.** Vol 1 : une preuve nue, puis sa
+        /// PR. Vol 2 : une preuve nue frappée **après** cette PR, par l'un des
+        /// producteurs de la grâce. La première est coupée, la seconde ne l'est
+        /// pas : la porte accepte sur la grâce, qui est comptée.
+        ///
+        /// Sans ce cas, « la borne coupe ce qui la précède » serait
+        /// indistinguable de « la borne coupe toute preuve nue dès qu'une PR
+        /// existe », qui arrêterait tout ticket à plusieurs vols groomé à la main.
+        #[tokio::test]
+        async fn mika2981_une_preuve_nue_posterieure_a_la_derniere_pr_garde_la_grace() {
+            let sync_db = db();
+            let vol_1 = preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-29T21:36:05Z",
+            );
+            vol_qui_ouvre_une_pr(&sync_db, &vol_1, 2971, "2026-10-29T22:24:20Z");
+            sync_db.update_task_status(&vol_1, "completed").unwrap();
+            preuve_a(
+                &sync_db,
+                GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-10-30T10:02:32Z",
+            );
+            let async_db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+            let outcome = evaluate_grooming_gate(
+                &async_db,
+                "task-2981",
+                OWNER,
+                REPO,
+                NUMBER,
+                &corps_nommant(GROOM_PLAN_VOL_2),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "une preuve nue frappée après la dernière PR ouverte est dans sa \
+                 grâce ; {outcome:?}"
+            );
+
+            let lignes = async_db
+                .get_audit_events(GROOM_PROOF_SESSION_ID)
+                .await
+                .expect("la base est lisible");
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_EVENT),
+                1,
+                "l'acceptation est celle de la grâce, et elle est comptée ; \
+                 lignes vues : {lignes:?}"
+            );
+            assert_eq!(
+                compte(&lignes, GROOM_PROOF_UNBOUND_SUPERSEDED_EVENT),
+                0,
+                "une grâce valide l'emporte sur une grâce coupée ; \
+                 lignes vues : {lignes:?}"
             );
         }
     }
@@ -12323,17 +15731,413 @@ Harness ticket.
         }
     }
 
-    mod mika2545_escalate_terminal {
+    mod mika2786_anchor_brake {
         use super::*;
         use crate::async_db::AsyncDatabase;
         use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent};
 
+        /// Le `result` d'un groom retenu par la garde d'ancrage, dans la forme
+        /// que `_escalate_groom` écrit (relevée sur mika#2762, 2026-10-18).
+        ///
+        /// Visibilité élargie au parent pour mika#3027 : le module voisin en fait
+        /// le **témoin positif** des quatre formes d'AC4, et une fixture sosie
+        /// dériverait de celle-ci sans le dire.
+        pub(super) const WITHHELD: &str = "claude-pilot completed (status: success).\n\
+             GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
+             Verdict: ESCALATE — human review required.\n\
+             Engine reason: F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld \
+             after the corrective re-prompt — anchors_found=3, anchors_valid=2, \
+             miss_reason=QuoteNotInBrief: paraphrase.\n\
+             Outcome: ESCALATE — first-pass";
+        const GROOMED: &str = "claude-pilot completed.\nOutcome: PLAN_GROOMED";
+        /// Le lanceur différé, tel qu'il est en base entre deux retenues.
+        const DEFERRED: &str = "deferred dispatch slot freed";
+
+        fn r(s: &str) -> Option<String> {
+            Some(s.to_string())
+        }
+
+        // --- La série -----------------------------------------------------------
+
+        /// La forme mesurée sur mika#2762 : un lanceur différé entre deux
+        /// retenues ne casse pas la série.
+        #[test]
+        fn mika2786_a_neutral_row_does_not_break_the_streak() {
+            let rows = [
+                r(WITHHELD),
+                r(DEFERRED),
+                r(WITHHELD),
+                r(WITHHELD),
+                r(GROOMED),
+            ];
+            assert_eq!(anchor_withheld_streak(&rows), 3);
+        }
+
+        #[test]
+        fn mika2786_a_converged_groom_ends_the_streak() {
+            assert_eq!(
+                anchor_withheld_streak(&[r(GROOMED), r(WITHHELD), r(WITHHELD)]),
+                0
+            );
+            assert_eq!(
+                anchor_withheld_streak(&[r(WITHHELD), r(GROOMED), r(WITHHELD)]),
+                1
+            );
+        }
+
+        /// Un ESCALATE d'architecte n'est pas une retenue : il arrête le compte.
+        #[test]
+        fn mika2786_an_architect_escalate_is_not_a_withholding() {
+            let architect =
+                "Verdict: ESCALATE — human review required.\nOutcome: ESCALATE — first-pass";
+            assert_eq!(anchor_withheld_streak(&[r(architect), r(WITHHELD)]), 0);
+        }
+
+        /// Le marqueur cité en prose, hors de la ligne `Engine reason:`, n'est
+        /// pas une retenue (motif mika#2050).
+        #[test]
+        fn mika2786_a_quoted_marker_is_not_a_withholding() {
+            let prose = "The guard writes `Engine reason: F1: (BLOCKING) [mika-engine] review-anchor:` \
+                         on a withheld pass.\nOutcome: PLAN_GROOMED";
+            assert_eq!(anchor_withheld_streak(&[r(prose)]), 0);
+        }
+
+        /// **Le rétrécissement assumé de mika#3027, dit plutôt que laissé
+        /// implicite.** Le prédicat de la série lit désormais la forme fixe chez
+        /// son propriétaire (`arch_disposition::is_engine_escalation_line`), donc
+        /// il exige la numérotation `F<n>:` que l'ancien `contains` du fragment
+        /// n'exigeait pas. Ce n'est pas un élargissement : c'est un rétrécissement
+        /// strict vers la forme que l'écrivain produit réellement —
+        /// `_escalate_groom` interpole la sortie de `_engine_escalation_line`, qui
+        /// *est* la ligne `F<n>:` complète. Le témoin positif est [`WITHHELD`],
+        /// relevé sur mika#2762 et compté par tous les tests voisins.
+        #[test]
+        fn mika3027_une_ligne_sans_numerotation_nest_plus_une_retenue() {
+            let sans_fn = "claude-pilot completed (status: success).\n\
+                 Engine reason: (BLOCKING) [mika-engine] review-anchor: attestation withheld.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                anchor_withheld_streak(&[r(sans_fn)]),
+                0,
+                "sans la numérotation `F<n>:`, la ligne n'est pas celle que \
+                 l'écrivain produit — la série ne la compte plus"
+            );
+            assert_eq!(
+                anchor_withheld_streak(&[r(WITHHELD)]),
+                1,
+                "contrôle de bonne foi : la forme complète reste une retenue"
+            );
+        }
+
+        #[test]
+        fn mika2786_a_null_result_is_neutral() {
+            assert_eq!(
+                anchor_withheld_streak(&[None, r(WITHHELD), None, r(WITHHELD)]),
+                2
+            );
+        }
+
+        #[test]
+        fn mika2786_the_threshold_parses_like_the_redrive_budget() {
+            assert_eq!(
+                parse_groom_anchor_brake_max(None),
+                GROOM_ANCHOR_BRAKE_DEFAULT
+            );
+            assert_eq!(
+                parse_groom_anchor_brake_max(Some("  ")),
+                GROOM_ANCHOR_BRAKE_DEFAULT
+            );
+            assert_eq!(parse_groom_anchor_brake_max(Some("0")), 0);
+            assert_eq!(parse_groom_anchor_brake_max(Some("5")), 5);
+            assert_eq!(
+                parse_groom_anchor_brake_max(Some("-1")),
+                GROOM_ANCHOR_BRAKE_DEFAULT
+            );
+        }
+
+        // --- La porte -------------------------------------------------------------
+
+        /// Un parent `in_progress` et `n` callbacks de groom terminaux portant
+        /// `result`. Tous identiques, donc l'ordre à la seconde ne compte pas.
+        fn seeded(result: &str, n: usize) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            for _ in 0..n {
+                let callback_id = sync
+                    .create_task(&groom_callback("mika", &parent_id, "groom"))
+                    .unwrap();
+                assert!(
+                    sync.update_task_completed(&callback_id, "mika", Some(result))
+                        .unwrap()
+                );
+            }
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        async fn dispatch(
+            db: &AsyncDatabase,
+            parent_id: &str,
+            originating: Option<&str>,
+        ) -> Result<String, String> {
+            let input = serde_json::json!({
+                "skill": "dev-groom", "prompt": "mika#123", "task_id": parent_id
+            });
+            validate_dispatch_readiness(db, parent_id, None, Some(&input), originating).await
+        }
+
+        async fn audit_rows(db: &AsyncDatabase) -> i64 {
+            db.count_audit_events_by_tool_name(GROOM_ANCHOR_BRAKE_EVENT)
+                .await
+                .unwrap()
+        }
+
+        /// **Contrôle positif.** Trois retenues d'affilée : le groom automatique
+        /// est refusé sous le nom du frein, avec sa levée nommée, et une ligne
+        /// d'audit est écrite.
+        #[tokio::test]
+        async fn mika2786_three_withholdings_brake_an_automatic_groom() {
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let rejection = dispatch(&db, &parent_id, None)
+                .await
+                .expect_err("trois retenues d'affilée doivent freiner");
+            assert!(rejection.contains(GROOM_ANCHOR_BRAKE_ERROR), "{rejection}");
+            assert!(
+                rejection.contains("senara-solutions/mika#123"),
+                "{rejection}"
+            );
+            assert!(
+                rejection.contains("mika ask --agent mika-dev"),
+                "le refus nomme sa levée : {rejection}"
+            );
+            assert_eq!(audit_rows(&db).await, 1, "une ligne d'audit par refus");
+        }
+
+        /// Le trou mesuré : un tour qui porte un message (le marqueur `ready`
+        /// hérité par mika-dev) traverse mika#2545. Le frein, lui, mord.
+        #[tokio::test]
+        async fn mika2786_a_ready_marker_does_not_lift_the_brake() {
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let marker = format!(
+                "{}senara-solutions/mika#123 — (auto_pull phase2_stuck_rescue)",
+                crate::webhook_dispatch::READY_LABEL_DISPATCH_MARKER
+            );
+            let rejection = dispatch(&db, &parent_id, Some(&marker))
+                .await
+                .expect_err("reposer `ready` ne lève pas le frein");
+            assert!(rejection.contains(GROOM_ANCHOR_BRAKE_ERROR), "{rejection}");
+        }
+
+        /// **Contrôle négatif du seuil.** Deux retenues ne freinent pas.
+        #[tokio::test]
+        async fn mika2786_two_withholdings_do_not_brake() {
+            let (db, parent_id) = seeded(WITHHELD, 2);
+            if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                assert!(!rejection.contains(GROOM_ANCHOR_BRAKE_ERROR), "{rejection}");
+            }
+            assert_eq!(audit_rows(&db).await, 0);
+        }
+
+        /// **Le rouge du défaut mika#3027, et son contrôle négatif dans le même
+        /// test.** Une retenue d'ancrage traverse la porte mika#2545 sur une
+        /// reprise automatique ; un ESCALATE d'architecte — le même
+        /// `Outcome: ESCALATE`, sans ligne `Engine reason:` — y reste refusé.
+        ///
+        /// Les deux moitiés sont dans **un seul** test parce que la propriété
+        /// n'est pas « la porte laisse passer » : c'est « la porte sépare ». Un
+        /// vol qui aurait simplement désarmé la porte passerait la première
+        /// moitié, et c'est la seconde qui dit qu'il ne l'a pas fait. La fixture
+        /// de l'ESCALATE d'architecte est empruntée à mika#2545 plutôt que
+        /// recopiée : une fixture sosie dérive de l'originale sans le dire.
+        #[tokio::test]
+        async fn mika3027_une_retenue_traverse_la_porte_un_escalate_darchitecte_non() {
+            let (db, parent_id) = seeded(WITHHELD, 1);
+            if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "une retenue d'ancrage du moteur n'est pas un jugement de \
+                     l'architecte : la reprise automatique doit traverser cette \
+                     porte, et sa dépense est bornée par le frein en amont — \
+                     {rejection}"
+                );
+                assert!(
+                    !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                    "une seule retenue n'atteint pas le seuil du frein : {rejection}"
+                );
+            }
+
+            let (db, parent_id) = seeded(super::mika2545_escalate_terminal::ESCALATED, 1);
+            let rejection = dispatch(&db, &parent_id, None)
+                .await
+                .expect_err("un ESCALATE d'architecte reste terminal (mika#2545)");
+            assert!(rejection.contains(GROOM_ESCALATED_ERROR), "{rejection}");
+            let body: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(
+                body["verdict"], "escalated",
+                "le refus garde son motif de fil : la population que mika#2545 \
+                 refuse n'est pas renommée par ce vol — {rejection}"
+            );
+        }
+
+        /// **La série que le frein n'avait jamais pu voir (mika#3027 AC3).**
+        ///
+        /// Le frein mika#2786 refuse à la 3e retenue d'affilée
+        /// (`MIKA_GROOM_ANCHOR_BRAKE_MAX`, défaut 3). Mesuré le 2026-11-03 :
+        /// **0 ligne** dans `audit_events`, 0 dans `server.log` depuis le
+        /// 2026-10-18. La cause n'était pas le frein — c'était la porte en aval,
+        /// qui refusait dès la **première** retenue, donc la série ne pouvait pas
+        /// dépasser 1 sur ce chemin.
+        ///
+        /// Ce test parcourt les trois rangs dans un seul appel, parce que la
+        /// propriété est la **progression** et non ses deux extrémités : aux
+        /// rangs 1 et 2 la reprise automatique traverse les DEUX gardes — c'est
+        /// ce qui fait monter le compteur — et au rang 3 le frein mord sous son
+        /// propre nom. Ses deux voisins pris séparément ne disent pas cela :
+        /// `mika2786_two_withholdings_do_not_brake` n'observe que l'absence du
+        /// frein, et sous l'ancien comportement il était vert alors que la porte
+        /// refusait le rang 2.
+        #[tokio::test]
+        async fn mika3027_la_serie_1_2_3_atteint_le_frein() {
+            for rang in [1usize, 2] {
+                let (db, parent_id) = seeded(WITHHELD, rang);
+                if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                    assert!(
+                        !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                        "rang {rang} : sous le seuil, le frein ne mord pas — {rejection}"
+                    );
+                    assert!(
+                        !rejection.contains(GROOM_ESCALATED_ERROR),
+                        "rang {rang} : si la porte refuse ici, le compteur reste \
+                         bloqué à 1 et le frein est inatteignable — c'est le \
+                         défaut mesuré le 2026-11-03 — {rejection}"
+                    );
+                }
+                assert_eq!(
+                    audit_rows(&db).await,
+                    0,
+                    "rang {rang} : aucun refus du frein"
+                );
+            }
+
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let rejection = dispatch(&db, &parent_id, None)
+                .await
+                .expect_err("rang 3 : le seuil est atteint, le frein refuse");
+            assert!(
+                rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                "rang 3 : le refus porte le nom du frein, pas celui de la porte — \
+                 les deux ne se lisent pas pareil dans `audit_events` — {rejection}"
+            );
+            assert!(
+                !rejection.contains(GROOM_ESCALATED_ERROR),
+                "rang 3 : le frein est en amont de la porte, donc c'est lui qui \
+                 tranche — {rejection}"
+            );
+            assert_eq!(
+                audit_rows(&db).await,
+                1,
+                "la morsure laisse la ligne qui manquait à la mesure d'AC5"
+            );
+        }
+
+        /// **Contrôle négatif de la levée.** La demande explicite de l'opérateur
+        /// traverse le frein, et la levée est écrite.
+        #[tokio::test]
+        async fn mika2786_an_operator_groom_request_lifts_the_brake() {
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            if let Err(rejection) = dispatch(&db, &parent_id, Some("groom mika issue#123")).await {
+                assert!(!rejection.contains(GROOM_ANCHOR_BRAKE_ERROR), "{rejection}");
+            }
+            assert_eq!(audit_rows(&db).await, 0);
+            assert_eq!(
+                db.count_audit_events_by_tool_name(GROOM_ANCHOR_BRAKE_LIFTED_EVENT)
+                    .await
+                    .unwrap(),
+                1,
+                "la levée laisse sa trace, qui borne la série"
+            );
+        }
+
+        /// La forme que la revue a trouvée : la demande est garée en lanceur
+        /// différé parce que la place est prise, et son rejeu part d'un tour
+        /// silencieux **sans** `originating_message`. La levée doit y survivre.
+        #[tokio::test]
+        async fn mika2786_the_lift_survives_the_deferred_replay() {
+            let (db, parent_id) = seeded(WITHHELD, 3);
+            let _ = dispatch(&db, &parent_id, Some("groom mika issue#123")).await;
+            if let Err(rejection) = dispatch(&db, &parent_id, None).await {
+                assert!(
+                    !rejection.contains(GROOM_ANCHOR_BRAKE_ERROR),
+                    "le rejeu différé d'une demande levée ne doit pas être freiné : {rejection}"
+                );
+            }
+            assert_eq!(audit_rows(&db).await, 0);
+        }
+
+        // --- La borne de levée ------------------------------------------------------
+
+        fn row(at: &str, result: &str) -> (String, Option<String>) {
+            (at.to_string(), Some(result.to_string()))
+        }
+
+        #[test]
+        fn mika2786_withholdings_before_the_lift_no_longer_count() {
+            let rows = vec![
+                row("2026-10-18T19:30:00Z", WITHHELD),
+                row("2026-10-18T19:00:00Z", WITHHELD),
+                row("2026-10-18T18:30:00Z", WITHHELD),
+            ];
+            let kept = groom_results_since_lift(rows, Some("2026-10-18T19:10:00Z"));
+            assert_eq!(anchor_withheld_streak(&kept), 1);
+        }
+
+        /// Une nouvelle série après la levée freine de nouveau.
+        #[test]
+        fn mika2786_a_new_series_after_the_lift_brakes_again() {
+            let rows = vec![
+                row("2026-10-18T21:00:00Z", WITHHELD),
+                row("2026-10-18T20:30:00Z", WITHHELD),
+                row("2026-10-18T20:00:00Z", WITHHELD),
+                row("2026-10-18T18:30:00Z", WITHHELD),
+            ];
+            let kept = groom_results_since_lift(rows, Some("2026-10-18T19:10:00Z"));
+            assert_eq!(anchor_withheld_streak(&kept), 3);
+        }
+
+        #[test]
+        fn mika2786_without_a_lift_every_row_counts() {
+            let rows = vec![
+                row("2026-10-18T19:00:00Z", WITHHELD),
+                row("2026-10-18T18:00:00Z", WITHHELD),
+            ];
+            assert_eq!(groom_results_since_lift(rows, None).len(), 2);
+        }
+    }
+
+    mod mika2545_escalate_terminal {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent, set_created_at};
+
         /// Le `result` que `_escalate_groom` écrit depuis mika#2545.
-        const ESCALATED: &str = "claude-pilot completed (status: done).\n\
+        ///
+        /// **Aucune ligne `Engine reason:`** : c'est un jugement de l'architecte,
+        /// et c'est à ce titre que le module voisin l'emprunte comme contrôle
+        /// négatif de mika#3027 — d'où la visibilité élargie au parent.
+        pub(super) const ESCALATED: &str = "claude-pilot completed (status: done).\n\
              GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
              Verdict: ESCALATE — human review required.\n\
              \n\
              Outcome: ESCALATE — first-pass";
+
+        /// Le `result` que `promote_next_deferred_callback_for_class` écrit sur
+        /// le lanceur différé promu. C'est un callback terminal
+        /// `dispatch_class='groom'` lui aussi, et il ne porte **aucune** ligne
+        /// `Outcome:` — la ligne de 18:20:02 qui a masqué l'`ESCALATE` de 18:13
+        /// sur mika#2762.
+        const DEFERRED_LAUNCHER: &str = "deferred dispatch slot freed";
 
         fn dispatch_input(skill: &str, prompt: &str) -> serde_json::Value {
             serde_json::json!({ "skill": skill, "prompt": prompt, "task_id": "t-2545" })
@@ -12398,6 +16202,78 @@ Harness ticket.
             );
         }
 
+        // --- Qui a écrit l'escalade (mika#3027) -------------------------------
+        //
+        // Quatre formes, et chacune a son test. Les trois premières *ressemblent*
+        // à une retenue d'ancrage sans en être une et doivent rester `Escalated`
+        // — fail-closed sur l'auteur. La quatrième est le **témoin positif** :
+        // sans elle, un prédicat qui rendrait toujours `false` passerait les trois
+        // premières et le vol serait un no-op vert.
+
+        /// **Forme 1 — aucune ligne `Engine reason:`.** C'est l'ESCALATE de
+        /// l'architecte, la population pour laquelle la porte mika#2545 existe
+        /// (huit rejeux mesurés le 2026-09-26). Inchangée par ce vol.
+        ///
+        /// Jumeau **délibéré** de `mika2545_an_escalate_line_reads_escalated` :
+        /// l'assertion est la même, mais le filtre du vol est `mika3027`, et le
+        /// premier cas d'AC4 doit y tomber. Supprimer celui-ci comme un doublon
+        /// sort ce cas de la couverture nommée du vol sans rien faire rougir.
+        #[test]
+        fn mika3027_sans_ligne_engine_reason_reste_escalated() {
+            assert_eq!(
+                groom_escalate_verdict(Some(ESCALATED.to_string())),
+                GroomVerdictState::Escalated
+            );
+        }
+
+        /// **Forme 2 — le préfixe cité au milieu d'une ligne de prose.** Un
+        /// pilote qui décrit ce mécanisme écrit `Engine reason: …` dans une
+        /// phrase ; le prédicat est un `strip_prefix` sur la LIGNE, donc il ne le
+        /// voit pas (faux positif du Signal S, mika#2050).
+        #[test]
+        fn mika3027_un_prefixe_cite_en_prose_reste_escalated() {
+            let prose = "claude-pilot completed (status: done).\n\
+                 The groom writes `Engine reason: F1: (BLOCKING) [mika-engine] \
+                 review-anchor: …` when it withholds.\n\
+                 Verdict: ESCALATE — human review required.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                groom_escalate_verdict(Some(prose.to_string())),
+                GroomVerdictState::Escalated,
+                "une prose qui DÉCRIT la retenue n'en est pas une"
+            );
+        }
+
+        /// **Forme 3 — la ligne est bien là, la forme fixe n'y est pas.** Le
+        /// reste de la ligne est passé à `arch_disposition::is_engine_escalation_line`,
+        /// qui exige la numérotation `F<n>:`, `(BLOCKING)`, `[mika-engine]` et
+        /// `review-anchor:`. C'est la forme que l'écrivain produit réellement, et
+        /// rien d'autre ne traverse.
+        #[test]
+        fn mika3027_une_forme_non_conforme_reste_escalated() {
+            let approx = "claude-pilot completed (status: done).\n\
+                 Engine reason: the architect could not attest the anchors.\n\
+                 Verdict: ESCALATE — human review required.\n\
+                 Outcome: ESCALATE — first-pass";
+            assert_eq!(
+                groom_escalate_verdict(Some(approx.to_string())),
+                GroomVerdictState::Escalated,
+                "fail-closed sur l'auteur : une ligne `Engine reason:` libre \
+                 n'atteste pas que le MOTEUR l'a écrite"
+            );
+        }
+
+        /// **Forme 4 — le témoin positif**, relevé sur mika#2762 : la ligne
+        /// complète, en tête de ligne, derrière un `Outcome: ESCALATE`. C'est la
+        /// seule forme qui traverse la porte.
+        #[test]
+        fn mika3027_la_forme_complete_est_une_retenue() {
+            assert_eq!(
+                groom_escalate_verdict(Some(super::mika2786_anchor_brake::WITHHELD.to_string())),
+                GroomVerdictState::AnchorWithheld
+            );
+        }
+
         /// Un `result` vide n'est pas une escalade — il est *lisible* et ne porte
         /// pas le marqueur. À distinguer de `None`, qui est l'absence de texte.
         #[test]
@@ -12406,6 +16282,141 @@ Harness ticket.
                 groom_escalate_verdict(Some(String::new())),
                 GroomVerdictState::NotEscalated
             );
+        }
+
+        // --- La sélection de ligne (mika#2795) --------------------------------
+        //
+        // Quatre cas, et pas un cinquième. Un test par cas, plus l'ancrage du
+        // prédicat et le contrôle qui dit que les lignes ANCIENNES ne votent
+        // pas : c'est la propriété mika#2545 (« le DERNIER groom », jamais « un
+        // ESCALATE existe-t-il ») qui doit survivre au saut.
+
+        /// Des `result` présents, du plus récent au plus ancien.
+        fn rows(results: &[&str]) -> Vec<Option<String>> {
+            results.iter().map(|r| Some((*r).to_string())).collect()
+        }
+
+        /// **Cas 1 — le défaut de mika#2762, au niveau du prédicat.** La row du
+        /// lanceur est en tête et ne dit rien ; l'`ESCALATE` derrière elle est
+        /// le verdict, et le saut est **compté**.
+        #[test]
+        fn mika2795_une_row_neutre_ne_masque_plus_lescalate_derriere() {
+            let selection = groom_verdict_from_rows(rows(&[DEFERRED_LAUNCHER, ESCALATED]));
+            assert_eq!(selection.state, GroomVerdictState::Escalated);
+            assert_eq!(
+                selection.skipped_neutral, 1,
+                "la population sautée est ce que la sonde existe pour mesurer"
+            );
+            assert_eq!(selection.rows_examined, 2);
+        }
+
+        /// **Cas 2 — et le `None` n'est délibérément PAS un saut.** Une colonne
+        /// `result` NULL sur un callback terminal est une anomalie, pas de la
+        /// plomberie : la sauter laisserait passer un re-dispatch sur une preuve
+        /// illisible, donc rouvrirait le trou par l'autre bout. Elle arrête la
+        /// marche, fail-closed, et les sauts déjà faits restent comptés.
+        #[test]
+        fn mika2795_un_result_null_arrete_la_marche_en_illisible() {
+            let selection = groom_verdict_from_rows(vec![
+                Some(DEFERRED_LAUNCHER.to_string()),
+                None,
+                Some(ESCALATED.to_string()),
+            ]);
+            assert!(
+                matches!(selection.state, GroomVerdictState::Unreadable(_)),
+                "attendu fail-closed, obtenu {:?}",
+                selection.state
+            );
+            assert_eq!(selection.skipped_neutral, 1);
+            assert_eq!(
+                selection.rows_examined, 3,
+                "le compteur porte la liste REÇUE, pas la portion parcourue — \
+                 c'est ce qui rend « 3 lues, 1 sautée » soustractible"
+            );
+        }
+
+        /// **Cas 3 — la liste vide.** Le premier grooming d'un ticket, le cas le
+        /// plus fréquent de la flotte : aucun groom n'a escaladé.
+        #[test]
+        fn mika2795_une_liste_vide_na_pas_escalade() {
+            let selection = groom_verdict_from_rows(Vec::new());
+            assert_eq!(selection.state, GroomVerdictState::NotEscalated);
+            assert_eq!(selection.skipped_neutral, 0);
+            assert_eq!(selection.rows_examined, 0);
+        }
+
+        /// **Cas 4 — la liste épuisée.** Que des lignes de plomberie : personne
+        /// n'a rendu de disposition, donc personne n'a escaladé. À distinguer du
+        /// cas 2 : ici tout est lisible, il n'y a simplement pas de verdict.
+        #[test]
+        fn mika2795_des_rows_neutres_seules_nont_pas_escalade() {
+            let selection = groom_verdict_from_rows(rows(&[DEFERRED_LAUNCHER, DEFERRED_LAUNCHER]));
+            assert_eq!(selection.state, GroomVerdictState::NotEscalated);
+            assert_eq!(selection.skipped_neutral, 2);
+            assert_eq!(selection.rows_examined, 2);
+        }
+
+        /// **mika#2545 intact : le DERNIER groom, jamais « un ESCALATE
+        /// existe-t-il ».** Une escalade suivie d'un grooming convergé se lit
+        /// `NotEscalated` — le saut ne transforme pas le lecteur en `EXISTS`,
+        /// sinon un ticket ayant escaladé une fois ne pourrait plus jamais être
+        /// groomé.
+        #[test]
+        fn mika2795_la_premiere_row_decisive_tranche_et_les_anciennes_ne_votent_pas() {
+            let selection = groom_verdict_from_rows(rows(&[
+                "claude-pilot completed.\nOutcome: PLAN_GROOMED",
+                ESCALATED,
+            ]));
+            assert_eq!(selection.state, GroomVerdictState::NotEscalated);
+            assert_eq!(
+                selection.skipped_neutral, 0,
+                "une row décisive n'est pas un saut"
+            );
+            assert_eq!(selection.rows_examined, 2);
+
+            // Et le frein reste un frein avec un lanceur différé posé entre les
+            // deux : la marche s'arrête sur la première ligne qui dit quelque
+            // chose, donc intercaler une row neutre derrière elle ne déplace
+            // aucun verdict. Le `rows_examined` monte, parce qu'il porte la
+            // liste reçue et non la portion parcourue.
+            let intercale = groom_verdict_from_rows(rows(&[
+                "claude-pilot completed.\nOutcome: PLAN_GROOMED",
+                DEFERRED_LAUNCHER,
+                ESCALATED,
+            ]));
+            assert_eq!(intercale.state, GroomVerdictState::NotEscalated);
+            assert_eq!(intercale.skipped_neutral, 0);
+            assert_eq!(intercale.rows_examined, 3);
+        }
+
+        /// **L'ancrage du prédicat de saut.** `carries_groom_outcome_line` est
+        /// `lines().any(starts_with)` et jamais un `contains` : la prose d'un
+        /// pilote cite ces en-têtes en parlant du mécanisme — le faux positif
+        /// mesuré sur le Signal S (mika#2050) et sur les 651 détections d'`instr`
+        /// (mika#2105). Une telle row doit être **sautée**, pas lue comme un
+        /// verdict.
+        #[test]
+        fn mika2795_le_predicat_de_saut_est_ancre_sur_la_ligne() {
+            let quoted = "deferred dispatch slot freed\n\
+                 The plan explains that `Outcome: ESCALATE` is now terminal.";
+            assert!(
+                !carries_groom_outcome_line(quoted),
+                "une mention indentée est de la prose, pas une disposition"
+            );
+            assert!(
+                carries_groom_outcome_line("claude-pilot completed.\nOutcome: PLAN_GROOMED"),
+                "contrôle de bonne foi : la vraie disposition est reconnue"
+            );
+            assert!(
+                !carries_groom_outcome_line(DEFERRED_LAUNCHER),
+                "le lanceur différé ne porte aucune ligne de disposition"
+            );
+
+            // Et le saut suit le prédicat : la row citante est sautée, celle qui
+            // suit tranche.
+            let selection = groom_verdict_from_rows(rows(&[quoted, ESCALATED]));
+            assert_eq!(selection.state, GroomVerdictState::Escalated);
+            assert_eq!(selection.skipped_neutral, 1);
         }
 
         // --- La porte ---------------------------------------------------------
@@ -12428,9 +16439,123 @@ Harness ticket.
             (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
         }
 
+        /// Frère de [`seeded`] pour mika#2795 : **N** callbacks de groom
+        /// terminaux sous un seul parent, `results[0]` étant le **plus récent**
+        /// — l'ordre dans lequel le lecteur les rend.
+        ///
+        /// `created_at` est forcé plutôt que subi. Les timestamps sont à la
+        /// seconde, donc deux rows créées dans le même test la partagent et
+        /// l'ordre retomberait sur le départage `id DESC` du lecteur, c'est-à-dire
+        /// sur un UUID v4 : arbitraire. Or la fixture de mika#2762 **est** un
+        /// ordre — le lanceur posé *après* l'escalade — et une fixture d'ordre ne
+        /// peut pas reposer sur un hasard.
+        fn seeded_rows(results: &[&str]) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            for (rank, result) in results.iter().enumerate() {
+                let callback_id = sync
+                    .create_task(&groom_callback("mika", &parent_id, "groom"))
+                    .unwrap();
+                assert!(
+                    sync.update_task_completed(&callback_id, "mika", Some(result))
+                        .unwrap()
+                );
+                set_created_at(
+                    &sync,
+                    &callback_id,
+                    &format!("2026-10-18T18:{:02}:00Z", 59 - rank),
+                );
+            }
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        // --- La sonde (mika#2795) ---------------------------------------------
+        //
+        // Même forme que `task_engine::engine::tests` et `teams::engine::tests`.
+        // L'installation passe par `test_helpers::install_capturing_subscriber`,
+        // le site unique permis par mika#2646.
+        //
+        // **`#[serial_test::serial]` porte sur les SEPT tests qui atteignent le
+        // callsite, pas seulement sur les deux qui capturent** — la moitié
+        // porteuse de mika#2646. Un callsite `tracing` ne s'enregistre qu'à sa
+        // *première* atteinte, et son `Interest` est alors décidé par le défaut
+        // du thread qui l'enregistre : un voisin qui y arrive en premier sans
+        // abonné l'éteint **globalement**, y compris pour un abonné déjà
+        // installé sur un autre thread. Et `#[serial]` ne sérialise que contre
+        // ses propres porteurs, donc annoter les seuls capturants laisserait la
+        // course entière ouverte (défaut fondateur : PR #2643).
+        //
+        // La population est close par **lecture**, pas par prudence : le
+        // callsite vit dans `groom_verdict_state`, dont l'unique appelant est le
+        // terme 3 de `validate_dispatch_readiness`, atteint seulement quand
+        // `originating_message` est absent ET que la compétence dérive en
+        // `groom` (seul `dev-groom`, cf. `derive_dispatch_class`) ET que le
+        // prompt porte une référence lisible. Six tests de ce module satisfont
+        // les trois, plus `test_open_pr_guard_bypasses_dev_groom_skill` dans le
+        // module parent — annoté là-bas pour cette raison. Tous les autres
+        // appelants du gate passent un `originating_message` (dont
+        // `ready_label_handler`) ou refusent avant (le frein mika#2634).
+
+        type CapturedEvents =
+            std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
+
+        struct CapturingLayer(CapturedEvents);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V<'a>(&'a mut std::collections::HashMap<String, String>);
+                impl tracing::field::Visit for V<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut fields = std::collections::HashMap::new();
+                event.record(&mut V(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        fn capture_events() -> (tracing::subscriber::DefaultGuard, CapturedEvents) {
+            use tracing_subscriber::layer::SubscriberExt;
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(CapturingLayer(std::sync::Arc::clone(&events)));
+            let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+            (guard, events)
+        }
+
+        /// La ligne de la sonde, filtrée sur son champ `event` — jamais sur le
+        /// niveau ni sur le message, qu'un voisin pourrait partager.
+        fn selected_probe(
+            events: &CapturedEvents,
+        ) -> Option<std::collections::HashMap<String, String>> {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|f| f.get("event").map(String::as_str) == Some(GROOM_VERDICT_SELECTED_EVENT))
+                .cloned()
+        }
+
         /// **Le rouge du défaut.** Le re-dispatch automatique du groom — un tour
         /// de callback, donc sans `originating_message` — est refusé à la porte.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_an_automatic_groom_redispatch_is_refused() {
             let (db, parent_id) = seeded(ESCALATED);
             let rejection = validate_dispatch_readiness(
@@ -12541,6 +16666,7 @@ Harness ticket.
         /// convergé) traverse. Sans lui, « la garde refuse un ESCALATE » ne se
         /// distingue pas de « la garde refuse tout groom ».
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_a_converged_groom_traverses_the_gate() {
             let (db, parent_id) = seeded("claude-pilot completed.\nOutcome: PLAN_GROOMED");
             let outcome = validate_dispatch_readiness(
@@ -12565,6 +16691,7 @@ Harness ticket.
         /// traverse aussi. C'est le cas le plus fréquent de la flotte, et le
         /// confondre avec « illisible » refuserait tout grooming.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_a_first_ever_groom_traverses_the_gate() {
             let sync = db();
             let parent_id = sync
@@ -12595,6 +16722,7 @@ Harness ticket.
         /// faire passer pour une escalade — les deux appellent la même
         /// disposition et deux lectures opérateur différentes.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_an_unreadable_verdict_is_refused_and_says_so() {
             let sync = db();
             let parent_id = sync
@@ -12633,6 +16761,7 @@ Harness ticket.
         /// chaque replay, brûlant un wrapper par tour sur un ticket qui ne peut
         /// pas partir. La preuve est l'absence de row `:deferred` après le refus.
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_the_refusal_precedes_any_deferred_wrapper() {
             let (db, parent_id) = seeded(ESCALATED);
             let _ = validate_dispatch_readiness(
@@ -12655,6 +16784,7 @@ Harness ticket.
         /// Et le refus laisse sa trace sur `tasks.result`, la surface que
         /// `mika tasks get` et le dashboard lisent (#1108).
         #[tokio::test]
+        #[serial_test::serial]
         async fn mika2545_the_refusal_is_recorded_on_the_task() {
             let (db, parent_id) = seeded(ESCALATED);
             let _ = validate_dispatch_readiness(
@@ -12670,6 +16800,137 @@ Harness ticket.
             let task = db.get_task(&parent_id).await.unwrap().unwrap();
             let result = task.result.expect("le refus est écrit sur la tâche");
             assert!(result.contains(GROOM_ESCALATED_ERROR), "{result}");
+        }
+
+        // --- mika#2795 : le bout-en-bout du défaut de mika#2762 ---------------
+
+        /// **La reproduction de 18:30:55 (D2).** Deux callbacks de groom
+        /// terminaux sous le même parent : l'`ESCALATE` de 18:13, puis le
+        /// lanceur différé promu à 18:20:02. Le re-dispatch automatique de
+        /// 18:30:55 est **passé** — il a coûté un pilote de groom (1,24 $) et un
+        /// tour d'architecte — parce que le lecteur rendait la tête de liste et
+        /// que la tête de liste ne disait rien.
+        ///
+        /// Ce test atterrit **rouge sur le HEAD d'avant la pièce 4** : sans le
+        /// saut, la row du lanceur se lit « le dernier groom n'a pas escaladé »
+        /// et `validate_dispatch_readiness` rend `Ok`. C'est la démonstration
+        /// que le détecteur atteint la faute qu'il nomme (classe mika#2638 D5).
+        ///
+        /// Il porte aussi la **preuve manuelle** attachée au corps de la PR : la
+        /// ligne `groom_verdict_selected` avec `rows_examined: 2`,
+        /// `skipped_neutral: 1`, `verdict: "escalated"`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2795_le_lanceur_differe_ne_masque_plus_un_escalate() {
+            let (_guard, events) = capture_events();
+            let (db, parent_id) = seeded_rows(&[DEFERRED_LAUNCHER, ESCALATED]);
+
+            let rejection = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await
+            .expect_err(
+                "l'ESCALATE est terminal — le lanceur différé posé après lui ne \
+                 le masque plus",
+            );
+
+            assert!(rejection.contains(GROOM_ESCALATED_ERROR), "{rejection}");
+            let body: serde_json::Value = serde_json::from_str(&rejection).unwrap();
+            assert_eq!(
+                body["verdict"], "escalated",
+                "le refus dit « escaladé » et non « illisible » : la row sautée \
+                 n'est pas une anomalie, c'est de la plomberie : {rejection}"
+            );
+
+            let probe = selected_probe(&events).expect(
+                "la sonde est le seul endroit où « sauté » se distingue de \
+                 « rien à sauter »",
+            );
+            assert_eq!(probe.get("rows_examined").map(String::as_str), Some("2"));
+            assert_eq!(
+                probe.get("skipped_neutral").map(String::as_str),
+                Some("1"),
+                "exactement la ligne de 18:20:02, et une seule : {probe:?}"
+            );
+            assert_eq!(
+                probe.get("verdict").map(String::as_str),
+                Some("escalated"),
+                "{probe:?}"
+            );
+        }
+
+        /// **Le contrôle négatif d'AC2.** Un lanceur différé **seul** — aucun
+        /// verdict derrière lui — ne refuse rien. Sans ce contrôle, un tri qui
+        /// refuserait *tout* passerait AC1 : la paire est ce qui sépare « saute
+        /// les neutres » de « refuse tout ». Et le cas est réel : la file
+        /// mika#1011 promeut un lanceur sur un ticket dont le grooming n'a
+        /// jamais tourné.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2795_une_row_neutre_seule_ne_refuse_rien() {
+            let (db, parent_id) = seeded_rows(&[DEFERRED_LAUNCHER]);
+            let outcome = validate_dispatch_readiness(
+                &db,
+                &parent_id,
+                None,
+                Some(&dispatch_input("dev-groom", "mika#123")),
+                None,
+            )
+            .await;
+
+            match outcome {
+                Ok(_) => {}
+                Err(rejection) => assert!(
+                    !rejection.contains(GROOM_ESCALATED_ERROR),
+                    "une ligne de plomberie n'est pas un verdict d'escalade : \
+                     {rejection}"
+                ),
+            }
+        }
+
+        /// **Le contrôle positif de la sonde (AC5).** La ligne est émise sur
+        /// **toutes** les branches, y compris celle où rien n'a été sauté. Une
+        /// sonde qui ne parle que quand quelque chose est sauté rend « rien
+        /// sauté » indistinguable de « pas de sonde » — et c'est précisément
+        /// cette ambiguïté qui a rendu le défaut de mika#2762 invisible pendant
+        /// qu'il coûtait un pilote (classes mika#2205 / mika#2340 / mika#2293 /
+        /// mika#2331).
+        ///
+        /// Ce test rougit le jour où quelqu'un met l'`info!` sous un
+        /// `if selection.skipped_neutral > 0`.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2795_la_sonde_porte_le_compteur_meme_a_zero() {
+            let (_guard, events) = capture_events();
+            let (db, _parent_id) = seeded_rows(&["claude-pilot completed.\nOutcome: PLAN_GROOMED"]);
+
+            let verdict = groom_verdict_state(&db, GROOM_ISSUE_URL).await;
+            assert_eq!(verdict, GroomVerdictState::NotEscalated);
+
+            let probe = selected_probe(&events)
+                .expect("la sonde parle AUSSI quand elle n'a rien sauté — c'est son objet");
+            assert_eq!(
+                probe.get("skipped_neutral").map(String::as_str),
+                Some("0"),
+                "zéro est une mesure ; l'absence de ligne n'en est pas une : {probe:?}"
+            );
+            assert_eq!(probe.get("rows_examined").map(String::as_str), Some("1"));
+            assert_eq!(
+                probe.get("verdict").map(String::as_str),
+                Some(GROOM_VERDICT_NOT_ESCALATED),
+                "le cas nominal a son propre mot, distinct des deux motifs de \
+                 refus du format de fil : {probe:?}"
+            );
+            assert_eq!(
+                probe.get("issue_url").map(String::as_str),
+                Some(GROOM_ISSUE_URL),
+                "la ligne nomme le ticket, sinon elle n'est pas joignable à un \
+                 incident : {probe:?}"
+            );
         }
     }
 
@@ -13245,6 +17506,86 @@ Harness ticket.
         );
     }
 
+    // ───────────────────────────────────────────────────────────────────────
+    // mika#2677 — la barrière des tests de handler long : un JOIN, pas une
+    // horloge
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Borne sur un **join**, jamais un budget de décantation (mika#2677).
+    ///
+    /// `SETTLE_MS` (4 s, retirée par ce ticket) était sur le chemin critique du
+    /// vert : sa valeur devait excéder la durée réelle, donc la charge du runner
+    /// avait une voix dans le verdict — c'est ce qui a rendu rouge deux fois en
+    /// CI un comportement correct. Ce budget-ci n'est atteignable que par un
+    /// sous-processus réellement pendu ; le chemin normal ne s'en approche
+    /// jamais. Il existe parce qu'un `handle.await` nu ferait pendre le binaire
+    /// de test jusqu'au timeout du job, ce qui est un rouge moins lisible qu'un
+    /// panic.
+    const HANDLER_JOIN_BUDGET_SECS: u64 = 60;
+
+    /// Joindre le task de surveillance de [`spawn_long_running_exec`].
+    ///
+    /// **C'est une barrière complète pour tout ce que ce task écrit** : les
+    /// trois écritures observables (`set_task_handler_failure`, la ligne
+    /// d'audit `pilot_launcher_health`, `record_launcher_recovery`) sont
+    /// `await`ées dans son corps, et il n'y a aucun `tokio::spawn` imbriqué
+    /// (`spawn_long_running_exec` porte le seul du fichier). *Un `tokio::spawn`
+    /// ajouté plus tard dans ce corps rouvrirait le trou en silence* — le join
+    /// retournerait avant l'écriture du task imbriqué. Si vous en ajoutez un,
+    /// l'écriture qu'il porte a besoin de son propre signal.
+    async fn join_handler_monitor(handle: tokio::task::JoinHandle<()>) {
+        join_handler_monitor_within(handle, Duration::from_secs(HANDLER_JOIN_BUDGET_SECS)).await;
+    }
+
+    /// Variante à budget explicite — elle existe pour que le refus de l'aide
+    /// soit **testable**, pas pour être appelée par les tests ordinaires.
+    async fn join_handler_monitor_within(handle: tokio::task::JoinHandle<()>, budget: Duration) {
+        tokio::time::timeout(budget, handle)
+            .await
+            .expect("mika#2677 — the handler's monitor task never finished: its subprocess is hung")
+            .expect("the handler's monitor task panicked");
+    }
+
+    /// **Anti-vacuité de la barrière elle-même.** Sans ce contrôle, une aide qui
+    /// avalerait son timeout rendrait les onze tests verts par défaut
+    /// d'observation — la classe mika#2205, déplacée d'un cran.
+    ///
+    /// Le sous-processus `sleep 5` survit au panic (`kill_on_drop(false)`, la
+    /// forme de production) et sort de lui-même ; le `tempdir` tombe avant, sans
+    /// conséquence puisque le handler ne lit plus rien.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "its subprocess is hung")]
+    async fn mika2677_la_barriere_refuse_un_handler_pendu() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db =
+            AsyncDatabase::new_with_agent(crate::db::Database::open_in_memory().unwrap(), "mika");
+        let task = build_callback_task(
+            "mika".to_string(),
+            None,
+            "build_mika",
+            &serde_json::json!({}),
+            600,
+            "session-2677",
+            "trace-2677",
+            None,
+        );
+        let task_id = db.create_task(task).await.unwrap();
+
+        let script = tmp.path().join("handler.sh");
+        write_script(&script, "#!/bin/sh\nsleep 5\n");
+
+        let monitor = spawn_long_running_exec(
+            script,
+            tmp.path().to_path_buf(),
+            serde_json::json!({}),
+            task_id,
+            db.clone(),
+            None,
+        );
+
+        join_handler_monitor_within(monitor, Duration::from_millis(100)).await;
+    }
+
     // -----------------------------------------------------------------------
     // mika#2532 — the stderr of a failed long-running handler survives a
     // terminal task
@@ -13276,11 +17617,6 @@ Harness ticket.
         use crate::db::Database;
         use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
 
-        /// Long enough that a green run says something, short enough that a red
-        /// one does not hang CI. T1/T3/T5 land in well under 100 ms on this
-        /// harness; the margin is for a loaded machine.
-        const SETTLE_MS: u64 = 4_000;
-
         fn db() -> AsyncDatabase {
             AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
         }
@@ -13310,28 +17646,27 @@ Harness ticket.
             path
         }
 
-        /// Poll until `$.handler_failure` appears, or give up after
-        /// [`SETTLE_MS`]. Returns `None` when it never appeared — which is the
-        /// assertion the negative controls make, not a test failure per se.
-        async fn await_handler_failure(
+        /// Read `$.handler_failure` ONCE.
+        ///
+        /// Appelée **après** [`join_handler_monitor`] (mika#2677), donc le
+        /// `None` qu'elle rend est une **absence constatée** sur un task de
+        /// surveillance terminé — jamais un épuisement de budget. C'est
+        /// exactement ce dont T2 a besoin pour conclure : avant ce ticket, son
+        /// `is_none()` pouvait aussi bien signifier « le chemin n'a pas encore
+        /// tourné ».
+        async fn read_handler_failure(
             db: &AsyncDatabase,
             task_id: &str,
         ) -> Option<serde_json::Value> {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            loop {
-                let task = db.get_task(task_id).await.unwrap().expect("row exists");
-                if let Some(raw) = task.metadata.as_deref()
-                    && let Ok(serde_json::Value::Object(map)) =
-                        serde_json::from_str::<serde_json::Value>(raw)
-                    && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
-                {
-                    return Some(found.clone());
-                }
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            let task = db.get_task(task_id).await.unwrap().expect("row exists");
+            if let Some(raw) = task.metadata.as_deref()
+                && let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_str::<serde_json::Value>(raw)
+                && let Some(found) = map.get(HANDLER_FAILURE_METADATA_KEY)
+            {
+                return Some(found.clone());
             }
+            None
         }
 
         /// **T1 — the measured defect.** A handler that crashes *after* its EXIT
@@ -13355,7 +17690,7 @@ Harness ticket.
                 tmp.path(),
                 "echo \"ERROR: could not cd to /nope/mika\" >&2\nexit 1",
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13363,8 +17698,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id)
+            let failure = read_handler_failure(&db, &task_id)
                 .await
                 .expect("the cause of a pre-result crash must reach the row");
 
@@ -13409,7 +17745,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), "echo 'noise on stdout'\nexit 0");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13417,9 +17753,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert!(
-                await_handler_failure(&db, &task_id).await.is_none(),
+                read_handler_failure(&db, &task_id).await.is_none(),
                 "a successful handler must leave no `handler_failure`: a cause of \
                  failure invented on a healthy row is a lie of the same order as \
                  the silence being repaired"
@@ -13437,7 +17774,7 @@ Harness ticket.
             let task_id = callback_row(&db).await;
 
             let script = handler(tmp.path(), "echo boom >&2\nexit 3");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13445,8 +17782,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let failure = read_handler_failure(&db, &task_id).await.expect("written");
             assert_eq!(
                 failure.get("exit").and_then(|v| v.as_str()),
                 Some("Exit code: 3")
@@ -13478,7 +17816,7 @@ Harness ticket.
                 tmp.path(),
                 "echo 'auth failed for ghp_0123456789abcdefghij' >&2\nexit 1",
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13486,8 +17824,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let failure = read_handler_failure(&db, &task_id).await.expect("written");
             let stderr = failure.get("stderr").and_then(|v| v.as_str()).unwrap();
             assert!(
                 !stderr.contains("ghp_0123456789abcdefghij"),
@@ -13513,7 +17852,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), "exit 4");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13521,8 +17860,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
-            let failure = await_handler_failure(&db, &task_id).await.expect("written");
+            let failure = read_handler_failure(&db, &task_id).await.expect("written");
             assert_eq!(
                 failure.get("exit").and_then(|v| v.as_str()),
                 Some("Exit code: 4")
@@ -13561,25 +17901,6 @@ Harness ticket.
         use crate::db::Database;
         use crate::task_engine::engine::HANDLER_FAILURE_METADATA_KEY;
 
-        /// Same budget and same reasoning as its mika#2532 sibling: long enough
-        /// that a green run says something, short enough that a red one does not
-        /// hang CI.
-        const SETTLE_MS: u64 = 4_000;
-
-        /// Residual window the two negative controls leave between the barrier
-        /// ([`require_handler_failure`]) and their absence assertion.
-        ///
-        /// **It is NOT a settle delay** — the barrier has already established
-        /// that the failure path ran. It covers only the handful of instructions
-        /// between `set_task_handler_failure` returning and the
-        /// `if status.code() == Some(EXIT_PILOT_LAUNCHER_DEAD)` block posting its
-        /// `log_audit_event`: both writes travel the same `AsyncDatabase`
-        /// channel, so they are ordered, but the spawned task yields at the
-        /// `await` in between and a loaded worker can be pre-empted there.
-        /// 250 ms is ~three orders of magnitude over the need and 16× cheaper
-        /// than the blind 4 s these controls used to sleep.
-        const NEGATIVE_CONTROL_MARGIN_MS: u64 = 250;
-
         fn db() -> AsyncDatabase {
             AsyncDatabase::new_with_agent(Database::open_in_memory().unwrap(), "mika")
         }
@@ -13612,6 +17933,11 @@ Harness ticket.
         ///
         /// The session key is the one the production site composes, so a change
         /// of that composition makes these tests red rather than silently blind.
+        ///
+        /// Depuis mika#2677 c'est le **seul** accès : l'ancien sondage
+        /// `await_launcher_health` a disparu avec son échéance murale. Chaque
+        /// appel vient **après** [`join_handler_monitor`], donc le `None` qu'il
+        /// rend est une absence constatée sur un task de surveillance terminé.
         async fn launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
             let session = format!("callback-{task_id}");
             db.get_audit_events(&session)
@@ -13620,21 +17946,6 @@ Harness ticket.
                 .iter()
                 .find(|e| e.tool_name == PILOT_LAUNCHER_HEALTH_TOOL)
                 .and_then(|row| row.after_value.clone())
-        }
-
-        /// Poll for the `pilot_launcher_health` row — the POSITIVE assertion
-        /// (T1). Returns `None` when none appeared within [`SETTLE_MS`].
-        async fn await_launcher_health(db: &AsyncDatabase, task_id: &str) -> Option<String> {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            loop {
-                if let Some(value) = launcher_health(db, task_id).await {
-                    return Some(value);
-                }
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
         }
 
         /// **Barrier for the two negative controls — it panics rather than
@@ -13650,29 +17961,37 @@ Harness ticket.
         /// observation**, which reads exactly like a control that looked (class
         /// mika#2205). A loaded CI runner is precisely where that happens, so the
         /// control meant to catch a false positive would be the first thing to
-        /// stop catching anything. Panicking on the budget turns that silence
-        /// into a red.
+        /// stop catching anything. Panicking turns that silence into a red.
+        ///
+        /// Depuis mika#2677 son corps est une **lecture unique** : l'attente est
+        /// déjà faite par [`join_handler_monitor`], que ses deux appelants
+        /// appellent juste avant. L'anti-vacuité reste entière — c'est elle qui
+        /// justifie cette aide — mais la cause nommée a changé de nature : ce
+        /// n'est plus « le chemin n'a pas tourné en 4 s » (un verdict que la
+        /// charge du runner pouvait rendre à tort), c'est « le task de
+        /// surveillance a joint sans avoir écrit `$.handler_failure` », une
+        /// absence constatée sur un task terminé.
         async fn require_handler_failure(db: &AsyncDatabase, task_id: &str) {
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            loop {
-                let task = db.get_task(task_id).await.unwrap().expect("row exists");
-                if let Some(raw) = task.metadata.as_deref()
-                    && let Ok(serde_json::Value::Object(map)) =
-                        serde_json::from_str::<serde_json::Value>(raw)
-                    && map.contains_key(HANDLER_FAILURE_METADATA_KEY)
-                {
-                    return;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "mika#2634 — the failure path never ran for task {task_id} within \
-                     {SETTLE_MS} ms: `$.{HANDLER_FAILURE_METADATA_KEY}` never appeared. This \
-                     control cannot conclude anything about the ABSENCE of a \
-                     `pilot_launcher_health` row until it has established that the handler \
-                     exited and the engine processed it."
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let task = db.get_task(task_id).await.unwrap().expect("row exists");
+            let written = task
+                .metadata
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|value| match value {
+                    serde_json::Value::Object(map) => {
+                        Some(map.contains_key(HANDLER_FAILURE_METADATA_KEY))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false);
+            assert!(
+                written,
+                "mika#2634 — the monitor task joined without having written \
+                 `$.{HANDLER_FAILURE_METADATA_KEY}` for task {task_id}, so the failure path \
+                 never ran. This control cannot conclude anything about the ABSENCE of a \
+                 `pilot_launcher_health` row until it has established that the handler \
+                 exited and the engine processed it."
+            );
         }
 
         /// **T1 — the measured defect, and this is the test to see RED before
@@ -13703,7 +18022,7 @@ Harness ticket.
                     "echo \"ModuleNotFoundError: No module named 'claude_pilot'\" >&2\nexit {EXIT_PILOT_LAUNCHER_DEAD}"
                 ),
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13711,9 +18030,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert_eq!(
-                await_launcher_health(&db, &task_id).await.as_deref(),
+                launcher_health(&db, &task_id).await.as_deref(),
                 Some(PILOT_LAUNCHER_DEAD_VALUE),
                 "mika#2634 AC1 — a launcher that did not start must be counted apart \
                  from a pilot that failed; without this row the class is drowned in \
@@ -13743,7 +18063,7 @@ Harness ticket.
                     log.display()
                 ),
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13751,11 +18071,11 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             // Establish that the failure path RAN before concluding on an
             // absence — see [`require_handler_failure`].
             require_handler_failure(&db, &task_id).await;
-            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
 
             assert_eq!(
                 launcher_health(&db, &task_id).await,
@@ -13789,7 +18109,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), "exit 78");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -13797,9 +18117,9 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             require_handler_failure(&db, &task_id).await;
-            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
 
             assert_eq!(
                 launcher_health(&db, &task_id).await,
@@ -14178,7 +18498,7 @@ Harness ticket.
             let task_id = callback_row(&db).await;
 
             let script = handler(tmp.path(), "exit 0");
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -14186,9 +18506,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert_eq!(
-                await_launcher_health(&db, &task_id).await.as_deref(),
+                launcher_health(&db, &task_id).await.as_deref(),
                 Some(PILOT_LAUNCHER_RECOVERED_VALUE),
                 "mika#2634 §16 — a dispatch that ran under a repaired launcher must \
                  record the transition, so the brake's own lifting is datable"
@@ -14214,7 +18535,7 @@ Harness ticket.
                 tmp.path(),
                 &format!("echo ran > {}\nexit 0", marker.display()),
             );
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -14222,19 +18543,18 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             // Barrier: establish that the handler really ran before concluding
-            // anything about an absence.
-            let deadline = std::time::Instant::now() + Duration::from_millis(SETTLE_MS);
-            while !marker.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the handler never ran within {SETTLE_MS} ms, so this control \
-                     cannot conclude on the ABSENCE of a recovery row"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(NEGATIVE_CONTROL_MARGIN_MS)).await;
+            // anything about an absence. Depuis mika#2677 le join l'a déjà
+            // établi — le marqueur est écrit par le script avant son `exit 0`,
+            // que le task de surveillance a `wait()`é —, donc c'est une
+            // constatation, pas une attente.
+            assert!(
+                marker.exists(),
+                "the monitor task joined without the handler having written its marker, \
+                 so this control cannot conclude on the ABSENCE of a recovery row"
+            );
 
             assert_eq!(
                 launcher_health(&db, &task_id).await,
@@ -14261,7 +18581,7 @@ Harness ticket.
                 .unwrap();
 
             let script = handler(tmp.path(), &format!("exit {EXIT_PILOT_LAUNCHER_DEAD}"));
-            spawn_long_running_exec(
+            let monitor = spawn_long_running_exec(
                 script,
                 tmp.path().to_path_buf(),
                 serde_json::json!({}),
@@ -14269,9 +18589,10 @@ Harness ticket.
                 db.clone(),
                 None,
             );
+            join_handler_monitor(monitor).await;
 
             assert_eq!(
-                await_launcher_health(&db, &task_id).await.as_deref(),
+                launcher_health(&db, &task_id).await.as_deref(),
                 Some(PILOT_LAUNCHER_DEAD_VALUE),
                 "a dispatch that died on the dedicated code must count as a DEATH; \
                  recording a recovery here would lift the brake on the very dispatch \
@@ -14306,6 +18627,1128 @@ Harness ticket.
             assert_eq!(
                 PILOT_LAUNCHER_BRAKED_ERROR, "pilot_launcher_braked",
                 "si ce nom bouge, `FILTER_LAUNCHER_BRAKED` doit bouger avec lui"
+            );
+        }
+    }
+
+    // ---- mika#2772 : le consentement d'un dispatch de groom forcé ----
+    //
+    // Un test par terme du prédicat, et le contrôle négatif de chacun : c'est la
+    // paire qui sépare « la garde discrimine » de « la garde refuse tout ».
+    //
+    // Les arms qui exigent une **vraie lecture de label** ne sont pas testés
+    // ici, pour la raison écrite au site : la lecture demande réseau + token. Ce
+    // sont les deux prédicats purs de `webhook_dispatch`
+    // (`forced_dispatch_needs_consent`, `labels_carry_ready`) qui portent la
+    // décision, et leurs tests qui les tiennent — c'est le partage, pas un trou.
+    //
+    // **Les HUIT portent `#[serial_test::serial]`, pas seulement celui qui pose
+    // la variable.** Le levier de désarmement est lu dans le process env, donc
+    // le test qui le pose empoisonne tout voisin qui atteint la même lecture —
+    // mesuré ici : `…_un_sujet_non_resolu_…` a rendu `Allowed` au premier
+    // passage, désarmé par un voisin. `#[serial]` ne sérialise que contre ses
+    // propres porteurs, donc annoter le seul poseur laisse la course entière
+    // ouverte (la moitié porteuse de mika#2646, et la leçon de mika#2073). Le
+    // huitième est celui de l'AC3 de mika#2995 : il atteint la même lecture que
+    // le refus nominal dont il inspecte le remède, donc il entre dans la même
+    // population — c'est le critère, jamais le compte.
+    //
+    // Et huit suffisent — le reste du crate n'est pas une population de
+    // poisonnés, par **lecture** et non par prudence : la lecture du levier est
+    // placée APRÈS le court-circuit du forçage, et aucun autre test ne pose
+    // `tool_constraint_forced`. Un test de dispatch voisin n'atteint donc jamais
+    // `std::env::var(FORCED_CONSENT_ENV)`, quelle que soit la fenêtre.
+    mod mika2772_consentement_force {
+        use super::*;
+
+        /// Le texte d'événement **mesuré** du 2026-10-17 08:59:18Z : c'est le
+        /// `groom` dans le slug cité qui a armé la contrainte d'outil.
+        const INCIDENT_EVENT: &str = "[GitHub] Check suite success on senara-solutions/mika \
+                                      (branch: fix/2762/rollback-reaper-groom)";
+
+        /// Le ticket que le dispatch de 08:59 a groomé sans que personne l'ait
+        /// promu.
+        const INCIDENT_SUBJECT: &str = "mika#2766";
+
+        fn ctx_forced(msg: Option<&str>, forced: bool) -> LongRunningContext {
+            let db = crate::db::Database::open_in_memory().unwrap();
+            let async_db = crate::async_db::AsyncDatabase::new_with_agent(db, "mika");
+            let ctx = make_lr_ctx_with_msg(async_db, msg.map(str::to_string));
+            ctx.tool_constraint_forced.store(forced, Ordering::Relaxed);
+            ctx
+        }
+
+        /// Le JSON de refus, décodé. Un refus qui ne se parse pas n'est pas
+        /// lisible par le modèle.
+        fn refusal(verdict: ForcedDispatchConsent) -> serde_json::Value {
+            match verdict {
+                ForcedDispatchConsent::Refused(json) => {
+                    serde_json::from_str(&json).unwrap_or_else(|e| {
+                        panic!("le refus doit être du JSON lisible : {e} — {json}")
+                    })
+                }
+                ForcedDispatchConsent::Allowed => {
+                    panic!("attendu un refus, la garde a laissé passer")
+                }
+            }
+        }
+
+        /// **Le refus nominal : la forme exacte de l'incident.**
+        ///
+        /// Un `groom` forcé par `required_tools`, sur un texte d'intention qui
+        /// n'est pas une demande de grooming, visant un ticket que rien n'a
+        /// promu. C'est le dispatch de 08:59:18Z — 48 tours, 3,40 $ — et il doit
+        /// être refusé **avant** tout spawn.
+        ///
+        /// Le verdict ici est `forced_dispatch_consent_no_token` et non le
+        /// nominal `forced_dispatch_without_consent`, parce que ce test ne donne
+        /// pas de token : il tient le **fail-closed**, qui est la propriété que
+        /// l'incident réclamait. Les deux arms sont des refus, et le refus est ce
+        /// qui comptait.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_force_et_non_demande_sur_ticket_sans_ready_est_refuse() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(
+                json["subject"].as_str(),
+                Some("senara-solutions/mika#2766"),
+                "le refus doit nommer le ticket visé, qualifié par son owner"
+            );
+
+            // Un refus qui ne nomme pas sa levée est un refus qu'on contourne au
+            // jugé. Les deux gestes de reprise, chacun vérifié.
+            let recovery = json["recovery"].as_str().expect("un refus nomme sa levée");
+            assert!(
+                recovery.contains("`ready`"),
+                "la reprise doit nommer le label de promotion : {recovery}"
+            );
+            assert!(
+                recovery.contains("mika ask --agent mika-dev"),
+                "la reprise doit nommer le groom opérateur de mika#1173 : {recovery}"
+            );
+        }
+
+        /// **AC3 de mika#2995 — le remède ne prescrit pas le geste interdit.**
+        ///
+        /// Ce test n'est pas une précaution, c'est la fermeture d'un défaut
+        /// mesuré. Le 2026-10-31 à 16:46:32Z ce champ disait *« promote the
+        /// ticket by posting the `ready` label as remove→add »* ; cinq minutes
+        /// plus tard, à 16:51:37Z, mika-dev a appelé
+        /// `run_gh ["issue","edit","2958","--add-label","ready"]` avec le
+        /// `GH_TOKEN` du moteur, et le groom est parti. Le remède d'une garde de
+        /// consentement avait enseigné comment se donner le consentement.
+        ///
+        /// La propriété tenue ici n'est donc **pas** « le remède ne nomme pas
+        /// `ready` » — il doit le nommer, un refus qui ne nomme pas sa levée se
+        /// contourne au jugé (mika#2520), et le test nominal ci-dessus l'exige.
+        /// C'est : le remède **attribue** la promotion à l'opérateur, et ne
+        /// fournit aucun gabarit exécutable pour l'écriture du label. Nommer la
+        /// personne qui agit, pas la commande.
+        ///
+        /// Les deux moitiés sont asserties ensemble à dessein : un remède qui
+        /// retire le gabarit sans dire à qui la promotion appartient laisse un
+        /// blanc, et un agent comble un blanc.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_le_remede_attribue_la_promotion_sans_prescrire_le_geste() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+            let recovery = json["recovery"].as_str().expect("un refus nomme sa levée");
+
+            // Aucun gabarit d'écriture du label, sous aucune forme.
+            for gabarit in ["--add-label", "--remove-label", "remove→add", "remove->add"] {
+                assert!(
+                    !recovery.contains(gabarit),
+                    "le remède ne doit porter aucun gabarit d'écriture du label — c'est le \
+                     geste du 2026-10-31. Trouvé `{gabarit}` dans : {recovery}"
+                );
+            }
+
+            // Et il dit à qui la promotion appartient, plutôt que de laisser le
+            // blanc que l'agent comblerait.
+            assert!(
+                recovery.contains("Promotion belongs to the operator"),
+                "le remède doit attribuer la promotion à l'opérateur : {recovery}"
+            );
+        }
+
+        /// **mika#1173 intact — T2b.**
+        ///
+        /// Le même ticket non promu, la même contrainte armée : seul le texte
+        /// d'intention change. `groom mika#2766` est une demande, et un groom
+        /// *demandé* sur un ticket non promu est la raison d'être de
+        /// `/mika-groom-ticket`. Sans ce contrôle, « la garde discrimine » serait
+        /// indistinguable de « la garde refuse tout ».
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_demande_sur_ticket_sans_ready_passe() {
+            let ctx = ctx_forced(Some("groom mika#2766"), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "un groom demandé en texte libre doit traverser cette porte (mika#1173)"
+            );
+        }
+
+        /// **T2a — le forçage est le prédicat, pas la classe.**
+        ///
+        /// Même texte d'événement, même ticket non promu, contrainte d'outil
+        /// **non** armée : le dispatch passe. C'est ce qui empêche la garde de
+        /// devenir le gate `ready` aveugle que le ticket refuse explicitement.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_groom_non_force_passe() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), false);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "sans forçage il n'y a rien à consentir : le drapeau est le prédicat"
+            );
+        }
+
+        /// **T1 — l'axe de mika#2757 n'est pas le nôtre.**
+        ///
+        /// Un `implement` forcé sort de la population **avant toute ligne de
+        /// journal** : la sonde de D5 compte des dispatchs de groom, pas des
+        /// tours. L'élargissement à `implement` est nommé hors périmètre par le
+        /// plan ; ce test est ce qui rend l'élargissement visible le jour où
+        /// quelqu'un le tente.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_dispatch_implement_force_passe() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-pilot", INCIDENT_SUBJECT, "task-2772");
+
+            assert_eq!(
+                validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                ForcedDispatchConsent::Allowed,
+                "la classe `implement` n'est pas dans la population de mika#2772"
+            );
+        }
+
+        /// **Fail-closed, verdict distinct : le sujet illisible.**
+        ///
+        /// Le prompt ne nomme aucun `<repo>#<number>`, donc le ticket dont il
+        /// faudrait prouver le consentement n'est pas identifiable. La garde
+        /// refuse quand elle ne peut pas lire sa preuve, et le dit **sous son
+        /// propre nom** — un refus qui emprunte le nom du refus nominal rend la
+        /// sonde de V6 illisible (mika#2205).
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_sujet_non_resolu_est_refuse_sous_son_propre_nom() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", "groom the rollback reaper", "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(
+                json["error"].as_str(),
+                Some(FORCED_CONSENT_SUBJECT_UNRESOLVED)
+            );
+            assert!(
+                json["subject"].is_null(),
+                "un sujet non résolu se rend `null`, jamais `\"\"` : absent n'est pas \
+                 zéro (mika#2331) — vu {}",
+                json["subject"]
+            );
+        }
+
+        /// **Fail-closed, verdict distinct : le token absent.**
+        ///
+        /// Le sujet est lisible, mais aucun token n'a atteint la garde : le label
+        /// `ready` ne peut pas être lu. Cause distincte, nom distinct, et le
+        /// sujet est tout de même nommé — c'est ce qui sépare « on n'a pas pu
+        /// regarder » de « le prompt ne disait pas quoi regarder ».
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_un_token_absent_est_refuse_sous_son_propre_nom() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", "senara-solutions/mika#2766", "task-2772");
+
+            let json = refusal(validate_forced_dispatch_consent(&ctx, None, Some(&input)).await);
+
+            assert_eq!(json["error"].as_str(), Some(FORCED_CONSENT_NO_TOKEN));
+            assert_eq!(
+                json["subject"].as_str(),
+                Some("senara-solutions/mika#2766"),
+                "le sujet est lu : c'est la lecture du label qui manque"
+            );
+            assert_ne!(
+                FORCED_CONSENT_NO_TOKEN, FORCED_CONSENT_SUBJECT_UNRESOLVED,
+                "deux causes sous un nom ne sont pas soustractibles (mika#2205)"
+            );
+        }
+
+        /// **Le levier opérateur rend `Allowed` — et il le dit.**
+        ///
+        /// `MIKA_FORCED_DISPATCH_CONSENT=0` désarme la garde, et la ligne
+        /// `forced_dispatch_consent` est émise quand même, avec le verdict
+        /// `allowed_disarmed` : un désarmement muet serait indiscernable d'une
+        /// garde absente (mika#2293).
+        ///
+        /// `#[serial_test::serial]` et non un prédicat pur, parce que le test
+        /// doit montrer que le **levier traverse la garde** et pas seulement
+        /// qu'une chaîne se parse. Le variable est process-wide : sa pose ne
+        /// serait pas sûre en parallèle, et aucun autre test de ce dépôt ne la
+        /// lit (`grep MIKA_FORCED_DISPATCH_CONSENT`). Le contrôle négatif est
+        /// dans le même test, après restauration : le refus doit revenir, sinon
+        /// c'est l'entrée qui passait, pas le levier qui désarmait.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2772_le_levier_de_desarmement_rend_allowed_et_le_dit() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let input = pilot_input("dev-groom", INCIDENT_SUBJECT, "task-2772");
+
+            // SAFETY: test sérialisé, et cette variable n'a aucun autre lecteur
+            // dans le dépôt.
+            unsafe { std::env::set_var(FORCED_CONSENT_ENV, "0") };
+            let disarmed = validate_forced_dispatch_consent(&ctx, None, Some(&input)).await;
+            unsafe { std::env::remove_var(FORCED_CONSENT_ENV) };
+
+            assert_eq!(
+                disarmed,
+                ForcedDispatchConsent::Allowed,
+                "`{FORCED_CONSENT_ENV}=0` doit désarmer la garde"
+            );
+
+            assert!(
+                matches!(
+                    validate_forced_dispatch_consent(&ctx, None, Some(&input)).await,
+                    ForcedDispatchConsent::Refused(_)
+                ),
+                "armée par défaut : sans le levier, la même entrée est refusée — \
+                 sinon ce test mesure l'entrée et non le levier"
+            );
+        }
+
+        /// **AC2 de mika#2995, voie B — un `ready` humain laisse passer le groom
+        /// forcé, et son absence le refuse.**
+        ///
+        /// Un seul test et **une seule fixture**, parce que c'est littéralement
+        /// ce que l'AC2 demande : « test dans le même appel, avec contrôle
+        /// négatif ». La fixture partagée est ce qui sépare « la garde laisse
+        /// passer un `ready` » de « la garde laisse tout passer » — deux moitiés
+        /// dans deux tests distincts ne se soustraient pas (mika#2205). Entre les
+        /// deux moitiés, **le seul octet qui change est le label**.
+        ///
+        /// `ctx_forced(INCIDENT_EVENT, true)` donne `forced = true` et
+        /// `requested = false` : l'intersection exacte où la garde décide, celle
+        /// du dispatch de 08:59:18Z.
+        ///
+        /// # Pourquoi ce test n'existait pas avant ce vol
+        ///
+        /// Les sept tests ci-dessus passent tous `github_token = None` et
+        /// s'arrêtent donc à [`FORCED_CONSENT_NO_TOKEN`], l'étape (4). L'étape
+        /// (5) — les quatre arms de la lecture de labels, qui sont *les deux
+        /// puces de l'AC2* — était hors d'atteinte sans réseau : le lecteur écrit
+        /// `https://api.github.com/…` en clair. Ce que ce vol a ajouté, c'est le
+        /// joint : [`decide_forced_consent_on_labels`] prend les labels en
+        /// paramètre, en production depuis le fetch, ici depuis une fixture.
+        ///
+        /// # Et `ready` posé par le **moteur** ?
+        ///
+        /// Ce n'est plus une entrée de test, parce que la voie B l'a retiré du
+        /// domaine : cette garde ne lit pas la provenance, donc un `ready` moteur
+        /// et un `ready` humain sont **le même octet** pour elle. Ce qui tient la
+        /// propriété, c'est qu'aucune route atteignable depuis un tour LLM ne
+        /// produit cet octet — `run_gh` refusé par le vol 1
+        /// (`builtin_handlers.rs`, `guards.rs`), et les détecteurs D1 et D2 de
+        /// `ready_label.rs` pour la route gouvernée. C'est la réécriture de
+        /// l'AC2 sous la voie B (décision du 2026-11-01), pas une version
+        /// affaiblie.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika2995_un_ready_humain_laisse_passer_le_groom_force_et_son_absence_le_refuse() {
+            let ctx = ctx_forced(Some(INCIDENT_EVENT), true);
+            let subject = "senara-solutions/mika#2766";
+
+            // ── Moitié positive : le ticket porte `ready`. ──
+            //
+            // Et un second label, pour que ce soit l'**appartenance** qui décide
+            // et non la longueur de la liste.
+            assert_eq!(
+                decide_forced_consent_on_labels(
+                    &ctx,
+                    subject,
+                    true,
+                    false,
+                    Ok(Some(vec!["bug".to_string(), "ready".to_string()])),
+                )
+                .await,
+                ForcedDispatchConsent::Allowed,
+                "un ticket que quelqu'un a promu laisse passer le dispatch forcé : `ready` \
+                 est le consentement positif de mika#841"
+            );
+
+            // Et la décision est **journalisée sous son propre verdict**. Un
+            // passage muet serait indiscernable d'une garde absente (mika#2293),
+            // et la sonde de D5 lit cette colonne.
+            let lignes = ctx
+                .db
+                .get_audit_events(&ctx.session_id)
+                .await
+                .expect("les événements d'audit de la session doivent se lire");
+            let consentement: Vec<&crate::evidence::audit::AuditEvent> = lignes
+                .iter()
+                .filter(|e| e.tool_name == FORCED_CONSENT_EVENT)
+                .collect();
+            assert_eq!(
+                consentement.len(),
+                1,
+                "la moitié positive écrit exactement une ligne de consentement"
+            );
+            assert_eq!(
+                consentement[0].after_value.as_deref(),
+                Some(FORCED_CONSENT_CONSENTED),
+                "le passage porte le verdict `allowed_consented`, pas un silence"
+            );
+            assert_eq!(
+                consentement[0].target_key, subject,
+                "la ligne nomme le ticket dont le consentement a été lu"
+            );
+
+            // ── Contrôle négatif, MÊME fixture, `ready` retiré. ──
+            let json = refusal(
+                decide_forced_consent_on_labels(
+                    &ctx,
+                    subject,
+                    true,
+                    false,
+                    Ok(Some(vec!["bug".to_string()])),
+                )
+                .await,
+            );
+
+            assert_eq!(
+                json["error"].as_str(),
+                Some(FORCED_CONSENT_WITHOUT_CONSENT),
+                "sans `ready`, le refus est le refus nominal et porte son propre nom — un \
+                 refus qui emprunte le nom d'un autre rend la sonde illisible (mika#2205)"
+            );
+            assert!(
+                json["reason"].as_str().is_some_and(|r| r.contains(subject)),
+                "le refus doit nommer le ticket visé : {}",
+                json["reason"]
+            );
+        }
+    }
+
+    // ---- mika#2772 : le drapeau de forçage a un écrivain et un lecteur ----
+    //
+    // Aucun test comportemental ne peut voir cette classe. Un second site
+    // d'écriture — typiquement un arm « on relâche la contrainte » qui poserait
+    // le drapeau par symétrie apparente — ne rend **aucune** décision fausse le
+    // jour où il est écrit : la garde continue de discriminer, les dix
+    // assertions ci-dessus restent vertes, et ce sont des dispatchs légitimes
+    // qui commencent à être refusés en production. C'est la classe
+    // `grooming_marker` (mika#2158), que seul un scan structurel voit.
+    mod mika2772_scan_du_drapeau {
+        use std::path::{Path, PathBuf};
+
+        /// **Livrée vide, et elle le reste.**
+        ///
+        /// Quand la garde tire, on **retire le site** ; on ne l'allowliste pas.
+        /// Une allowlist née vide est un emplacement où déposer la prochaine
+        /// infraction (doctrine mika#2201).
+        const FORCED_FLAG_ACCESS_ALLOWLIST: &[&str] = &[];
+
+        /// L'unique écrivain : l'arm de re-prompt `required_tools` de `run_loop`.
+        const WRITE_SITE: &str = "agent_loop/mod.rs";
+
+        /// L'unique lecteur : `validate_forced_dispatch_consent`.
+        const READ_SITE: &str = "skills/executor.rs";
+
+        /// Le nom du champ, assemblé par `concat!`.
+        ///
+        /// Le littéral est produit à la compilation, donc le nom cherché
+        /// n'apparaît nulle part dans le code **non commenté** de cette garde.
+        /// Écrit d'un bloc, il ferait de la garde son propre troisième site le
+        /// jour où la prémisse de masquage ci-dessous cesse d'être vraie — et
+        /// cette prémisse a déjà été fausse dans ce dépôt (mika#2335 F2a).
+        fn field() -> &'static str {
+            concat!("tool_constraint", "_forced")
+        }
+
+        /// La moitié production de chaque `.rs` sous `src/`, par chemin relatif.
+        ///
+        /// Le masquage est **obligatoire ici et non prudentiel** : le helper
+        /// `ctx_forced` du module voisin pose le drapeau, dans ce même fichier.
+        /// Un scan bâti sur le texte brut compterait donc deux accès dans
+        /// `skills/executor.rs` et serait rouge au jour de sa naissance,
+        /// c'est-à-dire désarmé le lendemain.
+        ///
+        /// [`crate::source_scan::is_test_source_path`] s'ajoute à `KTD3` plutôt
+        /// que de s'y substituer (mika#2335 F2a) : un module de test **extrait**
+        /// ne porte aucun littéral `#[cfg(test)]` — l'attribut reste sur la
+        /// déclaration `mod tests;` du parent — donc le masquage par région ne
+        /// le voit pas. Les deux sites déclarés sont hors de cette classe, la
+        /// double exclusion ne peut donc pas les cacher.
+        ///
+        /// Un fichier illisible **panique** plutôt que d'être sauté :
+        /// `ProductionScanner::production_of` le garantit, et l'anti-vacuité
+        /// ci-dessous compte les fichiers *après* le saut, donc ne le verrait pas.
+        fn production_sources() -> Vec<(String, String)> {
+            let scanner =
+                mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+            let root: PathBuf = scanner.src_root().to_path_buf();
+            let mut out: Vec<(String, String)> = Vec::new();
+            scanner.for_each(|path: &Path, production: &str| {
+                if crate::source_scan::is_test_source_path(path) {
+                    return;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("chemin sous src/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, production.to_string()));
+            });
+            out
+        }
+
+        /// `(fichier, écritures, lectures)` — le prédicat pur, sans disque.
+        ///
+        /// Deux normalisations, chacune réparant un faux verdict mesuré :
+        ///
+        /// 1. **Commentaires retirés.** Les deux sites portent trois paragraphes
+        ///    de prose sur le champ, et le doc-comment de la déclaration nomme
+        ///    « un seul écrivain / un seul lecteur ». Une prose qui *décrit*
+        ///    l'accès n'en est pas un (forme du signal S, mika#2050).
+        ///
+        /// 2. **Blancs retirés — et c'est la correction porteuse.** Le vrai site
+        ///    d'écriture est reflowé par rustfmt sur deux lignes :
+        ///    `ctx.<champ>` puis `.store(true, …)`. Une aiguille littérale
+        ///    `<champ>.store(` ne le voit donc **pas** : la garde aurait rendu
+        ///    « zéro écrivain » et serait passée pour toujours. Le voisin
+        ///    `mika2305_the_scope_has_a_single_decisional_reader` paie ce piège
+        ///    en maintenant à la main des arms sur une ligne ; en densifiant la
+        ///    source on en est quitte, quel que soit le reflow futur.
+        ///
+        /// Le compte par fichier est ce qui rend l'anti-vacuité portante : sans
+        /// lui, un second `.store(` ajouté dans le fichier déjà déclaré écrivain
+        /// serait indistinguable du premier.
+        fn accesses(sources: &[(String, String)]) -> Vec<(String, usize, usize)> {
+            let field = field();
+            sources
+                .iter()
+                .filter_map(|(rel, src)| {
+                    if !src.contains(field) {
+                        return None;
+                    }
+                    let stripped = crate::source_scan::strip_comment_lines(src);
+                    let dense: String = stripped.chars().filter(|c| !c.is_whitespace()).collect();
+                    let writes = dense.matches(&format!("{field}.store(")).count();
+                    let reads = dense.matches(&format!("{field}.load(")).count();
+                    (writes + reads > 0).then(|| (rel.clone(), writes, reads))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn mika2772_le_drapeau_de_forcage_a_un_seul_ecrivain_et_un_seul_lecteur() {
+            let sources = production_sources();
+            assert!(
+                sources.len() > 200,
+                "le scan n'a énuméré que {} fichiers — un scan qui ne scanne rien \
+                 est un laissez-passer vide, pas un arbre propre",
+                sources.len()
+            );
+
+            let sites = accesses(&sources);
+
+            // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ. Un scan qui vise
+            // un nom mort (champ renommé, site déplacé) rend zéro infraction et
+            // se lit comme un arbre sain.
+            let writer = sites
+                .iter()
+                .find(|(rel, _, _)| rel == WRITE_SITE)
+                .map(|(_, w, r)| (*w, *r));
+            assert_eq!(
+                writer,
+                Some((1, 0)),
+                "l'écrivain déclaré doit porter exactement UNE écriture et AUCUNE \
+                 lecture ; vu {writer:?}. Zéro = la garde vise un nom mort ; plus \
+                 d'une = un second arm pose le drapeau. Sites vus : {sites:?}"
+            );
+
+            let reader = sites
+                .iter()
+                .find(|(rel, _, _)| rel == READ_SITE)
+                .map(|(_, w, r)| (*w, *r));
+            assert_eq!(
+                reader,
+                Some((0, 1)),
+                "le lecteur déclaré doit porter exactement UNE lecture et AUCUNE \
+                 écriture ; vu {reader:?}. Une écriture ici signifie que le \
+                 masquage des régions `cfg(test)` a cessé de couvrir le helper \
+                 du module voisin. Sites vus : {sites:?}"
+            );
+
+            let offenders: Vec<&String> = sites
+                .iter()
+                .filter(|(rel, _, _)| rel.as_str() != WRITE_SITE && rel.as_str() != READ_SITE)
+                .filter(|(rel, _, _)| !FORCED_FLAG_ACCESS_ALLOWLIST.contains(&rel.as_str()))
+                .map(|(rel, _, _)| rel)
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "accès au drapeau de forçage hors de ses deux sites, dans : {offenders:?}\n\
+                 \n\
+                 RÉSOLUTION : retirer le site. Une écriture de plus refuserait des \
+                 dispatchs que personne n'a exigés — le drapeau dirait « ce tour \
+                 avait des outils requis » et non « ce tour a forcé un outil ». \
+                 Ne PAS ajouter d'entrée à `FORCED_FLAG_ACCESS_ALLOWLIST` : on \
+                 retire, on n'allowliste pas (mika#2201)."
+            );
+
+            assert!(
+                FORCED_FLAG_ACCESS_ALLOWLIST.is_empty(),
+                "il n'y a rien à excepter : le drapeau a deux sites et ils sont \
+                 nommés. Une entrée ici est un consentement rouvert."
+            );
+        }
+
+        /// Contrôle de bonne foi : sans lui, « la garde décide » est
+        /// indistinguable de « la garde ne regarde rien ».
+        ///
+        /// Trois sources synthétiques, et la troisième assertion est celle qui
+        /// atteste la densification : elle rejoue le reflow rustfmt du vrai site
+        /// d'écriture et exige que le scan le compte quand même.
+        #[test]
+        fn mika2772_le_scan_du_drapeau_rougit_sur_un_second_site() {
+            let field = field();
+            let synthetic = vec![
+                (
+                    WRITE_SITE.to_string(),
+                    format!(
+                        "                if let Some(ctx) = c {{\n                    ctx.{field}\n                        .store(true, Ordering::Relaxed);\n                }}\n"
+                    ),
+                ),
+                (
+                    "skills/second_ecrivain.rs".to_string(),
+                    format!("    ctx.{field}.store(false, Ordering::Relaxed);\n"),
+                ),
+                (
+                    "prose.rs".to_string(),
+                    format!(
+                        "    /// On ne fait plus `{field}.store(` ici, et on ne\n    /// relit plus `{field}.load(` non plus.\n"
+                    ),
+                ),
+            ];
+
+            let sites = accesses(&synthetic);
+
+            assert!(
+                sites
+                    .iter()
+                    .any(|(rel, w, _)| rel == "skills/second_ecrivain.rs" && *w == 1),
+                "le scan doit accuser un second écrivain : {sites:?}"
+            );
+            assert!(
+                !sites.iter().any(|(rel, _, _)| rel == "prose.rs"),
+                "une prose qui DÉCRIT l'accès n'en est pas un (mika#2050) : {sites:?}"
+            );
+            assert_eq!(
+                sites
+                    .iter()
+                    .find(|(rel, _, _)| rel == WRITE_SITE)
+                    .map(|(_, w, _)| *w),
+                Some(1),
+                "une écriture reflowée par rustfmt sur deux lignes doit compter \
+                 pour une — c'est la forme EXACTE du vrai site : {sites:?}"
+            );
+        }
+    }
+
+    /// mika#3044 — une parente `self_dev` fauchée par le reaper de groom, qu'un
+    /// plan convergé démente.
+    ///
+    /// **Tout passe par `validate_dispatch_readiness`**, et c'est la condition
+    /// pour que ces tests disent quelque chose : la garde d'état est au milieu
+    /// d'une quinzaine d'autres, et AC1(d) porte précisément sur leur conjonction.
+    /// Un test du prédicat seul serait vert alors qu'aucun dispatch n'aboutit.
+    ///
+    /// Les cas passent par cette porte et **non** par `execute_skill_tool` :
+    /// `tools/mod.rs` l. 1049, `validate_task` refuse une parente `manual` en
+    /// `failed` avec *« is not an active task »* **avant** d'arriver ici. Ce refus
+    /// amont est hors vol (il est le même pour les deux issues et ne distingue
+    /// rien) ; le lever serait un autre ticket.
+    mod mika3044_parente_fauchee {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::Database;
+        use crate::db::tests::{
+            GROOM_CALLBACK_AUTO_SKIPPED, GROOM_CALLBACK_PLAN_GROOMED, GROOM_CALLBACK_PLAN_ITERATE,
+            GROOM_ISSUE_URL, db, groom_callback, groom_parent, rendre_les_audits_illisibles,
+            set_completed_at,
+        };
+        use crate::parent_rehabilitation::{
+            PARENT_REHABILITATED_EVENT, PARENT_REHABILITATION_REFUSED_EVENT, RehabDecision,
+            RehabRefusal,
+        };
+        use crate::task_engine::engine::GROOM_PARENT_ORPHANED_EVENT;
+
+        /// L'instant terminal de l'enfant de groom, forcé **après** le reap.
+        ///
+        /// La fixture monte les deux rows dans la même seconde, et la condition
+        /// (c) est un `>` strict : sans ce forçage le test serait rouge pour une
+        /// raison qui n'est pas la sienne. Forcer l'enfant plutôt que reculer le
+        /// reap garde l'ordre d'écriture de la production (le reap, puis le groom).
+        const APRES_LE_REAP: &str = "2099-01-01T00:00:00Z";
+
+        /// Le motif du reaper de la classe `implement` — l'autre entrée de
+        /// `REAPER_CLASS_DISPOSITIONS`, et le premier des « autres motifs » d'AC2.
+        const REAP_IMPLEMENT: &str = "task_engine_reaper";
+
+        /// La transition qu'écrit le reap, telle que
+        /// `reap_orphaned_parent_tasks` l'inscrit : `target_key` = l'id de parente
+        /// **nu**, `session_id` = `system-<agent>`, les deux états présents.
+        fn transition(sync: &Database, parent_id: &str, outil: &str, apres: &str) {
+            sync.log_audit_event(
+                "mika",
+                "system-mika",
+                outil,
+                parent_id,
+                Some("in_progress"),
+                Some(apres),
+                Some("groom_callback_delivered_without_redispatch"),
+                None,
+            )
+            .unwrap();
+        }
+
+        /// La forme des trois parentes de la Mesure : une parente `manual` /
+        /// `self_dev` passée à `failed` par un reap, et — quand
+        /// `result_du_groom` est `Some` — un enfant de groom terminal livré
+        /// après lui.
+        ///
+        /// Chaque row naît du chemin d'écriture de **production** (`create_task`,
+        /// `update_task_completed`, `update_task_failed`, `log_audit_event`) :
+        /// une fixture montée en SQL brut atteste une forme que rien ne produit.
+        fn parente_fauchee(
+            outil_du_reap: &str,
+            result_du_groom: Option<&str>,
+        ) -> (AsyncDatabase, String) {
+            parente_fauchee_avec(Some(outil_du_reap), result_du_groom)
+        }
+
+        /// La même fixture, où `outil_du_reap` à `None` signifie *« le reaper
+        /// n'a abouti à aucune transition »* — la seule forme que le wrapper
+        /// ci-dessus ne sait pas monter, et la seule chose que ce paramètre
+        /// ajoute.
+        ///
+        /// Les six appels de T1 à T6 passent par le wrapper et sont inchangés :
+        /// si l'un d'eux rougit, c'est le wrapper qui est faux, pas le prédicat.
+        fn parente_fauchee_avec(
+            outil_du_reap: Option<&str>,
+            result_du_groom: Option<&str>,
+        ) -> (AsyncDatabase, String) {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            if let Some(result) = result_du_groom {
+                let child_id = sync
+                    .create_task(&groom_callback("mika", &parent_id, "groom"))
+                    .unwrap();
+                assert!(
+                    sync.update_task_completed(&child_id, "mika", Some(result))
+                        .unwrap()
+                );
+                set_completed_at(&sync, &child_id, APRES_LE_REAP);
+            }
+            assert!(
+                sync.update_task_failed(
+                    &parent_id,
+                    "mika",
+                    "groom_callback_delivered_without_redispatch"
+                )
+                .unwrap()
+            );
+            if let Some(outil) = outil_du_reap {
+                transition(&sync, &parent_id, outil, "failed");
+            }
+            (AsyncDatabase::new_with_agent(sync, "mika"), parent_id)
+        }
+
+        /// La ligne de bord du reaper — `engine.rs`, la branche `Err` de la
+        /// transition de fauche : le reaper a **essayé** de faucher et sa
+        /// transition a échoué.
+        ///
+        /// Elle porte donc le même `tool_name` que le reap — `engine.rs` passe
+        /// son `audit_tool_name` à la branche d'erreur comme à celle du succès —
+        /// l'état d'**avant** seul, et le `reasoning` `reaper_db_error: …`. Le
+        /// `after` à `None` n'est pas une commodité de test : c'est la colonne
+        /// telle que la production l'écrit, et coercer un NULL en `""` est ce que
+        /// mika#2331 refuse.
+        async fn ligne_de_bord(db: &AsyncDatabase, parent_id: &str) {
+            db.log_audit_event(
+                "system-mika",
+                GROOM_PARENT_ORPHANED_EVENT,
+                parent_id,
+                Some("in_progress"),
+                None,
+                Some("reaper_db_error: database is locked"),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Le dispatch du dev-pilot — celui qui a été refusé trois fois.
+        async fn dispatch(db: &AsyncDatabase, parent_id: &str) -> Result<String, String> {
+            let input = serde_json::json!({
+                "skill": "dev-pilot", "prompt": "mika#123", "task_id": parent_id
+            });
+            validate_dispatch_readiness(db, parent_id, None, Some(&input), None).await
+        }
+
+        /// Les `(before_value, after_value)` des lignes de refus, dans l'ordre.
+        async fn refus(db: &AsyncDatabase) -> Vec<(Option<String>, Option<String>)> {
+            db.get_audit_event_rows_by_tool_name(PARENT_REHABILITATION_REFUSED_EVENT)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, before, after, _)| (before, after))
+                .collect()
+        }
+
+        async fn statut(db: &AsyncDatabase, parent_id: &str) -> String {
+            db.get_task(parent_id).await.unwrap().unwrap().status
+        }
+
+        /// Le refus d'aujourd'hui, mot pour mot — c'est ce qu'AC1 demande de
+        /// laisser intact sur tous les cas négatifs.
+        fn est_le_refus_dhier(rejection: &str, statut: &str) {
+            let body: serde_json::Value = serde_json::from_str(rejection).unwrap();
+            assert_eq!(body["error"], "task_not_dispatchable", "{rejection}");
+            assert_eq!(body["current_status"], statut, "{rejection}");
+            assert_eq!(
+                body["reason"],
+                format!(
+                    "Task is in '{statut}' state and cannot be dispatched. \
+                     Only 'pending' and 'in_progress' tasks can be dispatched."
+                ),
+                "le motif part mot pour mot comme avant le vol : {rejection}"
+            );
+        }
+
+        /// **T1 — le contrôle positif.** La forme des trois vols perdus : reap de
+        /// groom, puis un groom convergé, puis une ligne de **jugement**. La
+        /// parente est réhabilitée et le dispatch aboutit.
+        ///
+        /// La ligne `manager_flight_verdict` n'est pas un décor : les trois
+        /// parentes de la Mesure en portent une après leur reap, et la condition
+        /// (b) tiendrait pour de mauvaises raisons si le prédicat la comptait
+        /// comme une transition. Elle est donc le **contrôle négatif de D1** —
+        /// « une ligne de jugement n'est pas une transition » — et il vit dans le
+        /// contrôle positif parce que c'est là qu'il était dans la réalité.
+        #[tokio::test]
+        async fn mika3044_une_parente_fauchee_quun_plan_converge_dement_est_rehabilitee() {
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            db.log_audit_event(
+                "system-mika",
+                "manager_flight_verdict",
+                &parent_id,
+                None,
+                Some("ship"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let status = dispatch(&db, &parent_id).await.expect(
+                "un plan convergé après un reap de groom doit rendre la parente dispatchable",
+            );
+
+            assert_eq!(
+                status, "in_progress",
+                "la porte rend l'état d'APRÈS la transition : `task` a été relu \
+                 avant la garde et son `status` y est figé à `failed`, que \
+                 `wi_status` lirait comme une parente jamais dispatchée"
+            );
+            assert_eq!(statut(&db, &parent_id).await, "in_progress");
+            assert!(refus(&db).await.is_empty(), "aucun refus n'est écrit");
+
+            let lignes = db
+                .get_audit_event_rows_by_tool_name(PARENT_REHABILITATED_EVENT)
+                .await
+                .unwrap();
+            assert_eq!(
+                lignes.len(),
+                1,
+                "une réhabilitation, une ligne : {lignes:?}"
+            );
+            let (cible, avant, apres, raison) = lignes.into_iter().next().unwrap();
+            assert_eq!(cible, parent_id, "la cible est l'id de parente nu");
+            assert_eq!(
+                (avant.as_deref(), apres.as_deref()),
+                (Some("failed"), Some("in_progress")),
+                "la ligne de succès porte les DEUX états : c'est une transition, \
+                 et c'est ce qui rend le vol idempotent"
+            );
+            let raison = raison.expect("la ligne nomme ce qui a été renversé");
+            assert!(raison.contains("groom_reap_overturned"), "{raison}");
+            assert!(
+                raison.contains("groom_child:"),
+                "un opérateur doit pouvoir remonter à QUEL groom a convergé : {raison}"
+            );
+        }
+
+        /// **T1b — l'idempotence, et par quoi elle tient.** Rejouer le dispatch
+        /// sur une parente déjà réhabilitée n'en écrit pas une seconde.
+        ///
+        /// Aucun compteur ni table ne le garantit : la ligne de succès **est** une
+        /// transition, donc la dernière transition de la parente n'est plus le
+        /// reap, donc (b) refuserait — et (a) refuse avant elle, la parente étant
+        /// désormais `in_progress`. C'est la propriété qu'il faut protéger : faire
+        /// de la ligne de succès un simple jugement (`before_value = None`) la
+        /// détruirait sans rougir ailleurs.
+        #[tokio::test]
+        async fn mika3044_une_parente_rehabilitee_ne_lest_pas_deux_fois() {
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            dispatch(&db, &parent_id).await.expect("premier dispatch");
+
+            let _ = dispatch(&db, &parent_id).await;
+
+            assert_eq!(
+                db.count_audit_events_by_tool_name(PARENT_REHABILITATED_EVENT)
+                    .await
+                    .unwrap(),
+                1,
+                "la seconde traversée ne réhabilite rien : la parente est déjà \
+                 `in_progress`, donc la garde d'état ne tire plus"
+            );
+        }
+
+        /// **T2 — un autre motif terminal.** Le reap de la classe `implement`, et
+        /// un `cancelled` : deux états terminaux que rien ne démente, deux refus
+        /// mot pour mot, deux raisons nommées.
+        ///
+        /// Les deux moitiés sont dans un seul test parce que la propriété n'est
+        /// pas « la porte refuse » mais « la porte **sépare** » : un vol qui
+        /// aurait désarmé la garde passerait un cas positif et échouerait ici.
+        #[tokio::test]
+        async fn mika3044_un_autre_motif_terminal_reste_refuse() {
+            let (db, parent_id) =
+                parente_fauchee(REAP_IMPLEMENT, Some(GROOM_CALLBACK_PLAN_GROOMED));
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("le motif `implement` du reaper n'est pas le reap de groom");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("last_transition_not_groom_reap".to_string()))],
+                "le refus porte sa raison, et `before_value` y est NULL : une \
+                 ligne de refus est un jugement, pas une transition — sinon elle \
+                 deviendrait « la dernière transition » et empoisonnerait (b)"
+            );
+
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            db.update_task_status(&parent_id, "cancelled")
+                .await
+                .unwrap();
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("une parente annulée reste terminale");
+            est_le_refus_dhier(&rejection, "cancelled");
+            assert_eq!(statut(&db, &parent_id).await, "cancelled");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("not_self_dev_failed_parent".to_string()))],
+                "(a) tombe la première et nomme SA raison : `cancelled` n'est pas \
+                 `failed`, et confondre les deux refus rendrait les deux \
+                 populations insoustrayables (classe mika#2205)"
+            );
+        }
+
+        /// **T3 — une transition suit le reap.** Le reap n'est plus le dernier
+        /// mot : quelque chose a bougé après lui, et ce quelque chose décide.
+        #[tokio::test]
+        async fn mika3044_une_transition_apres_le_reap_referme_la_porte() {
+            let (db, parent_id) = parente_fauchee(
+                GROOM_PARENT_ORPHANED_EVENT,
+                Some(GROOM_CALLBACK_PLAN_GROOMED),
+            );
+            // Une vraie transition, écrite après le reap. `created_at` tombe dans
+            // la même seconde : c'est le départage par `id DESC` qui la place
+            // après, exactement comme en base.
+            db.log_audit_event(
+                "system-mika",
+                PARENT_REHABILITATED_EVENT,
+                &parent_id,
+                Some("failed"),
+                Some("in_progress"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("une transition postérieure au reap referme (b)");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("last_transition_not_groom_reap".to_string()))]
+            );
+        }
+
+        /// **T4 — un groom qui n'a pas convergé.** Deux formes, un seul refus :
+        /// le verdict absent, et le marqueur hors de sa position.
+        ///
+        /// La seconde est la forme mesurée de mika#2590 : une enveloppe JSON
+        /// d'auto-skip dont le champ `note` cite `PLAN_GROOMED` en toutes
+        /// lettres. Un prédicat qui filtrerait le marqueur en SQL — ou par un
+        /// `contains` — réhabiliterait sur elle. C'est tout l'intérêt de lire la
+        /// convergence par `groom_result_convergence` et non par la chaîne.
+        #[tokio::test]
+        async fn mika3044_un_groom_sans_plan_converge_laisse_la_parente_fauchee() {
+            for (forme, result) in [
+                ("verdict non convergé", GROOM_CALLBACK_PLAN_ITERATE),
+                ("marqueur hors position", GROOM_CALLBACK_AUTO_SKIPPED),
+            ] {
+                let (db, parent_id) = parente_fauchee(GROOM_PARENT_ORPHANED_EVENT, Some(result));
+                let rejection = match dispatch(&db, &parent_id).await {
+                    Err(rejection) => rejection,
+                    Ok(status) => panic!("{forme} : le dispatch doit rester refusé ({status})"),
+                };
+                est_le_refus_dhier(&rejection, "failed");
+                assert_eq!(statut(&db, &parent_id).await, "failed", "{forme}");
+                assert_eq!(
+                    refus(&db).await,
+                    vec![(None, Some("no_groomed_child_since_reap".to_string()))],
+                    "{forme} : (c) tombe, et sa raison la nomme"
+                );
+            }
+
+            // Et le cas sans aucun enfant de groom, qui tombe du même côté.
+            let (db, parent_id) = parente_fauchee(GROOM_PARENT_ORPHANED_EVENT, None);
+            dispatch(&db, &parent_id)
+                .await
+                .expect_err("aucun groom livré après le reap");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("no_groomed_child_since_reap".to_string()))]
+            );
+        }
+
+        /// **T5 — la piste d'audit illisible.** Fail-closed : un signal qu'on ne
+        /// peut pas lire n'est jamais un terme satisfait (mika#2277/#2279).
+        ///
+        /// Les deux moitiés ne sont pas redondantes, et la seconde ne peut pas
+        /// passer par la porte. La porte relit la parente (`get_task`) **avant**
+        /// la garde d'état : une base entièrement coupée refuserait sous
+        /// `dispatch_check_failed`, bien avant le prédicat, et le test serait vert
+        /// pour la mauvaise raison. La fixture rend donc `audit_events` seule
+        /// illisible — le dispatch refuse mot pour mot, mais sa ligne de refus ne
+        /// peut pas s'écrire non plus (elle va dans la table absente), donc c'est
+        /// le prédicat lui-même qui est interrogé pour la raison nommée.
+        #[tokio::test]
+        async fn mika3044_une_piste_daudit_illisible_ne_rehabilite_rien() {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            let child_id = sync
+                .create_task(&groom_callback("mika", &parent_id, "groom"))
+                .unwrap();
+            assert!(
+                sync.update_task_completed(&child_id, "mika", Some(GROOM_CALLBACK_PLAN_GROOMED))
+                    .unwrap()
+            );
+            set_completed_at(&sync, &child_id, APRES_LE_REAP);
+            assert!(
+                sync.update_task_failed(&parent_id, "mika", "reaped")
+                    .unwrap()
+            );
+            transition(&sync, &parent_id, GROOM_PARENT_ORPHANED_EVENT, "failed");
+            // Tout est en place pour une réhabilitation — puis la piste disparaît.
+            rendre_les_audits_illisibles(&sync);
+            let db = AsyncDatabase::new_with_agent(sync, "mika");
+
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("sur une piste illisible, le refus d'hier reste");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+
+            let task = db.get_task(&parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                crate::parent_rehabilitation::decide(&db, &task).await,
+                RehabDecision::Refused(RehabRefusal::AuditTrailUnreadable),
+                "la lecture (b) a échoué : le prédicat rend l'illisible, jamais \
+                 `Eligible` — et jamais le refus d'une condition qu'il n'a pas pu \
+                 évaluer"
+            );
+        }
+
+        /// **T7 — une ligne de bord `reaper_db_error` ne vaut pas un reap de
+        /// groom.** La fauche a été *tentée* et sa transition a échoué : la
+        /// parente ne porte qu'une ligne qui ne dit que l'état d'**avant**. Elle
+        /// porte le même `tool_name` que le reap, donc rien ne la distingue d'un
+        /// reap sinon son `after_value` absent — et c'est précisément ce qui rend
+        /// ce cas nécessaire.
+        ///
+        /// La fixture force `status = 'failed'` et un groom convergé, et **ce
+        /// forçage est le test** : (a) et (c) tiennent, donc seul D1 décide. Sans
+        /// lui, le refus pourrait venir de l'un des deux et le test serait vert
+        /// pour une raison qui n'est pas la sienne.
+        ///
+        /// C'est le bord symétrique de T1, dont la ligne `manager_flight_verdict`
+        /// ne porte qu'un état *après*. Aucune branche neuve n'est traversée : le
+        /// `WHERE … after_value IS NOT NULL` de `latest_state_transition_for_target`
+        /// exclut déjà la ligne, et le prédicat redouble avec l'égalité sur
+        /// `after_value`. Ce test épingle le discriminant pour que l'élargir
+        /// devienne un geste visible — la propriété tient aujourd'hui par deux
+        /// filtres dont aucun n'était testé sur cette forme.
+        #[tokio::test]
+        async fn mika3044_une_ligne_de_bord_reaper_db_error_ne_vaut_pas_un_reap() {
+            let (db, parent_id) = parente_fauchee_avec(None, Some(GROOM_CALLBACK_PLAN_GROOMED));
+            ligne_de_bord(&db, &parent_id).await;
+
+            let rejection = dispatch(&db, &parent_id)
+                .await
+                .expect_err("une fauche qui n'a pas abouti n'est pas un reap");
+            est_le_refus_dhier(&rejection, "failed");
+            assert_eq!(statut(&db, &parent_id).await, "failed");
+            assert_eq!(
+                refus(&db).await,
+                vec![(None, Some("last_transition_not_groom_reap".to_string()))],
+                "(b) tombe sur l'absence de transition, et sa raison la nomme"
+            );
+
+            let task = db.get_task(&parent_id).await.unwrap().unwrap();
+            assert_eq!(
+                crate::parent_rehabilitation::decide(&db, &task).await,
+                RehabDecision::Refused(RehabRefusal::LastTransitionNotGroomReap),
+                "la ligne de bord n'est pas lue comme une transition : ni un reap, \
+                 ni une piste illisible"
             );
         }
     }

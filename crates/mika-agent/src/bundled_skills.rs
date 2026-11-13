@@ -306,6 +306,42 @@ pub fn bundled_skill_tool_map() -> std::collections::HashMap<String, Vec<String>
     map
 }
 
+/// Chaque fichier **exécutable** du bundle, en triplets
+/// `(propriétaire, chemin dans le bundle, contenu)`.
+///
+/// Le propriétaire est le nom du skill, ou celui du répertoire de support pour
+/// les fichiers de `_shared/` — qu'[`all_bundled_skills`] n'atteint pas, un
+/// `SupportDir` n'étant pas un skill. Les deux sources sont nécessaires : c'est
+/// `_shared/dispatch-lib.sh` qui porte toute la plomberie de dispatch.
+///
+/// **Lit les constantes compilées, jamais un checkout** (mika#2340) : ce que le
+/// binaire sert est ce que `build.rs` a figé, et un scan de `skills/bundled/`
+/// répondrait sur le répertoire de travail plutôt que sur le binaire.
+///
+/// **Restreint à la moitié exécutable, délibérément** (mika#3056). Un
+/// `system_prompt.md` qui dit à un agent d'appeler `gh issue close` ne ferme
+/// rien : il route vers `run_gh`, dont la garde de mika#1646 refuse ce geste.
+/// Compter la prose ferait rougir chaque prompt de pilote sur un fait qui n'est
+/// pas un chemin d'exécution.
+///
+/// Sous `#[cfg(test)]` : son unique lecteur est le recensement d'AC4
+/// ([`crate::evidence::forge_close_census`]), qui est lui-même une assertion et
+/// non un chemin d'exécution.
+#[cfg(test)]
+pub(crate) fn bundled_executables() -> Vec<(&'static str, &'static str, &'static str)> {
+    let from_skills = all_bundled_skills()
+        .into_iter()
+        .flat_map(|s| s.files.iter().map(move |f| (s.name, f)));
+    let from_support = SUPPORT_DIRS
+        .iter()
+        .flat_map(|d| d.files.iter().map(move |f| (d.name, f)));
+    from_skills
+        .chain(from_support)
+        .filter(|(_, f)| f.executable)
+        .map(|(owner, f)| (owner, f.path, f.content))
+        .collect()
+}
+
 /// Trust-critical bundled skills whose prompts must NOT be reviewed or adapted.
 ///
 /// These skills govern the agent's self-awareness, security posture, or ability
@@ -1956,6 +1992,439 @@ mod tests {
              l'exception est périmée et doit être retirée, avec son tracker \
              {CALLBACK_REACHABILITY_EXCEPTION_TRACKER}"
         );
+    }
+
+    /// mika#2961 — un marqueur de contexte déclaré est injecté EXACTEMENT une fois.
+    ///
+    /// `apply_context_replacements` (`skills/context.rs`) est un `replace_all` :
+    /// chaque occurrence de `{{clé}}` dans le prompt reçoit une copie COMPLÈTE du
+    /// contenu résolu, annotation comprise. Le 2026-10-31, la base de `qa-review`
+    /// portait `{{pr_diff}}` deux fois — le vrai bloc et une citation du marqueur
+    /// au milieu de la règle `DEPTH` (mika#1359) — et la revue de mika#2992 a payé
+    /// 2 × 76 401 octets de diff dans un prompt de 230 673. La citation datait du
+    /// 2026-06-01 et n'avait jamais coûté : la variante `generated/` servie jusqu'au
+    /// 2026-10-31 ne portait aucun marqueur, donc ce prompt-là n'injectait rien du
+    /// tout. C'est la variante périmée qui masquait le doublon, et le retour à la
+    /// base qui l'a révélé.
+    ///
+    /// Les deux sens de l'arité sont des défauts. `>= 2` est la duplication
+    /// ci-dessus ; `0` est le contexte dispatché, résolu, et jamais consommé —
+    /// l'état que la variante périmée a tenu quatre mois, où la QA rendait une
+    /// ligne `DEPTH:` sans aucun bloc sous les yeux. Un détecteur qui n'accepterait
+    /// que « ≤ 1 » laisserait passer la moitié du défaut.
+    ///
+    /// L'assertion porte sur les octets **embarqués** : `all_bundled_skills()` rend
+    /// ce que `build.rs` a compilé dans le binaire, c'est-à-dire exactement le texte
+    /// que `apply_context_replacements` reçoit quand la base est servie. Le défaut
+    /// est né dans le texte servi ; le détecteur le lit là, et non dans l'arbre du
+    /// dépôt.
+    ///
+    /// **Portée, et sa borne.** Le détecteur ne juge QUE les clés déclarées en
+    /// `[context.*]`, et QUE le fichier `system_prompt.md`. Un marqueur non déclaré
+    /// (`{{foo}}` sans `[context.foo]`) est hors portée à dessein : il n'est pas
+    /// substitué — les clés inconnues restent telles quelles — donc il ne coûte
+    /// rien. Une éventuelle variante de prompt embarquée sous un autre nom de
+    /// fichier est hors portée aussi : borne inférieure assumée.
+    #[test]
+    fn mika2961_un_marqueur_de_contexte_declare_est_injecte_exactement_une_fois() {
+        let mut declared = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+
+        for skill in all_bundled_skills() {
+            let Some(toml_src) = skill.files.iter().find(|f| f.path == "skill.toml") else {
+                continue;
+            };
+            let manifest: crate::skills::manifest::SkillManifest = toml::from_str(toml_src.content)
+                .unwrap_or_else(|e| panic!("{} skill.toml must parse: {e}", skill.name));
+            if manifest.context.is_empty() {
+                continue;
+            }
+            let prompt = skill
+                .files
+                .iter()
+                .find(|f| f.path == "system_prompt.md")
+                .map(|f| f.content)
+                .unwrap_or("");
+
+            for key in manifest.context.keys() {
+                declared += 1;
+                let marker = format!("{{{{{key}}}}}");
+                let count = prompt.matches(marker.as_str()).count();
+                if count != 1 {
+                    let lines: Vec<usize> = prompt
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, l)| l.contains(&marker))
+                        .map(|(i, _)| i + 1)
+                        .collect();
+                    violations.push(format!(
+                        "{}: `{marker}` déclaré en [context.{key}] apparaît {count} fois \
+                         (lignes {lines:?}) — attendu exactement 1",
+                        skill.name
+                    ));
+                }
+            }
+        }
+
+        // Assertion de population non vide, et elle vient d'abord : sans elle, le
+        // détecteur est vert le jour où la découverte de `build.rs` casse, ou le
+        // jour où le dernier `[context.*]` disparaît — c'est-à-dire exactement le
+        // jour où un vert cesse de vouloir dire « aucune violation ».
+        assert!(
+            declared > 0,
+            "population vide — aucun skill bundled ne déclare de [context.*] : le \
+             détecteur ne compte plus rien, vérifier la découverte de build.rs avant \
+             de croire ce test vert"
+        );
+
+        violations.sort();
+        assert!(
+            violations.is_empty(),
+            "arité de marqueur de contexte violée — chaque occurrence au-delà de la \
+             première fait injecter une copie COMPLÈTE du contenu résolu, et zéro \
+             occurrence fait résoudre un contexte que personne ne lit :\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// Exceptions nommées au détecteur de noms d'outils fantômes (mika#3000).
+    ///
+    /// LIVRÉE VIDE, et ce n'est pas un oubli : le discriminant de
+    /// [`phantom_tool_mentions`] a été choisi précisément parce qu'il ne produit
+    /// aucun faux positif sur la population actuelle, et les trois seules
+    /// violations réelles sont corrigées par le même vol. Une allowlist non vide
+    /// ici serait le signal qu'un identifiant légitime est devenu détectable —
+    /// auquel cas la réparation est le discriminant, jamais l'entrée.
+    ///
+    /// Toute entrée ajoutée DOIT nommer `(token, ticket de suivi)`, et elle est
+    /// auto-nettoyante : `mika3000_aucune_exception_de_scan_nest_devenue_stale`
+    /// rougit dès que le token nommé n'est plus rencontré par le scan.
+    const PHANTOM_TOOL_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// Rend, pour un prompt donné, les noms d'outils FANTÔMES qu'il nomme : un
+    /// token entre accents graves qui imite la forme d'un outil servi sans en
+    /// être un. Chaque violation porte l'outil du registre qu'elle imite — c'est
+    /// la **correction**, pas seulement le diagnostic.
+    ///
+    /// Rendu : `(numéro de ligne 1-based, token fantôme, outil du registre imité)`.
+    ///
+    /// # Comment le prédicat distingue un nom d'outil d'un autre identifiant
+    ///
+    /// Deux filtres successifs, et le second porte tout le travail.
+    ///
+    /// *Filtre de forme.* Le token entre accents graves doit matcher
+    /// `^[a-z][a-z0-9_]*$` et compter au moins deux segments non vides séparés
+    /// par `_`. Ce filtre écarte **structurellement** trois populations que les
+    /// prompts bundled citent massivement et qui ne sont pas des outils du
+    /// moteur : les outils de Claude Code en PascalCase (`Write`, `Edit`,
+    /// `Grep`, `Bash`), les chemins et fichiers (`skills/bundled/…`,
+    /// `dispatch-lib.sh`), et les clés à tirets (`origin:loop`, `pr-body.md`).
+    /// Il ne les met pas en allowlist : il ne les voit pas.
+    ///
+    /// *Filtre d'imitation.* Le token est une violation s'il existe au registre
+    /// un outil `A` tel que `premier_segment(token) == premier_segment(A)` **et**
+    /// `dernier_segment(token) == dernier_segment(A)` — le **même** `A` pour les
+    /// deux — et que `token` lui-même n'est pas au registre.
+    ///
+    /// # Pourquoi ce discriminant et pas le préfixe seul — mesuré, pas supposé
+    ///
+    /// Les 26 prompts sous `skills/bundled/` portent **187** tokens `snake_case`
+    /// distincts entre accents graves (mesuré le 2026-11-01). Sur cette
+    /// population :
+    ///
+    /// | discriminant | vraies violations | faux positifs |
+    /// |---|---|---|
+    /// | premier segment seul | 3 | **14** |
+    /// | premier **et** dernier segment | 3 | **0** |
+    ///
+    /// Les quatorze que le préfixe seul produirait sont `pr_diff`, `pr_url`,
+    /// `pr_state`, `pr_number`, `pr_closed`, `pr_view`, `check_suite`,
+    /// `review_failed`, `review_requested`, `qa_retry_count`,
+    /// `qa_build_callback_verdict`, `update_task_metadata`,
+    /// `build_command_exceeds_tool_budget`, `list_people` — un marqueur de
+    /// contexte, un type d'événement GitHub, des champs JSON, des noms de tests.
+    /// **Aucun ne référence un ticket de suivi, parce qu'il n'y a rien à
+    /// suivre** : ce ne sont pas des violations en attente de correction, ce sont
+    /// des identifiants légitimes. Une allowlist de quatorze entrées sans ticket
+    /// derrière est exactement l'allowlist que mika#2309 condamne — celle dont le
+    /// contenu légitime noie la seule entrée qui aurait dû attirer l'œil. Le
+    /// filtre d'imitation obtient le même rendement de détection avec une
+    /// allowlist **vide**, et c'est le seul argument qui le choisit.
+    ///
+    /// # Bornes, dites plutôt que découvertes plus tard
+    ///
+    /// Le détecteur couvre la classe du défaut — un nom qui **imite** un outil
+    /// servi — et non la classe « nom entièrement libre ». Un `frobnicate_widget`
+    /// dans un prompt bundled, dont ni le verbe ni le nom final n'existent au
+    /// registre, passerait. Borne inférieure assumée, même forme que mika#2961 :
+    /// un détecteur qui sous-approxime rend des faux verts bornés, jamais des
+    /// faux rouges, et c'est dans ce sens-là qu'on accepte l'erreur.
+    ///
+    /// Le découpage des spans de code est **par ligne** : en découpant la ligne
+    /// sur l'accent grave, les segments d'indice impair sont le contenu entre
+    /// accents graves. Une ligne au nombre impair d'accents graves ne décale donc
+    /// le pairage que sur elle-même, et un segment mal pairé porte presque
+    /// toujours une espace ou une ponctuation, que le filtre de forme écarte.
+    fn phantom_tool_mentions(
+        prompt: &str,
+        served: &std::collections::HashSet<&str>,
+    ) -> Vec<(usize, String, String)> {
+        let segments = |name: &str| -> Option<(String, String)> {
+            let parts: Vec<&str> = name.split('_').collect();
+            if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+                return None;
+            }
+            Some((parts[0].to_string(), parts[parts.len() - 1].to_string()))
+        };
+
+        let mut out = Vec::new();
+        for (idx, line) in prompt.lines().enumerate() {
+            for (position, span) in line.split('`').enumerate() {
+                // Les segments d'indice pair sont HORS d'un span de code.
+                if position % 2 == 0 || served.contains(span) {
+                    continue;
+                }
+                // Filtre de forme.
+                if !span.starts_with(|c: char| c.is_ascii_lowercase())
+                    || !span
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                {
+                    continue;
+                }
+                let Some((first, last)) = segments(span) else {
+                    continue;
+                };
+                // Filtre d'imitation. On collecte TOUS les outils imités et on
+                // retient le plus petit lexicographiquement : l'ordre
+                // d'itération d'un `HashSet` est aléatoire, et un message
+                // d'échec qui change d'une exécution à l'autre n'est pas une
+                // correction qu'on peut appliquer.
+                let imitated = served
+                    .iter()
+                    .filter(|candidate| {
+                        segments(candidate).is_some_and(|(cf, cl)| cf == first && cl == last)
+                    })
+                    .min();
+                if let Some(imitated) = imitated {
+                    out.push((idx + 1, span.to_string(), (*imitated).to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Le registre des outils SERVIS, en deux termes dont la réunion est
+    /// l'univers complet : les builtins du moteur et les `name` de tous les
+    /// `tools.json` bundled (y compris les templates legacy, d'où `run_shell`,
+    /// `read_file`, `tmux_*`, `qa_pr_view`…).
+    fn served_tool_names(
+        bundled: &std::collections::HashSet<String>,
+    ) -> std::collections::HashSet<&str> {
+        crate::tools::BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(bundled.iter().map(|s| s.as_str()))
+            .collect()
+    }
+
+    /// Une mention fantôme située : le prompt qui la porte, sa ligne, le token,
+    /// et l'outil du registre qu'il imite. L'ordre des champs EST la clé de tri.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct PhantomMention {
+        skill: String,
+        line: usize,
+        token: String,
+        imitated: String,
+    }
+
+    /// Le rendu du scan. Les deux compteurs sont là pour les assertions de
+    /// population non vide, et ils peuvent s'effondrer indépendamment.
+    struct PhantomScan {
+        prompts_scanned: usize,
+        registry_size: usize,
+        /// Exceptions NON appliquées — c'est ce que « rencontré » veut dire pour
+        /// l'assertion anti-stale.
+        mentions: Vec<PhantomMention>,
+    }
+
+    /// Toutes les violations rencontrées par le scan sur `ENTRIES`, exceptions
+    /// NON appliquées. Partagé par le test de scan et par son assertion
+    /// anti-stale, pour que « rencontré » veuille dire la même chose aux deux.
+    fn scan_bundled_prompts() -> PhantomScan {
+        let bundled = all_bundled_tool_names();
+        let served = served_tool_names(&bundled);
+
+        let mut prompts_scanned = 0usize;
+        let mut mentions: Vec<PhantomMention> = Vec::new();
+        for skill in ENTRIES {
+            let Some(prompt) = skill
+                .files
+                .iter()
+                .find(|f| f.path == "system_prompt.md")
+                .map(|f| f.content)
+            else {
+                continue;
+            };
+            prompts_scanned += 1;
+            for (line, token, imitated) in phantom_tool_mentions(prompt, &served) {
+                mentions.push(PhantomMention {
+                    skill: skill.name.to_string(),
+                    line,
+                    token,
+                    imitated,
+                });
+            }
+        }
+        mentions.sort();
+        PhantomScan {
+            prompts_scanned,
+            registry_size: served.len(),
+            mentions,
+        }
+    }
+
+    /// mika#3000 — aucun prompt bundled ne nomme un outil que le moteur ne sert pas.
+    ///
+    /// Le 2026-11-01, la base de `self-check` nommait `list_home_files`,
+    /// `read_home_file` et `write_file` : trois noms absents du registre, pour
+    /// trois outils réels nommés `list_agent_files`, `read_agent_file` et
+    /// `write_agent_file`. La base n'avait reçu aucun commit depuis le
+    /// 2026-04-18 et n'avait rien coûté, parce qu'elle n'était pas **servie** —
+    /// la variante `generated/` de juin, qui employait les bons noms, la
+    /// remplaçait. Le deploy de `8f7b2260` a écarté cette variante, et un tour de
+    /// `self-check` a commencé à appeler des outils inexistants. Même mécanique
+    /// que mika#2961, deux tests plus haut : *la variante périmée masquait le
+    /// défaut, et le retour à la base l'a révélé*.
+    ///
+    /// L'assertion porte sur les octets **embarqués** (`ENTRIES`, ce que
+    /// `build.rs` a compilé depuis `skills/bundled/`), c'est-à-dire le texte que
+    /// l'agent reçoit quand la base est servie — jamais sur un chemin de
+    /// l'arbre.
+    ///
+    /// **Portée, et ses bornes.** `ENTRIES` seul, donc `skills/bundled/`, ce
+    /// qu'AC2 demande littéralement ; les skills legacy sous
+    /// `crates/mika-agent/templates/skills/` **alimentent** le registre via
+    /// `all_bundled_tool_names()` mais ne sont pas scannés. Et `system_prompt.md`
+    /// seul : `skill.toml` porte de la prose de commentaire et `tools.json` des
+    /// descriptions, ni l'un ni l'autre n'est servi au modèle comme instruction
+    /// d'appel.
+    ///
+    /// **Aucun recouvrement avec `make verify-bundled-skills`** (mika#1575,
+    /// Check 4), qui vérifie les tokens de `[constraints] required_tools` dans
+    /// les `skill.toml` — pas les noms cités dans la **prose du prompt**.
+    /// `self-check` ne déclare aucun `required_tools`, ce qui est précisément
+    /// pourquoi ce gate l'a laissée passer pendant six mois.
+    #[test]
+    fn mika3000_aucun_prompt_bundled_ne_nomme_un_outil_fantome() {
+        let scan = scan_bundled_prompts();
+
+        // Assertions de population non vide, et elles viennent d'abord :
+        // `ENTRIES` vaut `&[]` si la découverte de `build.rs` casse ou si
+        // `skills/bundled/` disparaît, et le registre peut s'effondrer
+        // indépendamment. Sans elles, le détecteur est vert exactement le jour
+        // où un vert cesse de vouloir dire « aucune violation ».
+        assert!(
+            scan.prompts_scanned > 0,
+            "population vide — aucun prompt bundled scanné : vérifier la \
+             découverte de build.rs avant de croire ce test vert"
+        );
+        assert!(
+            scan.registry_size > 0,
+            "registre vide — ni BUILTIN_TOOL_NAMES ni all_bundled_tool_names() \
+             ne rend de nom : le détecteur accuserait tous les tokens, ou aucun"
+        );
+
+        let violations: Vec<String> = scan
+            .mentions
+            .iter()
+            .filter(|m| !PHANTOM_TOOL_EXCEPTIONS.iter().any(|(e, _)| *e == m.token))
+            .map(|m| {
+                format!(
+                    "{}/system_prompt.md:{} — `{}` n'est pas un outil servi ; utiliser `{}`",
+                    m.skill, m.line, m.token, m.imitated
+                )
+            })
+            .collect();
+
+        assert!(
+            violations.is_empty(),
+            "nom d'outil fantôme dans un prompt bundled — le tour appelle un \
+             outil que le moteur ne sert pas, et l'appel échoue au dispatch \
+             ({} prompts scannés, {} noms au registre) :\n{}",
+            scan.prompts_scanned,
+            scan.registry_size,
+            violations.join("\n")
+        );
+    }
+
+    /// mika#3000 — le scan mord sur un prompt planté, et le lâche une fois corrigé.
+    ///
+    /// Les deux moitiés dans la **même** fonction est une décision : séparées, le
+    /// contrôle négatif peut être supprimé sans que rien ne redevienne rouge, et
+    /// un détecteur dont on a retiré la preuve qu'il mord est un détecteur qui
+    /// passe par construction. Ensemble, le geste qui supprime l'un supprime
+    /// l'autre.
+    #[test]
+    fn mika3000_le_scan_rougit_sur_un_outil_plante_et_passe_une_fois_corrige() {
+        let bundled = all_bundled_tool_names();
+        let served = served_tool_names(&bundled);
+
+        // La ligne 25 de `self-check` telle qu'elle était avant le correctif.
+        let plante = "1. **Find previous report** via `list_home_files` on `data/self-check/`.";
+        let mentions = phantom_tool_mentions(plante, &served);
+        assert_eq!(
+            mentions.len(),
+            1,
+            "le scan doit rendre exactement une violation sur la fixture \
+             plantée, rendu : {mentions:?}"
+        );
+        assert_eq!(mentions[0].0, 1, "le numéro de ligne doit être 1-based");
+        assert_eq!(mentions[0].1, "list_home_files");
+        assert_eq!(
+            mentions[0].2, "list_agent_files",
+            "la violation doit porter l'outil du registre qu'elle imite — \
+             c'est la correction, pas seulement le diagnostic"
+        );
+
+        // La même ligne, corrigée.
+        let corrige =
+            "1. **Find previous report** via `list_agent_files` with `path: \"data/self-check\"`.";
+        assert!(
+            phantom_tool_mentions(corrige, &served).is_empty(),
+            "le scan doit lâcher la fixture corrigée : rendu {:?}",
+            phantom_tool_mentions(corrige, &served)
+        );
+    }
+
+    /// mika#3000 — aucune exception de scan n'est devenue stale.
+    ///
+    /// Une allowlist vide n'a pas d'entrée stale aujourd'hui ; l'assertion existe
+    /// pour le jour où elle en aura une. Elle rougit sur toute entrée de
+    /// [`PHANTOM_TOOL_EXCEPTIONS`] dont le token n'est plus **rencontré** par le
+    /// scan — c'est-à-dire sur toute exception dont la violation a été corrigée
+    /// sans que l'exception soit retirée. Le geste qui rend l'exception inutile
+    /// est le geste qui la fait expirer, ce qui est ce qui sépare cette
+    /// allowlist de celle que mika#2309 condamne.
+    ///
+    /// Livrée **armée dès maintenant** plutôt qu'au premier ajout : une
+    /// assertion de propreté écrite le jour où on ajoute une exception est une
+    /// assertion écrite par la personne qui avait une raison de contourner le
+    /// détecteur.
+    #[test]
+    fn mika3000_aucune_exception_de_scan_nest_devenue_stale() {
+        let scan = scan_bundled_prompts();
+        let rencontres: std::collections::HashSet<&str> =
+            scan.mentions.iter().map(|m| m.token.as_str()).collect();
+
+        for (token, tracker) in PHANTOM_TOOL_EXCEPTIONS {
+            assert!(
+                rencontres.contains(token),
+                "l'exception `{token}` ({tracker}) ne désigne plus aucune \
+                 violation rencontrée par le scan — elle est périmée, retirez \
+                 cette entrée"
+            );
+        }
     }
 
     /// Engine post-condition guards (agent.rs, engine.rs, executor.rs) reference

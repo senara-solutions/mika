@@ -27,6 +27,12 @@
 //!    outcome promotes. A gate that refuses whenever GitHub hiccups would close
 //!    the loop as effectively as the wedge it exists to remove.
 //!
+//!    **Une exception, et elle est nommée** (mika#2837) : la sonde « une PR
+//!    mergée porte-t-elle cette branche absente ? » refuse quand elle ne peut
+//!    pas répondre. Elle ne rétrécit pourtant rien — sans elle, ce ticket était
+//!    refusé de toute façon. Elle *élargit* le chemin d'acceptation, et
+//!    seulement sur une preuve.
+//!
 //! ## The `wip(...)` disposition (AC5)
 //!
 //! A stale branch carrying more than its plan commit — partial work from a
@@ -76,6 +82,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::async_db::AsyncDatabase;
 use crate::db::InFlightSelfDevTask;
+use crate::gh_process::{GhSubject, run_gh};
 use crate::ready_label::{
     self, ReadyApplyOutcome, ReadyApplyRequest, ReadyLabelEvent, ReadyWriteAuth,
 };
@@ -238,14 +245,24 @@ fn max_redrives() -> i64 {
 /// distribution instead of from this paragraph.
 /// The label the promotion gate applies when it refuses (mika#2123).
 ///
-/// **Not `operator-review`, and that is a measured constraint, not a style
-/// choice.** `operator-review` does not exist: it is absent from
-/// `gh label list` and undeclared in `.github/labels.yml` — verified
-/// 2026-09-01, alongside the control that `ready` (`labels.yml:102`) and
-/// `operator-gated` (`:106`) *are* declared, so the file is the source of
-/// truth. `blocked`, the module's other exclusion label, is equally absent.
+/// **Not `operator-review`, and that was a measured constraint, not a style
+/// choice.** On 2026-09-01, when this gate was written, `operator-review` did
+/// not exist: absent from `gh label list`, undeclared in `.github/labels.yml` —
+/// verified alongside the control that `ready` and `operator-gated` *were*
+/// declared, so the file was the source of truth and not the instrument lying.
+/// `blocked`, the module's other exclusion label, was equally absent.
 ///
-/// The consequence is in production, 48 times in `server.log`:
+/// **Both have been declared since** — `46eeef98` (PR #2128, the same day) added
+/// them. So the sentence above is history, not today's registry: do not read it
+/// as a reason `operator-review` is unusable *now*. What makes the choice of
+/// `operator-gated` still right is the paragraph below on its description, not
+/// the absence. And what keeps all three names declared is no longer a
+/// verification someone remembers to redo, but
+/// [`tests::test_exclusion_labels_are_declared_in_labels_yml`] (mika#2790),
+/// which reads the registry on every build.
+///
+/// The consequence, when the name was undeclared, is in production 48 times in
+/// `server.log`:
 ///
 /// ```text
 /// gh issue edit --add-label failed for #2117:
@@ -272,7 +289,7 @@ fn max_redrives() -> i64 {
 ///    own refusals would first have to re-evaluate tickets its own exclusion
 ///    forbids it to look at.
 /// 2. **The machine cannot tell its label from the operator's.** The declared
-///    description (`.github/labels.yml:106`) is *"Groomed work requiring
+///    description (`.github/labels.yml`) is *"Groomed work requiring
 ///    operator-host-time. Distinct from parked/blocked. No ready label."* — a
 ///    legitimate operator gesture. A gate that removed it would silently un-gate
 ///    work a human gated: exactly the fault mika#2140 fixes, a reader assuming
@@ -295,6 +312,23 @@ fn max_redrives() -> i64 {
 /// to redo.
 const REFUSAL_LABEL: &str = "operator-gated";
 
+/// Le label que l'abandon de re-drive pose (mika#2020 R8, constante depuis
+/// mika#2790).
+///
+/// Distinct de [`REFUSAL_LABEL`] : celui-ci marque *« l'auto-pull a renoncé, un
+/// humain doit regarder »*, celui-là *« la porte de promotion a refusé »*. Les
+/// deux sont dans [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`], donc les
+/// deux excluent le ticket des trois phases.
+///
+/// Constante et non littéral parce que son apposition **conditionne** l'abandon :
+/// [`abandon_stuck_ready`] fait `return` quand elle échoue, et elle échoue si
+/// `.github/labels.yml` ne déclare pas ce nom — c'est la classe mika#2127, 48
+/// fois en production. La garde est
+/// [`tests::test_exclusion_labels_are_declared_in_labels_yml`], et elle lit
+/// cette constante : un test qui recopierait le nom garderait sa copie, pas le
+/// nom que le code emploie.
+const ABANDON_LABEL: &str = "operator-review";
+
 const MAX_BEHIND_DEFAULT: i64 = 50;
 
 /// The only prefix a pure-grooming branch modifies (mika#2140).
@@ -312,6 +346,42 @@ const MAX_BEHIND_DEFAULT: i64 = 50;
 /// `docs/plansible/x.md` counts as *outside* the prefix, which is the intended
 /// reading.
 const PLAN_PATH_PREFIX: &str = "docs/plans/";
+
+/// GitHub's `compare` endpoint caps its `files` array at **300** entries
+/// (mika#2170 D5).
+///
+/// It matters for exactly one kind of claim: an **absence**. A branch touching
+/// more than 300 files could have its single plan file cut off the end of the
+/// list, and a predicate reading "no `docs/plans/` path in here" would then
+/// assert an absence it never measured. So the absence is only claimed on a
+/// provably complete list: at or above this cap,
+/// [`RefusalReason::SalvageWorkOnStaleBranch`] is produced instead of
+/// [`RefusalReason::StaleBranchWithoutPlan`] — which is today's behaviour,
+/// hence no regression. House pattern applied in the safe direction: *a signal
+/// you cannot read is never a satisfied term* (mika#2277).
+///
+/// The *presence* of a non-plan file needs no such guard — see
+/// [`non_plan_files`], where truncation cannot retract a fact already
+/// established.
+const GITHUB_COMPARE_FILES_CAP: usize = 300;
+
+/// `gh pr list --json files` plafonne à **100** fichiers par PR (mika#3001).
+///
+/// Servi par GraphQL, et non par le même endpoint que le `compare` ci-dessus :
+/// deux API, deux plafonds, et il faut les deux noms pour que chaque lecture
+/// cite le sien.
+///
+/// Contrairement à [`GITHUB_COMPARE_FILES_CAP`], celui-ci ne garde aucune
+/// décision, et c'est l'argument qui compte : le seul usage que
+/// [`parse_merged_pr_for_branch`] fait de `files` est d'y chercher une
+/// **présence** — « cette PR mergée porte-t-elle ce chemin de plan ? ». Une
+/// présence trouvée sur une liste coupée reste une présence, et une liste coupée
+/// ne peut donc produire qu'un faux *négatif* : la PR n'est pas retenue, le
+/// callout n'est pas réécrit, soit exactement l'état d'avant ce vol. La
+/// constante est ici pour que cette asymétrie soit vérifiable plutôt que
+/// supposée — le jour où une lecture d'**absence** s'ajoute sur ces `files`,
+/// c'est elle qu'il faudra consulter, comme la doctrine D5 le demande.
+pub const GH_PR_LIST_FILES_CAP: usize = 100;
 
 /// Env override for the promotion staleness threshold (mika#2123). The literal
 /// `0` disables the distance check entirely (pre-fix behaviour), mirroring the
@@ -402,6 +472,64 @@ pub struct Issue {
 // restent ici, où l'ancrage du ticket a sa valeur historique — ils exercent la
 // fonction importée, pas une copie.
 use crate::plan_callout::strip_fenced_blocks;
+// La cause de péremption d'un callout vit chez l'écrivain de sa prose
+// (mika#3001) : c'est lui qui doit rester le seul à savoir ce que chaque
+// variante fait dire à la ligne « Plan antérieur ».
+use crate::plan_callout::PriorPlanCause;
+use serde::{Deserialize, Serialize};
+
+/// Les trois signaux que le grooming écrit et que le dispatch exige.
+///
+/// Ce vocabulaire est **commun** aux deux prédicats : les `token()` ci-dessous
+/// sont, dans le même ordre, les jetons que `executor::check_grooming_markers`
+/// rend dans son `missing_signals` (`mika2956_le_vocabulaire_des_signaux_est_commun_aux_deux_predicats`,
+/// `grooming_marker.rs`). Un refus du bassin et un refus du dispatch nomment donc
+/// la même chose avec les mêmes mots, ce qui est la condition pour que l'opérateur
+/// puisse les rapprocher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroomingSignal {
+    BranchCallout,
+    PlanCallout,
+    GroomedVerdict,
+}
+
+impl GroomingSignal {
+    /// Le jeton que le dispatch écrit déjà dans son `missing_signals`.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::BranchCallout => "branch_callout",
+            Self::PlanCallout => "plan_callout",
+            Self::GroomedVerdict => "groomed_verdict",
+        }
+    }
+}
+
+/// Lesquels des trois signaux de grooming manquent à ce corps.
+///
+/// C'est la face **mesurée** de [`is_groomed`], dont celui-ci n'est que la
+/// réduction booléenne : les deux ne peuvent pas diverger, puisqu'il n'y a qu'un
+/// seul corps de prédicat. Un appelant qui doit *nommer* ce qui manque — le
+/// refus du bassin du manager (mika#2956) — passe par ici ; un appelant qui n'a
+/// qu'à promouvoir passe par `is_groomed`.
+///
+/// L'ordre du vecteur est celui des variantes, et il est stable : branche, plan,
+/// verdict. Un `Vec` vide signifie « les trois signaux sont là », jamais
+/// « on n'a pas lu ».
+pub fn missing_grooming_signals(body: &str) -> Vec<GroomingSignal> {
+    let readable = strip_fenced_blocks(body);
+    let mut missing = Vec::new();
+    if extract_branch_name(&readable).is_none() {
+        missing.push(GroomingSignal::BranchCallout);
+    }
+    if extract_plan_path(&readable).is_none() {
+        missing.push(GroomingSignal::PlanCallout);
+    }
+    if !crate::grooming_marker::has_groomed_verdict(&readable) {
+        missing.push(GroomingSignal::GroomedVerdict);
+    }
+    missing
+}
 
 /// Structural detection of a groomed issue body.
 ///
@@ -449,11 +577,18 @@ use crate::plan_callout::strip_fenced_blocks;
 /// les deux** — ce sens-là de l'alignement recréerait le défaut symétrique de
 /// celui que ce ticket ferme. C'est le lecteur qui rejoint son écrivain, pas
 /// l'inverse.
+///
+/// # Deux consommateurs de promotion, et c'est voulu (mika#2956)
+///
+/// Ce prédicat a désormais deux consommateurs de promotion — le feeder et le
+/// bassin du manager — et c'est voulu : les deux écrivains de `ready` partagent
+/// un seul prédicat d'admission. Le bassin jugeait la présence d'un plan avec
+/// `reader::plan_callout_present`, un lecteur plus lâche (mika#2608), donc il
+/// admettait un ticket que le gate du dispatch refusait ensuite en
+/// `dispatch_no_grooming_marker`. Depuis mika#2956, il admet sur
+/// [`missing_grooming_signals`], dont ce booléen est la réduction.
 pub fn is_groomed(body: &str) -> bool {
-    let readable = strip_fenced_blocks(body);
-    crate::grooming_marker::has_groomed_verdict(&readable)
-        && extract_branch_name(&readable).is_some()
-        && extract_plan_path(&readable).is_some()
+    missing_grooming_signals(body).is_empty()
 }
 
 // ───────────────────── Plan ownership (mika#2020) ─────────────────────
@@ -653,6 +788,63 @@ pub fn non_plan_files(changed: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+/// Le plan nommé par le callout est-il encore un ajout de cette branche à
+/// `main` (mika#3001) ?
+///
+/// Trois valeurs et pas un booléen, pour la raison qu'[`StalenessMeasurement`]
+/// porte un niveau plus haut : « je n'ai pas pu lire » n'est pas « il n'y est
+/// pas », et les fusionner est la manière dont une porte commence à mentir. La
+/// conséquence est ici franchement asymétrique — c'est sur `NotOnBranch` seul
+/// qu'on ira sonder une PR mergée, donc qu'on pourra réécrire le corps d'une
+/// issue. Les deux autres valeurs ne sont pas des abandons de réécriture, ce
+/// sont des **non-candidatures**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanPresence {
+    /// La branche l'ajoute : le callout est frais, il n'y a rien à faire.
+    OnBranch,
+    /// Elle ne l'ajoute pas : `main` l'a absorbé, ou il n'existe nulle part.
+    NotOnBranch,
+    /// La liste n'autorise aucune conclusion d'absence.
+    Unreadable,
+}
+
+/// Lire [`PlanPresence`] sur une mesure de branche (mika#3001 AC1).
+///
+/// Pure et totale. Les quatre règles, **dans cet ordre**, et l'ordre est le
+/// fond de la fonction :
+///
+/// 1. `ahead_by == 0` ⇒ `NotOnBranch`. **Le compte avant la liste**, et ce
+///    n'est pas une optimisation : GitHub omet la clé `files` sur un `compare`
+///    sans diff, donc `changed_files` y vaut `None` et la règle 4 classerait
+///    `Unreadable` le cas le plus net qui soit. C'est exactement le cas mesuré
+///    du 2026-10-31 à 16:36Z, où le first-push de mika#2626 avait recréé la
+///    branche de #2958 à l'identique de `main`. Une branche qui n'ajoute aucun
+///    commit n'ajoute aucun fichier : il n'y a là aucune ignorance à déclarer ;
+/// 2. `changed_files == Some(f)` et `f` contient `plan` ⇒ `OnBranch`. Aucun
+///    contrôle de troncature, pour la raison de [`non_plan_files`] : une
+///    troncature ne retire pas un fait déjà établi ;
+/// 3. `Some(f)`, `plan` absent, et `f.len() < GITHUB_COMPARE_FILES_CAP` ⇒
+///    `NotOnBranch`. La liste est **prouvée complète**, l'absence est donc
+///    mesurée et non supposée ;
+/// 4. sinon — `None`, ou liste au cap ⇒ `Unreadable`. C'est la doctrine D5 de
+///    [`GITHUB_COMPARE_FILES_CAP`] appliquée telle quelle : une absence ne se
+///    lit pas sur une liste que GitHub a pu couper.
+///
+/// `plan` est la forme **normalisée** que rend [`crate::plan_callout`] — un
+/// chemin relatif à la racine du dépôt, qui est aussi la forme que le `compare`
+/// rend. La comparaison est une égalité exacte, jamais un `contains` : deux
+/// plans d'un même ticket ne diffèrent que par leur suffixe de vol.
+fn plan_presence(staleness: &BranchStaleness, plan: &str) -> PlanPresence {
+    if staleness.ahead_by == 0 {
+        return PlanPresence::NotOnBranch;
+    }
+    match staleness.changed_files.as_deref() {
+        Some(files) if files.iter().any(|f| f == plan) => PlanPresence::OnBranch,
+        Some(files) if files.len() < GITHUB_COMPARE_FILES_CAP => PlanPresence::NotOnBranch,
+        _ => PlanPresence::Unreadable,
+    }
+}
+
 /// How many paths a refusal message or audit record names before summarising
 /// the rest (mika#2140 AC5). A GitHub comment must not become a `git diff
 /// --stat`.
@@ -675,22 +867,52 @@ fn format_named_files(files: &[String]) -> String {
 
 /// The outcome of trying to measure a branch (mika#2123 U1).
 ///
-/// Four outcomes, not two, because "I could not measure" and "I measured zero"
+/// Five outcomes, not two, because "I could not measure" and "I measured zero"
 /// are different facts and collapsing them is how a gate starts lying. A `404`
 /// in particular is **not** a distance of zero — it says the branch named in
 /// the callout is not on the remote at all.
+///
+/// Et « absente d'`origin` » n'est pas **un** fait mais deux (mika#2837) : le
+/// merge de sa PR l'a supprimée — son plan est alors sur `main`, le callout est
+/// périmé et pas le plan — ou bien aucune PR mergée ne la porte, et le plan
+/// annoncé n'existe nulle part. Les deux se mesurent `404` à l'identique ; seul
+/// le second justifie le gate, et refuser les deux a coûté un tour d'opérateur
+/// par vol sur chaque ticket à plusieurs vols (4 refus sur 2 tickets, chacun
+/// dans les dix minutes du merge qui avait supprimé la branche).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StalenessMeasurement {
     /// The compare endpoint answered.
     Measured(BranchStaleness),
-    /// The compare endpoint returned `404`: the branch is absent from origin.
-    BranchAbsent,
+    /// Absente d'`origin`, et la sonde « une PR mergée la porte-t-elle ? » n'a
+    /// pas promu — soit elle a répondu « aucune », soit elle n'a pas pu
+    /// répondre. Le refus est le même dans les deux cas ; `probe` dit lequel.
+    BranchAbsent { probe: AbsenceProbe },
+    /// Absente parce que le merge de sa PR l'a supprimée (mika#2837).
+    BranchDeletedByMerge { pr: u64 },
     /// The issue body carries no `> - **Branch:**` callout, so there is nothing
     /// to measure. Not an error — Phase 2 reconciles ungroomed tickets too.
     NoBranchCallout,
     /// The call failed for any other reason (network, rate limit, auth). The
     /// gate has no opinion, and says so rather than inventing one.
     Unavailable,
+}
+
+/// Pourquoi la sonde « une PR mergée porte-t-elle cette branche ? » n'a pas
+/// promu (mika#2837).
+///
+/// Les deux variantes refusent, et identiquement : celle-ci ne décide rien,
+/// elle **nomme**. Et il faut qu'elle nomme, parce qu'une sonde en panne et une
+/// branche réellement orpheline produisent la même ligne de refus — sans ce
+/// champ, une panne de la forge se lirait comme une population de branches
+/// orphelines, et c'est la classe mika#2013. `Unreadable` est la population
+/// qu'un opérateur doit pouvoir compter seule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsenceProbe {
+    /// La forge a répondu : aucune PR mergée ne porte cette branche.
+    NotCarried,
+    /// La forge n'a pas pu répondre — processus, statut non nul, ou charge
+    /// illisible. On ne promeut pas sur une absence de preuve (AC3).
+    Unreadable,
 }
 
 /// Why the gate refused to promote a ticket (mika#2123 R3).
@@ -722,16 +944,57 @@ pub enum RefusalReason {
         ahead_by: i64,
         non_plan_files: Vec<String>,
     },
+    /// The branch is stale and carries **no plan file at all** — every path it
+    /// touches is outside [`PLAN_PATH_PREFIX`] (mika#2170).
+    ///
+    /// **Population.** A branch that was never a grooming branch: typically
+    /// hand-made, named by a `ready` ticket's `> - **Branch:**` callout, and
+    /// reaching the gate through Phase 2 — the one entrance not fronted by
+    /// [`is_groomed`], and correctly so (the reasoning lives at the Phase 2 call
+    /// site). Measured **empty** on 2026-09-04 across the 18 open tickets
+    /// carrying a branch callout: the class was real, its population was not.
+    /// This variant is what makes the next member of it countable in one query
+    /// instead of waiting on a reader.
+    ///
+    /// **Discriminant.** `non_plan_files == changed_files`. Nothing about the
+    /// *decision* turns on it — both halves refuse, and that refusal is right
+    /// either way (R5). What turns on it is the diagnosis: the sibling variant's
+    /// remedy frames the work as a dead pilot's leftovers, which is false here,
+    /// and told an operator reading it on their own branch to go look for a
+    /// pilot that never existed.
+    ///
+    /// **Truncation.** Only produced on a list of fewer than
+    /// [`GITHUB_COMPARE_FILES_CAP`] entries: "carries no plan" is an absence,
+    /// and an absence cannot be read off a list GitHub may have cut (D5).
+    ///
+    /// `changed_files` is the **whole** list rather than a filtered one: on this
+    /// population the two are equal by construction, and carrying the
+    /// unfiltered name is what says so at the type level.
+    StaleBranchWithoutPlan {
+        branch: String,
+        behind_by: i64,
+        ahead_by: i64,
+        changed_files: Vec<String>,
+    },
     /// The branch named in the ticket's callout does not exist on origin.
     BranchAbsent { branch: String },
 }
 
 impl RefusalReason {
     /// Stable short slug for structured logs and audit events.
+    ///
+    /// **This is a wire format.** `reason` lands in `audit_events` and operators
+    /// `GROUP BY` it, so a split here is **dated and never retroactive**: rows
+    /// already written keep the name they carried, and a comparison spanning the
+    /// deploy must **sum both names** (mika#2170 D3; same reasoning, taken as
+    /// is, as the mika#2361 split of `operator_review_or_blocked`). The half
+    /// that keeps its name stays comparable to itself — a grooming branch
+    /// carrying code goes on producing `salvage_work_on_stale_branch`.
     pub fn slug(&self) -> &'static str {
         match self {
             Self::TooFarBehind { .. } => "branch_too_far_behind",
             Self::SalvageWorkOnStaleBranch { .. } => "salvage_work_on_stale_branch",
+            Self::StaleBranchWithoutPlan { .. } => "stale_branch_without_plan",
             Self::BranchAbsent { .. } => "branch_absent_on_origin",
         }
     }
@@ -741,6 +1004,7 @@ impl RefusalReason {
         match self {
             Self::TooFarBehind { branch, .. }
             | Self::SalvageWorkOnStaleBranch { branch, .. }
+            | Self::StaleBranchWithoutPlan { branch, .. }
             | Self::BranchAbsent { branch } => branch,
         }
     }
@@ -771,6 +1035,27 @@ impl RefusalReason {
                 n = non_plan_files.len(),
                 files = format_named_files(non_plan_files),
             ),
+            // mika#2170 R3 — name the **nature of the branch**, which is what
+            // the sibling message cannot say: on this population "modifies n
+            // files outside `docs/plans/`" is true and carries no information,
+            // because *everything* here is outside it. The word "partiel" is
+            // deliberately absent (D6): the gate has no way to know whether
+            // this work is unfinished, and saying so would be an inference it
+            // never measured.
+            Self::StaleBranchWithoutPlan {
+                branch,
+                behind_by,
+                ahead_by,
+                changed_files,
+            } => format!(
+                "La branche `{branch}` de #{issue_number} est en retard de **{behind_by} commits** \
+                 (avance : {ahead_by}) et **ne porte aucun fichier de plan** : ses \
+                 **{n} fichier(s)** sont tous hors `{PLAN_PATH_PREFIX}` — {files}. Ce n'est donc \
+                 pas une branche de grooming dont il resterait un reliquat à reprendre : c'est du \
+                 travail dont la porte ne connaît ni l'auteur ni l'état d'achèvement.",
+                n = changed_files.len(),
+                files = format_named_files(changed_files),
+            ),
             Self::BranchAbsent { branch } => format!(
                 "La branche `{branch}` désignée par le callout de #{issue_number} \
                  n'existe pas sur `origin`. Le plan est annoncé comme commité dessus ; \
@@ -792,6 +1077,23 @@ impl RefusalReason {
                  ou l'abandonner explicitement en re-groomant #{issue_number} sur une branche neuve. \
                  Ce choix porte sur du **travail**, pas sur git — c'est pour ça que la boucle ne le \
                  prend pas toute seule en rebasant par-dessus"
+            ),
+            // Same substance as its sibling — the fate of the work is the
+            // operator's call either way — **plus the backstop** (mika#2170 F7).
+            // Grooming this ticket is the one gesture the message must not let
+            // an operator reach for: `dev-groom` would add a file under
+            // `PLAN_PATH_PREFIX`, the code would still be there,
+            // `non_plan_files` would still be non-empty, and the refusal would
+            // come back at the next tick. Prescribing it would be an inert
+            // gesture, mika#2361's class.
+            Self::StaleBranchWithoutPlan { branch, .. } => format!(
+                "décide du sort du travail porté par `{branch}` : le rebaser et le garder, ou \
+                 l'abandonner explicitement en repartant d'une branche neuve pour \
+                 #{issue_number}. **Groomer #{issue_number} ne lèvera pas ce refus** : le \
+                 grooming ajouterait un fichier sous `{PLAN_PATH_PREFIX}`, le code resterait, et \
+                 la porte refuserait de nouveau au tick suivant. Ce choix porte sur du \
+                 **travail**, pas sur git — c'est pour ça que la boucle ne le prend pas toute \
+                 seule en rebasant par-dessus"
             ),
             Self::BranchAbsent { branch } => format!(
                 "pousse `{branch}`, ou corrige le callout `> - **Branch:**` de #{issue_number} \
@@ -824,6 +1126,42 @@ impl RefusalReason {
     }
 }
 
+/// Pourquoi la porte s'abstient — sans rien reprocher au ticket.
+///
+/// Distinct de [`RefusalReason`] parce que les suites diffèrent : un refus
+/// escalade (label `operator-review`, `ready` retiré, commentaire), un déclin
+/// n'écrit RIEN sur la forge. Le ticket est sain ; c'est le consentement qui
+/// manque, et seul un humain ou une phase qui le voit déjà peut le rendre.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// mika#3036 — en phase 0 le ticket ne porte pas `ready`, et la branche a
+    /// disparu parce qu'une PR a été mergée. Le merge vient de *rendre* le
+    /// consentement (mika#3022) ; le reprendre serait s'en donner un.
+    ConsentReturnedByMerge { pr: u64 },
+}
+
+impl DeclineReason {
+    /// Le nom sous lequel ce déclin se compte. **Distinct** de
+    /// `branch_absent_on_origin` : les deux mesures se ressemblent — une
+    /// branche absente dans les deux cas — mais l'une est une anomalie et
+    /// l'autre la trace normale d'un merge. Les compter sous un même nom, c'est
+    /// de nouveau mika#2205.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::ConsentReturnedByMerge { .. } => "consent_returned_by_merge",
+        }
+    }
+
+    /// La PR dont le merge a rendu le consentement, quand ce déclin en nomme
+    /// une. `None` — jamais `0` — pour un déclin qui n'en porte pas
+    /// (mika#2331).
+    pub fn merged_pr(&self) -> Option<u64> {
+        match self {
+            Self::ConsentReturnedByMerge { pr } => Some(*pr),
+        }
+    }
+}
+
 /// The gate's verdict on one ticket (mika#2123 U2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromotionGate {
@@ -832,6 +1170,48 @@ pub enum PromotionGate {
     Promote { detail: &'static str },
     /// Do not promote; hand the ticket to the operator.
     Refuse(RefusalReason),
+    /// Ne pas promouvoir, et ne rien reprocher au ticket (mika#3036). Aucune
+    /// écriture sur la forge : ni label, ni commentaire, ni corps.
+    Decline(DeclineReason),
+}
+
+impl PromotionGate {
+    /// Ce passage a-t-il le droit de réécrire le corps du ticket ?
+    ///
+    /// `Refuse` garde `true` : le comportement d'avant mika#3036, à l'identique.
+    /// Seul `Decline` dit non, et il le dit parce qu'un passage qui s'abstient
+    /// ne doit laisser aucune trace d'écriture (AC3).
+    pub fn authorizes_body_rewrite(&self) -> bool {
+        match self {
+            Self::Promote { .. } | Self::Refuse(_) => true,
+            Self::Decline(_) => false,
+        }
+    }
+}
+
+/// Ce que le site d'appel apprend de la porte (mika#3058).
+///
+/// Un `bool` ne disait que « promu ou pas ». La phase 1 a besoin de la
+/// distinction : sur un **refus** le ticket est escaladé et porte désormais le
+/// marqueur qui l'exclut de toutes les phases, donc le tick s'arrête ; sur un
+/// **déclin** rien n'est écrit — le ticket est sain, il reste en tête du
+/// backlog, et le tick suivant le reverrait à l'identique. C'est cette seule
+/// branche qui a le droit d'essayer le candidat d'après (AC3).
+///
+/// `Declined` ne porte aucune donnée : la raison est déjà au journal, à l'audit
+/// et au ledger, et un second porteur dériverait du premier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Allowed,
+    Refused,
+    Declined,
+}
+
+impl GateOutcome {
+    /// La lecture des phases 0 et 2 : elles ne distinguent pas les deux non.
+    fn allows(&self) -> bool {
+        matches!(self, Self::Allowed)
+    }
 }
 
 /// Extract the branch name from a ticket's grooming callout (mika#2123 U1).
@@ -882,6 +1262,160 @@ pub fn parse_compare_payload(stdout: &str) -> Result<BranchStaleness> {
     })
 }
 
+/// Une PR mergée dont la tête est la branche du callout (mika#2837).
+///
+/// `merged_at` est porté en plus du numéro bien qu'aucune décision ne le lise :
+/// c'est lui qui date la suppression de la branche, donc la seule valeur qui
+/// permette de relier un refus évité au merge qui l'avait causé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPrEvidence {
+    pub number: u64,
+    pub merged_at: String,
+}
+
+/// La charge de `gh pr list` sur une branche, lue comme une preuve de merge
+/// (mika#2837).
+///
+/// Split de l'appel subprocess pour la raison de [`parse_compare_payload`] :
+/// toute la décision se teste alors contre des charges figées, sans réseau.
+///
+/// **Trois conditions par entrée, toutes nécessaires :**
+///
+/// 1. `mergedAt` non nul — un `state: "CLOSED"` sans merge ne porte rien, et ce
+///    n'est pas un cas d'école : il arrive **en tête** de la charge réelle de
+///    #2680 (AC4) ;
+/// 2. `headRefName` égal à la branche demandée — `--head` est un filtre de la
+///    forge, pas une garantie que notre code peut lire ;
+/// 3. `baseRefName == "main"` — une PR mergée dans une branche de feature ne met
+///    pas le plan sur `main`, et `main` est d'où un pilote dispatché repartirait.
+///
+/// L'entrée retenue est celle de `mergedAt` **maximal**, comparé par
+/// [`crate::timestamp::parse`] et jamais comme deux chaînes : l'ordre de
+/// `gh pr list` n'est pas contractuel, et un `+00:00` RFC 3339 se compare
+/// lexicographiquement avant un `…Z` plus ancien.
+///
+/// **Deux niveaux d'échec, et leur asymétrie est délibérée** — celle que
+/// [`parse_open_pr_issue_numbers`] argumente longuement (l. 2672-2681), reprise
+/// par référence plutôt que recopiée : JSON global illisible ⇒ `Err`, donc le
+/// refus d'AC3 ; une entrée malformée ne prouve rien et les autres continuent.
+/// `Ok(None)` est par conséquent « la forge a répondu : aucune PR mergée ne
+/// porte cette branche », jamais « je n'ai pas pu lire ».
+///
+/// **Une quatrième condition, optionnelle, depuis mika#3001.** `carrying`
+/// nommé, l'entrée doit en plus porter ce chemin dans ses `files` : la question
+/// n'est alors plus « une PR mergée porte-t-elle cette branche ? » mais
+/// « laquelle de ces PR mergées a mis **ce plan** sur `main` ? ». Un paramètre
+/// et non un second parseur, parce que les trois conditions ci-dessus sont les
+/// mêmes dans les deux lectures et qu'un fichier qui tient à n'avoir qu'un site
+/// de décision par question ne les duplique pas. Les appelants du chemin
+/// mika#2839 passent `None` et ne changent pas de comportement.
+///
+/// **C'est `files[].path`, pas `filename`.** Les deux API ne nomment pas le
+/// champ pareil — le `compare` que lit [`parse_compare_payload`] rend
+/// `filename`, `gh pr list --json files` rend `path` (vérifié sur la charge
+/// réelle de #2992). Le test de fixture est ce qui empêche de les confondre.
+///
+/// Sous `carrying`, `Ok(None)` recouvre **deux** populations que ce parseur ne
+/// sépare pas, contrairement à ce que mika#2205 demande d'habitude : « aucune
+/// PR mergée visible ne porte ce plan » et « une liste de fichiers était coupée
+/// au cap » ([`GH_PR_LIST_FILES_CAP`]). La raison est que les deux appellent le
+/// **même** geste, et que ce geste est l'état d'avant mika#3001 : le callout
+/// n'est pas réécrit. Aucune des deux ne peut faire réécrire à tort, qui est le
+/// seul sens dangereux ici.
+///
+/// Le tri par `mergedAt` maximal reste en place mais ne décide plus seul sous
+/// `carrying` : sur la population réelle le filtre par fichiers laisse une seule
+/// PR, et le tri n'est plus qu'un départage si deux PR mergées portaient le même
+/// chemin de plan — ce qui ne mérite pas une erreur.
+pub fn parse_merged_pr_for_branch(
+    stdout: &str,
+    branch: &str,
+    carrying: Option<&str>,
+) -> Result<Option<MergedPrEvidence>> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(stdout)?;
+
+    let mut best: Option<(chrono::DateTime<chrono::Utc>, MergedPrEvidence)> = None;
+    for pr in raw {
+        let (Some(merged_at), Some(head), Some(base), Some(number)) = (
+            pr["mergedAt"].as_str(),
+            pr["headRefName"].as_str(),
+            pr["baseRefName"].as_str(),
+            pr["number"].as_u64(),
+        ) else {
+            continue;
+        };
+        if head != branch || base != "main" {
+            continue;
+        }
+        if let Some(plan) = carrying
+            && !pr_files_carry(&pr, plan)
+        {
+            continue;
+        }
+        let Ok(at) = crate::timestamp::parse(merged_at) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(previous, _)| at > *previous) {
+            best = Some((
+                at,
+                MergedPrEvidence {
+                    number,
+                    merged_at: merged_at.to_string(),
+                },
+            ));
+        }
+    }
+
+    Ok(best.map(|(_, evidence)| evidence))
+}
+
+/// Cette entrée de `gh pr list` porte-t-elle ce chemin (mika#3001) ?
+///
+/// Le site **unique** de la lecture de `files[].path`, pour que le voisinage de
+/// `filename` qu'[`parse_compare_payload`] lit ne puisse pas s'y glisser à deux
+/// endroits. `files` absente, non tableau, ou entrée sans `path` ⇒ `false` :
+/// cette fonction ne répond qu'à une question de **présence**, et une présence
+/// qu'on n'a pas vue n'est pas une présence.
+fn pr_files_carry(pr: &serde_json::Value, plan: &str) -> bool {
+    pr["files"]
+        .as_array()
+        .is_some_and(|files| files.iter().any(|f| f["path"].as_str() == Some(plan)))
+}
+
+/// Ce que vaut une branche absente d'`origin`, une fois la sonde rendue
+/// (mika#2837 AC1/AC2/AC3).
+///
+/// Prend la sonde **par valeur** : cette fonction est le seul lecteur de ce
+/// `Result`, et le prendre par référence obligerait chaque appelant à le garder
+/// vivant pour rien.
+///
+/// `Err` et `Ok(None)` restent fusionnés sous **un** refus mais sous **deux**
+/// noms. Les deux moitiés de cette fusion sont volontaires et aucune n'est un
+/// reste à nettoyer :
+///
+/// - fusionnées parce que la décision est la même — on ne promeut pas sur une
+///   absence de preuve (AC3). **Ne pas « harmoniser » le bras `Err` avec ses
+///   voisins de [`classify_promotion`]**, où toute mesure manquante promeut : ici
+///   l'inversion est l'AC, et le jour où `Err` promeut, AC3 tombe en silence ;
+/// - nommées parce qu'un opérateur doit pouvoir compter `Unreadable` seul, pour
+///   la raison qu'[`AbsenceProbe`] porte.
+///
+/// Point d'extension : une troisième raison de ne pas promouvoir s'ajoute comme
+/// variante d'[`AbsenceProbe`], pas comme nouvelle signature.
+pub fn classify_absent_branch(probe: Result<Option<MergedPrEvidence>>) -> StalenessMeasurement {
+    match probe {
+        Ok(Some(evidence)) => StalenessMeasurement::BranchDeletedByMerge {
+            pr: evidence.number,
+        },
+        Ok(None) => StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::NotCarried,
+        },
+        Err(_) => StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::Unreadable,
+        },
+    }
+}
+
 /// The whole promotion decision for one ticket. Pure — every input is already
 /// resolved (mika#2123 U2/U3).
 ///
@@ -894,10 +1428,15 @@ pub fn parse_compare_payload(stdout: &str) -> Result<BranchStaleness> {
 /// Rule order matters and is the plan's (U2), not an accident: the salvage rule
 /// is checked before the distance rule because it is the more specific fact
 /// about the same branch, and its remedy is different.
+///
+/// `phase` depuis mika#3036 : **une seule** mesure la consulte, celle du merge.
+/// Toutes les autres décident pareil dans les trois phases, et le paramètre les
+/// laisse intactes.
 pub fn classify_promotion(
     measurement: &StalenessMeasurement,
     branch: Option<&str>,
     max_behind: i64,
+    phase: ExclusionPhase,
 ) -> PromotionGate {
     let staleness = match measurement {
         StalenessMeasurement::NoBranchCallout => {
@@ -910,7 +1449,57 @@ pub fn classify_promotion(
                 detail: "staleness_unavailable",
             };
         }
-        StalenessMeasurement::BranchAbsent => {
+        // mika#2837 — absente d'`origin` **parce que** le merge de sa PR l'a
+        // supprimée. Le plan annoncé comme commité sur la branche est sur
+        // `main`, donc le pilote dispatché ici l'y trouve : le callout est
+        // périmé, le plan ne l'est pas. Le détail est distinct de
+        // `branch_absent_on_origin` (AC1) pour qu'un opérateur compte les deux
+        // populations séparément — c'est ce que le refus unique rendait
+        // impossible.
+        //
+        // mika#3036 — et c'est **le seul site** où la phase décide. Pas de bras
+        // `_` : une quatrième phase ne compilera pas sans qu'on dise ici ce
+        // qu'elle fait.
+        StalenessMeasurement::BranchDeletedByMerge { pr } => {
+            return match phase {
+                // Le ticket ne porte pas `ready` — dans NI L'UNE ni l'autre de
+                // ces deux phases. Le feeder le pose, et la phase 1 le pose
+                // aussi : elle pioche dans le backlog des tickets qui ne le
+                // portent pas, puis le leur pose (`apply_ready_label`,
+                // `"phase1_idle_pull"`). Le merge vient de le retirer
+                // (mika#3022) ; le reposer serait se donner le consentement
+                // qu'on vient de rendre.
+                //
+                // mika#3058 — la phase 1 était du côté promouvant, sous un
+                // commentaire qui disait « le ticket porte déjà `ready` ».
+                // C'était faux de cette phase-là, et douze vols sont partis
+                // sans mot humain depuis le 21/10 : la phase 0 refusait à
+                // 06:40:03Z le 06/11, la phase 1 promouvait à 06:40:04Z sur la
+                // même mesure.
+                ExclusionPhase::Phase0Feeder | ExclusionPhase::Phase1Pull => {
+                    PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: *pr })
+                }
+                // Le ticket porte VRAIMENT `ready` : le vivier de la phase 2
+                // est celui des tickets qui le portent déjà et que rien ne
+                // dispatche. mika#2837 inchangé : c'est ainsi que part le vol
+                // suivant d'un ticket à plusieurs vols.
+                //
+                // mika#3047 — « porte `ready` » est ce que la **liste du tick**
+                // dit, et c'est ce qui a dispatché #3044 sans consentement : au
+                // merge, le retrait de `ready` par mika#3022 et cette promotion
+                // se sont croisés à 163 ms. Cette fonction garde sa décision,
+                // qui porte sur une branche ; c'est la phase 2 qui relit le
+                // label juste avant de dispatcher
+                // (`gh_reread_issue_at_dispatch`).
+                ExclusionPhase::Phase2StuckReady => PromotionGate::Promote {
+                    detail: "branch_deleted_by_merged_pr",
+                },
+            };
+        }
+        // Inchangé, et c'est AC2 : aucune PR mergée ne porte la branche, ou la
+        // forge n'a pas pu le dire. Le message d'alors est juste, et on ne
+        // promeut pas sur une absence de preuve (AC3).
+        StalenessMeasurement::BranchAbsent { .. } => {
             return PromotionGate::Refuse(RefusalReason::BranchAbsent {
                 branch: branch.unwrap_or("<unknown>").to_string(),
             });
@@ -955,6 +1544,27 @@ pub fn classify_promotion(
     // fate of a dead pilot's partial work with nobody reading it.
     let non_plan = non_plan_files(staleness.changed_files.as_deref());
     if !non_plan.is_empty() {
+        // mika#2170 — one refusal, two names. **The decision is already taken
+        // by the line above and does not change** (R5): everything below picks
+        // which of two diagnoses the operator reads and which slug the audit
+        // trail can `GROUP BY`. No branch promotes here that refused before,
+        // and none refuses that promoted.
+        //
+        // The discriminant is "this branch carries no plan file at all" — an
+        // **absence**, so it is only claimed on a list GitHub did not cut
+        // ([`GITHUB_COMPARE_FILES_CAP`], D5). At or above the cap the old
+        // variant is produced, which is exactly today's behaviour.
+        let changed = staleness.changed_files.as_deref().unwrap_or(&[]);
+        if changed.len() < GITHUB_COMPARE_FILES_CAP
+            && !changed.iter().any(|f| f.starts_with(PLAN_PATH_PREFIX))
+        {
+            return PromotionGate::Refuse(RefusalReason::StaleBranchWithoutPlan {
+                branch,
+                behind_by: staleness.behind_by,
+                ahead_by: staleness.ahead_by,
+                changed_files: changed.to_vec(),
+            });
+        }
         return PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch {
             branch,
             behind_by: staleness.behind_by,
@@ -1024,26 +1634,80 @@ fn staleness_audit_json(
         .as_ref()
         .map(|v| v.iter().take(MAX_NAMED_FILES).collect());
     let non_plan_count: Option<usize> = non_plan.as_ref().map(Vec::len);
+    // mika#2170 D4 — **posed, not left to derive.** The question "does this
+    // branch carry a plan file at all?" was already computable from the two
+    // fields above, by subtraction, and that is precisely why nobody could
+    // answer it: mika#2170's own wake condition named fields that could not
+    // test its intention, and sat unverifiable for seventeen days. A value an
+    // operator `GROUP BY`s is posed (mika#2131). It is a raw dimension — a
+    // count, from which the "carries a plan" boolean derives, never the reverse
+    // (Signal O, mika#2331) — and it is emitted on **promotions** too, where
+    // there is no refusal slug to read.
+    //
+    // `null`, never `0`, when the list could not be read: same discipline as
+    // its two neighbours.
+    //
+    // **The count is over what was read.** `compare` caps `files` at
+    // [`GITHUB_COMPARE_FILES_CAP`], so a `changed_files_count` of 300 flags a
+    // list that may be cut, and a `plan_files_count` of `0` on such a row means
+    // "no plan among the 300 read", not "no plan" — which is why
+    // [`RefusalReason::StaleBranchWithoutPlan`] is not emitted there at all
+    // (D5).
+    let plan_files_count: Option<usize> = match (changed_files_count, non_plan_count) {
+        (Some(all), Some(non_plan)) => Some(all.saturating_sub(non_plan)),
+        _ => None,
+    };
     let (outcome, reason) = match decision {
         PromotionGate::Promote { detail } => ("promote", *detail),
         PromotionGate::Refuse(r) => ("refuse", r.slug()),
+        // mika#3036 — `"decline"` est une **valeur nouvelle** du vocabulaire
+        // `outcome`, pas un renommage : les agrégats `WHERE outcome='promote'`
+        // et `='refuse'` restent sommables, et la nouvelle population
+        // s'interroge seule (mika#2205).
+        PromotionGate::Decline(r) => ("decline", r.slug()),
     };
     let measurement_slug = match measurement {
         StalenessMeasurement::Measured(_) => "measured",
-        StalenessMeasurement::BranchAbsent => "branch_absent",
+        StalenessMeasurement::BranchAbsent { .. } => "branch_absent",
+        StalenessMeasurement::BranchDeletedByMerge { .. } => "branch_deleted_by_merge",
         StalenessMeasurement::NoBranchCallout => "no_branch_callout",
         StalenessMeasurement::Unavailable => "unavailable",
+    };
+    // mika#2837 — deux dimensions brutes, pas un booléen dérivé (Signal O,
+    // mika#2331) : le numéro de la PR qui a supprimé la branche, et ce que la
+    // sonde a répondu. `measurement` seul ne suffit pas — `branch_absent`
+    // couvre la branche orpheline *et* la sonde en panne, et confondre les deux
+    // fait lire une panne de la forge comme une population.
+    //
+    // `null`, jamais `0` ni `""` : hors du chemin d'absence la sonde n'a pas
+    // tourné, et une valeur par défaut s'agrégerait comme une mesure.
+    let merged_pr: Option<u64> = match measurement {
+        StalenessMeasurement::BranchDeletedByMerge { pr } => Some(*pr),
+        _ => None,
+    };
+    let merged_pr_probe: Option<&'static str> = match measurement {
+        StalenessMeasurement::BranchDeletedByMerge { .. } => Some("carried"),
+        StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::NotCarried,
+        } => Some("not_carried"),
+        StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::Unreadable,
+        } => Some("unreadable"),
+        _ => None,
     };
     serde_json::json!({
         "issue": issue_number,
         "branch": branch,
         "measurement": measurement_slug,
+        "merged_pr": merged_pr,
+        "merged_pr_probe": merged_pr_probe,
         "behind_by": behind_by,
         "ahead_by": ahead_by,
         "status": status,
         "changed_files_count": changed_files_count,
         "non_plan_files": non_plan_named,
         "non_plan_files_count": non_plan_count,
+        "plan_files_count": plan_files_count,
         "outcome": outcome,
         "reason": reason,
         "threshold": threshold,
@@ -1155,19 +1819,38 @@ fn feeder_rank(labels: &[IssueLabel]) -> u8 {
 /// Carried on every ledger entry so the operator can tell a Phase 2 skip
 /// (a `ready` ticket that will not be re-driven) from a Phase 0 one (a backlog
 /// ticket that will not be promoted) — the two call for different actions.
+/// `pub` depuis mika#3036 : [`classify_promotion`] est publique et reçoit la
+/// phase, et un test d'intégration l'appelle — un paramètre de type privé dans
+/// une signature publique est refusé par `private_interfaces`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum ExclusionPhase {
+pub enum ExclusionPhase {
     Phase0Feeder,
     Phase1Pull,
     Phase2StuckReady,
 }
 
 impl ExclusionPhase {
+    /// Le format de fil du **ledger d'exclusion**.
     fn as_str(self) -> &'static str {
         match self {
             Self::Phase0Feeder => "phase0_feeder",
             Self::Phase1Pull => "phase1_pull",
             Self::Phase2StuckReady => "phase2_stuck_ready",
+        }
+    }
+
+    /// Le format de fil de la **porte de promotion** — celui que
+    /// `auto_pull_staleness_measured.phase` porte depuis mika#2470.
+    ///
+    /// Deux projections, deux vocabulaires, et ils ne sont PAS
+    /// interchangeables : les deux sont déjà dans `audit_events`, et un
+    /// opérateur les groupe. Les faire converger renommerait une population à
+    /// moitié (mika#2205).
+    pub fn gate_phase(self) -> &'static str {
+        match self {
+            Self::Phase0Feeder => "phase0_feeder",
+            Self::Phase1Pull => "phase1_idle_pull",
+            Self::Phase2StuckReady => "phase2_stuck_rescue",
         }
     }
 }
@@ -1178,6 +1861,15 @@ impl ExclusionPhase {
 // of one filter would split it in half without saying so.
 
 /// An open PR already closes this ticket.
+///
+/// **La valeur est historique et le filtre est plus large que son nom depuis
+/// mika#2822** : il exclut désormais tout ticket qu'une PR ouverte porte, que
+/// le lien passe par `closingIssuesReferences` ou par la branche de tête. La
+/// chaîne reste `"open_pr_closing"` parce qu'elle est du **format de fil** —
+/// persistée dans le ledger d'exclusion et épinglée par un `assert_eq!` plus
+/// bas. La renommer rendrait non sommables les agrégats opérateur d'avant et
+/// d'après : une même population sous deux noms successifs ne s'additionne pas
+/// (miroir de mika#2205).
 const FILTER_OPEN_PR: &str = "open_pr_closing";
 /// A self_dev task is in flight for this ticket.
 const FILTER_IN_FLIGHT: &str = "in_flight_self_dev";
@@ -1204,6 +1896,19 @@ const FILTER_BELOW_THRESHOLD: &str = "below_threshold";
 const FILTER_NO_READY_LABEL_EVENT: &str = "no_ready_label_event";
 /// The mika#2123 promotion staleness gate refused this branch.
 const FILTER_PROMOTION_GATE: &str = "promotion_gate_refused";
+/// La porte s'est **abstenue** : le merge d'une PR vient de rendre le `ready`,
+/// et le reposer serait se donner le consentement qu'on rend (mika#3036, puis
+/// mika#3058 pour la phase 1).
+///
+/// Délibérément distinct de [`FILTER_PROMOTION_GATE`], et pour la raison qui a
+/// déjà séparé `below_threshold` de [`FILTER_NO_READY_LABEL_EVENT`]
+/// (mika#2131) : un refus escalade — label, `ready` retiré, commentaire — et
+/// l'opérateur a un geste à faire ; un déclin n'écrit rien et le ticket est
+/// sain. Les additionner sous un seul nom rendrait « combien de tickets ce
+/// vivier a-t-il escaladés » insoluble (mika#2205). Le nom est celui du slug de
+/// [`DeclineReason::ConsentReturnedByMerge`], et un test l'asserte : l'audit et
+/// le ledger se joignent alors sur une seule chaîne (AC4).
+const FILTER_CONSENT_RETURNED_BY_MERGE: &str = "consent_returned_by_merge";
 /// A DB probe failed and the ticket was skipped conservatively.
 const FILTER_PROBE_ERROR: &str = "state_probe_failed";
 /// A seat verdict refused without naming itself (defensive; see
@@ -1296,6 +2001,45 @@ const FILTER_EGRESS_DOWN: &str = "egress_relay_down";
 /// `below_threshold` / [`FILTER_NO_READY_LABEL_EVENT`] (mika#2131) et
 /// `in_flight_self_dev` / [`FILTER_LIVE_PILOT`] (mika#2279) ont déjà dû payer.
 const FILTER_LAUNCHER_BRAKED: &str = "pilot_launcher_braked";
+
+/// `ready` avait disparu de la forge à l'instant du dispatch (mika#3047 AC1).
+///
+/// **Le succès de mika#3047, et le numérateur de sa sonde AC4.** La course a eu
+/// lieu — `ready` retiré entre la liste du tick et le dispatch — et la garde a
+/// mordu : aucun dispatch préparé, aucune parente créée, et surtout aucun churn
+/// (voir le site d'appel). Le défaut mesuré le 2026-11-05 au merge de #3045
+/// s'inscrit ici au lieu de produire un `dev-pilot`.
+///
+/// Nom distinct de [`FILTER_READY_PARKED`], qui décrit le même label absent :
+/// celui-là est un **parc** mesuré sur la timeline, décidé avant la mesure
+/// d'âge, et son remède est un geste d'opérateur. Celui-ci est une **course**
+/// gagnée à l'instant du dispatch, et son remède est qu'il n'y a rien à faire.
+const FILTER_READY_ABSENT_AT_DISPATCH: &str = "ready_absent_at_dispatch";
+
+/// Le ticket avait été fermé à l'instant du dispatch (mika#3047 AC1).
+///
+/// Distinct du précédent bien que les deux rendent le même « pas de dispatch » :
+/// un ticket fermé n'attend rien de la boucle, tandis qu'un `ready` retiré peut
+/// revenir au prochain geste d'opérateur. Et surtout, c'est la population sur
+/// laquelle **rien ne doit être écrit** : un commentaire ou un label posé sur un
+/// ticket fermé est la forme exacte de la fuite mika#2713 (29 commentaires et un
+/// `operator-gated` sur le #2636 fermé).
+const FILTER_ISSUE_CLOSED_AT_DISPATCH: &str = "issue_closed_at_dispatch";
+
+/// La relecture d'état n'a pas pu répondre (mika#3047 AC2, fail-closed).
+///
+/// Troisième nom et non une fusion dans l'un des deux précédents : c'est une
+/// **panne de forge**, pas un état du ticket. Un compte qui ne décroît pas nomme
+/// une panne à traiter à sa source, pas un ticket à filtrer plus fort — et fondu
+/// dans `ready_absent_at_dispatch` il gonflerait le numérateur de la sonde AC4
+/// de refus qui ne sont pas des courses gagnées, rendant les deux populations
+/// non soustractables (mika#2205).
+///
+/// Il couvre les trois formes de « on ne sait pas lire » : le `gh` en échec, le
+/// JSON illisible, et le champ absent ou inconnu. Voir
+/// [`gh_reread_issue_at_dispatch`] pour pourquoi un champ absent ne prend pas
+/// son défaut (mika#2331).
+const FILTER_DISPATCH_REREAD_FAILED: &str = "dispatch_reread_failed";
 
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
@@ -1522,32 +2266,54 @@ impl ExclusionLedger {
 /// (p0 > p1 > p2 > p3 > unlabelled) and by oldest `updated_at` within same
 /// priority.
 ///
-/// Ledger-free view of [`select_best_candidate_recording`], kept for callers and
-/// tests that want the selection alone. Phase 1 goes through the recording form
-/// (mika#2131) — a tick that selects without recording is the silence that
+/// Ledger-free view of [`select_candidates_ranked_recording`], kept for callers
+/// and tests that want the selection alone. Phase 1 goes through the recording
+/// form (mika#2131) — a tick that selects without recording is the silence that
 /// ticket closed.
+///
+/// Rend la **tête** du classement, c'est-à-dire exactement ce que le `max_by`
+/// d'avant mika#3058 rendait. Les treize appelants de ce nom sont inchangés par
+/// le passage à la liste.
 pub fn select_best_candidate(
     issues: Vec<Issue>,
     open_pr_issue_numbers: &HashSet<u64>,
 ) -> Option<Issue> {
-    select_best_candidate_recording(
+    select_candidates_ranked_recording(
         issues,
         open_pr_issue_numbers,
         &mut ExclusionLedger::default(),
     )
+    .into_iter()
+    .next()
 }
 
 /// [`select_best_candidate`], recording why each dropped ticket was dropped
-/// (mika#2131).
+/// (mika#2131), et rendant **le classement entier** plutôt que son seul
+/// maximum.
 ///
-/// The selection is unchanged — the ledger is the only addition. The two are
+/// The filter chain is unchanged — the ledger is the only addition. The two are
 /// one function rather than two so the trace can never describe a filter chain
 /// the selection no longer runs.
-fn select_best_candidate_recording(
+///
+/// **mika#3058 — pourquoi la liste.** La phase 1 ne choisissait qu'un candidat
+/// par tick, et un déclin n'écrit rien : le ticket décliné reste sain, sans
+/// marqueur, donc en tête du classement au tick suivant, et la phase ne
+/// promouvrait plus jamais rien d'autre. Exclure le ticket à la **sélection**
+/// était l'autre voie, et elle n'est pas atteignable : `groomed_candidate_exclusion`
+/// est pure sur les labels et les PR ouvertes, là où la mesure du merge coûte
+/// un à deux appels forge par ticket. D'où le classement entier, que
+/// [`phase1_first_promotable`] parcourt.
+///
+/// L'ordre est celui de l'ancien `max_by`, **ex æquo compris** : `max_by` rend
+/// le **dernier** élément maximal, donc le tri descend sur l'index d'entrée en
+/// dernier critère. Sans ce détail, un ex æquo parfait changerait de vainqueur
+/// en silence, et treize tests le liraient comme une égalité qui ne les
+/// concerne pas.
+fn select_candidates_ranked_recording(
     issues: Vec<Issue>,
     open_pr_issue_numbers: &HashSet<u64>,
     ledger: &mut ExclusionLedger,
-) -> Option<Issue> {
+) -> Vec<Issue> {
     let candidates: Vec<_> = issues
         .into_iter()
         // Partitioning filter, not an exclusion: a ticket already carrying
@@ -1569,15 +2335,111 @@ fn select_best_candidate_recording(
         })
         .collect();
 
-    if candidates.is_empty() {
-        return None;
-    }
-
-    candidates.into_iter().max_by(|a, b| {
+    // L'index d'entrée, capturé AVANT le tri : c'est lui qui reproduit le
+    // dernier-maximal de `max_by`. `sort_by` est stable, mais la stabilité
+    // préserve l'ordre d'entrée — donc le PREMIER ex æquo — et ce n'est pas ce
+    // que `max_by` rendait.
+    let mut ranked: Vec<(usize, Issue)> = candidates.into_iter().enumerate().collect();
+    ranked.sort_by(|(ia, a), (ib, b)| {
         let pa = priority_rank(&a.labels);
         let pb = priority_rank(&b.labels);
-        pa.cmp(&pb).then_with(|| b.updated_at.cmp(&a.updated_at))
-    })
+        // `b` puis `a` : `max_by` cherchait le maximum, le tri veut le meilleur
+        // en tête — l'ordre du comparateur est donc inversé, index compris.
+        pb.cmp(&pa)
+            .then_with(|| a.updated_at.cmp(&b.updated_at))
+            .then_with(|| ib.cmp(ia))
+    });
+    ranked.into_iter().map(|(_, issue)| issue).collect()
+}
+
+/// Combien de candidats la phase 1 interroge au plus par tick (mika#3058 D4).
+///
+/// La porte coûte un à deux appels forge par candidat ; sans borne, un tick sur
+/// une file de vingt tickets fraîchement mergés en ferait quarante. Trois,
+/// parce que la mesure du ticket montre au plus deux tickets simultanément dans
+/// cet état (#3047 et #3050 le 06/11) et que la borne doit laisser une marge
+/// sans devenir un balayage. Au-delà, la phase abandonne le tick — et le tick
+/// suivant reprend du début, puisque rien n'est persisté.
+const PHASE1_DECLINE_BUDGET: usize = 3;
+
+/// Ce qu'un candidat de phase 1 vaut, du point de vue de la boucle (mika#3058).
+///
+/// Trois issues et non deux, parce que « ne pas promouvoir » couvre deux suites
+/// opposées : un refus ou un circuit-breaker a **écrit** quelque chose — label,
+/// commentaire, compteur — et le ticket est désormais exclu ou tenu, donc le
+/// tick s'arrête ; un déclin n'a rien écrit, le ticket reste sain et en tête du
+/// classement, donc s'arrêter là gèlerait la phase pour de bon.
+///
+/// Chaque verdict est consigné au ledger **par le site qui le rend**, jamais
+/// par la boucle : c'est ce qui permet au circuit-breaker et à la porte de
+/// garder leurs deux noms distincts sous un seul `AbandonTick`.
+enum Phase1Verdict {
+    /// Promouvable : la boucle s'arrête, et le tick continue sur ce candidat.
+    Promote,
+    /// Le tick s'arrête ici. Le site qui rend ce verdict a déjà consigné
+    /// pourquoi.
+    AbandonTick,
+    /// Rien n'a été écrit sur ce candidat ; la boucle essaie le suivant.
+    TryNext,
+}
+
+/// La sonde que [`phase1_first_promotable`] interroge, un candidat à la fois.
+///
+/// Un trait plutôt qu'une fermeture, et ce n'est pas une préférence de style :
+/// la sonde de production emprunte le ledger du tick en **mutable**, et une
+/// `FnMut` dont le futur emprunte ses captures n'est pas exprimable — le type
+/// du futur rendu dépendrait de l'emprunt. Le futur est boxé **et `Send`**, et
+/// le trait lui-même l'est, parce que le tick entier part dans un
+/// `tokio::spawn` : sans ces deux bornes, l'erreur ne remonte pas ici mais dans
+/// `server/handlers.rs` et `task_engine/engine.rs`, à mille lignes du site
+/// (mesuré en écrivant ce vol — le futur `Send` seul ne suffit pas, c'est le
+/// `&mut dyn` tenu en travers de l'`await` qui manque la borne).
+trait Phase1Probe: Send {
+    fn probe<'a>(
+        &'a mut self,
+        candidate: &'a Issue,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Phase1Verdict> + Send + 'a>>;
+}
+
+/// Le premier candidat promouvable du classement de phase 1 (mika#3058 AC3).
+///
+/// La phase ne choisissait qu'un candidat par tick, et c'était tenable tant que
+/// le seul « non » de la porte était un refus : il posait [`REFUSAL_LABEL`],
+/// `is_feeder_excluded` écartait le ticket, et le tick suivant atteignait le
+/// candidat d'après — un tick perdu, auto-guéri. Le déclin de mika#3036 n'écrit
+/// rien, par construction (AC4) : rien ne marque le ticket, il revient en tête
+/// à chaque tick, et la phase ne promeut plus jamais rien. D'où le parcours.
+///
+/// La sonde est injectée plutôt qu'appelée ici pour une seule raison, et ce
+/// n'est pas l'esthétique : la version de production coûte un à deux appels
+/// forge par candidat, et un test qui doit compter **combien de candidats la
+/// boucle interroge** ne peut pas le faire sur du réseau. Le compte est la
+/// moitié de ce que garde T2 — une implémentation qui interroge les trois
+/// candidats et rend quand même le bon passerait une assertion de résultat
+/// seul.
+///
+/// Bornée par [`PHASE1_DECLINE_BUDGET`]. Rien n'est persisté : un tick qui
+/// épuise son budget laisse l'état exactement comme il l'a trouvé, et le tick
+/// suivant repart de la tête.
+async fn phase1_first_promotable(ranked: Vec<Issue>, probe: &mut dyn Phase1Probe) -> Option<Issue> {
+    let mut tried = 0usize;
+    for candidate in ranked.into_iter().take(PHASE1_DECLINE_BUDGET) {
+        tried += 1;
+        match probe.probe(&candidate).await {
+            Phase1Verdict::Promote => return Some(candidate),
+            Phase1Verdict::AbandonTick => return None,
+            Phase1Verdict::TryNext => {}
+        }
+    }
+    // mika#2340 — la ligne existe pour que « le budget a été épuisé » se
+    // distingue de « la phase n'a pas tourné ». Sans elle, un tick qui décline
+    // trois fois est indiscernable d'un tick qui n'a trouvé aucun candidat.
+    info!(
+        tried,
+        budget = PHASE1_DECLINE_BUDGET,
+        "auto_pull_phase1_no_promotable_candidate"
+    );
+    None
 }
 
 /// The filter that drops `issue` from the groomed-candidate pool shared by
@@ -2381,26 +3243,23 @@ fn select_feeder_candidates_recording(
 /// Returns all open issues with number, body, labels, and updatedAt.
 /// `gh` CLI has no negative label filter, so we fetch all and filter client-side.
 async fn gh_list_open_issues(github_token: &str) -> Result<Vec<Issue>> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "list",
-        "--repo",
-        DEFAULT_REPO,
-        "--state",
-        "open",
-        "--json",
-        "number,body,labels,updatedAt",
-        "--limit",
-        "100",
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        github_token,
+        GhSubject::Repo,
+        &[
+            "issue",
+            "list",
+            "--repo",
+            DEFAULT_REPO,
+            "--state",
+            "open",
+            "--json",
+            "number,body,labels,updatedAt",
+            "--limit",
+            "100",
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("gh issue list failed: {}", stderr));
@@ -2439,52 +3298,159 @@ async fn gh_list_open_issues(github_token: &str) -> Result<Vec<Issue>> {
     Ok(issues)
 }
 
-/// List open PR closing-issue references via `gh pr list` (mika#1517).
+/// Ce que la réponse `gh pr list` apprend sur les tickets en vol (mika#2822).
 ///
-/// Returns the set of issue numbers that have at least one open PR closing
-/// them. Powered by GitHub's `closingIssuesReferences` field — populated when
-/// a PR body contains `Closes #N` (or equivalent keyword) or the PR is
-/// manually linked to an issue. Issues not so linked are absent from the set.
-async fn gh_list_open_pr_closing_issues(github_token: &str) -> Result<HashSet<u64>> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "pr",
-        "list",
-        "--repo",
-        DEFAULT_REPO,
-        "--state",
-        "open",
-        "--json",
-        "number,closingIssuesReferences",
-        "--limit",
-        "100",
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
+/// Les compteurs sont **par PR**, jamais par numéro : une PR dont les deux
+/// sources donnent le même `N` compte en [`via_closing`](Self::via_closing),
+/// ce qui garde [`via_branch_only`](Self::via_branch_only) exactement égal à la
+/// population que mika#2822 ajoute au filtre.
+pub(crate) struct OpenPrLinkage {
+    /// L'ensemble que les trois phases consomment : union des deux sources.
+    pub numbers: HashSet<u64>,
+    /// Entrées lues dans la réponse, malformées comprises.
+    pub prs: usize,
+    /// PR ayant au moins un `closingIssuesReferences` — la source historique.
+    pub via_closing: usize,
+    /// PR que **seule** la branche relie à un ticket — la population des 8 vols
+    /// à vide du 2026-10-19. C'est le champ qui dit si mika#2822 sert.
+    pub via_branch_only: usize,
+    /// PR dont la branche n'a donné aucun numéro : hors grammaire
+    /// `<type>/<N>/<slug>` (`dependabot/…`, `main`) ou `headRefName` illisible.
+    /// Les deux causes sont comptées ensemble faute d'un cinquième compteur que
+    /// personne ne lirait — `gh pr list --json headRefName` rend toujours le
+    /// champ, donc en pratique ce compteur ne voit que des branches.
+    pub nonconforming_branches: usize,
+}
 
-    let output = cmd.output().await?;
+/// Les tickets qu'une réponse `gh pr list` déclare en vol (mika#2822).
+///
+/// Séparé de l'appel au sous-processus, comme [`parse_compare_payload`], pour
+/// que tout le chemin de décision soit testable sur une charge figée, sans
+/// réseau : avant ce découpage, aucun test ne pouvait atteindre ce parsing.
+///
+/// **Deux sources, unies** :
+///
+/// 1. `closingIssuesReferences` — l'historique (mika#1517), peuplé par un
+///    mot-clé de fermeture (`Closes #N`) ou un lien manuel ;
+/// 2. `headRefName` — lu par [`crate::worktree_reaper::issue_number_from_branch`],
+///    le lecteur **unique** de la grammaire `<type>/<N>/<slug>`. Appel, pas
+///    copie : une troisième extraction serait la classe mika#2158 à son
+///    quatrième tour.
+///
+/// La deuxième existe parce que la première ne peut pas voir une PR de vol
+/// partiel : son ticket doit rester ouvert pour le vol suivant, donc son corps
+/// dit `Refs #N` et `closingIssuesReferences` reste vide. Le 2026-10-19 entre
+/// 00:00Z et 06:00Z, cet angle mort a coûté 7 vols d'implémentation à vide
+/// (11 à 27 tours, 1,0 $ à 2,6 $ chacun).
+///
+/// Une troisième source — un scan de `#N` sur le corps — est **refusée**, pas
+/// différée : les corps de PR de ce dépôt citent des tickets en doctrine autant
+/// qu'en périmètre (« la classe mika#2158 », « suivi de mika#1517 »), et
+/// l'asymétrie des coûts est inverse de celle du reste du filtre — un faux
+/// négatif coûte un vol à vide, réparable au tick suivant ; un faux positif
+/// retire un ticket du dispatch tant que la PR citante reste ouverte, en
+/// silence.
+///
+/// **Deux niveaux d'échec, et leur asymétrie est délibérée** — celle que
+/// [`parse_compare_payload`] tient déjà pour son champ `files` :
+///
+/// - **JSON global illisible** ⇒ `Err`, et l'appelant garde son fail-open à
+///   l'identique, donc le comportement d'avant le correctif.
+/// - **Une entrée malformée** ⇒ cette PR ne contribue simplement pas par la
+///   branche ; `closingIssuesReferences` continue et les autres PR gardent
+///   leurs exclusions. Faire échouer le lot sur une entrée ferait perdre tout
+///   le filtre pour une PR : le fail-open global est trop grossier pour servir
+///   de traitement d'erreur par entrée.
+pub(crate) fn parse_open_pr_issue_numbers(stdout: &str) -> Result<OpenPrLinkage> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(stdout)?;
+
+    let mut linkage = OpenPrLinkage {
+        numbers: HashSet::new(),
+        prs: raw.len(),
+        via_closing: 0,
+        via_branch_only: 0,
+        nonconforming_branches: 0,
+    };
+
+    for pr in raw {
+        let mut closing = false;
+        if let Some(refs) = pr["closingIssuesReferences"].as_array() {
+            for ref_obj in refs {
+                if let Some(n) = ref_obj["number"].as_u64() {
+                    linkage.numbers.insert(n);
+                    closing = true;
+                }
+            }
+        }
+        if closing {
+            linkage.via_closing += 1;
+        }
+
+        match pr["headRefName"]
+            .as_str()
+            .and_then(crate::worktree_reaper::issue_number_from_branch)
+        {
+            Some(n) => {
+                linkage.numbers.insert(n);
+                if !closing {
+                    linkage.via_branch_only += 1;
+                }
+            }
+            None => linkage.nonconforming_branches += 1,
+        }
+    }
+
+    Ok(linkage)
+}
+
+/// List the issue numbers an open PR is in flight for, via `gh pr list`
+/// (mika#1517, élargi par mika#2822).
+///
+/// Le parsing — et donc toute la décision — vit dans
+/// [`parse_open_pr_issue_numbers`], qui porte les deux sources et leur
+/// raison. Cette fonction ne fait que l'appel et la sonde.
+async fn gh_list_open_pr_issue_numbers(github_token: &str) -> Result<HashSet<u64>> {
+    let output = run_gh(
+        github_token,
+        GhSubject::Repo,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            DEFAULT_REPO,
+            "--state",
+            "open",
+            "--json",
+            "number,closingIssuesReferences,headRefName",
+            "--limit",
+            "100",
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!("gh pr list failed: {}", stderr));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let raw: Vec<serde_json::Value> = serde_json::from_str(&stdout)?;
+    let linkage = parse_open_pr_issue_numbers(&stdout)?;
 
-    let mut closed_issue_numbers = HashSet::new();
-    for pr in raw {
-        if let Some(refs) = pr["closingIssuesReferences"].as_array() {
-            for ref_obj in refs {
-                if let Some(n) = ref_obj["number"].as_u64() {
-                    closed_issue_numbers.insert(n);
-                }
-            }
-        }
-    }
-    Ok(closed_issue_numbers)
+    // Une ligne par tick, sur **toutes** les branches y compris celle où
+    // `via_branch_only == 0` : le census de pool émet déjà `open_pr`, mais ce
+    // nombre est muet sur la provenance — avant comme après mika#2822 il dirait
+    // la même chose. Son absence du journal signifie un binaire antérieur à ce
+    // correctif (classe mika#2340), jamais « aucune PR dans ce cas ».
+    info!(
+        event = "auto_pull_open_pr_set_resolved",
+        prs = linkage.prs,
+        via_closing = linkage.via_closing,
+        via_branch_only = linkage.via_branch_only,
+        nonconforming_branches = linkage.nonconforming_branches,
+        total = linkage.numbers.len(),
+        "auto_pull: l'ensemble « a une PR ouverte » est résolu sur deux sources"
+    );
+
+    Ok(linkage.numbers)
 }
 
 /// Apply a label to a GitHub issue.
@@ -2500,23 +3466,20 @@ pub(crate) async fn gh_apply_label(
     issue_number: u64,
     label: &str,
 ) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "edit",
-        &issue_number.to_string(),
-        "--repo",
-        DEFAULT_REPO,
-        "--add-label",
-        label,
-    ]);
-    cmd.env("GH_TOKEN", label_auth.token());
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        label_auth.token(),
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "edit",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--add-label",
+            label,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // AC5 : un refus de permission sous identité App a son propre nom, ici
@@ -2542,23 +3505,20 @@ async fn gh_remove_label(
     issue_number: u64,
     label: &str,
 ) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "edit",
-        &issue_number.to_string(),
-        "--repo",
-        DEFAULT_REPO,
-        "--remove-label",
-        label,
-    ]);
-    cmd.env("GH_TOKEN", label_auth.token());
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        label_auth.token(),
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "edit",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--remove-label",
+            label,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Tolerate the idempotent "label not present" case as success.
@@ -2586,23 +3546,20 @@ async fn gh_remove_label(
 /// is not a refusal anyone reads — mika#1901 was re-driven 16 times, and the
 /// only way to notice was to count timeline events by hand.
 async fn gh_comment_issue(github_token: &str, issue_number: u64, body: &str) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "issue",
-        "comment",
-        &issue_number.to_string(),
-        "--repo",
-        DEFAULT_REPO,
-        "--body",
-        body,
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await?;
+    let output = run_gh(
+        github_token,
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "comment",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--body",
+            body,
+        ],
+    )
+    .await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
@@ -2629,18 +3586,16 @@ async fn gh_comment_issue(github_token: &str, issue_number: u64, body: &str) -> 
 /// which promotes — the gate refuses on what it measured, never on what it
 /// failed to measure.
 async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasurement {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args([
-        "api",
-        &format!("repos/{DEFAULT_REPO}/compare/main...{branch}"),
-    ]);
-    cmd.env("GH_TOKEN", github_token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = match cmd.output().await {
+    let output = match run_gh(
+        github_token,
+        GhSubject::Repo,
+        &[
+            "api",
+            &format!("repos/{DEFAULT_REPO}/compare/main...{branch}"),
+        ],
+    )
+    .await
+    {
         Ok(o) => o,
         Err(e) => {
             warn!(error = %e, branch, "auto_pull: gh api compare failed to spawn");
@@ -2651,7 +3606,14 @@ async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasure
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
-            return StalenessMeasurement::BranchAbsent;
+            // L'absence **non sondée** : à cet instant la question « une PR
+            // mergée la porte-t-elle ? » (mika#2837) n'a pas été posée, et
+            // [`promotion_gate_allows`] remplace cette valeur par celle de
+            // [`classify_absent_branch`] avant toute décision. `NotCarried` est
+            // le seul des deux noms qui ne prétende pas à une lecture en erreur.
+            return StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            };
         }
         warn!(branch, stderr = %stderr, "auto_pull: gh api compare failed");
         return StalenessMeasurement::Unavailable;
@@ -2666,8 +3628,611 @@ async fn gh_compare_branch(github_token: &str, branch: &str) -> StalenessMeasure
     }
 }
 
-/// The promotion gate (mika#2123 R1–R5). Returns `true` when the ticket may be
-/// promoted; on `false` the ticket has already been handed to the operator.
+/// La sonde « une PR mergée porte-t-elle cette branche ? » (mika#2837).
+///
+/// Toute la décision vit dans [`parse_merged_pr_for_branch`] ; cette fonction
+/// ne fait que l'appel et les deux sondes de journal.
+///
+/// **`--state all`, pas `--state merged`.** Le discriminant « mergée » doit
+/// vivre dans notre code, là où un test l'atteint sur une charge figée.
+/// Délégué au filtre de la forge, le contrôle négatif d'AC4 — une PR fermée
+/// sans merge — ne serait vérifiable que contre le réseau.
+///
+/// **Les deux sondes sont émises ici**, et non dans
+/// [`classify_absent_branch`], qui est pure et le reste : une fonction pure qui
+/// journalise émet une ligne par test qui l'appelle, et le journal cesse d'être
+/// une trace de production.
+/// **`carrying` : un appel, deux questions** (mika#3001). `None` demande « une
+/// PR mergée porte-t-elle cette branche ? » (mika#2837) ; `Some(plan)` demande
+/// « laquelle de ces PR mergées a mis ce plan sur `main` ? ». La requête est la
+/// même à `files` près, qui est demandé dans les deux cas : un seul `--json`
+/// évite qu'un appelant obtienne une charge où le champ manque, ce qui ferait
+/// lire `false` à [`pr_files_carry`] pour une raison qui n'est pas la sienne.
+async fn gh_merged_pr_for_branch(
+    github_token: &str,
+    issue_number: u64,
+    branch: &str,
+    carrying: Option<&str>,
+) -> Result<Option<MergedPrEvidence>> {
+    let probe: Result<Option<MergedPrEvidence>> = async {
+        let output = run_gh(
+            github_token,
+            GhSubject::Repo,
+            &[
+                "pr",
+                "list",
+                "--repo",
+                DEFAULT_REPO,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "number,state,mergedAt,baseRefName,headRefName,files",
+                "--limit",
+                "30",
+            ],
+        )
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("gh pr list --head {branch} failed: {stderr}"));
+        }
+        parse_merged_pr_for_branch(&String::from_utf8_lossy(&output.stdout), branch, carrying)
+    }
+    .await;
+
+    // Deux lectures, deux noms d'évènement (mika#2205) : sous `carrying` la
+    // sonde n'a mesuré **aucune** suppression de branche, et réemployer le nom
+    // de mika#2837 ferait additionner deux populations qu'un opérateur doit
+    // pouvoir soustraire. Le `plan` est porté sur la seconde parce que c'est la
+    // valeur qui a filtré, donc la seule qui rende la ligne relisible.
+    match &probe {
+        Ok(Some(evidence)) => match carrying {
+            None => info!(
+                event = "auto_pull_branch_deleted_by_merge",
+                issue = issue_number,
+                branch,
+                pr = evidence.number,
+                merged_at = %evidence.merged_at,
+                "auto_pull: le merge de cette PR a supprimé la branche du callout ; \
+                 son plan est sur `main`, donc pas de gate"
+            ),
+            Some(plan) => info!(
+                event = "auto_pull_plan_merged_branch_reused",
+                issue = issue_number,
+                branch,
+                plan,
+                pr = evidence.number,
+                merged_at = %evidence.merged_at,
+                "auto_pull: le merge de cette PR a mis le plan du callout sur `main` ; \
+                 la branche existe toujours et porte autre chose (mika#3001)"
+            ),
+        },
+        // Rien sur « aucune PR mergée » : le refus se journalise déjà par son
+        // audit et se commente sur la forge. Une ligne de plus ne dirait que ce
+        // que `merged_pr_probe` porte. Sous `carrying`, « aucune » et « une
+        // liste coupée » appellent le même geste — ne pas réécrire — et c'est
+        // l'état d'avant mika#3001 : il n'y a rien à signaler là non plus.
+        Ok(None) => {}
+        Err(error) => warn!(
+            event = "auto_pull_merged_pr_probe_unreadable",
+            issue = issue_number,
+            branch,
+            plan = carrying.unwrap_or_default(),
+            error = %error,
+            "auto_pull: la sonde « quelle PR mergée porte ceci ? » n'a pas pu \
+             répondre ; sans `plan` le ticket reste au gate (mika#2837 AC3), avec \
+             `plan` le callout n'est pas réécrit (mika#3001)"
+        ),
+    }
+
+    probe
+}
+
+// ───── Réécriture du callout d'une branche morte (mika#2839) ─────
+
+/// Le corps **frais** d'une issue, relu juste avant d'être écrit (R9).
+///
+/// `gh issue view --json body -q .body`, et non l'`issue.body` que la boucle
+/// porte déjà : entre la mesure et l'écriture il y a deux appels réseau, et le
+/// grooming écrit ce même bloc par `_write_canonical_callout`. La relecture est
+/// ce qui rend possible le comparer-puis-écrire de [`rewrite_stale_callout`].
+///
+/// `jq -r` termine sa sortie par un `\n` qui n'est pas dans le corps : il est
+/// retiré, et lui seul, pour que la comparaison de R9 porte exactement sur les
+/// octets que GitHub a rendus.
+async fn gh_issue_body(github_token: &str, issue_number: u64) -> Result<String> {
+    let output = run_gh(
+        github_token,
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "view",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--json",
+            "body",
+            "-q",
+            ".body",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh issue view --json body failed for #{}: {}",
+            issue_number,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(body.strip_suffix('\n').unwrap_or(&body).to_string())
+}
+
+/// Écrire le corps d'une issue (mika#2839). Mirrors [`gh_apply_label`]'s shape.
+///
+/// Prend un [`LabelWriteToken`] pour la raison de mika#2228, et elle pèse plus
+/// lourd ici qu'ailleurs : c'est la **première** écriture de corps d'issue de ce
+/// module. Un corps écrit sous le token de lecture ne manquerait pas d'une
+/// permission en silence — il remplacerait le ticket par une page d'erreur
+/// d'autorisation.
+///
+/// `--body` **inline** et non `--body-file` : [`run_gh`] ferme l'entrée standard
+/// (`Stdio::null()`), un fichier intermédiaire demanderait une écriture hors
+/// worktree, et [`gh_comment_issue`] a déjà le précédent sur ce même seam.
+async fn gh_edit_issue_body(
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    body: &str,
+) -> Result<()> {
+    let output = run_gh(
+        label_auth.token(),
+        GhSubject::Issue(issue_number),
+        &[
+            "issue",
+            "edit",
+            &issue_number.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--body",
+            body,
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Même asymétrie que `gh_apply_label` : le refus de permission sous
+        // identité App a son nom là-bas, l'appelant garde le sien ici.
+        label_auth.report_write_failure("auto_pull", issue_number, "body", &stderr);
+        return Err(anyhow!(
+            "gh issue edit --body failed for #{}: {}",
+            issue_number,
+            stderr
+        ));
+    }
+    Ok(())
+}
+
+/// `audit_events.target_key` de la réécriture de callout (mika#2839 R7).
+const CALLOUT_REWRITE_TARGET_KEY: &str = "auto_pull_callout_rewrite";
+
+/// Dire ce que la réécriture a fait — une ligne d'audit et une sonde, sur
+/// **toutes** les branches (R7).
+///
+/// `cause` est `None` sur le chemin nominal et rend `null` dans le JSON, jamais
+/// `""` ni `"none"` : absent n'est pas zéro (mika#2331). La sonde du chemin
+/// nominal est INFO et non `debug!`, parce que son absence doit pouvoir se
+/// distinguer de « ce n'est jamais arrivé » : sans elle, un binaire antérieur à
+/// ce vol et une population vide rendent les mêmes octets (mika#2340).
+///
+/// Le vocabulaire de `cause` est **clos** — `body_changed`, `body_unreadable`,
+/// `write_refused` — pour la raison de mika#2205 : deux populations sous un même
+/// nom ne se soustraient pas, et trois orthographes d'une même panne ne se
+/// comptent pas. mika#3001 n'y ajoute **rien** : ses non-conclusions ne sont pas
+/// des abandons de réécriture mais des non-candidatures, et elles sortent avant
+/// d'arriver ici, par [`plan_presence`].
+///
+/// Ce que mika#3001 ajoute est un **champ**, `staleness`, qui dit par quel des
+/// deux chemins ce callout a été jugé périmé. C'est par lui qu'un opérateur
+/// compte la population du chemin B : `merged_pr` seul ne les distingue pas, et
+/// deux populations sous un même nom ne se soustraient pas (mika#2205). Il est
+/// gratuit — le JSON est déjà écrit ici.
+#[allow(clippy::too_many_arguments)]
+async fn note_callout_rewrite(
+    db: &AsyncDatabase,
+    issue_number: u64,
+    branch: &str,
+    plan: Option<&str>,
+    staleness: PriorPlanCause,
+    cause: Option<&str>,
+    token_source: &str,
+    phase: &str,
+    trace_id: &str,
+    session_id: &str,
+) {
+    let outcome = if cause.is_none() {
+        "rewritten"
+    } else {
+        "abandoned"
+    };
+    let merged_pr = staleness.merged_pr();
+    let after = serde_json::json!({
+        "issue": issue_number,
+        "branch": branch,
+        "plan": plan,
+        "merged_pr": merged_pr,
+        "staleness": staleness.slug(),
+        "outcome": outcome,
+        "cause": cause,
+        "token_source": token_source,
+    })
+    .to_string();
+
+    match cause {
+        None => info!(
+            event = "auto_pull_callout_rewritten",
+            issue = issue_number,
+            branch,
+            plan = ?plan,
+            merged_pr,
+            staleness = staleness.slug(),
+            phase,
+            "auto_pull: le callout d'un vol dont la PR est mergée est réécrit \
+             en « Plan antérieur » (mika#2839, mika#3001)"
+        ),
+        Some(cause) => warn!(
+            event = "auto_pull_callout_rewrite_abandoned",
+            issue = issue_number,
+            branch,
+            plan = ?plan,
+            merged_pr,
+            staleness = staleness.slug(),
+            cause,
+            phase,
+            "auto_pull: le callout n'a pas été réécrit ; le ticket est promu \
+             quand même (mika#2839 R6)"
+        ),
+    }
+
+    if let Err(e) = db
+        .log_audit_event(
+            session_id,
+            "auto_pull",
+            CALLOUT_REWRITE_TARGET_KEY,
+            None,
+            Some(&after),
+            Some(phase),
+            Some(trace_id),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            issue = issue_number,
+            "auto_pull: failed to write callout-rewrite audit event"
+        );
+    }
+}
+
+/// Réécrire le callout d'un vol dont le merge de la PR a périmé le plan
+/// (mika#2839 R6/R9, mika#3001).
+///
+/// Appelée depuis [`promotion_gate_allows`] dès que [`stale_callout_cause`] a
+/// nommé une cause — par l'un ou l'autre de ses deux chemins, qui ne diffèrent
+/// plus ici que par le `staleness` qu'ils portent —
+/// **après** la ligne d'audit de mika#2837, et sans pouvoir changer le verdict :
+/// tous les écarts et toutes les pannes sortent par
+/// `auto_pull_callout_rewrite_abandoned` avec leur `cause` et rendent `Ok(())`.
+/// Ce que ce vol ferme est le résidu de mika#2837 — la sonde
+/// `gh pr list --head` repayée à *chaque* pull pour reconstruire une réponse qui
+/// ne changera plus, et un lecteur humain renvoyé à une branche qui n'existe
+/// pas.
+///
+/// **Comparer-puis-écrire sur une relecture, et ce n'est pas un CAS.** GitHub
+/// n'offre aucune écriture conditionnelle sur un corps d'issue. On relit, on
+/// vérifie que le corps frais nomme toujours la même branche morte *et* le même
+/// plan, puis on écrit. La fenêtre qui reste est celle entre la relecture et
+/// l'écriture ; ce qu'on y perdrait est un dispatch de grooming, à comparer au
+/// tour d'opérateur par vol que mika#2837 vient de supprimer.
+///
+/// L'autre écrivain de ce bloc est `_write_canonical_callout`, au grooming. Les
+/// deux ne sont pas ordonnés, et c'est exactement l'objection que mika#2837
+/// avait posée : R9 est la réponse — celui qui perd la course ne détruit pas
+/// l'écriture de l'autre, il l'abandonne et le dit.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_stale_callout(
+    db: &AsyncDatabase,
+    github_token: &str,
+    label_auth: &LabelWriteToken,
+    issue_number: u64,
+    measured_body: &str,
+    branch: &str,
+    staleness: PriorPlanCause,
+    phase: &str,
+    trace_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let token_source = label_auth.source().as_str();
+    let measured_plan = extract_plan_path(measured_body);
+    // Les cinq appels à `note_callout_rewrite` sont épelés en entier plutôt que
+    // repliés dans une fermeture : une fermeture rendant un futur qui emprunte
+    // ses propres captures ne s'exprime pas dans le système de types ici, et la
+    // contourner coûterait plus de machinerie que la répétition n'en coûte.
+    let plan = measured_plan.as_deref();
+
+    let fresh = match gh_issue_body(github_token, issue_number).await {
+        Ok(body) => body,
+        Err(e) => {
+            debug!(
+                error = %e,
+                issue = issue_number,
+                "auto_pull: relecture du corps impossible avant réécriture du callout"
+            );
+            note_callout_rewrite(
+                db,
+                issue_number,
+                branch,
+                plan,
+                staleness,
+                Some("body_unreadable"),
+                token_source,
+                phase,
+                trace_id,
+                session_id,
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    // R9 — on n'écrit que si le corps frais nomme TOUJOURS la même branche morte
+    // et le même plan. Un corps qui a bougé depuis la mesure (le grooming a
+    // republié le callout, un humain l'a corrigé à la main) n'est plus celui
+    // qu'on a mesuré : l'écrire effacerait l'écriture de l'autre.
+    let fresh_plan = extract_plan_path(&fresh);
+    let same_branch = extract_branch_name(&fresh).as_deref() == Some(branch);
+    if !same_branch || fresh_plan.is_none() || fresh_plan != measured_plan {
+        note_callout_rewrite(
+            db,
+            issue_number,
+            branch,
+            plan,
+            staleness,
+            Some("body_changed"),
+            token_source,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // `None` est inatteignable ici : R9 vient de vérifier que le corps frais
+    // porte un callout lisible par le lecteur strict, qui est exactement celui
+    // que ce transform cherche. Replié sur `body_changed` plutôt que dépilé —
+    // un `expect` tuerait la tick pour une réécriture facultative, et le
+    // vocabulaire de `cause` est clos.
+    let Some(rewritten) =
+        crate::plan_callout::rewrite_callout_as_prior_plan(&fresh, branch, staleness)
+    else {
+        note_callout_rewrite(
+            db,
+            issue_number,
+            branch,
+            plan,
+            staleness,
+            Some("body_changed"),
+            token_source,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    };
+
+    if let Err(e) = gh_edit_issue_body(label_auth, issue_number, &rewritten).await {
+        debug!(
+            error = %e,
+            issue = issue_number,
+            "auto_pull: écriture du corps refusée ; le callout reste périmé"
+        );
+        note_callout_rewrite(
+            db,
+            issue_number,
+            branch,
+            plan,
+            staleness,
+            Some("write_refused"),
+            token_source,
+            phase,
+            trace_id,
+            session_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    note_callout_rewrite(
+        db,
+        issue_number,
+        branch,
+        plan,
+        staleness,
+        None,
+        token_source,
+        phase,
+        trace_id,
+        session_id,
+    )
+    .await;
+    Ok(())
+}
+
+/// La PR dont le merge rend ce callout périmé, ou rien (mika#3001 AC1).
+///
+/// Le discriminant de la porte, et il a changé de nature. Avant ce vol :
+/// *« la branche du callout est-elle absente d'`origin` ? »* — ce qu'une branche
+/// repoussée douze minutes après le merge de son plan fait répondre « non »
+/// (mika#2958, 2026-10-31 16:36Z). Après : *« la PR qui a porté le plan du
+/// callout est-elle mergée ? »*, ce qui rend l'état de la branche **non
+/// pertinent**.
+///
+/// Deux chemins y mènent, et les deux nomment une PR mergée :
+///
+/// - [`StalenessMeasurement::BranchDeletedByMerge`] — la sonde de mika#2837 a
+///   déjà établi que le merge de cette PR a supprimé la branche, et la branche
+///   n'a eu aucune autre vie depuis : la PR nommée est celle qui a porté le
+///   plan. **Zéro appel de plus**, et le comportement de mika#2839 est conservé
+///   à l'identique ;
+/// - [`StalenessMeasurement::Measured`] — la branche vit. On lit d'abord
+///   [`plan_presence`] sur la charge `compare` **déjà reçue** : c'est gratuit, et
+///   sur `OnBranch` comme sur `Unreadable` on sort sans rien appeler. Ce n'est
+///   que sur `NotOnBranch` — `main` a absorbé le plan, ou il n'existe nulle
+///   part — qu'on pose la sonde, et elle demande alors *quelle* PR mergée porte
+///   ce plan, pas si une PR porte la branche.
+///
+/// Toute autre mesure rend `None` : `NoBranchCallout` n'a pas de callout à
+/// réécrire, `Unavailable` n'a rien mesuré, et `BranchAbsent` est le refus de
+/// mika#2837 — dont le plan annoncé n'existe nulle part, donc rien ne prouve
+/// qu'un merge l'a périmé.
+///
+/// La sonde n'est donc posée que sur une population rare par construction et
+/// **auto-tarissante** : après réécriture le run de callout n'existe plus, donc
+/// [`extract_branch_name`] rend `None`, donc la porte ne mesure plus rien sur ce
+/// ticket.
+async fn stale_callout_cause(
+    github_token: &str,
+    issue_number: u64,
+    measurement: &StalenessMeasurement,
+    branch: &str,
+    plan: &str,
+) -> Option<PriorPlanCause> {
+    match measurement {
+        StalenessMeasurement::BranchDeletedByMerge { pr } => {
+            Some(PriorPlanCause::BranchDeletedByMerge { pr: *pr })
+        }
+        StalenessMeasurement::Measured(staleness) => {
+            match plan_presence(staleness, plan) {
+                PlanPresence::OnBranch => None,
+                PlanPresence::Unreadable => {
+                    // Une non-candidature, pas un abandon : rien n'est tenté,
+                    // donc rien n'est à réparer. `debug!` et non INFO parce que
+                    // le cas nominal passe par le même `match` — mais la
+                    // population existe et doit être trouvable.
+                    debug!(
+                        event = "auto_pull_callout_plan_presence_unreadable",
+                        issue = issue_number,
+                        branch,
+                        plan,
+                        "auto_pull: la liste des fichiers de la branche n'autorise \
+                         aucune conclusion d'absence ; callout laissé tel quel"
+                    );
+                    None
+                }
+                PlanPresence::NotOnBranch => {
+                    let probe =
+                        gh_merged_pr_for_branch(github_token, issue_number, branch, Some(plan))
+                            .await;
+                    // `Err` et `Ok(None)` fusionnés sous un même `None`, et
+                    // c'est délibéré : les deux appellent le geste d'avant ce
+                    // vol — ne pas réécrire. Le détail est déjà journalisé par
+                    // la sonde elle-même.
+                    probe
+                        .ok()
+                        .flatten()
+                        .map(|e| PriorPlanCause::PlanMergedBranchReused { pr: e.number })
+                }
+            }
+        }
+        StalenessMeasurement::NoBranchCallout
+        | StalenessMeasurement::Unavailable
+        | StalenessMeasurement::BranchAbsent { .. } => None,
+    }
+}
+
+/// Réécrit le callout du ticket si la mesure vient de le dire périmé — et
+/// seulement si la décision autorise une écriture (mika#3036 AC3).
+///
+/// mika#2839, étendu par mika#3001 — la mesure vient peut-être de dire que le
+/// merge d'une PR a périmé le callout de ce ticket : le callout est périmé, le
+/// plan ne l'est pas. On le réécrit ici, et seulement ici, parce que c'est le
+/// seul endroit où cette réponse est déjà payée. Le discriminant de la *cause*
+/// vit tout entier dans [`stale_callout_cause`], qui lit la mesure et ne sonde
+/// la forge que sur la seule population candidate. L'écriture ne peut pas
+/// coûter le verdict que mika#2837 vient de rendre — voir
+/// [`rewrite_stale_callout`].
+///
+/// Extraite de [`promotion_gate_allows`] par mika#3036, dont elle hérite les
+/// neuf paramètres : un déclin ne doit laisser **aucune** trace d'écriture, et
+/// le garde-fou se lit mieux au seuil d'une fonction nommée qu'au milieu de la
+/// porte.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_rewrite_stale_callout(
+    db: &AsyncDatabase,
+    github_token: &str,
+    label_auth: &LabelWriteToken,
+    issue: &Issue,
+    measurement: &StalenessMeasurement,
+    decision: &PromotionGate,
+    phase: ExclusionPhase,
+    trace_id: &str,
+    session_id: &str,
+) {
+    if !decision.authorizes_body_rewrite() {
+        return;
+    }
+
+    // `plan_callout` et non [`extract_plan_path`] : c'est `normalized` qu'il faut
+    // ici — la forme sans préfixe de dépôt, celle des `filename` du `compare` et
+    // des `files[].path` d'une PR — et `extract_plan_path` jette ce champ.
+    let callout_plan =
+        crate::plan_callout::plan_callout(&issue.body, crate::plan_callout::FenceHandling::Strip);
+    let branch = extract_branch_name(&issue.body);
+    if let (Some(b), Some(callout)) = (branch.as_deref(), &callout_plan)
+        && let Some(cause) = stale_callout_cause(
+            github_token,
+            issue.number,
+            measurement,
+            b,
+            &callout.normalized,
+        )
+        .await
+    {
+        let rewrite = rewrite_stale_callout(
+            db,
+            github_token,
+            label_auth,
+            issue.number,
+            &issue.body,
+            b,
+            cause,
+            phase.gate_phase(),
+            trace_id,
+            session_id,
+        )
+        .await;
+        if let Err(e) = rewrite {
+            // Inatteignable par construction : la fonction nomme ses écarts par
+            // leur `cause` et rend toujours `Ok(())`. La branche existe pour que
+            // le verdict reste hors de portée si un futur éditeur lui donnait
+            // une erreur à remonter.
+            warn!(
+                error = %e,
+                issue = issue.number,
+                "auto_pull: la réécriture du callout a remonté une erreur"
+            );
+        }
+    }
+}
+
+/// The promotion gate (mika#2123 R1–R5). Returns [`GateOutcome::Allowed`] when
+/// the ticket may be promoted; on [`GateOutcome::Refused`] the ticket has
+/// already been handed to the operator, and on [`GateOutcome::Declined`]
+/// (mika#3058) nothing at all was written — the ticket is sound and waits for a
+/// consent only a human can return.
 ///
 /// Called from **all three** sites that apply the `ready` label — the Phase 0
 /// feeder, the Phase 1 idle pull, and the Phase 2 stuck-ready rescue. The
@@ -2685,17 +4250,33 @@ async fn promotion_gate_allows(
     github_token: &str,
     label_auth: &LabelWriteToken,
     issue: &Issue,
-    phase: &str,
+    phase: ExclusionPhase,
     trace_id: &str,
     session_id: &str,
-) -> bool {
+) -> GateOutcome {
     let branch = extract_branch_name(&issue.body);
     let measurement = match branch.as_deref() {
         Some(b) => gh_compare_branch(github_token, b).await,
         None => StalenessMeasurement::NoBranchCallout,
     };
+    // mika#2837 — « absente d'`origin` » n'est pas encore une décision : on
+    // demande *pourquoi*. Un second appel, et seulement sur cette branche-là du
+    // match : le cas courant d'un ticket à plusieurs vols est le plus bénin des
+    // deux — le merge du vol précédent a supprimé la branche, et son plan est
+    // sur `main`. Le refuser coûtait un tour d'opérateur par vol.
+    let measurement = match (measurement, branch.as_deref()) {
+        (StalenessMeasurement::BranchAbsent { .. }, Some(b)) => {
+            // `carrying: None` — la question de mika#2837 porte sur la
+            // **branche**, pas sur un plan : c'est son propre discriminant, et
+            // mika#3001 ne le touche pas (§ 2.5).
+            classify_absent_branch(
+                gh_merged_pr_for_branch(github_token, issue.number, b, None).await,
+            )
+        }
+        (m, _) => m,
+    };
     let threshold = max_behind();
-    let decision = classify_promotion(&measurement, branch.as_deref(), threshold);
+    let decision = classify_promotion(&measurement, branch.as_deref(), threshold, phase);
     let audit = staleness_audit_json(
         issue.number,
         branch.as_deref(),
@@ -2715,7 +4296,7 @@ async fn promotion_gate_allows(
             "auto_pull_staleness_measured",
             None,
             Some(&audit),
-            Some(phase),
+            Some(phase.gate_phase()),
             Some(trace_id),
         )
         .await
@@ -2723,16 +4304,29 @@ async fn promotion_gate_allows(
         warn!(error = %e, issue = issue.number, "auto_pull: failed to write staleness audit event");
     }
 
+    maybe_rewrite_stale_callout(
+        db,
+        github_token,
+        label_auth,
+        issue,
+        &measurement,
+        &decision,
+        phase,
+        trace_id,
+        session_id,
+    )
+    .await;
+
     match decision {
         PromotionGate::Promote { detail } => {
             info!(
                 issue = issue.number,
-                phase,
+                phase = phase.gate_phase(),
                 detail,
                 staleness = %audit,
                 "auto_pull_promotion_allowed"
             );
-            true
+            GateOutcome::Allowed
         }
         PromotionGate::Refuse(reason) => {
             refuse_promotion(
@@ -2741,13 +4335,27 @@ async fn promotion_gate_allows(
                 label_auth,
                 issue.number,
                 reason,
-                phase,
+                phase.gate_phase(),
                 &audit,
                 trace_id,
                 session_id,
             )
             .await;
-            false
+            GateOutcome::Refused
+        }
+        // mika#3036 — aucune écriture sur la forge : ni label, ni commentaire.
+        // Le ticket est sain ; il attend un consentement que seul un humain peut
+        // rendre. Le verdict suffit, et c'est lui qui fait compter le déclin dans
+        // le ledger d'exclusion du site d'appel (AC4).
+        PromotionGate::Decline(reason) => {
+            warn!(
+                issue = issue.number,
+                merged_pr = ?reason.merged_pr(),
+                reason = reason.slug(),
+                phase = phase.gate_phase(),
+                "auto_pull_promotion_declined"
+            );
+            GateOutcome::Declined
         }
     }
 }
@@ -2953,9 +4561,9 @@ impl AbandonReason {
             "## Auto-pull : re-drive abandonné pour #{issue_number}\n\n\
              **Raison.** {}\n\n\
              **Ce qu'il faudrait pour passer.** Pour remettre ce ticket en jeu : {}, \
-             puis retire son label de tenue — `operator-review` (posé ci-dessus), ou \
+             puis retire son label de tenue — `{ABANDON_LABEL}` (posé ci-dessus), ou \
              `blocked` / `operator-gated` si le ticket en porte un.\n\n\
-             Le label `ready` a été retiré et `operator-review` posé — l'auto-pull ne \
+             Le label `ready` a été retiré et `{ABANDON_LABEL}` posé — l'auto-pull ne \
              re-drivera plus ce ticket tant qu'il porte un label de tenue. Reposer `ready` \
              par-dessus ne lève rien. Retirer le label de tenue remet son compteur de \
              re-drives à zéro.\n\n\
@@ -2995,8 +4603,8 @@ async fn abandon_stuck_ready(
     // gesture, and the budget would reset — a fresh loop every N re-drives.
     // Aborting instead is convergent: the counter is still past the budget, so
     // the next tick simply retries the abandonment.
-    if let Err(e) = gh_apply_label(label_auth, issue_number, "operator-review").await {
-        warn!(error = %e, issue = issue_number, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
+    if let Err(e) = gh_apply_label(label_auth, issue_number, ABANDON_LABEL).await {
+        warn!(error = %e, issue = issue_number, label = ABANDON_LABEL, "auto_pull: abandon could not apply operator-review label; leaving ticket untouched for the next tick");
         if let Err(e2) = db
             .increment_auto_pull_failure(DEFAULT_REPO, issue_number)
             .await
@@ -3391,7 +4999,11 @@ pub async fn auto_pull_groomed_ticket(
 
     // Fetch open-PR closing-issue refs once (mika#1517). Both phases consume it.
     // Fail-open: an empty set preserves pre-fix behavior on infra glitches.
-    let open_pr_issue_numbers = match gh_list_open_pr_closing_issues(github_token).await {
+    // Ce que ce fail-open abandonne depuis mika#2822 : les **deux** sources de
+    // l'ensemble — `closingIssuesReferences` et le numéro porté par la branche
+    // de tête — donc un tick qui tombe ici re-dispatche aussi les tickets dont
+    // une PR de vol partiel est ouverte.
+    let open_pr_issue_numbers = match gh_list_open_pr_issue_numbers(github_token).await {
         Ok(set) => set,
         Err(e) => {
             warn!(error = %e, "auto_pull: failed to list open PR closing-issue refs; proceeding without filter");
@@ -3893,19 +5505,36 @@ async fn phase0_feed_ready_pool(
         // failure class wearing a different hat. It gets a WARN, not a shrug.
         match issues.iter().find(|i| i.number == n) {
             Some(issue) => {
-                if !promotion_gate_allows(
+                let outcome = promotion_gate_allows(
                     db,
                     github_token,
                     label_auth,
                     issue,
-                    "phase0_feeder",
+                    ExclusionPhase::Phase0Feeder,
                     trace_id,
                     session_id,
                 )
-                .await
-                {
-                    ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
-                    continue;
+                .await;
+                // mika#3058 — le **comportement** est celui d'avant : les deux
+                // non passent au candidat suivant. Seul le nom sous lequel
+                // l'exclusion se compte change, et il change parce qu'un refus
+                // escalade — label, `ready` retiré, commentaire, un geste
+                // d'opérateur à faire — là où un déclin n'écrit rien. Les
+                // additionner sous `promotion_gate_refused`, c'est mika#2205.
+                match outcome {
+                    GateOutcome::Allowed => {}
+                    GateOutcome::Refused => {
+                        ledger.record(ExclusionPhase::Phase0Feeder, n, FILTER_PROMOTION_GATE);
+                        continue;
+                    }
+                    GateOutcome::Declined => {
+                        ledger.record(
+                            ExclusionPhase::Phase0Feeder,
+                            n,
+                            FILTER_CONSENT_RETURNED_BY_MERGE,
+                        );
+                        continue;
+                    }
                 }
             }
             None => warn!(
@@ -3959,6 +5588,124 @@ async fn phase0_feed_ready_pool(
     promoted
 }
 
+/// La sonde de production de la phase 1 : circuit-breaker, puis porte de
+/// promotion (mika#3058 AC3).
+///
+/// Elle porte le ledger du tick en emprunt **mutable** — c'est la raison pour
+/// laquelle [`Phase1Probe`] est un trait et non une fermeture. Chaque verdict
+/// qui arrête le tick consigne son propre nom au ledger ici même, et non dans
+/// la boucle : `circuit_breaker` et `promotion_gate` restent deux refus
+/// distincts sous un seul [`Phase1Verdict::AbandonTick`], et le déclin de
+/// mika#3036 garde le sien.
+struct GateProbe<'p> {
+    db: &'p AsyncDatabase,
+    github_token: &'p str,
+    label_auth: &'p LabelWriteToken,
+    trace_id: &'p str,
+    session_id: &'p str,
+    ledger: &'p mut ExclusionLedger,
+}
+
+impl Phase1Probe for GateProbe<'_> {
+    fn probe<'a>(
+        &'a mut self,
+        candidate: &'a Issue,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Phase1Verdict> + Send + 'a>> {
+        Box::pin(async move {
+            // 4. Circuit-breaker check (AC3): skip if failure_count >= threshold.
+            //
+            // Lu PAR CANDIDAT, et non plus sur la seule tête de liste : la
+            // boucle peut désormais promouvoir un candidat de rang 2, et il doit
+            // passer la même garde. Son verdict reste celui de mika#3058 D5 — il
+            // abandonne le tick, il ne passe pas au suivant.
+            match self
+                .db
+                .get_auto_pull_failure_count(DEFAULT_REPO, candidate.number)
+                .await
+            {
+                Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
+                    info!(
+                        issue = candidate.number,
+                        failure_count = count,
+                        "auto_pull: circuit-breaker skip for #{} ({}× failures)",
+                        candidate.number,
+                        count
+                    );
+                    // Audit the skip decision
+                    if let Err(e) = self
+                        .db
+                        .log_audit_event(
+                            self.session_id,
+                            "auto_pull",
+                            "auto_pull_skip",
+                            None,
+                            Some(&format!(
+                                "#{} skipped: failure_count={} >= threshold={}",
+                                candidate.number, count, CIRCUIT_BREAKER_THRESHOLD
+                            )),
+                            None,
+                            Some(self.trace_id),
+                        )
+                        .await
+                    {
+                        warn!(error = %e, "auto_pull: failed to write skip audit event");
+                    }
+                    self.ledger.record(
+                        ExclusionPhase::Phase1Pull,
+                        candidate.number,
+                        FILTER_CIRCUIT_BREAKER,
+                    );
+                    return Phase1Verdict::AbandonTick;
+                }
+                Err(e) => {
+                    warn!(error = %e, "auto_pull: failed to check circuit-breaker, proceeding");
+                    // Fail-open: proceed with the selection
+                }
+                _ => {} // count < threshold, proceed
+            }
+
+            // 4b. mika#2123: the promotion staleness gate. Same gate as Phase 0
+            // and Phase 2 — all three apply `ready`, so all three must pass
+            // through it.
+            match promotion_gate_allows(
+                self.db,
+                self.github_token,
+                self.label_auth,
+                candidate,
+                ExclusionPhase::Phase1Pull,
+                self.trace_id,
+                self.session_id,
+            )
+            .await
+            {
+                GateOutcome::Allowed => Phase1Verdict::Promote,
+                // Un refus a escaladé : le ticket porte [`REFUSAL_LABEL`], un
+                // opérateur a un geste à faire, et le tick s'arrête comme il
+                // s'arrêtait avant ce vol.
+                GateOutcome::Refused => {
+                    self.ledger.record(
+                        ExclusionPhase::Phase1Pull,
+                        candidate.number,
+                        FILTER_PROMOTION_GATE,
+                    );
+                    Phase1Verdict::AbandonTick
+                }
+                // mika#3058 — le déclin a son propre compte, et il n'escalade
+                // rien : le ticket reste sain, donc en tête du classement. C'est
+                // le seul verdict qui fait avancer la boucle.
+                GateOutcome::Declined => {
+                    self.ledger.record(
+                        ExclusionPhase::Phase1Pull,
+                        candidate.number,
+                        FILTER_CONSENT_RETURNED_BY_MERGE,
+                    );
+                    Phase1Verdict::TryNext
+                }
+            }
+        })
+    }
+}
+
 /// Phase 1 (mika#1363): promote the best groomed-not-ready ticket to `ready`.
 ///
 /// Verbatim of the original `auto_pull_groomed_ticket` body, including its own
@@ -3992,91 +5739,35 @@ async fn phase1_promote_groomed(
         return None;
     }
 
-    // 3. Select the best groomed-not-ready candidate (skip those with open PRs).
-    let candidate =
-        match select_best_candidate_recording(issues.to_vec(), open_pr_issue_numbers, ledger) {
-            Some(c) => c,
-            None => {
-                debug!("auto_pull: no groomed-not-ready candidates found");
-                return None;
-            }
-        };
-
-    // 4. Circuit-breaker check (AC3): skip if failure_count >= threshold.
-    match db
-        .get_auto_pull_failure_count(DEFAULT_REPO, candidate.number)
-        .await
-    {
-        Ok(count) if count >= CIRCUIT_BREAKER_THRESHOLD => {
-            info!(
-                issue = candidate.number,
-                failure_count = count,
-                "auto_pull: circuit-breaker skip for #{} ({}× failures)",
-                candidate.number,
-                count
-            );
-            // Audit the skip decision
-            if let Err(e) = db
-                .log_audit_event(
-                    session_id,
-                    "auto_pull",
-                    "auto_pull_skip",
-                    None,
-                    Some(&format!(
-                        "#{} skipped: failure_count={} >= threshold={}",
-                        candidate.number, count, CIRCUIT_BREAKER_THRESHOLD
-                    )),
-                    None,
-                    Some(trace_id),
-                )
-                .await
-            {
-                warn!(error = %e, "auto_pull: failed to write skip audit event");
-            }
-            ledger.record(
-                ExclusionPhase::Phase1Pull,
-                candidate.number,
-                FILTER_CIRCUIT_BREAKER,
-            );
-            return None;
-        }
-        Err(e) => {
-            warn!(error = %e, "auto_pull: failed to check circuit-breaker, proceeding");
-            // Fail-open: proceed with the selection
-        }
-        _ => {} // count < threshold, proceed
+    // 3. Rank the groomed-not-ready candidates (skip those with open PRs).
+    //
+    // mika#3058 — le classement entier, et non plus son seul maximum. Un déclin
+    // de porte n'écrit RIEN : le ticket décliné n'a ni label ni marqueur, donc
+    // il reste en tête au tick suivant, et la phase ne promouvrait plus jamais
+    // rien d'autre (AC3). Le commentaire d'avant disait l'inverse, et il avait
+    // raison du seul cas qu'il connaissait : un *refus* pose [`REFUSAL_LABEL`],
+    // que `is_feeder_excluded` voit, et c'est cette auto-guérison qui rendait
+    // la boucle inutile.
+    let ranked = select_candidates_ranked_recording(issues.to_vec(), open_pr_issue_numbers, ledger);
+    if ranked.is_empty() {
+        debug!("auto_pull: no groomed-not-ready candidates found");
+        return None;
     }
 
-    let rank = priority_rank(&candidate.labels);
-
-    // 4b. mika#2123: the promotion staleness gate. Same gate as Phase 0 and
-    // Phase 2 — all three apply `ready`, so all three must pass through it.
-    //
-    // Phase 1 picks exactly one candidate, so a refusal here costs the whole
-    // tick: nothing is promoted even if a healthy candidate ranked just below.
-    // Left that way deliberately. The refused ticket now carries
-    // [`REFUSAL_LABEL`], `is_feeder_excluded` drops it, and the next tick
-    // reaches the next-best candidate — one idle tick, self-healing, against the
-    // complexity of a retry loop inside a phase whose whole shape is "one pick
-    // when the queue is idle".
-    if !promotion_gate_allows(
+    // 4 et 4b. Par candidat, dans l'ordre : le circuit-breaker (AC3 de
+    // mika#2123), puis la porte de promotion de mika#2123. Les deux abandonnent
+    // le tick ; seul un déclin essaie le candidat d'après.
+    let mut probe = GateProbe {
         db,
         github_token,
         label_auth,
-        &candidate,
-        "phase1_idle_pull",
         trace_id,
         session_id,
-    )
-    .await
-    {
-        ledger.record(
-            ExclusionPhase::Phase1Pull,
-            candidate.number,
-            FILTER_PROMOTION_GATE,
-        );
-        return None;
-    }
+        ledger,
+    };
+    let candidate = phase1_first_promotable(ranked, &mut probe).await?;
+
+    let rank = priority_rank(&candidate.labels);
 
     // 5. Apply the `ready` label to trigger webhook-driven dispatch — through
     // the canonical applicator, which refuses a parked ticket (mika#2315).
@@ -4198,6 +5889,130 @@ fn churn_is_moot(action: &VerdictAction, engine_holds_ticket: bool) -> bool {
     !matches!(action, VerdictAction::Dispatched { .. }) && engine_holds_ticket
 }
 
+// ───── La relecture d'état juste avant le dispatch (mika#3047) ─────
+
+/// Ce que la forge répond quand on relit un ticket juste avant de le dispatcher.
+///
+/// Trois états, parce que trois remèdes — et un quatrième que ce type ne porte
+/// pas : la relecture en erreur, qui est le `Err` du `Result` et non une
+/// variante. Une panne de forge n'est pas un état du ticket.
+#[derive(Debug)]
+enum DispatchReread {
+    /// Ouvert, et portant `ready` : la lecture fraîche, celle qu'on dispatche.
+    Ready(Issue),
+    /// Ouvert, mais `ready` a disparu depuis la liste du tick.
+    ReadyAbsent,
+    /// Fermé depuis la liste du tick.
+    Closed,
+}
+
+/// L'état **frais** d'un ticket, relu à la forge juste avant le dispatch en
+/// processus (mika#3047 AC1).
+///
+/// # Pourquoi cette lecture existe
+///
+/// La phase 2 décide sur la liste d'`issues` lue une fois par tick (l. 3031) et
+/// agit sur la forge. Le 2026-11-05 au merge de #3045, `ready` a été retiré à
+/// 14:10:05.646Z par le nettoyage de mika#3022 et un `dev-pilot` a été préparé
+/// 163 ms plus tard, sur la copie du tick : un dispatch sans consentement, que
+/// seul le refus `dispatch_no_grooming_marker` a arrêté — et il l'a gagné d'une
+/// course de 184 µs. C'est cette copie que cette fonction remplace.
+///
+/// # Ce qu'elle demande, et pourquoi quatre champs
+///
+/// Elle mire [`gh_issue_body`] jusqu'au traitement du `status` non nul, à deux
+/// différences près. Pas de `-q` : les quatre champs sont parsés en Rust, parce
+/// que la **décision** a besoin de `state` et de `labels`, et que le **dispatch**
+/// a besoin de `body` et de `labels`.
+///
+/// `updatedAt` est demandé bien que personne ne le lise ici : l'[`Issue`] rendue
+/// est une `Issue` entière, pas une `Issue` à un champ vide. Un `updated_at: ""`
+/// serait un champ qui mente à son prochain lecteur (mika#2331), pour un coût
+/// nul.
+///
+/// # Fail-closed, champ par champ
+///
+/// `gh` rend `"OPEN"` ou `"CLOSED"` ; la comparaison est insensible à la casse,
+/// et **toute autre valeur** — champ absent, JSON illisible, `state` inconnu —
+/// rend `Err`, jamais [`DispatchReread::Ready`]. Une valeur qu'on ne sait pas
+/// lire n'est pas « ouvert ».
+///
+/// Les trois autres champs sont **exigés** eux aussi, et c'est la doctrine
+/// mika#2131 plutôt que de la prudence en plus : un `labels` absent a bien un
+/// défaut fail-closed — vide, donc pas de `ready` — mais il s'inscrirait au
+/// ledger sous `ready_absent_at_dispatch`, le nom d'une course gagnée. Une panne
+/// de forge comptée comme un succès de la garde, c'est la sonde AC4 qui mesure
+/// le contraire de ce qu'elle croit. L'absence n'est pas un zéro (mika#2331) :
+/// elle a son propre nom, `dispatch_reread_failed`.
+async fn gh_reread_issue_at_dispatch(github_token: &str, n: u64) -> Result<DispatchReread> {
+    let output = run_gh(
+        github_token,
+        GhSubject::Issue(n),
+        &[
+            "issue",
+            "view",
+            &n.to_string(),
+            "--repo",
+            DEFAULT_REPO,
+            "--json",
+            "state,labels,body,updatedAt",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh issue view --json state,labels,body,updatedAt failed for #{}: {}",
+            n,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let raw: serde_json::Value = serde_json::from_str(&stdout)?;
+
+    let state = raw["state"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh issue view returned no `state` for #{n}"))?;
+    if state.eq_ignore_ascii_case("CLOSED") {
+        return Ok(DispatchReread::Closed);
+    }
+    if !state.eq_ignore_ascii_case("OPEN") {
+        return Err(anyhow!(
+            "gh issue view returned an unknown `state` for #{n}: {state:?}"
+        ));
+    }
+
+    let labels: Vec<IssueLabel> = raw["labels"]
+        .as_array()
+        .ok_or_else(|| anyhow!("gh issue view returned no `labels` array for #{n}"))?
+        .iter()
+        .filter_map(|l| {
+            l["name"].as_str().map(|name| IssueLabel {
+                name: name.to_string(),
+            })
+        })
+        .collect();
+    if !labels.iter().any(|l| l.name == "ready") {
+        return Ok(DispatchReread::ReadyAbsent);
+    }
+
+    let body = raw["body"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh issue view returned no `body` for #{n}"))?
+        .to_string();
+    let updated_at = raw["updatedAt"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh issue view returned no `updatedAt` for #{n}"))?
+        .to_string();
+
+    Ok(DispatchReread::Ready(Issue {
+        number: n,
+        body,
+        labels,
+        updated_at,
+    }))
+}
+
 /// mika#2470 — dispatch a rescued ticket by a **direct, in-process** call of the
 /// ready-label handler. The webhook channel may be dead: nothing here depends
 /// on it.
@@ -4205,10 +6020,20 @@ fn churn_is_moot(action: &VerdictAction, engine_holds_ticket: bool) -> bool {
 /// This is the handler the gateway's `labeled ready` event reaches — its fifteen
 /// gates (repo allowlist, live pilot, egress relay, seat, held, groomed →
 /// `dev-pilot` / not → `dev-groom`, slot and deferral, spawn) apply unchanged,
-/// by construction rather than by copy (D1). The issue body and labels the tick
-/// has already read are handed in as the injected fetcher (D2): no `gh issue
-/// view` per rescue, and the handler decides on the **same snapshot** the
-/// Phase 2 filters just used to call the ticket eligible.
+/// by construction rather than by copy (D1). The issue body and labels are
+/// handed in as the injected fetcher (D2), so the handler runs no `gh issue
+/// view` of its own.
+///
+/// **Quelle `Issue` arrive ici, et ce que mika#3047 y a changé.** La phase 2
+/// passait la copie du tick — un snapshot pouvant dater de plusieurs secondes,
+/// et c'était le défaut : un ticket dont `ready` venait d'être retiré se
+/// dispatchait quand même. Elle passe désormais la lecture **fraîche** de
+/// [`gh_reread_issue_at_dispatch`], relue à la forge juste avant cet appel. La
+/// propriété recherchée en mika#2470 — zéro `gh issue view` par secours —
+/// s'achetait sur le consentement ; cet appel coûte une lecture par dispatch
+/// **tenté**, borné par `MAX_STUCK_RESCUE_PER_TICK`, et c'est ce coût qui achète
+/// le consentement. La signature est inchangée : la fonction prend toujours un
+/// `&Issue`, elle ne décide pas lequel.
 async fn dispatch_rescued_ticket_in_process(
     db: &AsyncDatabase,
     ctx: &DirectDispatchCtx<'_>,
@@ -4619,24 +6444,59 @@ async fn phase2_reconcile_stuck_ready(
         // ticket never eats one of the tick's rescue slots. And a lookup miss is
         // a WARN, not a silently skipped gate.
         //
-        // **The one gate entrance not fronted by [`is_groomed`] (mika#2140).**
-        // Phase 0 and Phase 1 both filter on it, so a branch with no plan file
-        // never reaches the gate through them. This path filters on `ready`
-        // alone, so a `ready` ticket whose callout names a hand-made, plan-less
-        // branch *can* arrive here — and under the file-based predicate such a
-        // branch is refused as salvage where it used to promote, which costs it
-        // `ready` and parks it under `operator-gated` until a human lifts it by
-        // hand. Measured 2026-09-04: zero of the 18 open tickets carrying a
+        // **The one gate entrance not fronted by [`is_groomed`] (mika#2140) —
+        // and that asymmetry is correct, not an oversight (mika#2170 F4).**
+        // Phase 0 and Phase 1 *set* `ready`: they decide to commit a ticket
+        // nobody had committed, and requiring it to be groomed is the very
+        // condition of committing it. This path *replays* a `ready` somebody
+        // else already set — an operator, a webhook, or the loop itself. It
+        // does not decide to commit; it repairs a lost delivery. Requiring
+        // `is_groomed` at the rescue would **overrule an operator** who set
+        // `ready` by hand, and would drop the net under what `CLAUDE.md`
+        // § mika#2020 calls the pipeline's nominal entry state — a rescue
+        // mika#996 makes productive, since an ungroomed `ready` reaching
+        // dispatch fires `dev-groom` first.
+        //
+        // So a `ready` ticket whose callout names a hand-made, plan-less branch
+        // *can* arrive here, and the file-based predicate refuses it where the
+        // old `ahead_by > 1` test promoted. **That refusal is right** — the
+        // choice between rebasing such work and abandoning it is a judgement
+        // about work, which is the rule's stated reason and not conflict
+        // prediction (KTD2b forbids the latter). Widening [`PLAN_PATH_PREFIX`]
+        // to let it through, the body's other proposed resolution, would betray
+        // that reason on the rule's *strongest* case: hand-written code is
+        // deliberate, so the human judgement is owed all the more (F5).
+        //
+        // Both resolutions the ticket proposed are therefore refused. What was
+        // actually wrong was the **diagnosis**, now split off as
+        // [`RefusalReason::StaleBranchWithoutPlan`] — and **the discriminant
+        // lives in the slug**, where one `GROUP BY` counts the class. The
+        // original wake condition (an audit record carrying
+        // `reason=salvage_work_on_stale_branch` whose `non_plan_files` holds no
+        // `docs/plans/` sibling) was unverifiable as written: `non_plan_files`
+        // is that prefix filtered out, so the condition was **trivially true of
+        // every salvage refusal**, starting with the nominal grooming branch the
+        // rule exists to catch (F2). A watch whose instrument answers wrong is
+        // less than no watch.
+        //
+        // Measured 2026-09-04: zero of the 18 open tickets carrying a
         // `> - **Branch:**` callout point at a plan-less branch, so the
-        // population is empty *today*. That is a measurement, not a guard —
-        // tracked in mika#2170, whose wake condition is the first audit record
-        // from `phase2_stuck_rescue` carrying
-        // `reason=salvage_work_on_stale_branch` with a `non_plan_files` list
-        // that contains no `docs/plans/` sibling.
-        // The issue is needed twice below — for the staleness gate and for the
-        // in-process dispatch (its body and labels are the injected fetcher).
-        // Without it we can neither decide nor dispatch, and churning the label
-        // without dispatching is exactly the defect of mika#2470: skip, loudly.
+        // population was empty *that day*. That is a measurement, not a guard,
+        // and it no longer waits on a reader: the policy question mika#2140
+        // reserved — widen the prefix, or filter here — stays open and is still
+        // owed a real case, but it now waits with a **count** rather than an
+        // argument. See the `stale_branch_without_plan` reading rule in
+        // `docs/operator/environment-variables.md` for the query and its halts.
+        // The issue is needed below for the staleness gate, which decides on the
+        // branch callout the tick read. Without it we cannot decide, and
+        // churning the label without dispatching is exactly the defect of
+        // mika#2470: skip, loudly.
+        //
+        // mika#3047 — ce n'est plus cette copie qui part au dispatch : la
+        // relecture fraîche de `gh_reread_issue_at_dispatch` la remplace, plus
+        // bas. Le gate de staleness garde la copie du tick, et c'est correct :
+        // il mesure une branche, pas un consentement, et son propre mécanisme de
+        // péremption est la réécriture de callout de mika#2839.
         let Some(issue) = issues.iter().find(|i| i.number == n) else {
             warn!(
                 issue = n,
@@ -4650,12 +6510,16 @@ async fn phase2_reconcile_stuck_ready(
             github_token,
             label_auth,
             issue,
-            "phase2_stuck_rescue",
+            ExclusionPhase::Phase2StuckReady,
             trace_id,
             session_id,
         )
         .await
+        .allows()
         {
+            // mika#3058 — un seul nom suffit ici : par AC1, la phase 2 ne
+            // décline jamais. Son vivier est celui des tickets qui portent
+            // déjà `ready`, donc aucune promotion n'y fabrique de consentement.
             ledger.record(ExclusionPhase::Phase2StuckReady, n, FILTER_PROMOTION_GATE);
             continue;
         }
@@ -4665,8 +6529,74 @@ async fn phase2_reconcile_stuck_ready(
         // back, under the tick's trace_id, so `SELECT after_value, count(*) …
         // GROUP BY 1` answers "how many rescues actually dispatched" (D5).
         attempted += 1;
+
+        // mika#3047 — la relecture d'état, **dernier** contrôle avant le
+        // dispatch, et sur la forge plutôt que sur la copie du tick.
+        //
+        // Placée APRÈS `attempted += 1` exprès : c'est un contrôle du dispatch,
+        // donc il est borné par le même budget que lui — au plus
+        // `MAX_STUCK_RESCUE_PER_TICK` lectures par tick, quoi que fasse la
+        // forge. Avant l'incrément, une forge qui répond mal ferait une lecture
+        // par candidat et par tick, sans borne autre que la taille du vivier :
+        // le coût caché que le commentaire ci-dessus refuse déjà pour la chaîne
+        // de readiness du handler, et la relecture est de la même classe.
+        //
+        // Les trois refus `continue` **ici**, donc avant le churn des l. ci-
+        // dessous, et cette moitié est celle qui compte :
+        //
+        // - sur `ready_absent_at_dispatch`, re-poser `ready` serait se rendre le
+        //   consentement qu'on vient de rendre — ce que la phase 0 refuse depuis
+        //   mika#3036 sous `ConsentReturnedByMerge`. Le défaut serait alors pire
+        //   qu'avant ce vol : non plus un dispatch sans consentement, mais un
+        //   consentement fabriqué par la boucle ;
+        // - sur `issue_closed_at_dispatch`, toute écriture part vers un ticket
+        //   fermé (la forme de la fuite mika#2713).
+        //
+        // Un refus ne touche donc ni `rescued`, ni le budget de re-drive, ni le
+        // compteur d'échecs : il n'y a pas eu d'échec, il y a eu une décision.
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(DispatchReread::Ready(fresh)) => fresh,
+            Ok(DispatchReread::ReadyAbsent) => {
+                warn!(
+                    issue = n,
+                    "auto_pull: `ready` a disparu entre la liste du tick et le \
+                     dispatch ; aucun dispatch préparé (mika#3047)"
+                );
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_READY_ABSENT_AT_DISPATCH,
+                );
+                continue;
+            }
+            Ok(DispatchReread::Closed) => {
+                info!(
+                    issue = n,
+                    "auto_pull: ticket fermé entre la liste du tick et le \
+                     dispatch ; aucun dispatch préparé, aucune écriture (mika#3047)"
+                );
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_ISSUE_CLOSED_AT_DISPATCH,
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(error = %e, issue = n, "auto_pull: la relecture d'état avant dispatch a échoué ; fail-closed, aucun dispatch (mika#3047)");
+                ledger.record(
+                    ExclusionPhase::Phase2StuckReady,
+                    n,
+                    FILTER_DISPATCH_REREAD_FAILED,
+                );
+                continue;
+            }
+        };
+
+        // AC3 — c'est `fresh`, et non la copie du tick, que le fetcher injecté
+        // rend au handler.
         let action =
-            dispatch_rescued_ticket_in_process(db, ctx, issue, github_token, trace_id, session_id)
+            dispatch_rescued_ticket_in_process(db, ctx, &fresh, github_token, trace_id, session_id)
                 .await;
         let action_label = direct_dispatch_action_label(&action);
         let task_id = match &action {
@@ -4812,6 +6742,24 @@ mod tests {
     }
 
     // ── mika#2123 promotion staleness gate ──
+
+    /// Ancre les tests antérieurs à mika#3036 sur la phase dont aucun vol n'a
+    /// changé la décision. C'est ce qui en fait leur contrôle de
+    /// non-régression : s'ils bougent, c'est que la phase 2 a bougé.
+    ///
+    /// L'ancre était `Phase1Pull` jusqu'à mika#3058, parce que mika#3036 n'avait
+    /// déplacé que la phase 0. Ce vol déplace la phase 1 — elle décline
+    /// désormais sur `BranchDeletedByMerge` — donc l'ancre passe à
+    /// `Phase2StuckReady`, la seule qui promeut encore. Les tests de la phase
+    /// appellent [`super::classify_promotion`] nommément, avec leur phase
+    /// explicite.
+    fn classify_promotion(
+        m: &StalenessMeasurement,
+        branch: Option<&str>,
+        max_behind: i64,
+    ) -> PromotionGate {
+        super::classify_promotion(m, branch, max_behind, ExclusionPhase::Phase2StuckReady)
+    }
 
     /// A measurement whose file list is **unavailable** (`files` absent from
     /// the payload). Kept at its original signature so every test that never
@@ -4973,16 +6921,26 @@ mod tests {
 
     /// AC5 / U3 — the `wip(...)` disposition. A stale branch carrying more than
     /// its plan commit is never auto-promoted, whatever the distance.
+    ///
+    /// **Both halves of the mika#2170 split are asserted here**, because the
+    /// rule is one rule: the refusal does not depend on whether the branch also
+    /// carries a plan, only its *name* and its *wording* do. Drop either half
+    /// and a future reader could satisfy this test while the other population
+    /// quietly started promoting.
     #[test]
     fn test_promotion_gate_salvage_work_refuses_independently_of_threshold() {
-        // One commit behind, carrying code: far under any threshold, still
-        // refused. (mika#2140: the discriminator is the file, not the count.)
+        // A grooming branch carrying code: plan **plus** code. One commit
+        // behind, far under any threshold, still refused. (mika#2140: the
+        // discriminator is the file, not the count.)
         match classify_promotion(
             &measured_files(
                 1,
                 2,
                 "diverged",
-                &["crates/mika-agent/src/agent_loop/mod.rs"],
+                &[
+                    "crates/mika-agent/src/agent_loop/mod.rs",
+                    "docs/plans/2026-06-30-016-fix-1680-x-plan.md",
+                ],
             ),
             Some("fix/1680/x"),
             50,
@@ -4990,12 +6948,46 @@ mod tests {
             PromotionGate::Refuse(r @ RefusalReason::SalvageWorkOnStaleBranch { .. }) => {
                 assert_eq!(r.slug(), "salvage_work_on_stale_branch");
                 // The remedy names the real choice: what to do with the *work*.
+                // "travail partiel" stays on **this** half only — the half
+                // where a grooming pilot really did leave something behind.
                 assert!(r.remedy(1680).contains("travail partiel"));
             }
             other => panic!("expected SalvageWorkOnStaleBranch, got {other:?}"),
         }
-        // And it survives the threshold being disabled — the two rules are
+        // The plan-less half (mika#2170): same refusal, different name.
+        match classify_promotion(
+            &measured_files(
+                1,
+                2,
+                "diverged",
+                &["crates/mika-agent/src/agent_loop/mod.rs"],
+            ),
+            Some("fix/x/hand-made"),
+            50,
+        ) {
+            PromotionGate::Refuse(r @ RefusalReason::StaleBranchWithoutPlan { .. }) => {
+                assert_eq!(r.slug(), "stale_branch_without_plan");
+            }
+            other => panic!("expected StaleBranchWithoutPlan, got {other:?}"),
+        }
+        // And both survive the threshold being disabled — the two rules are
         // independent, which is exactly why no single mutation can flip #1680.
+        assert!(matches!(
+            classify_promotion(
+                &measured_files(
+                    180,
+                    2,
+                    "diverged",
+                    &[
+                        "crates/mika-agent/src/evidence/guards.rs",
+                        "docs/plans/2026-06-30-016-fix-1680-x-plan.md"
+                    ]
+                ),
+                Some("fix/1680/x"),
+                0
+            ),
+            PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch { .. })
+        ));
         assert!(matches!(
             classify_promotion(
                 &measured_files(
@@ -5004,10 +6996,10 @@ mod tests {
                     "diverged",
                     &["crates/mika-agent/src/evidence/guards.rs"]
                 ),
-                Some("fix/1680/x"),
+                Some("fix/x/hand-made"),
                 0
             ),
-            PromotionGate::Refuse(RefusalReason::SalvageWorkOnStaleBranch { .. })
+            PromotionGate::Refuse(RefusalReason::StaleBranchWithoutPlan { .. })
         ));
     }
 
@@ -5050,7 +7042,10 @@ mod tests {
     /// there either.
     #[test]
     fn test_promotion_gate_absent_branch_is_its_own_outcome() {
-        match classify_promotion(&StalenessMeasurement::BranchAbsent, Some("feat/gone"), 50) {
+        let absent = StalenessMeasurement::BranchAbsent {
+            probe: AbsenceProbe::NotCarried,
+        };
+        match classify_promotion(&absent, Some("feat/gone"), 50) {
             PromotionGate::Refuse(r @ RefusalReason::BranchAbsent { .. }) => {
                 assert_eq!(r.slug(), "branch_absent_on_origin");
                 assert!(r.reason(42).contains("n'existe pas sur `origin`"));
@@ -5084,6 +7079,66 @@ mod tests {
             non_plan_files(Some(&["docs/plansible/x.md".into()])),
             vec!["docs/plansible/x.md".to_string()]
         );
+    }
+
+    /// **mika#2170 AC8 — the reason the original wake condition was false,
+    /// frozen so nobody writes it that way again.**
+    ///
+    /// mika#2170 slept for seventeen days behind this condition: *"the first
+    /// audit record carrying `reason=salvage_work_on_stale_branch` whose
+    /// `non_plan_files` list contains no `docs/plans/` sibling."* But
+    /// [`non_plan_files`] **is** that prefix filtered out, so the condition was
+    /// trivially true of every salvage refusal there has ever been — including
+    /// the nominal grooming branch the rule was built to catch. A watch whose
+    /// instrument answers wrong is worse than one that stays silent: it does not
+    /// abstain, it lies.
+    ///
+    /// The invariant is pinned at both surfaces an operator reads — the returned
+    /// vector and the audit field — and the checker carries a positive control,
+    /// so the test cannot pass by being unable to see a plan path at all.
+    #[test]
+    fn test_non_plan_files_can_never_contain_a_plan_path() {
+        let has_plan = |files: &[String]| files.iter().any(|f| f.starts_with(PLAN_PATH_PREFIX));
+        // Positive control: the checker can see a plan path when there is one.
+        assert!(has_plan(&["docs/plans/x.md".to_string()]));
+
+        for list in [
+            vec!["docs/plans/x.md".to_string()],
+            vec!["docs/plans/a.md".to_string(), "docs/plans/b.md".to_string()],
+            vec!["crates/a.rs".to_string(), "docs/plans/x.md".to_string()],
+            vec!["docs/plansible/x.md".to_string()],
+            vec![],
+        ] {
+            assert!(
+                !has_plan(&non_plan_files(Some(&list))),
+                "non_plan_files({list:?}) leaked a `{PLAN_PATH_PREFIX}` path — the mika#2170 \
+                 wake condition tested this and was therefore always satisfied"
+            );
+        }
+
+        // Same invariant at the audit surface, on a real salvage refusal: the
+        // emitted list cannot carry the plan either, which is why "does this
+        // branch carry a plan?" needed `plan_files_count` (D4) and could never
+        // have been read off `non_plan_files`.
+        let m = measured_files(8, 2, "diverged", &["crates/a.rs", "docs/plans/x.md"]);
+        let d = classify_promotion(&m, Some("fix/x/y"), 50);
+        assert_eq!(
+            match &d {
+                PromotionGate::Refuse(r) => r.slug(),
+                other => panic!("expected a refusal, got {other:?}"),
+            },
+            "salvage_work_on_stale_branch"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&staleness_audit_json(1, Some("fix/x/y"), &m, &d, 50)).unwrap();
+        let emitted: Vec<String> = json["non_plan_files"]
+            .as_array()
+            .expect("the list is readable here")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(!has_plan(&emitted));
+        assert_eq!(json["plan_files_count"], 1, "and the answer is posed here");
     }
 
     /// **AC1, the core.** A branch groomed over three architect passes carries
@@ -5145,6 +7200,10 @@ mod tests {
         assert!(json["changed_files_count"].is_null());
         assert!(json["non_plan_files"].is_null());
         assert!(json["non_plan_files_count"].is_null());
+        // mika#2170 D4 — and `plan_files_count` joins that discipline rather
+        // than reporting `0`, which would read as "measured: carries no plan"
+        // on the one branch nothing was measured about (Signal O, mika#2331).
+        assert!(json["plan_files_count"].is_null());
     }
 
     /// **AC5** — the refusal names the files, and the naming is bounded.
@@ -5198,6 +7257,128 @@ mod tests {
         assert_eq!(json["non_plan_files"].as_array().unwrap().len(), 10);
         assert_eq!(json["non_plan_files_count"], 12);
         assert_eq!(json["changed_files_count"], 12);
+        // mika#2170 AC1 — and the plan question is answered **without the
+        // subtraction** an operator would otherwise have to do: twelve files,
+        // none of them a plan.
+        assert_eq!(json["plan_files_count"], 0);
+    }
+
+    /// **mika#2170 AC4/AC6/R3 — what the plan-less refusal *says*.**
+    ///
+    /// The decision was already right before this split; the diagnosis was not.
+    /// Four things are asserted, and each one is a defect that was measured
+    /// rather than imagined:
+    ///
+    /// - it names the branch carries **no** plan file — on this population the
+    ///   sibling's "modifies n files outside `docs/plans/`" is true and says
+    ///   nothing, because everything here is outside it;
+    /// - it does **not** say "partiel": the gate cannot know whether this work
+    ///   is unfinished (D6);
+    /// - it still names the files, under the same [`MAX_NAMED_FILES`] bound;
+    /// - it carries the F7 backstop — grooming the ticket will not lift this
+    ///   refusal, so the message must not leave an operator reaching for the
+    ///   one gesture that provably does nothing (mika#2361's inert-gesture
+    ///   class).
+    #[test]
+    fn test_stale_branch_without_plan_message_names_the_branch_and_not_partial_work() {
+        let d = classify_promotion(
+            &measured_files(
+                17,
+                1,
+                "diverged",
+                &[
+                    ".github/workflows/release-pr.yml",
+                    "release-please-config.json",
+                    "version.txt",
+                ],
+            ),
+            Some("ci/2048-re-enable-release-please"),
+            50,
+        );
+        let PromotionGate::Refuse(r) = d else {
+            panic!("a plan-less stale branch must still be refused")
+        };
+        assert_eq!(r.slug(), "stale_branch_without_plan");
+
+        let reason = r.reason(2048);
+        assert!(reason.contains("aucun fichier de plan"), "got: {reason}");
+        assert!(reason.contains("`version.txt`"), "got: {reason}");
+        // R3 — and the gate stops guessing at the state of the work.
+        let body = r.comment_body(2048);
+        assert!(
+            !body.contains("partiel"),
+            "the refusal must not call this work partial: {body}"
+        );
+        // AC6 — the backstop, named as such.
+        let remedy = r.remedy(2048);
+        assert!(remedy.contains("ne lèvera pas ce refus"), "got: {remedy}");
+        assert!(
+            remedy.contains("décide du sort du travail"),
+            "got: {remedy}"
+        );
+        // Positive control on the negation above: the *sibling* refusal does
+        // still say "partiel", so the assertion is about this message rather
+        // than about a word that left the module.
+        let sibling = classify_promotion(
+            &measured_files(17, 1, "diverged", &["crates/a.rs", "docs/plans/x.md"]),
+            Some("fix/x/y"),
+            50,
+        );
+        let PromotionGate::Refuse(sibling) = sibling else {
+            panic!("expected a refusal")
+        };
+        assert!(sibling.comment_body(2048).contains("partiel"));
+    }
+
+    /// **mika#2170 AC7 / D5 — a list GitHub may have cut never produces the new
+    /// slug.**
+    ///
+    /// "This branch carries no plan" is an **absence**, and `compare` caps its
+    /// `files` array at [`GITHUB_COMPARE_FILES_CAP`]. A branch touching more
+    /// could have its one plan file truncated off the end, and the new slug
+    /// would then assert an absence nobody measured. At the cap the old variant
+    /// is produced — today's behaviour, so there is nothing to regress.
+    ///
+    /// The control is the same list one file shorter: it *does* cross over, so
+    /// the test proves the cap is what decides and not some other property of a
+    /// long list.
+    #[test]
+    fn test_truncated_file_list_never_claims_a_missing_plan() {
+        let paths =
+            |n: usize| -> Vec<String> { (0..n).map(|i| format!("crates/f{i}.rs")).collect() };
+
+        for n in [GITHUB_COMPARE_FILES_CAP, GITHUB_COMPARE_FILES_CAP + 1] {
+            let owned = paths(n);
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            let d = classify_promotion(
+                &measured_files(8, 2, "diverged", &refs),
+                Some("fix/x/huge"),
+                50,
+            );
+            let PromotionGate::Refuse(r) = d else {
+                panic!("{n} non-plan files must still be refused")
+            };
+            assert_eq!(
+                r.slug(),
+                "salvage_work_on_stale_branch",
+                "a list of {n} entries may have been cut by the API; claiming \
+                 'carries no plan' on it would be an unmeasured absence"
+            );
+        }
+
+        // Control: one entry below the cap, the list is provably complete and
+        // the same population does cross over.
+        let owned = paths(GITHUB_COMPARE_FILES_CAP - 1);
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let d = classify_promotion(
+            &measured_files(8, 2, "diverged", &refs),
+            Some("fix/x/large"),
+            50,
+        );
+        let PromotionGate::Refuse(r) = d else {
+            panic!("expected a refusal")
+        };
+        assert_eq!(r.slug(), "stale_branch_without_plan");
     }
 
     /// The parse contract in both directions (mika#2140 D1).
@@ -5243,6 +7424,9 @@ mod tests {
         assert_eq!(json["status"], "diverged");
         assert_eq!(json["outcome"], "promote");
         assert_eq!(json["threshold"], 50);
+        // Unreadable list ⇒ `null`, on a **promotion** (mika#2170 D4: the field
+        // covers the accept path too, where there is no refusal slug to read).
+        assert!(json["plan_files_count"].is_null());
 
         let m = measured_files(
             180,
@@ -5272,6 +7456,11 @@ mod tests {
             serde_json::json!(["crates/mika-agent/src/agent_loop/mod.rs"])
         );
         assert_eq!(json["non_plan_files_count"], 1);
+        // mika#2170 AC1/AC2 — the branch carries a plan, so it is a grooming
+        // branch carrying code: the count says `1` directly and the slug above
+        // stays the one it has always been. Those two facts together are what
+        // makes the split countable without rewriting history (D3).
+        assert_eq!(json["plan_files_count"], 1);
 
         // Unmeasurable outcomes carry nulls, never a fabricated zero.
         let m = StalenessMeasurement::Unavailable;
@@ -5283,30 +7472,128 @@ mod tests {
         assert!(json["changed_files_count"].is_null());
     }
 
-    /// The label the gate applies must actually exist.
+    /// Tout label que ce module pose, et tout label de tenue par lequel la boucle
+    /// exclut un ticket ([`crate::webhook_dispatch::OPERATOR_HELD_LABELS`]), doit
+    /// être déclaré dans `.github/labels.yml`. Les labels de siège `dispatch:*`
+    /// ont leur propre garde, dans les deux sens
+    /// (`scripts/check-dispatch-seats-declared.sh`, mika#2092).
     ///
-    /// This is mika#2123's own correction, made structural. `operator-review` is
-    /// referenced a dozen times in this module and declared nowhere; 48
-    /// production lines say `'operator-review' not found`. Prose cannot prevent
-    /// the next instance — reading the declaration file can.
+    /// **La classe de défaut.** `label-sync` tourne avec
+    /// `delete-other-labels: true` : un nom que le code emploie mais que ce
+    /// fichier ne déclare pas est supprimé du dépôt **et de chaque ticket qui le
+    /// portait**, sans événement `unlabeled` et sans ligne de journal. C'est
+    /// mika#2127, 48 lignes `'operator-review' not found` en production, chacune
+    /// un [`abandon_stuck_ready`] qui n'a rien abandonné. La prose ne peut pas
+    /// empêcher la récidive — lire le fichier de déclaration, oui.
+    ///
+    /// **Pourquoi l'itération se fait sur la constante.**
+    /// [`crate::webhook_dispatch::OPERATOR_HELD_LABELS`] grandit (trois membres
+    /// aujourd'hui, un quatrième un jour). Une liste recopiée ici garderait sa
+    /// copie et non la liste que le code lit : le label ajouté serait couvert le
+    /// jour où quelqu'un y repense, pas le jour où il atterrit. Même idiome que
+    /// [`mika2361_each_held_label_names_itself`].
+    ///
+    /// **Pourquoi le prédicat est durci.** Un prédicat qui rend `true` à tort est
+    /// la seule manière dont cette garde peut mentir. Le `contains("- name:
+    /// {name}")` nu de mika#2123 avait deux trous, tous deux rendus concrets par
+    /// l'entrée de `blocked` dans l'ensemble gardé : non ancré à droite (il rend
+    /// `true` pour `block` tant que `blocked` est déclaré, donc il resterait vert
+    /// au retrait de `blocked` au profit d'un `blocked-*`) et aveugle aux noms
+    /// cités (`labels.yml` met entre guillemets tout nom portant un `:`). Les
+    /// quatre contrôles ci-dessous — deux positifs, deux négatifs — sont ce qui
+    /// rougit le jour où ce durcissement se perd.
+    ///
+    /// **Portée.** Ce détecteur lit exactement trois constantes :
+    /// [`REFUSAL_LABEL`], [`ABANDON_LABEL`] et les membres de
+    /// `OPERATOR_HELD_LABELS`. Il ne garde pas « tout label apparaissant dans
+    /// l'arbre » — un littéral en dur reste hors de sa portée, d'où `ABANDON_LABEL`.
+    ///
+    /// Nommé `test_refusal_label_is_declared_in_labels_yml` jusqu'à mika#2790,
+    /// quand il a cessé de ne garder qu'un seul littéral.
     #[test]
-    fn test_refusal_label_is_declared_in_labels_yml() {
+    fn test_exclusion_labels_are_declared_in_labels_yml() {
         let yml = include_str!("../../../.github/labels.yml");
-        let declared = |name: &str| yml.contains(&format!("- name: {name}"));
 
-        // Positive control: the guard can see a label that IS declared.
+        // Ancré à droite sur la fin de ligne, et tolérant au nom cité :
+        // `labels.yml` entoure de guillemets tout nom portant un `:`
+        // (`"dispatch:loop"`). Un `contains("- name: {name}")` nu rendrait `true`
+        // pour `block` tant que `blocked` est déclaré, et `false` pour tout nom
+        // cité — les deux contrôlés ci-dessous.
+        let declared = |name: &str| {
+            yml.lines().any(|line| {
+                line.strip_prefix("- name: ")
+                    .map(str::trim)
+                    .is_some_and(|d| d == name || d.trim_matches('"') == name)
+            })
+        };
+
+        // -- contrôles du prédicat --
+        // Positif, forme nue.
         assert!(declared("ready"), "labels.yml must declare `ready`");
-        // Negative control: the guard can see a label that is NOT declared. A
-        // check that answers `true` for everything proves nothing.
+        // Positif, forme citée : sans lui, le durcissement n'est pas couvert.
+        assert!(
+            declared("dispatch:loop"),
+            "the predicate must see a quoted entry; labels.yml quotes every name \
+             carrying a `:`"
+        );
+        // Négatif : un prédicat qui répond `true` à tout ne prouve rien.
         assert!(
             !declared("a-label-nobody-has-ever-declared"),
             "the guard must be able to detect an undeclared label"
         );
-
+        // Négatif d'ancrage : `blocked` est déclaré, `block` ne l'est pas. Un
+        // prédicat non ancré resterait vert au retrait de `blocked` au profit
+        // d'un `blocked-*`.
         assert!(
-            declared(REFUSAL_LABEL),
-            "the promotion gate applies `{REFUSAL_LABEL}`, which .github/labels.yml does not \
-             declare — the refusal would fail exactly as `operator-review` does today"
+            !declared("block"),
+            "the predicate must anchor on the whole name, not on a prefix of it"
+        );
+
+        // -- l'ensemble gardé : chaque entrée nomme son site d'emploi --
+        let mut guarded: Vec<(&str, &str)> = vec![
+            (REFUSAL_LABEL, "auto_pull::refuse_promotion (REFUSAL_LABEL)"),
+            (
+                ABANDON_LABEL,
+                "auto_pull::abandon_stuck_ready (ABANDON_LABEL)",
+            ),
+        ];
+        // Itération sur la constante, jamais sur une liste recopiée : un label
+        // ajouté à OPERATOR_HELD_LABELS est couvert le jour où il atterrit, pas
+        // le jour où quelqu'un y repense (même idiome que
+        // `mika2361_each_held_label_names_itself`).
+        for label in crate::webhook_dispatch::OPERATOR_HELD_LABELS {
+            guarded.push((
+                label,
+                "webhook_dispatch::OPERATOR_HELD_LABELS — lu par operator_held_label \
+                 et label_read_by_loop (exclusion des trois phases)",
+            ));
+        }
+
+        // Contrôle positif de l'itération : une constante vide rendrait la boucle
+        // vacante et la garde verte pour rien.
+        assert!(
+            !crate::webhook_dispatch::OPERATOR_HELD_LABELS.is_empty(),
+            "OPERATOR_HELD_LABELS must be non-empty, or the loop above guards nothing"
+        );
+
+        // Un seul panic, portant TOUS les sites : `operator-review` est employé
+        // par deux d'entre eux, et un opérateur qui le retire de labels.yml doit
+        // lire les deux, pas le premier.
+        let offenders: Vec<String> = guarded
+            .iter()
+            .filter(|(label, _)| !declared(label))
+            .map(|(label, site)| format!("  `{label}` — employé par {site}"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`.github/labels.yml` ne déclare pas {} des labels que le code pose ou \
+             lit. `label-sync` tourne avec `delete-other-labels: true` : le label \
+             est supprimé du dépôt ET de chaque ticket qui le portait, sans \
+             événement ni journal, et le site ci-dessous échoue en silence \
+             (classe mika#2127, 48 occurrences en production). Déclare-le dans \
+             `.github/labels.yml` :\n{}",
+            offenders.len(),
+            offenders.join("\n")
         );
     }
 
@@ -5332,6 +7619,12 @@ mod tests {
     /// R4 / DoD — no content conflict is ever auto-resolved. The gate has no
     /// merge strategy because it performs no merge; this asserts the module
     /// never grew one.
+    ///
+    /// **Porte aussi le détecteur S1 de mika#3036** (AC2 et le premier membre
+    /// d'AC4). Greffé ici plutôt que câblé à part : la tranche de production est
+    /// déjà lue, et son contrôle positif déjà posé. S1 asserte des **comptes**,
+    /// jamais des présences — une présence survit à un second lecteur de la
+    /// phase ajouté à côté du premier, et c'est précisément ce qu'AC2 interdit.
     #[test]
     fn test_promotion_gate_never_resolves_conflicts() {
         // Scan the production half only: the needles below appear verbatim in
@@ -5359,6 +7652,82 @@ mod tests {
                 "auto_pull must never carry a merge strategy flag ({forbidden})"
             );
         }
+
+        // ── S1 (mika#3036) — un seul lecteur de la phase, trois ledgers ──
+
+        // Le type `[&str; 0]` fait mieux que l'assertion : une entrée ajoutée
+        // sans élargir le type ne compile pas, et l'élargir est le geste visible
+        // au `grep` que mika#1574 demande. L'assertion reste parce qu'elle nomme
+        // la règle à qui la lira.
+        const T3036_PHASE_READER_ALLOWLIST: [&str; 0] = [];
+        assert!(
+            T3036_PHASE_READER_ALLOWLIST.is_empty(),
+            "S1: table d'exceptions du scan de lecteur de phase — doit rester vide; \
+             toute entrée nomme sa donnée et son ticket de suivi (mika#3036)"
+        );
+
+        assert_eq!(
+            production.matches("match phase {").count(),
+            1,
+            "AC2 — la phase décide dans UN seul site. Un second `match phase` \
+             dans la production de ce fichier est le défaut de mika#3036 qui \
+             repousse : deux lecteurs de la même sonde peuvent dériver l'un \
+             sans l'autre"
+        );
+
+        // « Suivi de » et non « présent dans le fichier » : les trois appels
+        // n'ont pas la même mise en forme — deux sur une ligne, un éclaté sur
+        // cinq — donc on découpe sur l'appel et on lit ses arguments.
+        let ledger_filter_count = |needle: &str| {
+            production
+                .split("ledger.record(")
+                .skip(1)
+                .filter(|rest| rest.split(')').next().is_some_and(|a| a.contains(needle)))
+                .count()
+        };
+        assert_eq!(
+            ledger_filter_count("FILTER_PROMOTION_GATE"),
+            3,
+            "AC4 — les trois phases comptent leur **refus** de porte sous \
+             `{FILTER_PROMOTION_GATE}`. Un compte qui tombe à deux, c'est une \
+             phase dont les refus ne se comptent plus. Les déclins, eux, ont \
+             leur propre compte depuis mika#3058 — `{FILTER_CONSENT_RETURNED_BY_MERGE}` \
+             ci-dessous : un refus escalade, un déclin n'écrit rien, et les \
+             additionner serait mika#2205"
+        );
+
+        // ── T5 (mika#3058) — le recensement du déclin au ledger ──
+
+        // Même forme que l'allowlist de S1 ci-dessus, et pour la même raison :
+        // une entrée ajoutée sans élargir le type ne compile pas, et l'élargir
+        // est le geste visible au `grep` que mika#1574 demande.
+        const T3058_DECLINE_LEDGER_ALLOWLIST: [&str; 0] = [];
+        assert!(
+            T3058_DECLINE_LEDGER_ALLOWLIST.is_empty(),
+            "mika#3058 — table d'exceptions du recensement de déclin au ledger : \
+             doit rester vide ; toute entrée nomme sa donnée précise et son \
+             ticket de suivi"
+        );
+
+        // La constante du ledger et le slug de la raison sont **le même texte**.
+        // Sans cette égalité, l'audit et le ledger se joindraient sur deux
+        // chaînes voisines, et la requête de la sonde AC5 ne verrait qu'une
+        // moitié de la population.
+        assert_eq!(
+            FILTER_CONSENT_RETURNED_BY_MERGE,
+            DeclineReason::ConsentReturnedByMerge { pr: 0 }.slug(),
+            "AC4 — le ledger et l'audit comptent le déclin sous le MÊME slug ; \
+             deux textes voisins ne se joignent pas"
+        );
+
+        assert_eq!(
+            ledger_filter_count("FILTER_CONSENT_RETURNED_BY_MERGE"),
+            2,
+            "AC4 — **deux** sites, pas trois : les phases 0 et 1 déclinent, la \
+             phase 2 jamais (AC1 — son vivier porte déjà `ready`). Un troisième \
+             site dirait qu'une phase a commencé à décliner sans qu'on le \
+             décide, et un seul qu'une des deux a cessé de se compter"
+        );
     }
 
     // ── is_groomed tests ──
@@ -5404,6 +7773,85 @@ Some description of the issue.
 > - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
 "#;
         assert!(!is_groomed(body));
+    }
+
+    // ── missing_grooming_signals : la face mesurée (mika#2956) ──
+
+    /// Le corps de la population de mika#2956 : il *cite* `docs/plans/` dans une
+    /// ligne de prose citée — donc le lecteur lâche de mika#2608 le croit porteur
+    /// d'un plan — mais il n'a ni callout de branche ni marqueur GROOMED.
+    const CORPS_QUI_CITE_SANS_ETRE_GROOME: &str = r#"## Le défaut
+
+> Plan de référence : `docs/plans/2026-01-01-001-fixture-plan.md` (sur main, § 1).
+> La branche du vol 3 n'existe plus.
+"#;
+
+    #[test]
+    fn mika2956_un_corps_qui_cite_un_plan_sans_branche_ni_verdict_nomme_ce_qui_manque() {
+        let missing = missing_grooming_signals(CORPS_QUI_CITE_SANS_ETRE_GROOME);
+        assert!(
+            missing.contains(&GroomingSignal::BranchCallout),
+            "le callout de branche manque et doit être nommé : {missing:?}"
+        );
+        assert!(
+            missing.contains(&GroomingSignal::GroomedVerdict),
+            "le marqueur GROOMED manque et doit être nommé : {missing:?}"
+        );
+        assert!(
+            missing.contains(&GroomingSignal::PlanCallout),
+            "la citation n'est pas un callout de plan ancré : {missing:?}"
+        );
+        assert!(!is_groomed(CORPS_QUI_CITE_SANS_ETRE_GROOME));
+    }
+
+    /// `is_groomed` n'est que la réduction booléenne de la mesure : les deux ne
+    /// peuvent pas diverger, et ce test est ce qui l'épingle.
+    #[test]
+    fn mika2956_is_groomed_est_la_reduction_de_la_mesure() {
+        for (ticket, body, _) in crate::grooming_marker::tests::FIXTURES {
+            assert_eq!(
+                is_groomed(body),
+                missing_grooming_signals(body).is_empty(),
+                "fixture #{ticket}: le booléen et la mesure divergent"
+            );
+        }
+        for body in [
+            CORPS_QUI_CITE_SANS_ETRE_GROOME,
+            "",
+            "> - **Branch:** `fix/1/x`\n",
+        ] {
+            assert_eq!(is_groomed(body), missing_grooming_signals(body).is_empty());
+        }
+    }
+
+    /// Un corps canoniquement groomé ne manque de rien : `Some(vec![])` est
+    /// « mesuré et groomé », pas « on n'a pas lu » (discipline tri-état mika#2340).
+    #[test]
+    fn mika2956_un_corps_groome_ne_manque_de_rien() {
+        let body = r#"## Description
+
+> - **Branch:** `feat/123/some-feature`
+> - **Plan:** `docs/plans/2026-06-01-001-some-plan.md` (committed on branch @ abc1234)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: 550e8400
+"#;
+        assert_eq!(missing_grooming_signals(body), Vec::new());
+    }
+
+    /// Les trois jetons sont ceux que le dispatch écrit déjà. Le pendant croisé,
+    /// qui les confronte à `check_grooming_markers`, vit dans `grooming_marker.rs`.
+    #[test]
+    fn mika2956_les_jetons_sont_ceux_du_dispatch() {
+        assert_eq!(GroomingSignal::BranchCallout.token(), "branch_callout");
+        assert_eq!(GroomingSignal::PlanCallout.token(), "plan_callout");
+        assert_eq!(GroomingSignal::GroomedVerdict.token(), "groomed_verdict");
+        assert_eq!(
+            missing_grooming_signals("")
+                .iter()
+                .map(|s| s.token())
+                .collect::<Vec<_>>(),
+            vec!["branch_callout", "plan_callout", "groomed_verdict"],
+            "l'ordre du vecteur est stable, et c'est celui du dispatch"
+        );
     }
 
     /// **Inversé par mika#2158 (AC1).** Une première passe `READY` sans seconde passe est
@@ -6300,8 +8748,14 @@ This ticket has been GROOMED and is ready.
         let end = body.find("\n}\n").expect("function body must close");
         let body = &body[..end];
 
+        // mika#3047 — l'aiguille se resserre : l'argument ne s'appelle plus
+        // `issue` mais `&fresh`, la lecture relue à la forge. Le resserrement
+        // est un gain, pas une concession : ce scan garde un **ordre** (le
+        // dispatch précède le churn), jamais le nom d'une variable locale, et
+        // une aiguille qui épingle ce nom est stale au premier renommage sans
+        // que la propriété ait bougé.
         let dispatch = body
-            .find("dispatch_rescued_ticket_in_process(db, ctx, issue")
+            .find("dispatch_rescued_ticket_in_process(db, ctx, ")
             .expect("Phase 2 must dispatch in-process (mika#2470 R1)");
         let churn = body
             .find("gh_remove_label(label_auth, n, \"ready\")")
@@ -6343,6 +8797,577 @@ This ticket has been GROOMED and is ready.
             dispatch < guard && guard < churn,
             "mika#2470 Option A VIOLATED: the churn_is_moot guard must sit between \
              the direct dispatch and gh_remove_label"
+        );
+    }
+
+    /// Lignes de la boucle de secours exemptées du compte de
+    /// [`mika3047_la_copie_du_tick_na_quun_lecteur_dans_la_boucle_de_dispatch`].
+    ///
+    /// **Livrée vide, et quand le scan tire, la résolution est de router la
+    /// lecture par la relecture fraîche de [`gh_reread_issue_at_dispatch`],
+    /// jamais d'ajouter une entrée ici** (doctrine mika#2201 / mika#2309). Même
+    /// contrat que `REHAB_PREDICATE_READERS_ALLOWED` (mika#3044),
+    /// `CONTEXT_HISTORY_READERS_ALLOWED` (mika#2425),
+    /// `BRIEF_SIZE_THRESHOLD_READERS_ALLOWED` (mika#2474) et
+    /// `ZERO_BUDGET_READER_EXCEPTIONS` (mika#1833) : une liste née vide est un
+    /// emplacement pour le prochain écart, donc sa vacuité est elle-même
+    /// assertée — et l'assertion exige de toute entrée qu'elle nomme le
+    /// `mika#NNNN` qui la retirera. Il n'y a ici aucune violation existante à
+    /// exempter : la fenêtre mesurée le 2026-11-06 en porte zéro.
+    const TICK_COPY_READERS_ALLOWED: &[&str] = &[];
+
+    /// L'ancre de début de la fenêtre : la boucle de **secours** seule.
+    ///
+    /// Elle nomme la sortie de la sélection pure, pas une variable de commodité.
+    /// `for &n in &survivors {` est l'autre boucle `for &n` de cette fonction,
+    /// elle apparaît deux fois et elle est avant : l'ancre complète les
+    /// distingue.
+    const RESCUE_LOOP_ANCHOR: &str = "for &n in &selected {";
+
+    /// L'ancre de droite du motif de liaison, § 4.2 du plan.
+    ///
+    /// C'est `issues.iter().find(` et **non** `let Some(` : ce dernier apparaît
+    /// plusieurs fois dans la fenêtre (`if let Some(&age)`), alors que la copie
+    /// du tick est la seule liaison issue d'une recherche dans `issues`.
+    const BINDING_ANCHOR: &str = ") = issues.iter().find(";
+
+    const BINDING_OPEN: &str = "let Some(";
+
+    /// La fenêtre de comptage : la boucle de secours de
+    /// `phase2_reconcile_stuck_ready`, commentaires retirés.
+    ///
+    /// **Pourquoi la moitié de production et non un `find` nu.** Le motif
+    /// `async fn phase2_reconcile_stuck_ready(` apparaît **deux** fois dans ce
+    /// fichier : la définition, et la chaîne littérale du scan mika#2470
+    /// ci-dessus. Un `find` rend aujourd'hui la bonne — la première — mais par
+    /// accident d'ordre. [`crate::source_scan::production_half`] coupe au
+    /// `\n#[cfg(test)]\nmod tests`, donc la fenêtre ne peut pas, même par
+    /// réordonnancement, tomber sur une fixture de test.
+    ///
+    /// **Pourquoi pas le corps entier de la fonction.** La boucle de filtrage
+    /// qui précède lit la copie du tick une dizaine de fois, légitimement : un
+    /// scan posé sur le corps entier serait rouge par construction, et la
+    /// réaction naturelle serait d'allowlister ces sites — une allowlist née
+    /// pleine, exactement ce que mika#2309 condamne, parce que sa taille ne dit
+    /// plus rien et que sa vacuité cesse d'être assertable.
+    ///
+    /// Rend `Err` plutôt que de paniquer, pour que le contrôle de bonne foi
+    /// puisse montrer le scan **rougir** sur une source synthétique.
+    /// Blanchit le **contenu** des littéraux de chaîne, en préservant les
+    /// longueurs en octets et les retours à la ligne.
+    ///
+    /// **La prémisse que le plan de ce vol avait fausse.** Le plan § 4.3 avait
+    /// mesuré « zéro violation » dans la fenêtre et nommé un seul faux positif
+    /// résiduel, celui du commentaire de fin de ligne. Il en restait un, et il
+    /// n'est pas réparable en déplaçant quoi que ce soit : le `warn!` de la
+    /// liaison elle-même porte la prose anglaise *« candidate absent from the
+    /// issue list; cannot decide or dispatch »*, où `issue` est suivi d'un
+    /// espace non suivi de `=` — donc compté comme une lecture. Un message
+    /// d'opérateur n'est pas un site à déplacer, et la classe entière (prose
+    /// dans un `warn!`, `format!("issue:{n}")`) se ferme ici plutôt que par une
+    /// entrée d'allowlist.
+    ///
+    /// **Pourquoi des espaces et non une suppression.** Tout le scan raisonne en
+    /// **positions** — l'exclusion de la liaison, le span des arguments du gate,
+    /// l'ordre vis-à-vis de la relecture. Un blanchiment à longueur constante
+    /// laisse ces positions comparables à celles de la source dépouillée ; une
+    /// suppression les décalerait. Un caractère multi-octets est donc remplacé
+    /// par autant d'espaces qu'il pèse.
+    ///
+    /// **Les limites, nommées.** Ni les chaînes brutes (`r"…"`), ni les
+    /// littéraux de caractère (`'"'`) ne sont reconnus : aucun des deux
+    /// n'apparaît dans la fenêtre, et un `'"'` qui y entrerait désynchroniserait
+    /// l'état — ce que le contrôle de bonne foi ne peut pas voir, d'où cette
+    /// phrase. Le dépouillement des commentaires passe **avant**, pour qu'un
+    /// guillemet de prose ne décide de rien.
+    ///
+    /// Reste local à ce scan parce qu'il en est le seul lecteur. S'il en gagne
+    /// un second, il monte dans [`crate::source_scan`] — c'est la règle écrite
+    /// de ce module, et la classe mika#2158.
+    fn blank_string_literals(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for c in src.chars() {
+            let blank = |out: &mut String, c: char| {
+                for _ in 0..c.len_utf8() {
+                    out.push(' ');
+                }
+            };
+            if !in_string {
+                out.push(c);
+                if c == '"' {
+                    in_string = true;
+                }
+                continue;
+            }
+            if escaped {
+                escaped = false;
+                if c == '\n' {
+                    out.push('\n');
+                } else {
+                    blank(&mut out, c);
+                }
+                continue;
+            }
+            match c {
+                '\\' => {
+                    escaped = true;
+                    out.push(' ');
+                }
+                '"' => {
+                    in_string = false;
+                    out.push('"');
+                }
+                '\n' => out.push('\n'),
+                _ => blank(&mut out, c),
+            }
+        }
+        out
+    }
+
+    fn phase2_rescue_window(src: &str) -> Result<String, String> {
+        let half = blank_string_literals(&crate::source_scan::strip_comment_lines(
+            crate::source_scan::production_half(src),
+        ));
+
+        // Terme de non-vacuité 1 : l'ancre est présente **une seule fois**.
+        // Deux occurrences voudraient dire que la boucle a été dupliquée, et le
+        // scan ne regarderait plus que la première.
+        let anchors = half.matches(RESCUE_LOOP_ANCHOR).count();
+        if anchors != 1 {
+            return Err(format!(
+                "l'ancre de fenêtre `{RESCUE_LOOP_ANCHOR}` apparaît {anchors} fois dans la \
+                 moitié de production (attendu : 1) — le scan de mika#3047 ne vise plus la \
+                 boucle de secours de la phase 2. RÉSOLUTION : réparer l'ancre, pas le compte."
+            ));
+        }
+        let start = half
+            .find(RESCUE_LOOP_ANCHOR)
+            .expect("compté juste au-dessus");
+        let tail = &half[start..];
+        // Fin de fenêtre : la fermeture du corps de la fonction, seul `}` en
+        // colonne 0 après la boucle — même borne que le scan mika#2470 voisin.
+        let end = tail.find("\n}\n").ok_or_else(|| {
+            "le corps de `phase2_reconcile_stuck_ready` ne se referme pas".to_string()
+        })?;
+        let window = &tail[..end];
+
+        // Termes de non-vacuité 2 et 3. Sans eux, un renommage ou une refonte
+        // rendrait le scan vert en ne regardant rien : le mode de panne qu'il
+        // existe précisément pour rendre visible.
+        if !window.contains(BINDING_ANCHOR) {
+            return Err(format!(
+                "la fenêtre ne porte plus le motif de liaison `{BINDING_ANCHOR}` — le site a \
+                 été refondu et ce scan ne mesure plus rien. RÉSOLUTION : réancrer le scan sur \
+                 le nouveau site, jamais le laisser vert."
+            ));
+        }
+        if !window.contains("gh_reread_issue_at_dispatch") {
+            return Err(
+                "la fenêtre ne porte plus `gh_reread_issue_at_dispatch` — l'ordre que ce scan \
+                 vérifie n'a plus de sens, et son absence serait le vol 1 de mika#3047 défait"
+                    .to_string(),
+            );
+        }
+        Ok(window.to_string())
+    }
+
+    /// Le nom de la liaison, **lu dans la source** plutôt qu'écrit ici.
+    ///
+    /// La propriété épinglée par mika#3047 ne porte sur aucun nom de variable :
+    /// un `rename` qui laisserait deux lecteurs doit rougir. Si l'extraction
+    /// échoue, le scan échoue — il ne retombe **pas** sur `"issue"` en dur. Un
+    /// défaut nommé est une garde ; un défaut silencieux est le nom de variable
+    /// qu'on avait refusé d'épingler, réintroduit par la porte de service.
+    ///
+    /// Rend `(nom, position de l'occurrence de liaison dans la fenêtre)` — la
+    /// position sert à exclure la liaison du compte **par position et non par
+    /// forme** : elle est l'origine de la fenêtre de comptage, pas un de ses
+    /// habitants.
+    fn tick_copy_binding(window: &str) -> Result<(String, usize), String> {
+        let anchor = window
+            .find(BINDING_ANCHOR)
+            .ok_or_else(|| format!("motif de liaison `{BINDING_ANCHOR}` absent de la fenêtre"))?;
+        let open = window[..anchor].rfind(BINDING_OPEN).ok_or_else(|| {
+            format!("`{BINDING_OPEN}` introuvable avant `{BINDING_ANCHOR}` — la liaison a changé de forme")
+        })?;
+        let at = open + BINDING_OPEN.len();
+        let name = window[at..anchor].trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(format!(
+                "le nom extrait du motif de liaison n'est pas un identifiant : {name:?}"
+            ));
+        }
+        // `trim` a pu avancer : on rend la position réelle du nom.
+        let at = at + window[at..anchor].find(name).unwrap_or(0);
+        Ok((name.to_string(), at))
+    }
+
+    /// Les positions des **lectures** de `name` dans `window`.
+    ///
+    /// Une occurrence est une lecture quand elle est à frontière de token des
+    /// deux côtés **et** que le caractère qui la suit est l'un de `,` `)` `.`
+    /// `;`, ou un espace non suivi de `=`. Ce que chaque clause écarte, mesuré
+    /// sur la fenêtre d'aujourd'hui :
+    ///
+    /// | clause | écarte | occurrences |
+    /// |---|---|---|
+    /// | frontière de token | `issues`, `issue_url`, `timelines_by_issue` | 4 |
+    /// | espace non suivi de `=` | `issue = n` — un champ `tracing`, dont la valeur est `n` et jamais la liaison | ~20 |
+    /// | caractère suivant dans l'ensemble clos | `issue:` de `format!("issue:{n}")` | 2 |
+    /// | [`blank_string_literals`] | la prose anglaise du `warn!` de la liaison (`"… the issue list; cannot …"`) | 1 |
+    ///
+    /// La dernière ligne de cette table est celle que le plan de ce vol n'avait
+    /// pas : voir le doc-comment de [`blank_string_literals`].
+    ///
+    /// **La frontière a un seul juge**, [`crate::source_scan::occurs_at_boundary`]
+    /// (monté là au vol 2 de mika#3047 depuis le `mod tests` de
+    /// [`crate::parent_rehabilitation`]) : on l'interroge sur le **contexte
+    /// minimal** de chaque occurrence — le caractère précédent, le nom, le
+    /// caractère suivant — plutôt que de réécrire le prédicat ici. Recopier la
+    /// frontière serait la classe mika#2158.
+    ///
+    /// **Les deux faux positifs que ce prédicat admet encore**, nommés plutôt
+    /// que tus : [`crate::source_scan::strip_comment_lines`] est *à la ligne*,
+    /// jamais lexical, donc un commentaire de **fin** de ligne et l'intérieur
+    /// d'un bloc `/* … */` dont les continuations ne commencent pas par `*`
+    /// survivent au dépouillement. Une prose de fin de ligne écrivant `issue,`
+    /// dans la fenêtre serait comptée. Le remède est de déplacer le commentaire
+    /// — c'est un faux positif réparable, pas un trou de détection, et le
+    /// message d'échec le dit.
+    fn tick_copy_reads(window: &str, name: &str) -> Vec<usize> {
+        window
+            .match_indices(name)
+            .filter(|&(at, _)| {
+                let before = window[..at].chars().next_back();
+                let after = window[at + name.len()..].chars();
+                let mut after = after;
+                let next = after.next();
+                // Un seul juge pour la frontière : le contexte minimal ne porte
+                // qu'une occurrence du nom, donc le `any` du helper est exact.
+                let mut ctx = String::new();
+                if let Some(c) = before {
+                    ctx.push(c);
+                }
+                ctx.push_str(name);
+                if let Some(c) = next {
+                    ctx.push(c);
+                }
+                if !crate::source_scan::occurs_at_boundary(&ctx, name, true) {
+                    return false;
+                }
+                match next {
+                    Some(',') | Some(')') | Some('.') | Some(';') => true,
+                    Some(' ') => after.next() != Some('='),
+                    _ => false,
+                }
+            })
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    /// Le span des arguments d'un appel, par équilibrage de parenthèses.
+    ///
+    /// `callee` porte sa parenthèse ouvrante. L'équilibrage ignore les
+    /// parenthèses dans les littéraux de chaîne — aucun argument des appels
+    /// visés n'en porte, et une fixture qui en porterait le verrait.
+    fn call_arg_span(window: &str, callee: &str) -> Result<std::ops::Range<usize>, String> {
+        let open = window
+            .find(callee)
+            .ok_or_else(|| format!("appel `{callee}` absent de la fenêtre"))?
+            + callee.len();
+        let mut depth = 1usize;
+        for (i, c) in window[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(open..open + i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(format!(
+            "la liste d'arguments de `{callee}` ne se referme pas"
+        ))
+    }
+
+    /// Le scan entier, en `Result` pour que son contrôle de bonne foi puisse le
+    /// montrer rougir sur une source synthétique.
+    ///
+    /// Quatre propriétés, et elles ne sont pas redondantes : un compte, un
+    /// consommateur et un ordre sont trois propriétés dont chacune survit à la
+    /// violation des deux autres.
+    fn scan_tick_copy_single_reader(src: &str) -> Result<(), String> {
+        let window = phase2_rescue_window(src)?;
+        let (name, binding_at) = tick_copy_binding(&window)?;
+
+        let reads: Vec<usize> = tick_copy_reads(&window, &name)
+            .into_iter()
+            // La liaison elle-même n'est pas une lecture : exclusion **par
+            // position**, pas par forme.
+            .filter(|&at| at != binding_at)
+            // L'allowlist, livrée vide : une lecture dont la ligne porte une
+            // entrée est exemptée.
+            .filter(|&at| {
+                let line_start = window[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line_end = window[at..].find('\n').map_or(window.len(), |i| at + i);
+                let line = &window[line_start..line_end];
+                !TICK_COPY_READERS_ALLOWED.iter().any(|e| line.contains(e))
+            })
+            .collect();
+
+        let sites: Vec<&str> = reads
+            .iter()
+            .map(|&at| {
+                let line_start = window[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line_end = window[at..].find('\n').map_or(window.len(), |i| at + i);
+                window[line_start..line_end].trim()
+            })
+            .collect();
+
+        // **Exactement une**, jamais « au plus une ». Zéro voudrait dire le gate
+        // de staleness débranché, ou la liaison morte et le scan orphelin — un
+        // correctif désarmé qu'un `<= 1` lirait comme un arbre propre.
+        if reads.len() != 1 {
+            return Err(format!(
+                "la copie du tick (`{name}`) a {} lecteur(s) dans la boucle de dispatch de la \
+                 phase 2, attendu exactement 1 : {sites:?}\n\
+                 RÉSOLUTION : router la lecture par la relecture fraîche de \
+                 `gh_reread_issue_at_dispatch`, jamais ajouter une entrée à \
+                 TICK_COPY_READERS_ALLOWED (doctrine mika#2201).\n\
+                 ZÉRO n'est pas un arbre propre : c'est le gate de staleness débranché ou la \
+                 liaison devenue morte.\n\
+                 Si un site accusé est une PROSE de fin de ligne nommant `{name},` ou \
+                 `{name}.` : `strip_comment_lines` est à la ligne et non lexical — déplacez le \
+                 commentaire sur sa propre ligne.",
+                reads.len()
+            ));
+        }
+        let read = reads[0];
+
+        // Le consommateur. Sans cette assertion, une lecture **déplacée** — même
+        // compte, autre consommateur — passerait : un gate neuf lisant la copie
+        // du tick, c'est-à-dire le défaut de mika#3047 sous un autre nom.
+        let gate = call_arg_span(&window, "promotion_gate_allows(")?;
+        if !gate.contains(&read) {
+            return Err(format!(
+                "l'unique lecture de `{name}` n'est pas un argument de `promotion_gate_allows` : \
+                 {sites:?}\n\
+                 RÉSOLUTION : un gate qui décide sur la copie du tick est le défaut de \
+                 mika#3047 sous un autre nom — il décide sur la relecture fraîche."
+            ));
+        }
+
+        // L'ordre. Sans lui, la lecture unique glissée **après** la relecture
+        // laisserait le gate décider sur la copie pendant que le dispatch part
+        // sur la lecture fraîche : deux vérités dans un appel.
+        let reread = window
+            .find("gh_reread_issue_at_dispatch")
+            .ok_or_else(|| "`gh_reread_issue_at_dispatch` absent de la fenêtre".to_string())?;
+        if read >= reread {
+            return Err(format!(
+                "l'unique lecture de `{name}` est posée APRÈS `gh_reread_issue_at_dispatch` : le \
+                 gate décide sur la copie du tick pendant que le dispatch part sur la lecture \
+                 fraîche — deux vérités dans un appel (mika#3047 AC1)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// **AC3, seconde phrase — aucun chemin de dispatch de la phase 2 n'utilise
+    /// plus la copie du tick.**
+    ///
+    /// La liaison produite par `issues.iter().find(…)` — quel que soit son nom —
+    /// est lue **exactement une fois** dans la boucle de secours, et cette
+    /// lecture est l'argument de `promotion_gate_allows`, qui précède
+    /// `gh_reread_issue_at_dispatch`.
+    ///
+    /// **Pourquoi aucune assertion de comportement ne peut voir ça.** Un second
+    /// lecteur de la copie du tick ne rend aucune décision fausse le jour où il
+    /// est écrit : il est écrit sur une copie qui, ce jour-là, est encore
+    /// fraîche. C'est la classe que `grooming_marker` a dû graver une fois
+    /// (mika#2158), et seule une garde structurelle la voit.
+    #[test]
+    fn mika3047_la_copie_du_tick_na_quun_lecteur_dans_la_boucle_de_dispatch() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/auto_pull.rs"),
+        )
+        .expect("read auto_pull.rs");
+        if let Err(e) = scan_tick_copy_single_reader(&src) {
+            panic!("INVARIANT VIOLÉ (mika#3047 AC3) — {e}");
+        }
+    }
+
+    /// Le contrôle de bonne foi : le scan ci-dessus pourrait être vert parce
+    /// qu'il ne regarde rien — le mode de panne qu'il existe pour rendre
+    /// visible. On le montre donc **rougir** sur une source synthétique, et
+    /// **rester muet** sur les formes qui nomment la liaison sans la lire.
+    ///
+    /// Frère de `mika2474_the_reader_scan_reddens_on_a_second_reader` et de
+    /// `mika3044_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur`, sur un
+    /// troisième objet.
+    #[test]
+    fn mika3047_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur() {
+        /// Enveloppe une fenêtre synthétique dans une fonction de la bonne
+        /// forme : une boucle `survivors` avant, l'ancre de secours, et une
+        /// fermeture en colonne 0.
+        fn fixture(body: &str) -> String {
+            format!(
+                "async fn phase2_reconcile_stuck_ready(db: &Db) {{\n\
+                 \x20   for &n in &survivors {{\n\
+                 \x20       let _ = n;\n\
+                 \x20   }}\n\
+                 \x20   for &n in &selected {{\n\
+                 {body}\n\
+                 \x20       rescued += 1;\n\
+                 \x20   }}\n\
+                 }}\n\
+                 \n\
+                 fn apres_la_fonction() {{}}\n"
+            )
+        }
+
+        const SANE: &str = "\
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        if !promotion_gate_allows(db, issue, trace_id).await {
+            continue;
+        }
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+
+        // Contrôle positif : la forme saine passe. Sans lui, les quatre rouges
+        // ci-dessous seraient compatibles avec un scan qui rougit sur tout.
+        scan_tick_copy_single_reader(&fixture(SANE))
+            .expect("la forme saine doit passer, sinon le scan rougit sur tout");
+
+        // 1 — une seconde lecture, ajoutée après la relecture.
+        let second = format!("{SANE}\n        let _ = sonde(issue);");
+        assert!(
+            scan_tick_copy_single_reader(&fixture(&second)).is_err(),
+            "un second lecteur de la copie du tick doit faire rougir le scan"
+        );
+
+        // 2 — une lecture **déplacée** : même compte, autre consommateur.
+        const DISPLACED: &str = "\
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        if !promotion_gate_allows(db, trace_id).await {
+            continue;
+        }
+        if !un_gate_neuf(db, issue).await {
+            continue;
+        }
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(DISPLACED)).is_err(),
+            "une lecture déplacée vers un autre gate garde le compte et doit rougir"
+        );
+
+        // 3 — l'ordre inversé : la lecture unique posée après la relecture.
+        const INVERTED: &str = "\
+        let Some(issue) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if !promotion_gate_allows(db, issue, trace_id).await {
+            continue;
+        }
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(INVERTED)).is_err(),
+            "le gate décidant sur la copie APRÈS la relecture fraîche doit rougir"
+        );
+
+        // 4 — la liaison **renommée** et lue deux fois sous son nouveau nom.
+        // C'est ce qui prouve que le nom est lu dans la source et non écrit
+        // ici ; aucune autre assertion ne peut le voir.
+        const RENAMED: &str = "\
+        let Some(copie_du_tick) = issues.iter().find(|i| i.number == n) else {
+            continue;
+        };
+        if !promotion_gate_allows(db, copie_du_tick, trace_id).await {
+            continue;
+        }
+        let _ = sonde(copie_du_tick);
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(RENAMED)).is_err(),
+            "un renommage de la liaison ne met pas le scan hors d'état : le nom est lu dans la \
+             source"
+        );
+
+        // 5 à 8 — reste muet sur les quatre formes qui nomment la liaison sans
+        // la lire : la frontière de token, le champ `tracing`, le littéral, et
+        // la prose de doc-comment (la forme exacte du faux positif Signal S de
+        // mika#2050, et la fenêtre réelle en porte une trentaine de lignes).
+        let silent = format!(
+            "{SANE}\n\
+             \x20       let issue_url = format!(\"https://github.com/{{R}}/issues/{{n}}\");\n\
+             \x20       let _ = timelines_by_issue.get(&n);\n\
+             \x20       warn!(issue = n, \"auto_pull: rien\");\n\
+             \x20       let _ = format!(\"issue:{{n}}\");\n\
+             \x20       // La liaison `issue` n'est lue qu'une fois, et cette lecture, issue,\n\
+             \x20       // est l'argument du gate — prose, pas une lecture."
+        );
+        scan_tick_copy_single_reader(&fixture(&silent))
+            .expect("les formes qui nomment la liaison sans la lire ne doivent pas être comptées");
+
+        // Le cas qui manquerait si on ne l'écrivait pas : l'extraction du nom en
+        // échec. Une fenêtre sans motif de liaison doit faire **échouer** le
+        // scan, et non le rendre vert sur un défaut tacite.
+        const NO_BINDING: &str = "\
+        if !promotion_gate_allows(db, trace_id).await {
+            continue;
+        }
+        let fresh = match gh_reread_issue_at_dispatch(github_token, n).await {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        dispatch_rescued_ticket_in_process(db, &fresh).await;";
+        assert!(
+            scan_tick_copy_single_reader(&fixture(NO_BINDING)).is_err(),
+            "une fenêtre sans motif de liaison doit faire ÉCHOUER le scan, jamais le rendre vert \
+             sur un défaut tacite"
+        );
+    }
+
+    /// L'allowlist du scan ci-dessus est **vide**, et sa vacuité est assertée —
+    /// une liste née vide est un emplacement pour le prochain écart.
+    #[test]
+    fn mika3047_lallowlist_du_scan_de_la_copie_du_tick_est_vide() {
+        for entry in TICK_COPY_READERS_ALLOWED {
+            assert!(
+                entry.contains("mika#"),
+                "toute entrée de TICK_COPY_READERS_ALLOWED doit nommer le ticket qui la \
+                 retirera : {entry:?}"
+            );
+        }
+        assert!(
+            TICK_COPY_READERS_ALLOWED.is_empty(),
+            "l'allowlist du scan de la copie du tick doit rester vide : quand le scan tire, on \
+             route la lecture par `gh_reread_issue_at_dispatch`, on n'ajoute pas un second \
+             lecteur (doctrine mika#2201)."
         );
     }
 
@@ -7581,7 +10606,8 @@ This ticket has been GROOMED and is ready.
         let mut ledger = ExclusionLedger::default();
         let pool = vec![make_issue(2118, GROOMED_BODY, &["p1-important"], "t")];
         assert!(
-            select_best_candidate_recording(pool.clone(), &HashSet::new(), &mut ledger).is_some()
+            !select_candidates_ranked_recording(pool.clone(), &HashSet::new(), &mut ledger)
+                .is_empty()
         );
         assert!(ledger.entries.is_empty(), "{:?}", ledger.entries);
 
@@ -7606,7 +10632,7 @@ This ticket has been GROOMED and is ready.
     fn mika2131_the_partitioning_filter_is_not_an_exclusion() {
         let mut ledger = ExclusionLedger::default();
         let pool = vec![make_issue(2119, GROOMED_BODY, &["ready"], "t")];
-        assert!(select_best_candidate_recording(pool, &HashSet::new(), &mut ledger).is_none());
+        assert!(select_candidates_ranked_recording(pool, &HashSet::new(), &mut ledger).is_empty());
         assert!(
             ledger.entries.is_empty(),
             "a ticket belonging to another phase was not dropped by this one: {:?}",
@@ -7652,7 +10678,7 @@ This ticket has been GROOMED and is ready.
         let open_pr: HashSet<u64> = [4003].into_iter().collect();
 
         let mut ledger = ExclusionLedger::default();
-        assert!(select_best_candidate_recording(pool.clone(), &open_pr, &mut ledger).is_none());
+        assert!(select_candidates_ranked_recording(pool.clone(), &open_pr, &mut ledger).is_empty());
         let recorded: HashSet<(u64, &str)> = ledger
             .entries
             .iter()
@@ -8386,6 +11412,15 @@ This ticket has been GROOMED and is ready.
             EmptyBacklogCause::InFlightUnreadable.event_name(),
             EVENT_IN_FLIGHT_UNREADABLE
         );
+        // mika#3047 — les trois noms de la relecture avant dispatch, dans le
+        // MÊME test de wire-format que leurs quatorze aînés et pour la raison du
+        // commentaire de mika#2161 ci-dessus. Les deux premiers sont les chaînes
+        // qu'AC1 nomme à l'octet : les renommer casserait la sonde AC4, dont le
+        // numérateur est le compte de `ready_absent_at_dispatch`.
+        assert_eq!(FILTER_READY_ABSENT_AT_DISPATCH, "ready_absent_at_dispatch");
+        assert_eq!(FILTER_ISSUE_CLOSED_AT_DISPATCH, "issue_closed_at_dispatch");
+        assert_eq!(FILTER_DISPATCH_REREAD_FAILED, "dispatch_reread_failed");
+
         assert_eq!(EXCLUSION_AUDIT_TOOL_NAME, "auto_pull_exclusion");
         // mika#2361 — the audit `tool_name`s are wire format too: an operator
         // greps them by hand, so a rename silently empties their query.
@@ -9519,7 +12554,10 @@ This ticket has been GROOMED and is ready.
             Database::open_in_memory().expect("open in-memory DB"),
             "mika",
         );
-        let n = 2049u64;
+        // mika#2713 — numéro hors de la plage des vrais tickets, et distinct de
+        // ceux des tests voisins : le journal d'appels `gh` est process-global.
+        let n = 990_101u64;
+        crate::gh_process::assert_fixture_issue(n);
         let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
         let mut ledger = ExclusionLedger::default();
@@ -9826,7 +12864,9 @@ This ticket has been GROOMED and is ready.
             Database::open_in_memory().expect("open in-memory DB"),
             "mika",
         );
-        let n = 2635u64;
+        // mika#2713 — voir la note du test `mika2049_…` : hors plage, et distinct.
+        let n = 990_102u64;
+        crate::gh_process::assert_fixture_issue(n);
         let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
 
@@ -9881,7 +12921,10 @@ This ticket has been GROOMED and is ready.
             Database::open_in_memory().expect("open in-memory DB"),
             "mika",
         );
-        let n = 2636u64;
+        // mika#2713 — **le** numéro de l'incident : c'est ce test qui a posté 29
+        // commentaires sur le #2636 fermé. Hors plage, et distinct de ses voisins.
+        let n = 990_103u64;
+        crate::gh_process::assert_fixture_issue(n);
         let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
         let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
 
@@ -9908,6 +12951,1969 @@ This ticket has been GROOMED and is ready.
                 .any(|(_, _, reason)| *reason == FILTER_LAUNCHER_BRAKED),
             "sans mort de lanceur, aucune exclusion de frein ; ledger = {:?}",
             ledger.entries
+        );
+    }
+
+    /// **mika#2713 — la fuite historique, rejouée : elle va au journal.**
+    ///
+    /// Le 2026-10-03 puis le 2026-10-14, ce chemin exact — même corps
+    /// (`GROOMED_BODY`, dont le callout nomme `feat/123/x`), même label
+    /// `ready`, même appel à `phase2_reconcile_stuck_ready` — a posté 29
+    /// commentaires sur le ticket **fermé** #2636 sous l'identité du moteur. Le
+    /// premier appel à partir pour de vrai était la lecture de timeline.
+    ///
+    /// Ici il est **enregistré** au lieu de partir. Si quelqu'un retirait la
+    /// couture, l'appel partirait et ce journal serait vide : c'est ce que
+    /// l'assertion lit.
+    #[tokio::test]
+    async fn mika2713_la_fuite_historique_va_au_journal_pas_a_la_forge() {
+        use crate::db::Database;
+        use crate::gh_process::{GhSubject, recorded_calls};
+        use mika_common::label_write::{LabelWriteToken, LabelWriteTokenSource};
+
+        let db = AsyncDatabase::new_with_agent(
+            Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        );
+        // Numéro propre à ce test : le journal est process-global, donc le
+        // filtre ci-dessous doit être indifférent aux tests voisins (D4).
+        let n = 990_104u64;
+        crate::gh_process::assert_fixture_issue(n);
+        let issues = vec![make_issue(n, GROOMED_BODY, &["ready"], "t")];
+        let auth = LabelWriteToken::new("fake-token".to_string(), LabelWriteTokenSource::Pat);
+        let mut ledger = ExclusionLedger::default();
+
+        let fx = test_ctx_fixture();
+        let _ = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &auth,
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "session",
+            &mut ledger,
+            false,
+            &fx.ctx(),
+        )
+        .await;
+
+        let mine: Vec<String> = recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect();
+
+        assert!(
+            mine.iter()
+                .any(|a| a.contains(&format!("repos/{DEFAULT_REPO}/issues/{n}/timeline"))),
+            "mika#2713 — l'appel qui fuyait doit être au journal du double. \
+             Un journal vide ici veut dire que la couture n'est plus sur ce \
+             chemin : l'appel est reparti vers la forge réelle. Appels vus \
+             pour #{n} : {mine:?}"
+        );
+    }
+
+    // ── mika#3047 : la phase 2 relit le ticket à la forge avant de dispatcher ──
+
+    /// La charge que le double rendra pour `gh issue view --json
+    /// state,labels,body,updatedAt` — construite par `serde_json`, jamais par
+    /// une `format!` de JSON à la main : `GROOMED_BODY` porte des retours à la
+    /// ligne et des backticks, et un échappement artisanal ferait échouer le
+    /// test sur sa propre fixture plutôt que sur le code.
+    fn relecture_cannee(state: &str, labels: &[&str], body: &str) -> String {
+        serde_json::json!({
+            "state": state,
+            "labels": labels
+                .iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>(),
+            "body": body,
+            // L'instant exact de la mesure du ticket : le tick de 14:10 du
+            // 2026-11-05, celui qui a dispatché #3044 163 ms après le retrait
+            // de `ready`.
+            "updatedAt": "2026-11-05T14:10:05Z",
+        })
+        .to_string()
+    }
+
+    /// Un tick dont **tout** est prêt à dispatcher, sauf la relecture.
+    ///
+    /// Les quatre tests d'AC2 ne diffèrent que par la charge que le double rend
+    /// au `gh issue view` de [`gh_reread_issue_at_dispatch`] : c'est le seul
+    /// degré de liberté, et c'est ce qui fait de T1 un contrôle positif et non
+    /// un cinquième montage.
+    ///
+    /// Ce que la fixture pose, et pourquoi chaque pièce est nécessaire pour que
+    /// la phase 2 atteigne le point d'insertion :
+    ///
+    /// - la **liste du tick** porte `ready` et `GROOMED_BODY` — sans quoi le
+    ///   filtre 1 écarte le ticket avant toute I/O ;
+    /// - la **timeline cannée** porte un `labeled(ready)` de 2020, donc un âge
+    ///   très au-dessus du seuil : sans elle le double rend `b"[]"` par défaut,
+    ///   la mesure d'âge rend `Ok(None)` et le ticket sort sous
+    ///   `no_ready_label_event`. C'est exactement par là que les sept appels
+    ///   existants de `phase2_reconcile_stuck_ready` sortent, et c'est pourquoi
+    ///   aucun d'eux n'atteint la nouvelle lecture (§ 5.4 du plan) ;
+    /// - la **preuve `PLAN_GROOMED`** en base est ce qui route le handler vers
+    ///   `dev-pilot` plutôt que `dev-groom` (mika#2484) ;
+    /// - la parente de groom que cette preuve traîne est **terminée** ici, alors
+    ///   que `completed_groom_pair` la laisse `in_progress`. Sans cela elle
+    ///   serait une tâche `self_dev` active sur l'URL du ticket, le filtre 4 de
+    ///   la phase 2 écarterait le candidat comme `in_flight`, et les quatre
+    ///   tests seraient verts sans jamais relire quoi que ce soit.
+    ///
+    /// Le numéro vit dans la bande 990 105+ : au-dessus du plancher
+    /// `FIXTURE_ISSUE_FLOOR`, et distinct de 990 101-990 104, parce que le
+    /// journal d'appels du double est global au processus (mika#2713 D4).
+    struct TickPretADispatcher {
+        db: AsyncDatabase,
+        issues: Vec<Issue>,
+        auth: mika_common::label_write::LabelWriteToken,
+        fx: TestCtxFixture,
+        /// Les parentes que la **fixture** a posées, avant tout dispatch : la
+        /// preuve de grooming en est une, et elle porte l'URL du ticket. C'est
+        /// la ligne de base de « zéro parente créée », qui se lit donc comme un
+        /// delta et non comme un absolu — un zéro absolu serait faux ici, et
+        /// l'assertion passerait pour une autre raison que la bonne.
+        parentes_de_la_fixture: usize,
+    }
+
+    async fn tick_pret_a_dispatcher(n: u64) -> TickPretADispatcher {
+        crate::gh_process::assert_fixture_issue(n);
+
+        let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+        let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+        // L'API d'écriture de production (mika#2310), jamais un `INSERT` SQL
+        // brut — voir `mika2470_the_handler_decides_groom_vs_implement`.
+        let (parente_de_groom, _) = crate::db::tests::completed_groom_pair(
+            &sync_db,
+            "mika",
+            &url,
+            crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED,
+        );
+        assert!(
+            sync_db
+                .update_task_completed(&parente_de_groom, "mika", None)
+                .expect("terminer la parente de groom"),
+            "la parente de groom doit être terminée, sinon le filtre 4 de la \
+             phase 2 écarte le candidat comme `in_flight`"
+        );
+        let db = AsyncDatabase::new_with_agent(sync_db, "mika");
+
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "/timeline?",
+            r#"[{"event":"labeled","label":{"name":"ready"},"actor":{"login":"samidarko"},"created_at":"2020-01-01T00:00:00Z"}]"#,
+        );
+
+        let parentes_de_la_fixture = parents_for(&db, n).await;
+        assert_eq!(
+            parentes_de_la_fixture, 1,
+            "la preuve de grooming pose exactement une parente portant l'URL"
+        );
+
+        TickPretADispatcher {
+            db,
+            issues: vec![make_issue(n, GROOMED_BODY, &["ready"], "t")],
+            auth: fake_label_auth(),
+            fx: test_ctx_fixture(),
+            parentes_de_la_fixture,
+        }
+    }
+
+    /// Les écritures que le double a vues pour ce ticket — tout ce qui n'est ni
+    /// la lecture de timeline ni la relecture d'état.
+    ///
+    /// « Aucune écriture » se lit sur le journal du double, pas sur une absence
+    /// de panique : la couture enregistre l'appel au lieu de le laisser partir
+    /// (mika#2713), donc un chemin qui écrirait serait vert sans cette lecture.
+    fn ecritures_forge_pour(n: u64) -> Vec<String> {
+        gh_calls_for(n)
+            .into_iter()
+            .filter(|a| !a.contains("/timeline?") && !a.contains("issue view"))
+            .collect()
+    }
+
+    /// **T1 — le contrôle positif : la relecture confirme, le dispatch part.**
+    ///
+    /// Sans lui, les trois tests qui suivent seraient satisfaits par une garde
+    /// qui refuse tout le monde — le mode de défaillance que les contrôles
+    /// négatifs de mika#2049 et de mika#2634 ont dû ajouter après coup.
+    ///
+    /// L'observable n'est pas `rescued` : avec un registre de skills vide le
+    /// handler s'arrête à `tool_not_found` (porte 9a), rend `Handled` en
+    /// laissant une parente `pending`, et le churn devient donc sans objet
+    /// (`FILTER_IN_FLIGHT`). Ce que ce test lit est ce que la phase 2 a
+    /// réellement obtenu : une parente de plus, et la ligne de routage du
+    /// handler.
+    #[tokio::test]
+    async fn mika3047_la_relecture_confirme_ready_et_le_dispatch_part() {
+        let n = 990_105u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t1";
+        let _ = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture + 1,
+            "une parente de plus : le dispatch a bien atteint l'étape 7 du handler"
+        );
+        assert_eq!(
+            audit_after_values(&t.db, session, "ready_label_handled").await,
+            vec!["dev-pilot_dispatch_prepared".to_string()],
+            "le handler décide, et il décide `dev-pilot` : la relecture lui a \
+             rendu un ticket ouvert, `ready`, et groomé"
+        );
+        for filtre in [
+            FILTER_READY_ABSENT_AT_DISPATCH,
+            FILTER_ISSUE_CLOSED_AT_DISPATCH,
+            FILTER_DISPATCH_REREAD_FAILED,
+        ] {
+            assert!(
+                !ledger
+                    .entries
+                    .iter()
+                    .any(|(_, _, reason)| *reason == filtre),
+                "aucun des trois filtres de mika#3047 sur le chemin nominal ; \
+                 {filtre} vu dans {:?}",
+                ledger.entries
+            );
+        }
+    }
+
+    /// **T2 — `ready` a disparu entre la liste du tick et le dispatch.**
+    ///
+    /// C'est la mesure du 2026-11-05 rejouée : la liste du tick porte `ready`,
+    /// la forge ne le porte plus. Aucun dispatch, aucune parente — et surtout
+    /// **aucune écriture**, parce que re-poser `ready` au churn fabriquerait le
+    /// consentement qu'on vient de rendre.
+    #[tokio::test]
+    async fn mika3047_ready_retire_avant_le_dispatch_ne_dispatche_pas() {
+        let n = 990_106u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["p1-important"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t2";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "aucun secours sans consentement");
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_READY_ABSENT_AT_DISPATCH
+            )),
+            "l'exclusion est comptable sous son propre nom — c'est le \
+             numérateur de la sonde AC4 ; ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente créée : c'est la parente `pending` de la mesure, \
+             celle qui a coûté deux tours mika-dev pour rien"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture, et le `--remove-label` du churn en particulier : \
+             le retirer puis le re-poser rendrait un consentement que \
+             l'opérateur vient de retirer (mika#3036)"
+        );
+    }
+
+    /// **T3 — le ticket a été fermé entre la liste du tick et le dispatch.**
+    ///
+    /// Un nom distinct de T2 parce que le remède est distinct : sur un `ready`
+    /// retiré, un opérateur peut le remettre ; sur un ticket fermé, il n'y a
+    /// rien à reprendre. Et la forme que ce refus évite est nommée : 29
+    /// commentaires sur le #2636 fermé, sous l'identité du moteur (mika#2713).
+    #[tokio::test]
+    async fn mika3047_un_ticket_ferme_avant_le_dispatch_nest_pas_ecrit() {
+        let n = 990_107u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("CLOSED", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t3";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "un ticket fermé ne se secourt pas");
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_ISSUE_CLOSED_AT_DISPATCH
+            )),
+            "ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente sur un ticket fermé"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "rien ne part vers un ticket fermé — la forme exacte de la fuite \
+             mika#2713"
+        );
+    }
+
+    /// **T4 — la relecture échoue : fail-closed, sous son propre nom.**
+    ///
+    /// Une panne de la forge n'est pas un état du ticket. Elle porte donc un
+    /// troisième filtre, et pas celui de T2 : confondre les deux ferait lire
+    /// une panne de lecture comme une course gagnée, et empoisonnerait le
+    /// numérateur de la sonde AC4 (mika#2131, mika#2205, mika#2331).
+    #[tokio::test]
+    async fn mika3047_une_relecture_en_erreur_ne_dispatche_pas() {
+        let n = 990_108u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        // L'échec est posé **par motif** : la lecture de timeline du même sujet
+        // doit continuer de répondre, sans quoi le ticket sortirait sur
+        // `probe_error` et ce test n'exercerait pas la relecture.
+        crate::gh_process::set_canned_failure(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            "HTTP 502: Bad Gateway",
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-t4";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            rescued, 0,
+            "fail-closed : une lecture en panne ne dispatche pas"
+        );
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_DISPATCH_REREAD_FAILED
+            )),
+            "le ledger du tick inscrit la panne sous un filtre nommé (AC2) ; \
+             ledger = {:?}",
+            ledger.entries
+        );
+        assert!(
+            !ledger
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_READY_ABSENT_AT_DISPATCH),
+            "une panne de lecture n'est pas un `ready` retiré : les deux noms \
+             ne se mélangent pas ; ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente sur une relecture en erreur"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture non plus : le refus est en amont du churn"
+        );
+    }
+
+    /// **AC3 — le handler décide sur la lecture fraîche, pas sur la copie du
+    /// tick.**
+    ///
+    /// Les quatre tests ci-dessus prouvent qu'une relecture *refusante* arrête
+    /// le dispatch. Aucun d'eux ne prouve qu'une relecture *acceptante* est
+    /// bien celle qui arrive au handler : T1 canne le même corps que la liste du
+    /// tick, donc il resterait vert si la phase 2 passait la copie du tick après
+    /// avoir relu pour rien. C'est précisément la régression la plus plausible
+    /// de ce vol — ajouter la lecture, oublier de la passer — et c'est ce test
+    /// qui la ferme.
+    ///
+    /// Le discriminant est **comportemental**, pas structurel : les deux corps
+    /// mènent à deux routages observables du handler, celui-là même que
+    /// `mika2470_the_handler_decides_groom_vs_implement` épingle. La liste du
+    /// tick porte `UNGROOMED_BODY`, qui route `dev-groom` ; la relecture porte
+    /// `GROOMED_BODY` avec sa preuve en base, qui route `dev-pilot`. Un seul des
+    /// deux peut sortir, et il nomme sa source.
+    ///
+    /// Le scan structurel d'AC3 — « aucun chemin de dispatch de la phase 2
+    /// n'utilise plus la copie du tick » — part au vol 2 (§ 6 du plan) : il
+    /// répond d'une autre question, l'absence de *tout autre* chemin, que ce
+    /// test ne couvre pas et ne prétend pas couvrir.
+    #[tokio::test]
+    async fn mika3047_le_handler_decide_sur_la_lecture_fraiche_pas_sur_le_tick() {
+        let n = 990_109u64;
+        let t = tick_pret_a_dispatcher(n).await;
+        // La seule chose qui diffère de T1 : la liste du tick, délibérément
+        // périmée. La fixture pose un `GROOMED_BODY` ; ici le tick a lu un corps
+        // d'avant le grooming, et la forge en porte un d'après.
+        let liste_du_tick = vec![make_issue(n, UNGROOMED_BODY, &["ready"], "t")];
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3047-ac3";
+        let _ = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &liste_du_tick,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(
+            audit_after_values(&t.db, session, "ready_label_handled").await,
+            vec!["dev-pilot_dispatch_prepared".to_string()],
+            "le handler a décidé sur `GROOMED_BODY`, donc sur la lecture \
+             fraîche. `dev-groom_dispatch_prepared` ici voudrait dire que la \
+             copie du tick est encore celle qui part au dispatch : la relecture \
+             aurait été payée et jetée"
+        );
+    }
+
+    // ── mika#2839 : le callout d'une branche morte est réécrit ──
+
+    /// Le corps d'un ticket dont la branche a été supprimée par le merge de sa
+    /// PR — trois lignes `> - `, la forme exacte que `dispatch-lib` écrit.
+    const DEAD_CALLOUT_BODY: &str = r#"## Le résidu
+
+Un ticket à plusieurs vols.
+
+> - **Branch:** `chore/2839/auto-pull-r-crire-le-callout-d-une`
+> - **Plan:** `docs/plans/2026-10-20-002-chore-2839-x.md` (committed on branch @ 3cbeec04)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: bcbf52ea"#;
+
+    const DEAD_CALLOUT_BRANCH: &str = "chore/2839/auto-pull-r-crire-le-callout-d-une";
+    const DEAD_CALLOUT_MERGED_PR: u64 = 2840;
+    /// La cause du chemin A, celle que ces quatre tests exercent (mika#3001).
+    ///
+    /// Les quatre sont conservés tels quels à ce paramètre près : leur prose
+    /// attendue ne change pas d'un octet, ce qui en fait le contrôle de
+    /// non-régression du vol et le cas 3 d'AC2 — « branche supprimée par le
+    /// merge, reste réécrit ».
+    const DEAD_CALLOUT_STALENESS: PriorPlanCause = PriorPlanCause::BranchDeletedByMerge {
+        pr: DEAD_CALLOUT_MERGED_PR,
+    };
+
+    /// Les lignes d'audit de réécriture de callout d'une session.
+    async fn callout_rewrite_rows(db: &AsyncDatabase, session: &str) -> Vec<String> {
+        db.get_audit_events(session)
+            .await
+            .expect("read audit events")
+            .into_iter()
+            .filter(|e| e.target_key == CALLOUT_REWRITE_TARGET_KEY)
+            .filter_map(|e| e.after_value)
+            .collect()
+    }
+
+    /// Les appels `gh` que le double a vus pour **cette** issue (le journal est
+    /// process-global : le filtre est ce qui rend le test parallèle-sûr, D4).
+    fn gh_calls_for(n: u64) -> Vec<String> {
+        crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect()
+    }
+
+    /// Un `LabelWriteToken` de test, source `pat` — la valeur que `token_source`
+    /// doit porter dans la ligne d'audit (R7).
+    fn fake_label_auth() -> mika_common::label_write::LabelWriteToken {
+        mika_common::label_write::LabelWriteToken::new(
+            "fake-token".to_string(),
+            mika_common::label_write::LabelWriteTokenSource::Pat,
+        )
+    }
+
+    fn in_memory_db() -> AsyncDatabase {
+        AsyncDatabase::new_with_agent(
+            crate::db::Database::open_in_memory().expect("open in-memory DB"),
+            "mika",
+        )
+    }
+
+    /// **V3 nominal — le corps écrit est la sortie du transform.**
+    ///
+    /// Pas « un corps qui contient la prose » : *la* sortie, celle que les tests
+    /// de `plan_callout` figent à l'octet (AC1). Ce que ce test ajoute est le
+    /// câblage — relire frais, transformer, écrire sur la bonne issue.
+    #[tokio::test]
+    async fn mika2839_le_chemin_nominal_ecrit_la_sortie_du_transform() {
+        let db = in_memory_db();
+        // Bande 990_3xx : les 990_2xx sont celles des contrôles du double
+        // lui-même (`gh_process`), et le journal d'appels est process-global —
+        // deux tests sur le même numéro se lisent mutuellement (mika#2713 D4).
+        let n = 990_301u64;
+        crate::gh_process::assert_fixture_issue(n);
+        // Le `\n` final est celui que `jq -r` ajoute : le lecteur doit le
+        // retirer, sans quoi la comparaison de R9 porterait sur d'autres octets
+        // que ceux que GitHub a rendus.
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{DEAD_CALLOUT_BODY}\n"),
+        );
+
+        let outcome = rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_STALENESS,
+            "phase1",
+            "trace",
+            "session-2839-nominal",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — la réécriture ne remonte rien");
+
+        let expected = crate::plan_callout::rewrite_callout_as_prior_plan(
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_STALENESS,
+        )
+        .expect("le transform doit réécrire ce corps");
+
+        let edits: Vec<String> = gh_calls_for(n)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "exactement un `issue edit` sur #{n} ; vu : {edits:?}"
+        );
+        assert!(
+            edits[0].contains(&expected),
+            "le corps écrit doit être la sortie du transform.\nattendu : \
+             {expected:?}\nargv vu : {:?}",
+            edits[0]
+        );
+
+        let rows = callout_rewrite_rows(&db, "session-2839-nominal").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "une ligne d'audit par passage ; vu : {rows:?}"
+        );
+        for needle in [
+            "\"outcome\":\"rewritten\"",
+            "\"cause\":null",
+            "\"token_source\":\"pat\"",
+            "\"merged_pr\":2840",
+            // mika#3001 : le numéro seul ne dit plus de quelle population cette
+            // réécriture vient — deux causes le portent. Le `slug` est ce qui
+            // rend les deux soustractibles (mika#2205).
+            "\"staleness\":\"branch_deleted_by_merge\"",
+            "\"plan\":\"docs/plans/2026-10-20-002-chore-2839-x.md\"",
+        ] {
+            assert!(
+                rows[0].contains(needle),
+                "la ligne d'audit doit porter {needle} ; vu : {}",
+                rows[0]
+            );
+        }
+    }
+
+    /// **V3 — un corps frais nommant une AUTRE branche n'est pas écrasé.**
+    ///
+    /// C'est la course avec `_write_canonical_callout` que mika#2837 avait posée
+    /// en objection : celui qui la perd abandonne et le dit, il ne détruit pas
+    /// l'écriture de l'autre.
+    #[tokio::test]
+    async fn mika2839_un_corps_frais_dune_autre_branche_nest_pas_ecrase() {
+        let db = in_memory_db();
+        let n = 990_302u64;
+        crate::gh_process::assert_fixture_issue(n);
+        let regroomed = DEAD_CALLOUT_BODY.replace(DEAD_CALLOUT_BRANCH, "chore/2839/un-second-vol");
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{regroomed}\n"),
+        );
+
+        let outcome = rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_STALENESS,
+            "phase1",
+            "trace",
+            "session-2839-autre-branche",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — l'abandon ne remonte rien");
+
+        let edits: Vec<String> = gh_calls_for(n)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert!(
+            edits.is_empty(),
+            "R9 — aucune écriture quand le corps frais a changé ; vu : {edits:?}"
+        );
+
+        let rows = callout_rewrite_rows(&db, "session-2839-autre-branche").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "l'abandon est audité lui aussi ; vu : {rows:?}"
+        );
+        assert!(
+            rows[0].contains("\"outcome\":\"abandoned\"")
+                && rows[0].contains("\"cause\":\"body_changed\""),
+            "l'abandon doit se nommer `body_changed` ; vu : {}",
+            rows[0]
+        );
+    }
+
+    /// **V3 — un corps frais sans callout n'est pas réécrit.**
+    ///
+    /// La `cause` est `body_changed` et non une quatrième : le vocabulaire est
+    /// clos, et ce corps-là *a* changé — il ne porte plus ce qu'on a mesuré.
+    #[tokio::test]
+    async fn mika2839_un_corps_frais_sans_callout_nest_pas_reecrit() {
+        let db = in_memory_db();
+        let n = 990_303u64;
+        crate::gh_process::assert_fixture_issue(n);
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            "Le callout a été retiré à la main.\n",
+        );
+
+        let outcome = rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_STALENESS,
+            "phase1",
+            "trace",
+            "session-2839-sans-callout",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — l'abandon ne remonte rien");
+
+        assert!(
+            !gh_calls_for(n).iter().any(|a| a.contains("issue edit")),
+            "aucune écriture sur un corps qui ne porte plus de callout"
+        );
+        let rows = callout_rewrite_rows(&db, "session-2839-sans-callout").await;
+        assert_eq!(rows.len(), 1, "vu : {rows:?}");
+        assert!(
+            rows[0].contains("\"cause\":\"body_changed\""),
+            "vu : {}",
+            rows[0]
+        );
+    }
+
+    /// **V3 — une écriture refusée rend `Ok(())` et se nomme `write_refused`.**
+    ///
+    /// Le refus est injecté sur l'`argv` de l'écriture et non sur le sujet : la
+    /// relecture doit réussir, sans quoi ce test mesurerait `body_unreadable`
+    /// en croyant mesurer le refus (c'est la raison d'être de
+    /// `set_canned_failure`, mika#2839).
+    #[tokio::test]
+    async fn mika2839_une_ecriture_refusee_rend_ok_et_se_nomme() {
+        let db = in_memory_db();
+        let n = 990_304u64;
+        crate::gh_process::assert_fixture_issue(n);
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{DEAD_CALLOUT_BODY}\n"),
+        );
+        crate::gh_process::set_canned_failure(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue edit",
+            "gh: Resource not accessible by integration (HTTP 403)",
+        );
+
+        let outcome = rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            DEAD_CALLOUT_BODY,
+            DEAD_CALLOUT_BRANCH,
+            DEAD_CALLOUT_STALENESS,
+            "phase1",
+            "trace",
+            "session-2839-refus",
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "R6 — un refus d'écriture ne peut pas coûter le verdict de mika#2837"
+        );
+
+        assert!(
+            gh_calls_for(n).iter().any(|a| a.contains("issue edit")),
+            "l'écriture doit avoir été tentée : sans tentative, ce test \
+             mesurerait un autre chemin"
+        );
+        let rows = callout_rewrite_rows(&db, "session-2839-refus").await;
+        assert_eq!(rows.len(), 1, "vu : {rows:?}");
+        assert!(
+            rows[0].contains("\"outcome\":\"abandoned\"")
+                && rows[0].contains("\"cause\":\"write_refused\""),
+            "vu : {}",
+            rows[0]
+        );
+    }
+
+    // ── mika#2822 : une PR ouverte compte, quelle que soit la forme de son lien ──
+
+    /// Une réponse `gh pr list` figée, reproduisant les deux PR réelles du
+    /// 2026-10-19 plus les contrôles.
+    ///
+    /// Les deux premières entrées sont le constat de mika#2822 : #2812 ne porte
+    /// que `Refs #2680` (donc `closingIssuesReferences` vide) et #2813 n'a
+    /// aucune référence (donc le champ est **absent**, pas vide) — les deux
+    /// formes que GitHub rend, et les deux que la source historique ne voit pas.
+    /// Les trois suivantes sont les contrôles : une branche hors grammaire, une
+    /// PR que la source historique relie déjà, et une branche hors grammaire
+    /// dont la source historique relie quand même le ticket.
+    const OPEN_PR_LIST_FIXTURE: &str = r#"[
+      {
+        "number": 2812,
+        "closingIssuesReferences": [],
+        "headRefName": "feat/2680/terme-de-relache"
+      },
+      {
+        "number": 2813,
+        "headRefName": "feat/1381/la-fenetre-de-transmission"
+      },
+      {
+        "number": 1,
+        "closingIssuesReferences": [],
+        "headRefName": "dependabot/cargo/serde-1.0.2"
+      },
+      {
+        "number": 2,
+        "closingIssuesReferences": [{"number": 606}],
+        "headRefName": "fix/606/x"
+      },
+      {
+        "number": 3,
+        "closingIssuesReferences": [{"number": 9}],
+        "headRefName": "main"
+      }
+    ]"#;
+
+    /// AC1 — la PR du vol 4 de mika#2680, `Refs #2680` et rien d'autre.
+    #[test]
+    fn mika2822_une_pr_en_refs_seul_compte_par_sa_branche() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert!(
+            linkage.numbers.contains(&2680),
+            "mika#2822 AC1 — #2812 est ouverte sur `feat/2680/…` et ne porte \
+             que `Refs #2680`. Si 2680 n'entre pas dans l'ensemble, le ticket \
+             reste re-dispatchable tant qu'il garde `ready` : c'est le défaut \
+             qui a coûté 6 vols à vide le 2026-10-19."
+        );
+    }
+
+    /// AC2 — la PR du vol 1/2 de mika#1381, aucune référence nulle part.
+    #[test]
+    fn mika2822_une_pr_sans_aucune_reference_compte_par_sa_branche() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert!(
+            linkage.numbers.contains(&1381),
+            "mika#2822 AC2 — #2813 n'a pas même le champ \
+             `closingIssuesReferences` ; seule sa branche `feat/1381/…` relie \
+             la PR au ticket."
+        );
+    }
+
+    /// AC3 — une branche hors grammaire n'alimente rien.
+    ///
+    /// L'assertion est une **égalité stricte** de l'ensemble, et c'est
+    /// délibéré : un `!contains(&1)` laisserait passer un numéro inventé
+    /// ailleurs dans `dependabot/cargo/serde-1.0.2` (`1`, `0`, `2`), c'est-à-dire
+    /// exactement ce que `issue_number_from_branch` refuse de faire (B3.2,
+    /// mika#2482). Seule l'égalité dit « rien d'autre n'est entré ».
+    #[test]
+    fn mika2822_une_branche_hors_convention_najoute_rien() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        let expected: HashSet<u64> = [2680, 1381, 606, 9].into_iter().collect();
+        assert_eq!(
+            linkage.numbers, expected,
+            "mika#2822 AC3 — `dependabot/cargo/serde-1.0.2` a `cargo` en \
+             deuxième segment, donc aucun numéro. L'AC est tenu par la \
+             réutilisation de `issue_number_from_branch`, pas par une clause \
+             spéciale `dependabot`."
+        );
+        assert_eq!(
+            linkage.nonconforming_branches, 2,
+            "les deux branches hors grammaire de la fixture sont \
+             `dependabot/cargo/serde-1.0.2` et `main`"
+        );
+    }
+
+    /// Non-régression de mika#1517 : la source historique garde ses deux cas,
+    /// dont celui où la branche ne suit pas la grammaire.
+    #[test]
+    fn mika2822_la_source_historique_est_intacte() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert!(
+            linkage.numbers.contains(&606),
+            "mika#1517 — #2 déclare `Closes #606`"
+        );
+        assert!(
+            linkage.numbers.contains(&9),
+            "une branche non conforme ne **retire** rien : #3 est sur `main`, \
+             mais sa source historique relie 9. Élargir le filtre ne doit pas \
+             le rétrécir ailleurs."
+        );
+    }
+
+    /// AC4, sa moitié testable sans réseau.
+    ///
+    /// Le fail-open du site d'appel n'est atteignable que si le parseur rend
+    /// bien une `Err` sur un JSON global illisible — et une erreur ne doit pas
+    /// dégénérer en ensemble partiel, qui serait pris pour une vérité.
+    #[test]
+    fn mika2822_un_json_illisible_rend_une_erreur() {
+        assert!(parse_open_pr_issue_numbers("ceci n'est pas du JSON").is_err());
+        assert!(
+            parse_open_pr_issue_numbers("{}").is_err(),
+            "la réponse de `gh pr list` est un tableau ; un objet n'en est pas un"
+        );
+        // Contre-épreuve : une entrée malformée, elle, ne fait pas échouer le
+        // lot — les 99 autres PR gardent leurs exclusions.
+        let linkage = parse_open_pr_issue_numbers(
+            r#"[{"number": 7}, {"number": 8, "headRefName": "fix/42/x"}]"#,
+        )
+        .expect("une entrée sans branche ne fait pas échouer le lot");
+        assert_eq!(linkage.numbers, [42].into_iter().collect::<HashSet<u64>>());
+    }
+
+    /// La provenance est comptée **par PR**, pas par numéro.
+    ///
+    /// C'est l'assertion qui lie le code aux 8 vols du constat : seule
+    /// `via_branch_only == 2` dit que la source ajoutée par mika#2822 voit
+    /// exactement #2812 et #2813. C'est aussi la seule qui rougirait si un
+    /// futur refactor recomptait par numéro.
+    #[test]
+    fn mika2822_la_provenance_est_comptee_par_pr() {
+        let linkage = parse_open_pr_issue_numbers(OPEN_PR_LIST_FIXTURE)
+            .expect("la fixture est du JSON valide");
+        assert_eq!(linkage.prs, 5, "cinq entrées dans la fixture");
+        assert_eq!(
+            linkage.via_closing, 2,
+            "#2 et #3 — et #2 compte ici plutôt qu'en `via_branch_only` bien \
+             que sa branche donne le même 606 : la source historique suffisait"
+        );
+        assert_eq!(
+            linkage.via_branch_only, 2,
+            "#2812 et #2813 — la population que mika#2822 ajoute au filtre"
+        );
+        assert_eq!(linkage.nonconforming_branches, 2, "#1 et #3");
+        assert_eq!(linkage.numbers.len(), 4, "2680, 1381, 606, 9");
+    }
+
+    // ───────────── mika#2837 — une branche supprimée par un merge ─────────────
+
+    const BRANCH_2108: &str = "fix/2108/p1-dispatch-lib-le-bac-sable-ne-monte";
+    const BRANCH_2680: &str = "feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur";
+
+    /// Sortie réelle, figée le 2026-10-20 :
+    /// `gh pr list --repo senara-solutions/mika --head fix/2108/… --state all
+    /// --json number,state,mergedAt,baseRefName,headRefName --limit 30`.
+    ///
+    /// C'est la charge du refus du 2026-10-20T06:20:08Z sur #2108 — celui qui a
+    /// suivi de dix minutes le merge de #2834. Deux merges, pas un : la branche
+    /// avait déjà servi un vol antérieur, et c'est ce qui rend l'argmax
+    /// nécessaire plutôt que décoratif.
+    const MERGED_PR_LIST_2108: &str = r#"[
+      {"baseRefName":"main","headRefName":"fix/2108/p1-dispatch-lib-le-bac-sable-ne-monte","mergedAt":"2026-10-20T06:10:45Z","number":2834,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"fix/2108/p1-dispatch-lib-le-bac-sable-ne-monte","mergedAt":"2026-10-19T06:15:38Z","number":2791,"state":"MERGED"}
+    ]"#;
+
+    /// Sortie réelle, figée le 2026-10-20, même commande sur la branche de
+    /// #2680 — les trois refus du constat.
+    ///
+    /// Son intérêt est en tête de liste : l'entrée `[0]` est #2833, **fermée
+    /// sans merge**. La forge la rend d'abord, et un parseur qui lirait la
+    /// première entrée promouvrait sur une PR qui n'a rien mis sur `main`.
+    const MERGED_PR_LIST_2680: &str = r#"[
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":null,"number":2833,"state":"CLOSED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-19T16:27:54Z","number":2829,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-19T05:27:37Z","number":2812,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-17T09:14:05Z","number":2764,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-17T06:26:44Z","number":2747,"state":"MERGED"},
+      {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":"2026-10-16T12:11:01Z","number":2705,"state":"MERGED"}
+    ]"#;
+
+    /// Le parseur sur les deux charges réelles du constat (AC1).
+    #[test]
+    fn mika2837_le_parseur_sur_les_deux_charges_reelles() {
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2108, BRANCH_2108, None).unwrap(),
+            Some(MergedPrEvidence {
+                number: 2834,
+                merged_at: "2026-10-20T06:10:45Z".to_string(),
+            }),
+            "le plus récent des deux merges, pas le premier venu : c'est #2834 \
+             qui a supprimé la branche dix minutes avant le refus"
+        );
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2680, BRANCH_2680, None)
+                .unwrap()
+                .map(|e| e.number),
+            Some(2829),
+            "et ce, bien que l'entrée [0] soit #2833, fermée sans merge"
+        );
+    }
+
+    /// AC4 — le contrôle négatif. Une PR fermée sans merge ne porte pas la
+    /// branche, donc le refus d'aujourd'hui tient, message compris.
+    ///
+    /// L'entrée est celle de `[0]` de [`MERGED_PR_LIST_2680`], seule : c'est
+    /// exactement l'état qu'aurait eu la branche si le vol 4 de #2680 avait été
+    /// abandonné au lieu d'être mergé.
+    #[test]
+    fn mika2837_une_pr_fermee_sans_merge_ne_porte_pas_la_branche() {
+        let closed_only = r#"[
+          {"baseRefName":"main","headRefName":"feat/2680/pr-filtre-webhook-phase-4-tours-vide-sur","mergedAt":null,"number":2833,"state":"CLOSED"}
+        ]"#;
+        let probe = parse_merged_pr_for_branch(closed_only, BRANCH_2680, None);
+        assert_eq!(
+            probe.as_ref().unwrap(),
+            &None,
+            "`mergedAt: null` — la forge a répondu, et sa réponse est « aucune »"
+        );
+        assert_eq!(
+            classify_absent_branch(probe),
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            }
+        );
+        match classify_promotion(
+            &StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            },
+            Some(BRANCH_2680),
+            50,
+        ) {
+            PromotionGate::Refuse(r @ RefusalReason::BranchAbsent { .. }) => {
+                assert_eq!(r.slug(), "branch_absent_on_origin");
+                assert!(r.reason(2680).contains("n'existe pas sur `origin`"));
+            }
+            other => panic!("AC4 attend le refus d'aujourd'hui, obtenu {other:?}"),
+        }
+    }
+
+    /// Les trois conditions par entrée, chacune par son contre-exemple — plus
+    /// l'asymétrie par entrée et l'indépendance de l'argmax à l'ordre.
+    #[test]
+    fn mika2837_les_trois_conditions_sont_necessaires() {
+        let into_feature = r#"[{"number":1,"state":"MERGED","mergedAt":"2026-10-20T06:10:45Z",
+          "baseRefName":"feat/parent","headRefName":"fix/2108/x"}]"#;
+        assert_eq!(
+            parse_merged_pr_for_branch(into_feature, "fix/2108/x", None).unwrap(),
+            None,
+            "mergée dans une branche de feature : le plan n'est pas sur `main`, \
+             et `main` est d'où le pilote repartirait"
+        );
+
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2108, BRANCH_2680, None).unwrap(),
+            None,
+            "`--head` est un filtre de la forge ; la condition se vérifie ici"
+        );
+
+        // Une entrée malformée ne prouve rien — et ne fait pas perdre les
+        // autres. Deux formes : le champ qui manque, et le `mergedAt` qui ne se
+        // parse pas. La seconde est la seule qui pourrait être prise pour un
+        // merge si on ne lisait que la non-nullité.
+        let mixed = r#"[
+          {"state":"MERGED","mergedAt":"2026-10-20T06:10:45Z","baseRefName":"main","headRefName":"fix/2108/x"},
+          {"number":2,"state":"MERGED","mergedAt":"hier","baseRefName":"main","headRefName":"fix/2108/x"},
+          {"number":3,"state":"MERGED","mergedAt":"2026-10-18T10:00:00Z","baseRefName":"main","headRefName":"fix/2108/x"}
+        ]"#;
+        assert_eq!(
+            parse_merged_pr_for_branch(mixed, "fix/2108/x", None)
+                .unwrap()
+                .map(|e| e.number),
+            Some(3),
+            "l'entrée sans `number` et celle au `mergedAt` illisible sont \
+             ignorées ; la troisième garde sa preuve"
+        );
+
+        // L'argmax ne doit rien devoir à l'ordre de `gh pr list`, qui n'est pas
+        // contractuel : la même paire dans les deux sens rend le même numéro.
+        let ascending = r#"[
+          {"number":10,"state":"MERGED","mergedAt":"2026-10-18T10:00:00Z","baseRefName":"main","headRefName":"fix/2108/x"},
+          {"number":11,"state":"MERGED","mergedAt":"2026-10-20T06:10:45Z","baseRefName":"main","headRefName":"fix/2108/x"}
+        ]"#;
+        assert_eq!(
+            parse_merged_pr_for_branch(ascending, "fix/2108/x", None)
+                .unwrap()
+                .map(|e| e.number),
+            Some(11)
+        );
+    }
+
+    /// La partition des trois sondes, en table nommée (AC1/AC2/AC3).
+    ///
+    /// C'est le test du correctif : une seule des trois réponses de la forge
+    /// promeut, et le refus des deux autres est celui d'aujourd'hui — même
+    /// variante, même slug, même message. Un refus dont le texte aurait bougé
+    /// serait une régression d'AC2 que la variante seule ne verrait pas.
+    #[test]
+    fn mika2837_la_partition_des_trois_sondes() {
+        let refusal = PromotionGate::Refuse(RefusalReason::BranchAbsent {
+            branch: BRANCH_2680.to_string(),
+        });
+        let cases: Vec<(&str, Result<Option<MergedPrEvidence>>, PromotionGate)> = vec![
+            (
+                "AC1 — portée par une PR mergée : le callout est périmé, pas le plan",
+                Ok(Some(MergedPrEvidence {
+                    number: 2834,
+                    merged_at: "2026-10-20T06:10:45Z".to_string(),
+                })),
+                PromotionGate::Promote {
+                    detail: "branch_deleted_by_merged_pr",
+                },
+            ),
+            (
+                "AC2 — aucune PR mergée ne la porte : le refus d'aujourd'hui",
+                Ok(None),
+                refusal.clone(),
+            ),
+            (
+                "AC3 — la forge n'a pas pu répondre : le refus, sans promotion \
+                 sur une absence de preuve",
+                Err(anyhow!("gh pr list failed: HTTP 502")),
+                refusal.clone(),
+            ),
+        ];
+
+        for (label, probe, expected) in cases {
+            let decision =
+                classify_promotion(&classify_absent_branch(probe), Some(BRANCH_2680), 50);
+            assert_eq!(decision, expected, "{label}");
+            if let PromotionGate::Refuse(r) = &decision {
+                assert_eq!(r.slug(), "branch_absent_on_origin", "{label}");
+                assert!(
+                    r.reason(2680).contains("n'existe pas sur `origin`"),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    /// Le journal d'audit par mesure, en table **totale** (AC1).
+    ///
+    /// Six lignes pour cinq variantes, et le `match` de `row` est exhaustif :
+    /// une sixième variante de [`StalenessMeasurement`] ne compilera pas sans sa
+    /// ligne ici. C'est la garde qui empêche la table de devenir un
+    /// sous-ensemble silencieux de l'énumération.
+    ///
+    /// `merged_pr` est `null` — jamais `0` — partout où aucune PR ne porte la
+    /// branche, et `merged_pr_probe` est `null` hors du chemin d'absence : un
+    /// `0` ou un `""` se lirait comme une valeur mesurée (motif mika#2331).
+    #[test]
+    fn mika2837_laudit_par_mesure_table_complete() {
+        fn row(m: &StalenessMeasurement) -> (&'static str, Option<u64>, Option<&'static str>) {
+            match m {
+                StalenessMeasurement::Measured(_) => ("measured", None, None),
+                StalenessMeasurement::NoBranchCallout => ("no_branch_callout", None, None),
+                StalenessMeasurement::Unavailable => ("unavailable", None, None),
+                StalenessMeasurement::BranchAbsent {
+                    probe: AbsenceProbe::NotCarried,
+                } => ("branch_absent", None, Some("not_carried")),
+                StalenessMeasurement::BranchAbsent {
+                    probe: AbsenceProbe::Unreadable,
+                } => ("branch_absent", None, Some("unreadable")),
+                StalenessMeasurement::BranchDeletedByMerge { pr } => {
+                    ("branch_deleted_by_merge", Some(*pr), Some("carried"))
+                }
+            }
+        }
+
+        let inputs = [
+            measured(3, 1, "behind"),
+            StalenessMeasurement::NoBranchCallout,
+            StalenessMeasurement::Unavailable,
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::NotCarried,
+            },
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::Unreadable,
+            },
+            StalenessMeasurement::BranchDeletedByMerge { pr: 2834 },
+        ];
+
+        for m in inputs {
+            let (slug, merged_pr, probe) = row(&m);
+            let decision = classify_promotion(&m, Some(BRANCH_2680), 50);
+            let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
+                2837,
+                Some(BRANCH_2680),
+                &m,
+                &decision,
+                50,
+            ))
+            .expect("l'audit est du JSON valide");
+            assert_eq!(json["measurement"], slug, "mesure {m:?}");
+            match merged_pr {
+                Some(n) => assert_eq!(json["merged_pr"], n, "mesure {m:?}"),
+                None => assert!(
+                    json["merged_pr"].is_null(),
+                    "`null`, jamais `0` : aucune PR ne porte {m:?}"
+                ),
+            }
+            match probe {
+                Some(p) => assert_eq!(json["merged_pr_probe"], p, "mesure {m:?}"),
+                None => assert!(
+                    json["merged_pr_probe"].is_null(),
+                    "hors du chemin d'absence, la sonde n'a pas tourné : {m:?}"
+                ),
+            }
+        }
+    }
+
+    /// AC3 — on ne promeut pas sur une absence de preuve.
+    ///
+    /// La charge illisible rend une `Err`, jamais un `Ok(None)` : confondre les
+    /// deux ferait d'une panne de la forge une promotion.
+    #[test]
+    fn mika2837_un_json_illisible_est_une_erreur_jamais_une_absence() {
+        assert!(parse_merged_pr_for_branch("ceci n'est pas du JSON", BRANCH_2108, None).is_err());
+        assert!(
+            parse_merged_pr_for_branch("{}", BRANCH_2108, None).is_err(),
+            "la réponse de `gh pr list` est un tableau ; un objet n'en est pas un"
+        );
+        assert_eq!(
+            classify_absent_branch(Err(anyhow!("gh pr list failed: HTTP 502"))),
+            StalenessMeasurement::BranchAbsent {
+                probe: AbsenceProbe::Unreadable,
+            },
+            "AC3 — le refus, et sous un nom qui se compte seul"
+        );
+    }
+
+    // ───── mika#3001 — un callout périmé dont la branche a été repoussée ─────
+
+    const BRANCH_2958: &str = "feat/2958/manager-phase-2-c-vol-2-le-manager";
+
+    /// Le plan du vol 2d : celui que le callout de #2958 nommait encore le
+    /// 2026-10-31 à 16:52Z, vingt-huit minutes après le merge de #2992 qui
+    /// l'avait mis sur `main`.
+    const PLAN_2958_VOL_2D: &str =
+        "docs/plans/2026-10-31-005-feat-2958-manager-groome-la-releve-vol-2d-plan.md";
+    /// Le plan du vol **en cours** à cet instant. Sa PR, #3005, était encore
+    /// ouverte : c'est le contrôle négatif d'AC2, et il vit sur la même charge
+    /// que le cas positif.
+    const PLAN_2958_VOL_2E: &str =
+        "docs/plans/2026-10-31-006-feat-2958-manager-groome-la-releve-vol-2e-plan.md";
+    /// Le plan du vol 2c, porté par #2988 — une PR mergée qui n'est **pas** la
+    /// plus récente. C'est par lui que la liaison par fichiers se distingue de
+    /// la liaison par horodatage.
+    const PLAN_2958_VOL_2C: &str =
+        "docs/plans/2026-10-31-003-feat-2958-manager-groome-la-releve-vol-2c-plan.md";
+
+    /// AC3 — le cas mesuré de mika#2958, figé.
+    ///
+    /// `gh pr list --repo senara-solutions/mika --head
+    /// feat/2958/manager-phase-2-c-vol-2-le-manager --state all --json
+    /// number,state,mergedAt,baseRefName,headRefName,files --limit 30`, à l'état
+    /// du **2026-10-31 vers 16:52Z** — l'instant du groom d18d6ef1, celui qui a
+    /// rendu `auto_skipped` / `already_groomed` en prenant le plan du vol 2d pour
+    /// celui du vol en cours. Les six PR et leurs plans sont ceux de la relecture
+    /// du 2026-11-01 (§ 1.3 du plan, une PR par plan sur toute la population) ;
+    /// seule l'entrée #3005 est à son état d'alors, `OPEN` / `mergedAt: null`,
+    /// puisque son merge n'a eu lieu que le lendemain.
+    ///
+    /// Cet instant-là est ce qui permet aux deux premiers cas d'AC2 de tenir sur
+    /// **une seule** charge : elle porte à la fois la PR mergée qui a périmé le
+    /// callout et la PR ouverte qui porte le plan du vol en cours. Le contrôle
+    /// négatif n'est donc pas supprimable séparément du cas positif.
+    ///
+    /// Les `additions`/`deletions` de la première entrée sont conservés tels que
+    /// la forge les rend : ce parseur ne les lit pas, et une charge qui ne
+    /// porterait que `path` laisserait croire qu'il en dépend.
+    const MERGED_PR_LIST_2958: &str = r#"[
+      {"baseRefName":"main","headRefName":"feat/2958/manager-phase-2-c-vol-2-le-manager","mergedAt":null,"number":3005,"state":"OPEN",
+       "files":[{"path":"crates/mika-agent/src/milestone_manager/cadence.rs","additions":41,"deletions":6},
+                {"path":"crates/mika-agent/src/milestone_manager/groom_trigger.rs","additions":120,"deletions":3},
+                {"path":"crates/mika-agent/src/milestone_manager/reporter.rs","additions":188,"deletions":11},
+                {"path":"docs/plans/2026-10-31-006-feat-2958-manager-groome-la-releve-vol-2e-plan.md","additions":404,"deletions":0}]},
+      {"baseRefName":"main","headRefName":"feat/2958/manager-phase-2-c-vol-2-le-manager","mergedAt":"2026-10-31T16:24:32Z","number":2992,"state":"MERGED",
+       "files":[{"path":"crates/mika-agent/src/milestone_manager/cadence.rs"},
+                {"path":"crates/mika-agent/src/milestone_manager/spawn.rs"},
+                {"path":"crates/mika-agent/src/server/mod.rs"},
+                {"path":"docs/plans/2026-10-31-005-feat-2958-manager-groome-la-releve-vol-2d-plan.md"}]},
+      {"baseRefName":"main","headRefName":"feat/2958/manager-phase-2-c-vol-2-le-manager","mergedAt":"2026-10-31T12:47:21Z","number":2988,"state":"MERGED",
+       "files":[{"path":"crates/mika-agent/src/groom_in_flight.rs"},
+                {"path":"crates/mika-agent/src/db/tasks.rs"},
+                {"path":"docs/plans/2026-10-31-003-feat-2958-manager-groome-la-releve-vol-2c-plan.md"}]},
+      {"baseRefName":"main","headRefName":"feat/2958/manager-phase-2-c-vol-2-le-manager","mergedAt":"2026-10-30T11:04:06Z","number":2975,"state":"MERGED",
+       "files":[{"path":"crates/mika-agent/src/milestone_manager/groom_trigger.rs"},
+                {"path":"docs/egress/egress-manifest.toml"},
+                {"path":"docs/plans/2026-10-30-002-feat-2958-manager-groome-la-releve-vol-2b-plan.md"}]},
+      {"baseRefName":"main","headRefName":"feat/2958/manager-phase-2-c-vol-2-le-manager","mergedAt":"2026-10-30T07:02:41Z","number":2970,"state":"MERGED",
+       "files":[{"path":"crates/mika-agent/src/milestone_manager/mod.rs"},
+                {"path":"docs/plans/2026-10-29-005-feat-2958-manager-groome-la-releve-vol-2-plan.md"}]},
+      {"baseRefName":"main","headRefName":"feat/2958/manager-phase-2-c-vol-2-le-manager","mergedAt":"2026-10-29T14:02:54Z","number":2960,"state":"MERGED",
+       "files":[{"path":"crates/mika-agent/src/milestone_manager/groom_trigger.rs"},
+                {"path":"docs/operator/environment-variables.md"},
+                {"path":"docs/plans/2026-10-29-003-feat-2958-manager-groome-la-releve-plan.md"}]}
+    ]"#;
+
+    /// AC2 cas 1 + cas 2, et AC3 — sur **une** charge et dans **un** appel de
+    /// test, pour que le contrôle négatif ne soit pas supprimable seul.
+    #[test]
+    fn mika3001_la_pr_mergee_portant_le_plan_est_celle_qui_est_nommee() {
+        // Cas 1 — le plan que le callout nommait est porté par #2992, mergée :
+        // le callout est périmé, et c'est ce numéro-là que la prose dira.
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2958, BRANCH_2958, Some(PLAN_2958_VOL_2D))
+                .unwrap(),
+            Some(MergedPrEvidence {
+                number: 2992,
+                merged_at: "2026-10-31T16:24:32Z".to_string(),
+            }),
+            "la branche existe toujours — le first-push de 16:36Z l'avait \
+             recréée — et c'est exactement le cas que mika#2839 ne voyait pas"
+        );
+
+        // Cas 2 — le contrôle négatif. Le plan du vol en cours est porté par
+        // #3005, encore OUVERTE : aucune PR mergée ne le porte, donc rien à
+        // réécrire. C'est le cas nominal de tous les vols en vol.
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2958, BRANCH_2958, Some(PLAN_2958_VOL_2E))
+                .unwrap(),
+            None,
+            "`mergedAt: null` : la PR qui porte ce plan n'a rien mis sur `main`"
+        );
+
+        // AC1 — la liaison est par **les fichiers de la PR**, pas par
+        // l'horodatage du merge. Le plan du vol 2c nomme #2988, que « la plus
+        // récente des mergées » ne donnerait jamais.
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2958, BRANCH_2958, Some(PLAN_2958_VOL_2C))
+                .unwrap()
+                .map(|e| e.number),
+            Some(2988)
+        );
+
+        // Et le raccourci qu'AC1 refuse, montré sur la même charge : sans
+        // `carrying`, elle rend #2992 — la bonne réponse pour le vol 2d, mais
+        // par coïncidence de séquence, et la même valeur pour les six plans.
+        assert_eq!(
+            parse_merged_pr_for_branch(MERGED_PR_LIST_2958, BRANCH_2958, None)
+                .unwrap()
+                .map(|e| e.number),
+            Some(2992),
+            "le chemin mika#2837 ne change pas : sa question porte sur la branche"
+        );
+
+        // `files[].path`, et pas `filename` : la même charge réécrite avec le nom
+        // de champ du `compare` ne porte plus rien. Les deux API ne le nomment
+        // pas pareil, et c'est la seule confusion que ce vol pouvait commettre.
+        let as_compare = MERGED_PR_LIST_2958.replace("\"path\"", "\"filename\"");
+        assert_eq!(
+            parse_merged_pr_for_branch(&as_compare, BRANCH_2958, Some(PLAN_2958_VOL_2D)).unwrap(),
+            None,
+            "`filename` est la clé du `compare`, pas celle de `gh pr list --json files`"
+        );
+    }
+
+    /// Les quatre règles de `plan_presence`, et l'**ordre** des deux premières.
+    #[test]
+    fn mika3001_plan_presence_lit_le_compte_avant_la_liste() {
+        fn st(ahead_by: i64, changed_files: Option<Vec<String>>) -> BranchStaleness {
+            BranchStaleness {
+                behind_by: 12,
+                ahead_by,
+                status: if ahead_by == 0 { "behind" } else { "diverged" }.to_string(),
+                changed_files,
+            }
+        }
+        fn paths(files: &[&str]) -> Option<Vec<String>> {
+            Some(files.iter().map(|f| f.to_string()).collect())
+        }
+
+        // Règle 1 — le cas mesuré du 2026-10-31 à 16:36Z. Le first-push de
+        // mika#2626 avait recréé la branche à l'identique de `main` : GitHub omet
+        // alors la clé `files`, donc `changed_files` est `None`, et c'est le
+        // **compte** qui conclut. Sans la précédence, la règle 4 classerait
+        // `Unreadable` le cas le plus net de toute la population.
+        assert_eq!(
+            plan_presence(&st(0, None), PLAN_2958_VOL_2D),
+            PlanPresence::NotOnBranch,
+            "0 commit d'avance ⇒ 0 fichier ajouté : il n'y a aucune ignorance ici"
+        );
+
+        // La précédence elle-même, montrée sur une charge contradictoire : même
+        // si une liste nommait le plan, un `ahead_by` nul dit qu'il n'est pas un
+        // ajout de cette branche.
+        assert_eq!(
+            plan_presence(&st(0, paths(&[PLAN_2958_VOL_2D])), PLAN_2958_VOL_2D),
+            PlanPresence::NotOnBranch,
+            "le compte avant la liste, et dans cet ordre"
+        );
+
+        // Règle 2 — le cas nominal d'un vol en vol : la branche ajoute son plan.
+        assert_eq!(
+            plan_presence(
+                &st(
+                    4,
+                    paths(&["crates/mika-agent/src/auto_pull.rs", PLAN_2958_VOL_2E])
+                ),
+                PLAN_2958_VOL_2E
+            ),
+            PlanPresence::OnBranch
+        );
+
+        // Règle 3 — l'absence **mesurée** : la liste est prouvée complète, et le
+        // plan n'y est pas. Le voisin immédiat suffit à l'établir : deux plans
+        // d'un même ticket ne diffèrent que par leur suffixe de vol, donc la
+        // comparaison est une égalité exacte et jamais un `contains`.
+        assert_eq!(
+            plan_presence(&st(4, paths(&[PLAN_2958_VOL_2E])), PLAN_2958_VOL_2D),
+            PlanPresence::NotOnBranch,
+            "le plan 2e n'est pas le plan 2d"
+        );
+        assert_eq!(
+            plan_presence(&st(4, paths(&[])), PLAN_2958_VOL_2D),
+            PlanPresence::NotOnBranch,
+            "une liste vide et complète est une absence, pas une ignorance"
+        );
+
+        // Règle 4, premier cas — `files` illisible sur une branche qui, elle,
+        // avance : rien ne permet de conclure à une absence.
+        assert_eq!(
+            plan_presence(&st(4, None), PLAN_2958_VOL_2D),
+            PlanPresence::Unreadable
+        );
+
+        // Règle 4, second cas — la doctrine D5 : au cap, la liste a pu être
+        // coupée juste avant le plan.
+        let at_cap: Vec<String> = (0..GITHUB_COMPARE_FILES_CAP)
+            .map(|i| format!("crates/mika-agent/src/f{i}.rs"))
+            .collect();
+        assert_eq!(at_cap.len(), GITHUB_COMPARE_FILES_CAP);
+        assert_eq!(
+            plan_presence(&st(4, Some(at_cap.clone())), PLAN_2958_VOL_2D),
+            PlanPresence::Unreadable,
+            "une absence ne se lit pas sur une liste que GitHub a pu couper"
+        );
+
+        // Mais une **présence** sur cette même liste au cap reste une présence :
+        // l'asymétrie de `non_plan_files`, appliquée telle quelle.
+        let mut at_cap_with_plan = at_cap;
+        at_cap_with_plan[GITHUB_COMPARE_FILES_CAP - 1] = PLAN_2958_VOL_2D.to_string();
+        assert_eq!(
+            plan_presence(&st(4, Some(at_cap_with_plan)), PLAN_2958_VOL_2D),
+            PlanPresence::OnBranch,
+            "la troncature ne retire pas un fait déjà établi"
+        );
+    }
+
+    /// Le corps de #2958 à l'instant du groom d18d6ef1 — la branche vit encore
+    /// (repoussée à 16:36Z par le first-push de mika#2626) et le callout nomme
+    /// toujours le plan du vol 2d, déjà sur `main` depuis le merge de #2992.
+    ///
+    /// C'est le corps que le chemin A n'a jamais réécrit, parce que son
+    /// discriminant — l'absence de la branche — était faux ici.
+    const REUSED_CALLOUT_BODY_2958: &str = r#"## Phase 2-C — le manager groome la relève
+
+> - **Branch:** `feat/2958/manager-phase-2-c-vol-2-le-manager`
+> - **Plan:** `docs/plans/2026-10-31-005-feat-2958-manager-groome-la-releve-vol-2d-plan.md` (committed on branch @ 6fa323a9)
+> - **Grooming history:** first-pass (READY) → second-pass (GROOMED) — session-id: dd15af62"#;
+
+    /// **Le câblage du chemin B — la cause que la porte a mesurée atteint la
+    /// prose écrite ET la ligne d'audit.**
+    ///
+    /// `rewrite_stale_callout` ne juge rien : il porte la `PriorPlanCause` que
+    /// `stale_callout_cause` a rendue. Ce test en fige les deux sorties sur le
+    /// corps réel de #2958, et son contrôle négatif est que la prose du chemin A
+    /// ne s'y trouve **pas** — sans quoi les deux variantes auraient pu se
+    /// confondre en gardant ce test vert, et le ticket aurait reçu la phrase
+    /// fausse (« la branche a été supprimée ») sur une branche bien vivante.
+    #[tokio::test]
+    async fn mika3001_le_chemin_b_ecrit_la_prose_de_sa_cause() {
+        let db = in_memory_db();
+        let n = 990_305u64;
+        crate::gh_process::assert_fixture_issue(n);
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(n),
+            format!("{REUSED_CALLOUT_BODY_2958}\n"),
+        );
+
+        // #2992, vol 2d : la PR que la fixture d'AC3 désigne pour ce plan.
+        let cause = PriorPlanCause::PlanMergedBranchReused { pr: 2992 };
+        let outcome = rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            n,
+            REUSED_CALLOUT_BODY_2958,
+            BRANCH_2958,
+            cause,
+            "phase1",
+            "trace",
+            "session-3001-chemin-b",
+        )
+        .await;
+        assert!(outcome.is_ok(), "R6 — la réécriture ne remonte rien");
+
+        let expected = crate::plan_callout::rewrite_callout_as_prior_plan(
+            REUSED_CALLOUT_BODY_2958,
+            BRANCH_2958,
+            cause,
+        )
+        .expect("le transform doit réécrire ce corps");
+        let path_a = crate::plan_callout::rewrite_callout_as_prior_plan(
+            REUSED_CALLOUT_BODY_2958,
+            BRANCH_2958,
+            PriorPlanCause::BranchDeletedByMerge { pr: 2992 },
+        )
+        .expect("le transform doit réécrire ce corps");
+
+        let edits: Vec<String> = gh_calls_for(n)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "exactement un `issue edit` sur #{n} ; vu : {edits:?}"
+        );
+        assert!(
+            edits[0].contains(&expected),
+            "le corps écrit doit être la sortie du transform pour CETTE \
+             cause.\nattendu : {expected:?}\nargv vu : {:?}",
+            edits[0]
+        );
+        assert!(
+            !edits[0].contains(&path_a),
+            "contrôle négatif — la prose du chemin A annoncerait une branche \
+             supprimée sur une branche repoussée, donc vivante"
+        );
+
+        let rows = callout_rewrite_rows(&db, "session-3001-chemin-b").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "une ligne d'audit par passage ; vu : {rows:?}"
+        );
+        for needle in [
+            "\"outcome\":\"rewritten\"",
+            "\"cause\":null",
+            "\"staleness\":\"plan_merged_branch_reused\"",
+            "\"merged_pr\":2992",
+            // Le plan NOMMÉ par le callout, pas celui du vol en cours : c'est
+            // la liaison de mika#2981 que ce vol répare.
+            "\"plan\":\"docs/plans/2026-10-31-005-feat-2958-manager-groome-la-releve-vol-2d-plan.md\"",
+        ] {
+            assert!(
+                rows[0].contains(needle),
+                "la ligne d'audit doit porter {needle} ; vu : {}",
+                rows[0]
+            );
+        }
+    }
+
+    // ─── mika#3036 — la phase sépare rendre un consentement et s'en donner un ───
+
+    /// La branche du ticket #3030, celle que la PR #3032 a mergée puis
+    /// supprimée : la mesure du § 1.1 du plan, rejouée.
+    const BRANCH_3030: &str = "fix/3030/lallowlist-du-worktree-est-construite";
+
+    /// **AC3 — un déclin ne réécrit pas le corps, et le témoin dit que quelque
+    /// chose a tourné.**
+    ///
+    /// Les deux passages partagent tout — même mesure, même corps, même réponse
+    /// cannée disponible — et ne diffèrent que par la décision. Le témoin est ce
+    /// qui distingue « il n'a rien écrit » de « rien n'a tourné » : sans lui, un
+    /// câblage mort se lirait comme une abstention (mika#2340).
+    ///
+    /// La réponse de `gh issue view` est cannée **des deux côtés**. Le déclin
+    /// avait donc l'écriture à portée et ne l'a pas prise ; prouver l'abstention
+    /// par l'absence d'une réponse cannée aurait prouvé l'absence de la réponse.
+    #[tokio::test]
+    async fn mika3036_un_declin_ne_touche_pas_le_corps_du_ticket() {
+        let db = in_memory_db();
+        let measurement = StalenessMeasurement::BranchDeletedByMerge {
+            pr: DEAD_CALLOUT_MERGED_PR,
+        };
+        let declined = PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge {
+            pr: DEAD_CALLOUT_MERGED_PR,
+        });
+        let promoted = PromotionGate::Promote {
+            detail: "branch_deleted_by_merged_pr",
+        };
+
+        // Bande 990_3xx, cf. `mika2839_le_chemin_nominal_…` : le journal
+        // d'appels est process-global, donc deux tests sur un même numéro se
+        // liraient mutuellement (mika#2713 D4).
+        let n_declined = 990_306u64;
+        let n_witness = 990_307u64;
+        for n in [n_declined, n_witness] {
+            crate::gh_process::assert_fixture_issue(n);
+            crate::gh_process::set_canned_stdout(
+                crate::gh_process::GhSubject::Issue(n),
+                format!("{DEAD_CALLOUT_BODY}\n"),
+            );
+        }
+
+        let issue_declined = make_issue(n_declined, DEAD_CALLOUT_BODY, &[], "2026-11-04T06:20:02Z");
+        maybe_rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            &issue_declined,
+            &measurement,
+            &declined,
+            ExclusionPhase::Phase0Feeder,
+            "trace",
+            "session-3036-declin",
+        )
+        .await;
+
+        assert!(
+            callout_rewrite_rows(&db, "session-3036-declin")
+                .await
+                .is_empty(),
+            "AC3 — aucun `{CALLOUT_REWRITE_TARGET_KEY}` pour un ticket décliné ; \
+             vu : {:?}",
+            callout_rewrite_rows(&db, "session-3036-declin").await
+        );
+        assert!(
+            gh_calls_for(n_declined).is_empty(),
+            "AC3 — aucune écriture sur la forge, sous le jeton de l'App ou un \
+             autre : la moitié du défaut mesuré est précisément celle-là ; \
+             vu : {:?}",
+            gh_calls_for(n_declined)
+        );
+
+        // Le témoin : même mesure, même corps, décision promouvante — le câblage
+        // tourne et écrit.
+        let issue_witness = make_issue(n_witness, DEAD_CALLOUT_BODY, &[], "2026-11-04T06:20:02Z");
+        maybe_rewrite_stale_callout(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            &issue_witness,
+            &measurement,
+            &promoted,
+            ExclusionPhase::Phase1Pull,
+            "trace",
+            "session-3036-temoin",
+        )
+        .await;
+
+        let rows = callout_rewrite_rows(&db, "session-3036-temoin").await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "témoin — une ligne de réécriture par passage ; vu : {rows:?}"
+        );
+        let edits: Vec<String> = gh_calls_for(n_witness)
+            .into_iter()
+            .filter(|a| a.contains("issue edit"))
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "témoin — exactement un `issue edit` sur #{n_witness} ; vu : {edits:?}"
+        );
+    }
+
+    /// **AC1 et AC2 (mika#3058) — les trois phases, dans un seul appel, sur une
+    /// seule mesure.**
+    ///
+    /// Le merge vient de rendre le `ready` (mika#3022, voie B de mika#2995), et
+    /// deux des trois phases ne peuvent pas se le redonner :
+    ///
+    /// - la **phase 0** pose `ready` sur un ticket du vivier qui ne le porte
+    ///   pas — c'est ce que mika#3036 a tranché ;
+    /// - la **phase 1** le pose aussi (`apply_ready_label`,
+    ///   `"phase1_idle_pull"`), sur un candidat du backlog que la sélection
+    ///   choisit précisément parce qu'il ne le porte pas. mika#3036 l'avait
+    ///   laissée du côté promouvant sous un commentaire disant « le ticket
+    ///   porte déjà `ready` » : faux de cette phase-là. Le 06/11 à 06:40Z la
+    ///   phase 0 déclinait à `:03Z` et la phase 1 promouvait à `:04Z` **sur la
+    ///   même mesure** ; le vol 2 de #3047 est parti sans mot humain ;
+    /// - la **phase 2** promeut, et c'est le contrôle négatif : son vivier est
+    ///   celui des tickets qui portent déjà `ready` et que rien ne dispatche,
+    ///   donc mika#2837 y reste entier, et mika#3047 lui fait relire le label
+    ///   juste avant le dispatch.
+    ///
+    /// **Une seule** mesure, trois appels : le contrôle négatif vit dans le même
+    /// test que l'exigence, parce que deux tests séparés peuvent dériver l'un
+    /// sans l'autre et laisser « la phase 1 décline » vrai sans que « la phase 2
+    /// promeut toujours » le soit encore.
+    ///
+    /// AC4 y est tenu aussi : la ligne d'audit du déclin de **phase 1** est
+    /// relue sur le JSON de [`staleness_audit_json`], et `issue` comme
+    /// `merged_pr` y sont exigés **non nuls** — un `0` ou un `""` se lirait
+    /// comme une valeur mesurée (mika#2331).
+    #[test]
+    fn mika3058_les_trois_phases_dans_un_seul_appel() {
+        let measurement = StalenessMeasurement::BranchDeletedByMerge { pr: 3032 };
+        let expected_decline =
+            PromotionGate::Decline(DeclineReason::ConsentReturnedByMerge { pr: 3032 });
+
+        let declined_phase0 = super::classify_promotion(
+            &measurement,
+            Some(BRANCH_3030),
+            50,
+            ExclusionPhase::Phase0Feeder,
+        );
+        assert_eq!(
+            declined_phase0, expected_decline,
+            "AC1 — en `phase0_feeder`, le `ready` que le merge a rendu n'est pas \
+             un consentement que le feeder puisse se redonner"
+        );
+
+        let declined_phase1 = super::classify_promotion(
+            &measurement,
+            Some(BRANCH_3030),
+            50,
+            ExclusionPhase::Phase1Pull,
+        );
+        assert_eq!(
+            declined_phase1, expected_decline,
+            "AC1 (mika#3058) — en `phase1_idle_pull` non plus : la phase pioche \
+             dans le backlog des tickets SANS `ready`, puis le leur pose. C'est \
+             la promotion du 06/11 06:40:04Z sur #3047, une seconde après le \
+             déclin de la phase 0 sur la même mesure"
+        );
+
+        let PromotionGate::Decline(reason) = &declined_phase1 else {
+            panic!("la décision de la phase 1 vient d'être assertée `Decline`");
+        };
+        assert_eq!(reason.slug(), "consent_returned_by_merge");
+        assert_ne!(
+            reason.slug(),
+            "branch_absent_on_origin",
+            "AC1 — une branche absente par anomalie et une branche absente par \
+             merge sont deux populations ; un nom commun les additionnerait \
+             (mika#2205)"
+        );
+
+        // Le contrôle négatif : mika#2837 inchangé là où le ticket porte
+        // vraiment `ready`.
+        assert_eq!(
+            super::classify_promotion(
+                &measurement,
+                Some(BRANCH_3030),
+                50,
+                ExclusionPhase::Phase2StuckReady,
+            ),
+            PromotionGate::Promote {
+                detail: "branch_deleted_by_merged_pr",
+            },
+            "AC1 — `phase2_stuck_rescue` promeut toujours : c'est ainsi que part \
+             le vol suivant d'un ticket à plusieurs vols, et elle relit le label \
+             avant de dispatcher (mika#3047)"
+        );
+
+        // AC4 — la ligne d'audit du déclin de phase 1, relisible.
+        let json: serde_json::Value = serde_json::from_str(&staleness_audit_json(
+            3030,
+            Some(BRANCH_3030),
+            &measurement,
+            &declined_phase1,
+            50,
+        ))
+        .expect("l'audit est du JSON valide");
+        assert_eq!(json["outcome"], "decline");
+        assert_eq!(json["reason"], "consent_returned_by_merge");
+        assert_eq!(json["issue"], 3030);
+        assert_eq!(json["merged_pr"], 3032);
+        assert!(
+            !json["issue"].is_null() && !json["merged_pr"].is_null(),
+            "AC4 — les deux dimensions que l'opérateur groupe doivent être \
+             présentes et non nulles ; vu : {json}"
+        );
+    }
+
+    /// La sonde de phase 1 d'un test : un verdict par numéro de ticket, et la
+    /// liste **ordonnée** des candidats effectivement interrogés (mika#3058).
+    ///
+    /// Le compte des interrogations n'est pas de la décoration : une boucle qui
+    /// interroge les trois candidats et rend quand même le bon passerait une
+    /// assertion portant sur le seul résultat. Or chaque interrogation coûte un
+    /// à deux appels forge en production, et `PHASE1_DECLINE_BUDGET` n'existe
+    /// que pour les borner — un budget qu'aucun test ne mesure ne borne rien.
+    ///
+    /// Un numéro absent de la table est un échec du test, pas un `TryNext` par
+    /// défaut : un défaut silencieux ferait passer une boucle qui interroge un
+    /// candidat que le classement n'aurait pas dû lui donner.
+    struct ScriptedProbe {
+        verdicts: Vec<(u64, Phase1Verdict)>,
+        seen: Vec<u64>,
+    }
+
+    impl Phase1Probe for ScriptedProbe {
+        fn probe<'a>(
+            &'a mut self,
+            candidate: &'a Issue,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Phase1Verdict> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.seen.push(candidate.number);
+                match self
+                    .verdicts
+                    .iter()
+                    .find(|(number, _)| *number == candidate.number)
+                {
+                    Some((_, Phase1Verdict::Promote)) => Phase1Verdict::Promote,
+                    Some((_, Phase1Verdict::AbandonTick)) => Phase1Verdict::AbandonTick,
+                    Some((_, Phase1Verdict::TryNext)) => Phase1Verdict::TryNext,
+                    None => panic!(
+                        "la boucle a interrogé #{} — le scénario ne lui donne pas \
+                         de verdict, donc le classement l'a produit par erreur",
+                        candidate.number
+                    ),
+                }
+            })
+        }
+    }
+
+    /// **AC3 — un déclin en tête ne fige pas la phase.**
+    ///
+    /// C'est la moitié du défaut que l'AC1 seul laisserait ouverte. Avant ce
+    /// vol, le seul « non » de la porte en phase 1 était un **refus** : il pose
+    /// [`REFUSAL_LABEL`], `is_feeder_excluded` écarte le ticket, et le tick
+    /// suivant atteint le candidat d'après — un tick perdu, auto-guéri. Le
+    /// déclin de mika#3036 n'écrit **rien**, par construction (AC4) : rien ne
+    /// marque le ticket, il revient en tête du classement à chaque tick, et une
+    /// phase qui s'arrête au premier « non » ne promeut plus jamais rien. Le
+    /// ticket #3050, gardé ouvert après son merge `Refs`, est exactement ce
+    /// candidat-là.
+    ///
+    /// Trois candidats, et non deux : avec deux, une boucle qui prendrait
+    /// systématiquement le **dernier** du classement passerait aussi. Le troisième
+    /// est là pour que « le premier sain » se distingue de « le dernier ».
+    ///
+    /// La moitié ledger de l'AC4 n'est pas ici : la sonde scriptée ne consigne
+    /// rien, par choix — c'est la sonde de **production** qui consigne, et c'est
+    /// le scan structurel de
+    /// [`test_promotion_gate_never_resolves_conflicts`] qui garde ses deux
+    /// sites et leur constante.
+    #[tokio::test]
+    async fn mika3058_un_declin_en_tete_ne_fige_pas_la_phase() {
+        let declined = make_issue(3050, GROOMED_BODY, &["p1-important"], "t");
+        let healthy = make_issue(3051, GROOMED_BODY, &["p1-important"], "t");
+        let never_reached = make_issue(3052, GROOMED_BODY, &["p1-important"], "t");
+
+        let mut probe = ScriptedProbe {
+            verdicts: vec![
+                (3050, Phase1Verdict::TryNext),
+                (3051, Phase1Verdict::Promote),
+                (3052, Phase1Verdict::TryNext),
+            ],
+            seen: Vec::new(),
+        };
+
+        let promoted =
+            phase1_first_promotable(vec![declined, healthy, never_reached], &mut probe).await;
+
+        assert_eq!(
+            promoted.map(|i| i.number),
+            Some(3051),
+            "AC3 — le candidat sain derrière le ticket décliné est promu dans le \
+             MÊME tick ; sans ce parcours, la phase 1 ne promouvrait plus rien \
+             tant que #3050 reste ouvert"
+        );
+        assert_eq!(
+            probe.seen,
+            vec![3050, 3051],
+            "la boucle s'arrête au premier promouvable : #3052 n'est jamais \
+             interrogé, donc la porte ne lui coûte aucun appel forge"
+        );
+    }
+
+    /// **D4 — le budget borne le tick, et le tick suivant repart du début.**
+    ///
+    /// Sans borne, un tick sur une file de vingt tickets fraîchement mergés
+    /// paierait quarante appels forge pour ne rien promouvoir. Avec la borne,
+    /// la phase abandonne, et comme un déclin ne persiste rien, le tick suivant
+    /// reprend le classement du début — ce n'est pas une perte, c'est le même
+    /// état.
+    ///
+    /// Quatre candidats pour un budget de trois : avec exactement trois, un
+    /// `take` absent passerait le test par coïncidence.
+    #[tokio::test]
+    async fn mika3058_le_budget_de_declins_borne_le_tick() {
+        let ranked: Vec<Issue> = (0..4)
+            .map(|i| make_issue(4100 + i, GROOMED_BODY, &["p1-important"], "t"))
+            .collect();
+        let mut probe = ScriptedProbe {
+            verdicts: (0..4).map(|i| (4100 + i, Phase1Verdict::TryNext)).collect(),
+            seen: Vec::new(),
+        };
+
+        let promoted = phase1_first_promotable(ranked, &mut probe).await;
+
+        assert!(
+            promoted.is_none(),
+            "quatre déclins d'affilée ne promeuvent personne"
+        );
+        assert_eq!(
+            probe.seen.len(),
+            PHASE1_DECLINE_BUDGET,
+            "D4 — la boucle s'arrête à {PHASE1_DECLINE_BUDGET} interrogations et \
+             n'atteint pas le quatrième candidat ; vu : {:?}",
+            probe.seen
+        );
+    }
+
+    /// **Le classement rend le même premier que `max_by` rendait.**
+    ///
+    /// `select_best_candidate_recording` rendait `max_by(…)`, que mika#3058
+    /// remplace par un `sort_by` dont la tête doit être le même ticket — sinon
+    /// le vol change, en silence, quel ticket la phase 1 promeut quand elle
+    /// promeut, et ce changement n'est dans aucun critère d'acceptation.
+    ///
+    /// Trois propriétés, parce que l'ordre en a trois niveaux :
+    ///
+    /// 1. priorité d'abord (rang le plus HAUT gagne) ;
+    /// 2. à priorité égale, le `updated_at` le plus ANCIEN gagne — la phase sert
+    ///    le ticket qui attend depuis le plus longtemps ;
+    /// 3. à égalité parfaite, le **dernier** de la liste d'entrée gagne. Ce n'est
+    ///    pas un choix : c'est ce que `Iterator::max_by` fait, documenté, et
+    ///    l'inverser déplacerait silencieusement la promotion d'un tick.
+    ///
+    /// Les labels de priorité sont écrits **nus** (`"p0"`, `"p1"`, `"p2"`) et
+    /// non suffixés, parce que c'est ce que [`priority_rank`] matche — le bug
+    /// latent nommé dans la doc de [`feeder_rank`], qui rend 0 pour tout vrai
+    /// ticket de la taxonomie. Ce test garde l'ordre **tel qu'il est**, pas tel
+    /// qu'il devrait être : corriger le ranker déplacerait quel ticket la phase
+    /// 1 promeut, et ce n'est dans aucun critère de ce vol.
+    #[test]
+    fn mika3058_lordre_des_candidats_est_celui_de_max_by() {
+        let rank = |pool: Vec<Issue>| -> Vec<u64> {
+            select_candidates_ranked_recording(
+                pool,
+                &HashSet::new(),
+                &mut ExclusionLedger::default(),
+            )
+            .into_iter()
+            .map(|i| i.number)
+            .collect()
+        };
+
+        assert_eq!(
+            rank(vec![
+                make_issue(5001, GROOMED_BODY, &["p2"], "2026-01-01T00:00:00Z"),
+                make_issue(5002, GROOMED_BODY, &["p0"], "2026-06-01T00:00:00Z"),
+            ]),
+            vec![5002, 5001],
+            "la priorité passe avant l'ancienneté : le p0 récent devance le p2 \
+             ancien"
+        );
+
+        assert_eq!(
+            rank(vec![
+                make_issue(5011, GROOMED_BODY, &["p1"], "2026-06-01T00:00:00Z"),
+                make_issue(5012, GROOMED_BODY, &["p1"], "2026-01-01T00:00:00Z"),
+            ]),
+            vec![5012, 5011],
+            "à priorité égale, le plus ancien `updated_at` passe devant"
+        );
+
+        assert_eq!(
+            rank(vec![
+                make_issue(5021, GROOMED_BODY, &["p1"], "2026-01-01T00:00:00Z"),
+                make_issue(5022, GROOMED_BODY, &["p1"], "2026-01-01T00:00:00Z"),
+            ]),
+            vec![5022, 5021],
+            "à égalité parfaite, le DERNIER de la liste d'entrée gagne — c'est \
+             ce que rendait `max_by`, et l'inverser déplacerait la promotion sans \
+             qu'aucun critère ne l'ait demandé"
         );
     }
 }

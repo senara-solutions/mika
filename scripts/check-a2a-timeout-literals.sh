@@ -98,6 +98,7 @@ SCAN_ROOT="${1:-$REPO_ROOT}"
 PERIMETER=(
     "crates/mika-a2a/src"                      # the client and its transport
     "crates/mika-cli/src/remote_ask.rs"        # A2aClient call site
+    "crates/mika-cli/src/budget_floor.rs"      # a2a send-floor attestation
     "crates/mika-agent/src/tools/a2a_call.rs"  # A2aClient call site
     "crates/mika-common/src/llm"               # the rail carrying the cascade
 )

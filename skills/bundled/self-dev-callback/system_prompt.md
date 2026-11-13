@@ -22,9 +22,9 @@ When you receive a callback result from a completed background task (`run_claude
 >
 >    - **If `second-pass (GROOMED)` IS present → GROOMED success:**
 >      a. Call `update_task_status(task_id, "completed")` to mark the groom task done (frees groom dispatch slot — independent from implement slot per mika#1001).
->      b. Call `run_gh("issue edit <n> --add-label ready --repo senara-solutions/<repo>")` to re-add the `ready` label. This re-triggers the ready-label webhook handler, which finds the groomed body callout and dispatches dev-pilot.
->      c. Call `send_message`: "Auto-groom completed for {repo}#{n}. Re-added `ready` label to trigger dev-pilot dispatch."
->      d. Stop the turn. The ready-label webhook handler takes over from here.
+>      b. Call `send_message`: "Auto-groom completed for {repo}#{n}. The `ready` label was not touched."
+>      c. Stop the turn.
+>      **Do NOT post the `ready` label — not with `run_gh`, not by any other route (mika#2995).** `ready` is the operator's positive consent to autonomous dispatch (mika#841), and the mika#2772 consent gate reads only its presence: an agent that posts it grants itself the consent that gate exists to require of a human. Promoting a ticket belongs to the operator. It also never did anything here: the engine dispatches dev-pilot **directly** after a groom success (`try_dispatch_pilot_after_groom_success`, mika#1614), and a ticket that reached this callback already carries `ready` — nothing in the dispatch library removes it, and GitHub emits `labeled` only on a transition (mika#2323) — so the re-add this step used to prescribe was a silent no-op. If you believe this ticket needs an operator decision, say so with `send_message` and stop.
 >      **Do NOT check the callback result text for `PIPELINE FAILURE:` or `Outcome:` lines — the body marker is authoritative.**
 >
 >    - **If `second-pass (GROOMED)` is ABSENT → failure routing, and the FIRST test is terminality:**
@@ -93,6 +93,20 @@ Permitted post-callback actions are described prosaically in the success/failure
 > 4. `update_task_status(task_id, "blocked")` with metadata `{"groom_escalated": true, "escalation_stage": "<stage from the Outcome line>"}` — countable apart from `operator_cancel` / `containment_refusal` (mika#2131).
 > 5. `send_message` naming the ticket, the `Verdict:` line, the `Session:` and the **findings path** verbatim (`Architect findings preserved at: …`) — that path is what an operator reads to decide whether to revise, refactor or kill the plan.
 > 6. Proceed to Step 6. Never announce a PR, a retry, or "awaiting QA review".
+
+**Dispatch-halt discriminator (mika#2976 — MANDATORY, BEFORE pipeline result classification):**
+
+> **Predicate:** the **first line** of `RESULT` **starts with** `STATUS=REBASE_CONFLICT` or `STATUS=BRANCH_HAS_UNMERGED_WORK`. Here `starts with` is correct, like the launcher-dead branch above and unlike the two `contains` branches: `dispatch-lib` poses this banner itself, as the first line of the `RESULT` it delivers. The table is **closed to these two values** — never a bare `STATUS=` prefix, which would swallow `STATUS=CANCELLED_BY_OPERATOR` and `STATUS=CANCELLED_BY_SIGNAL`, whose own discriminator sits above and whose outcome is different.
+>
+> **Why:** the dispatch already halted **safely**. It reset nothing, removed nothing, stashed nothing, and the `RESULT` says so. Nothing is left for this turn to repair, and a repair attempted here runs **outside the pipeline**, on a worktree no guard is watching. Measured 2026-10-30 on the callback of mika#2968 (session `callback-233cab88`): the turn ran `git rebase origin/main` in the worktree, then `git checkout --theirs` on the plan file — in a rebase, "theirs" is the commit being replayed, so the flight's old draft won over the final version in `main`, a 14-insertion/22-deletion regression, staged. The turn then died on "max steps exhausted", leaving the worktree on a detached HEAD with `rebase-merge` open at 1/7, and the groom parent frozen `in_progress` with its only child delivered. Cleanup took three manual gestures on the operator's word.
+>
+> 1. **Do NOT repair.** No `git rebase`, no `git checkout`, no `git reset`, no `git cherry-pick`, no conflict resolution — and no shell tool whatsoever against a worktree. The remedy is a human's, and the `RESULT` names it (`Resolve manually before re-dispatching …`).
+> 2. **Do NOT retry** — no `run_claude_pilot_groom`, no `run_claude_pilot`. The branch is in the same state that produced the halt, so a replay reproduces it.
+> 3. **Do NOT increment** `pipeline_retry_count`.
+> 4. **Do NOT touch any label** (`ready`, `blocked`, `operator-review`) — same rule as the three branches above.
+> 5. `update_task_status(task_id, "blocked")` with metadata `{"dispatch_halt": true, "halt_status": "<REBASE_CONFLICT|BRANCH_HAS_UNMERGED_WORK>"}` — countable apart from `operator_cancel` / `containment_refusal` / `launcher_dead` / `groom_escalated` (mika#2131).
+> 6. `send_message` with the `RESULT` **verbatim**. It carries the branch, how far behind it is, the conflicted files or the unmerged commits, and the sentence that says nothing was touched — that last part is what tells the operator the worktree is safe to inspect as-is.
+> 7. Proceed to Step 6. Never announce a PR, a retry, a rebase, or "awaiting QA review".
 
 **Pipeline result classification (MANDATORY — before generic failure handling):**
 

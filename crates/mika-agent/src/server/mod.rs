@@ -6,16 +6,22 @@ pub mod check_suite_dedup;
 pub mod checkpoint;
 pub mod ci_failure_handler;
 pub mod ci_success_handler;
+pub(crate) mod comment_triage;
 pub mod dashboard;
 pub mod dashboard_dev_runs;
 pub mod deadline_verdict;
 pub mod draft_pr_opened_handler;
 pub mod embedded_dashboard;
+pub mod fabrication_p0_guard;
 mod handlers;
 pub mod investigate;
 pub mod iterate_dispatch;
 pub mod json_extractor;
 pub mod merge_ready_handler;
+// Privé comme `milestone_context_handler`, et pour la même raison : un injecteur
+// à effet de bord seul n'a qu'un appelant, `handlers`, qui est son frère sous
+// `server` et voit donc les items privés de leur parent commun (mika#3022).
+mod merged_pr_ready_cleanup_handler;
 mod milestone_context_handler;
 pub mod openapi;
 pub mod permissions_stream;
@@ -33,6 +39,7 @@ pub mod verdict_handler;
 pub(crate) mod webhook_prefilter;
 pub mod webhook_queue;
 pub mod webhook_queue_v2;
+pub(crate) mod webhook_turn_outcome;
 
 use crate::kg::config::KgAgentConfig;
 use anyhow::{Context as _, Result, anyhow};
@@ -83,7 +90,6 @@ use mika_common::home;
 use crate::async_db::AsyncDatabase;
 use crate::db::Database;
 use crate::messaging::{GatewayMessageSender, MessageSender};
-use crate::skills::SkillRegistry;
 use crate::startup;
 use crate::task_engine::{self, TaskDispatcher, TaskEngine};
 use crate::tools;
@@ -120,6 +126,28 @@ const QA_REVIEW_RECONCILE_CRON: &str = "0 */15 * * * *";
 /// donc dix minutes de latence coûtent ~1,3 % de disque — négligeable devant
 /// l'écart entre 55 % et 85 % que la purge manuelle refait trois fois par jour.
 const WORKTREE_REAP_CRON: &str = "0 */10 * * * *";
+
+/// Seuil de l'avertissement de taille de `mika.db` (mika#2658).
+///
+/// **Dérivation.** 1 012 Mo mesurés le 2026-10-03 − ≈ 475 Mo de payload
+/// `embedding_json` récupérés par la migration v56 ≈ 540 Mo de plancher, dont
+/// ≈ 240 Mo sont les fenêtres de 30 jours de `tool_calls` + `llm_calls`
+/// (`task_engine/engine.rs`, étape 5 de `startup_recovery`). × 1,5 ≈ 800 Mo.
+///
+/// **Pourquoi il bouge.** Le 500 Mo d'origine était franchi *en permanence* :
+/// un seuil qu'on ne repasse jamais sous n'alerte sur rien.
+///
+/// **La dérivation est à recalculer, et mika#2735 dit pourquoi.** Les ≈ 475 Mo
+/// ne sont rendus au système que par un compactage, et il n'y en a plus aucun
+/// dans le chemin de démarrage depuis mika#2735 — la migration v56 ne fait plus
+/// que rendre les pages à la *freelist*. La ligne `v56: vacuum complete` qui
+/// devait donner le plancher mesuré n'existe plus. Donc ce seuil est franchi
+/// *en permanence* lui aussi, jusqu'au premier compactage opérateur (runbook :
+/// `docs/deployment.md` § 4b *Schema Migrations and File Rewrites*).
+/// Le plancher à comparer à 540 Mo est la taille **après** ce geste ; s'il s'en
+/// écarte de plus de 20 %, corriger ce nombre ici — la dérivation est écrite
+/// pour qu'il soit recalculable, pas pour qu'il soit cru.
+const DB_SIZE_WARN_BYTES: u64 = 800_000_000;
 
 /// Build the Axum router with all routes and middleware.
 ///
@@ -324,8 +352,10 @@ fn build_router(state: AppState) -> Router {
             post(permissions_stream::handle_permission_answer),
         )
         // Task-event live stream (mika#1732 sub-B): SSE surface for task
-        // lifecycle transitions. Wire-only in v1 — emission from task_engine
-        // transition sites lands in a follow-up ticket.
+        // lifecycle transitions. Emission landed at mika#1758 — this route
+        // serves real frames, one per transition. The channel is attached
+        // per-process from two sites, one of them `run_server` below; see
+        // `tasks_stream`'s module doc for what a consumer may assume.
         .route(
             "/dashboard/tasks/stream",
             get(tasks_stream::handle_tasks_events_stream),
@@ -612,26 +642,18 @@ async fn init_agent(
     {
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
-    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
-    // Phase -1: identity-driven skill allowlist (well-known agents like mika-arch)
-    if let Some(ref allowlist) = identity.skills.allowlist {
-        skill_registry.apply_identity_allowlist(allowlist);
-    }
-    // Phase 0+1: DB-backed overrides (disabled state, always_on, LLM provider/model)
-    if let Ok(overrides) = async_db.get_skill_overrides(agent_name).await {
-        skill_registry.apply_overrides(&overrides);
-    }
-    // Phase 2: testimony-grade ban (mika#1798, non-transit doctrine).
-    // Runs after allowlist + overrides so any re-enabling of a testimony-tagged
-    // skill is still overridden by the structural ban.
-    skill_registry.apply_testimony_grade_ban();
-    skill_registry.apply_load_safety_check();
-    // Runtime allowlist↔required_tools coherence guard (mika#1576). Runs after
-    // identity allowlist + DB overrides + safety check — the one point where both
-    // the allowlist and each skill's required_tools are simultaneously visible.
-    skill_registry.apply_required_tools_coherence_check(agent_name);
-    skill_registry.log_summary();
-    let skill_registry = Arc::new(skill_registry);
+    // The reference sequence of the whole fleet, now carried by the single
+    // assembler (mika#2889) so every hot reload replays this exact order.
+    let overrides = async_db
+        .get_skill_overrides(agent_name)
+        .await
+        .unwrap_or_default();
+    let skill_registry = Arc::new(crate::skills::assembly::assemble_agent_registry(
+        &skills_dir,
+        &identity,
+        &overrides,
+        agent_name,
+    ));
 
     let engine_sender = GatewayMessageSender::new(
         gateway_url.to_string(),
@@ -642,7 +664,10 @@ async fn init_agent(
         Some(agent_name.to_string()),
         None,
         agent_settings.customer_id.clone(),
-    );
+    )
+    // The task-engine rail carries the dispatch-stall P0 (`agent_loop`), so it
+    // must know the escalation chat too (mika#1381).
+    .with_escalation_chat_id(agent_settings.operator_escalation_chat_id);
     let engine_sender: Arc<dyn MessageSender> = Arc::new(engine_sender);
 
     let skills_dirty = Arc::new(AtomicBool::new(false));
@@ -769,7 +794,7 @@ async fn init_agent(
     Ok(agent_state)
 }
 
-/// Run background startup cleanup tasks (pruning, vacuum, backfill).
+/// Run background startup cleanup tasks (pruning, compaction, backfill).
 ///
 /// These are slow operations moved out of the hot path. Runs concurrently with
 /// the main server after `ready` is set.
@@ -795,10 +820,21 @@ async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingCl
         .await
     {
         Ok(deleted) if deleted > 0 => {
+            // Ici se tenait un `db.vacuum()`, retiré par mika#2735. C'était le
+            // plus exposé des deux sites du chemin de démarrage : celui de la
+            // migration v56 tournait avant toute autre connexion, celui-ci
+            // tourne dans une tâche fire-and-forget lancée **après** `ready`,
+            // donc en concurrence avec tout le tick du moteur et avec une
+            // connexion par agent. Il n'était pas gardé par une version de
+            // schéma : il repartait à chaque démarrage dès que la compaction
+            // avait supprimé au moins une ligne.
+            //
+            // Conséquence assumée : l'espace que cette compaction libère reste
+            // dans la *freelist* du fichier jusqu'au compactage opérateur
+            // (`docs/deployment.md` § 4b). SQLite le réutilisera pour
+            // les écritures suivantes ; il ne revient pas au système de
+            // fichiers.
             info!(deleted, "compacted old audit events");
-            if let Err(e) = db.vacuum().await {
-                warn!(error = %e, "failed to vacuum database");
-            }
         }
         Ok(_) => {}
         Err(e) => warn!(error = %e, "failed to compact old audit events"),
@@ -806,8 +842,12 @@ async fn startup_cleanup(db: AsyncDatabase, embedding_client: Option<EmbeddingCl
 
     // Warn if DB is growing large
     match db.db_size_bytes().await {
-        Ok(size) if size > 500_000_000 => {
-            warn!(size_bytes = size, "database size exceeds 500MB");
+        Ok(size) if size > DB_SIZE_WARN_BYTES => {
+            warn!(
+                size_bytes = size,
+                threshold_bytes = DB_SIZE_WARN_BYTES,
+                "database size exceeds threshold"
+            );
         }
         Err(e) => warn!(error = %e, "failed to check database size"),
         _ => {}
@@ -932,6 +972,28 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // provider outage and is not one.
     budget_guard::assert_llm_budgets_valid(global_home)?;
 
+    // mika#2871 AC3 — même geste, même raison, pour la porte P0 de fabrication
+    // armée sans chat d'escalade. Ici et pas ailleurs : la garde lit le
+    // `config.toml` par agent que le provisionnement vient d'écrire, et elle doit
+    // précéder `init_agent`, qui est l'endroit où le `GatewayMessageSender` reçoit
+    // son chat d'escalade — refuser après aurait laissé le premier P0 partir chez
+    // l'utilisateur final avant que quiconque lise le refus.
+    fabrication_p0_guard::assert_fabrication_p0_arming_valid(global_home)?;
+
+    // mika#2978 — le cinquième membre de la famille `log_*_gate_state`, et il
+    // vient **ici** et non avec les quatre autres ci-dessous : la garde qu'on
+    // vient de passer a établi que *si* la porte est armée, *alors* elle a une
+    // route, donc la ligne peut dire les deux faits ensemble — « armée, et routée
+    // vers tel canal » — sans re-résoudre la cascade pour la valider.
+    //
+    // Sa polarité est celle de `log_pass_evidence_gate_state` par la lettre et
+    // celle des trois autres par l'esprit : la porte part désarmée
+    // (Fire-Disposition mika#1574), mais l'état livré est l'état **sûr**, donc
+    // c'est l'état ARMÉ qui est la dérogation et qui parle. Le silence veut dire
+    // « désarmée ». Une ligne par agent armé, jamais agrégée : désarmer se fait
+    // dans le `config.toml` d'un agent, pas de la flotte.
+    fabrication_p0_guard::log_fabrication_p0_gate_state(global_home);
+
     // mika#2455 — say, once at startup, that the CI↔verdict gate is disarmed.
     // Silent when armed: a line per boot on a healthy fleet is the churn the
     // mika#2131 doctrine bounds, while the silence of a *disarmed* gate reads
@@ -940,6 +1002,22 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
 
     // mika#2519 — same gesture, same reason, for the verdict↔dependabot gate.
     crate::evidence::guards::log_dependabot_verdict_gate_state();
+
+    // mika#2687 — same gesture again, for the verdict↔guard-citation gate. Its
+    // STOP is `MIKA_PIPELINE_GROUNDING_GATE=0` + restart, and an operator who
+    // pulled it needs the boot log to say so: a `block[pipeline]` that goes out
+    // ungrounded is then the declared state, not a regression.
+    crate::evidence::guards::log_pipeline_grounding_gate_state();
+
+    // mika#2961 — le second membre de cette famille, et **la polarité inverse**
+    // de ses quatre voisins ci-dessus : il est désarmé par défaut, donc sa ligne
+    // de démarrage décrit le cas NOMINAL, pas une dérogation. D'où l'absence de
+    // ligne qui veut dire « armé », à l'envers de `log_pipeline_grounding_gate_state`
+    // juste au-dessus — ce qui est aussi pourquoi la ligne est obligatoire : sans
+    // elle, un `pass` sans preuve pipeline passerait sans que rien n'ait dit que
+    // le garde dort. L'ouverture est `MIKA_QA_PASS_EVIDENCE_GATE=1` + redémarrage,
+    // et elle revient à Vincent.
+    crate::evidence::guards::log_pass_evidence_gate_state();
 
     // Warn if embedded dashboard is enabled but no assets were compiled in
     if settings.dashboard_enabled && !embedded_dashboard::has_embedded_assets() {
@@ -1053,7 +1131,14 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                     agents.insert(name.clone(), Arc::new(agent_state));
                 }
                 Err(e) => {
-                    warn!(agent = name, error = %e, "failed to initialize agent, skipping");
+                    // mika#2876 — le sigil `%` de `tracing` est un `Display`, et
+                    // sur une erreur `anyhow` `Display` ne rend que le contexte le
+                    // plus externe : la cause posée sous un `.with_context(...)`
+                    // disparaît du log. `{e:#}` aplatit la chaîne `source()`
+                    // entière. Message, champs et niveau inchangés — les greps
+                    // opérateur portent sur ce littéral.
+                    let chain = format!("{e:#}");
+                    warn!(agent = name, error = %chain, "failed to initialize agent, skipping");
                 }
             }
         }
@@ -1663,6 +1748,22 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // `webhook_queue_shutdown`; cancelled at shutdown below. The spawn is
     // env-gated on `MIKA_MANAGER_TARGET_MILESTONE` — unset → no spawn.
     let manager_shutdown_token = CancellationToken::new();
+
+    // mika#2958 vol 2b — le rail du geste de groom se résout **ici**, parce que
+    // c'est ici que le jeton interne est en portée : `/a2a/{agent}` n'accepte
+    // que `MIKA_INTERNAL_TOKEN` (`auth::require_internal_token`), donc le rail
+    // n'a pas de variable de jeton à lui et ne doit pas en avoir une seconde.
+    // Hors du `match` ci-dessous, parce que la résolution n'a rien à voir avec
+    // `manager_config_from_env` : elle appartient au jeton, pas à la cible.
+    // `None` est l'état nominal — `MIKA_MANAGER_GROOM_URL` absente ⇒ rail
+    // désarmé, le cycle dit `no_sender`, et mika-spirit démarre comme il démarre
+    // sans `liveness_sink`. La sonde `manager_groom_rail_resolved` dit laquelle
+    // des trois issues a eu lieu.
+    let groom_sender = crate::milestone_manager::resolve_groom_rail(Some(
+        internal_token.expose_secret(),
+    ))
+    .map(|s| std::sync::Arc::new(s) as std::sync::Arc<dyn crate::milestone_manager::GroomSender>);
+
     // mika#1968 AC5: `manager_config_from_env` now takes `&Settings` + optional
     // `GitHubApp` and routes token acquisition through `Settings::resolve_github_token`
     // (PAT first, App fallback). `global_github_app` is constructed above at this
@@ -1705,6 +1806,82 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 // décide s'il est appelé, donc rien n'est posté tant que
                 // l'opérateur n'a pas déclaré l'endpoint.
                 std::sync::Arc::new(crate::milestone_manager::HttpLivenessSink::new()),
+                // mika#2698 vol 1 — d'où viennent les vols terminés à évaluer.
+                //
+                // `agents.get(&default_agent)` fournit une **connexion**, et
+                // rien d'autre : le conteneur n'a qu'une base
+                // (`home::container_db_path`), et depuis mika#2792 la requête ne
+                // filtre plus sur l'`agent_id` que ce handle porte — son lecteur
+                // est `list_finished_implement_flights_in_container`, dont le nom
+                // dit le scope. Ce commentaire affirmait l'inverse, et c'est
+                // l'affirmation qui portait le défaut : sur gentux l'agent par
+                // défaut est `mika-test`, les vols d'implement sont des tâches de
+                // `mika-dev`, donc la source interrogeait un agent sans aucun vol
+                // et rendait zéro ligne — quarante-trois vols en quatre jours,
+                // aucun verdict, un vide indiscernable de « aucun vol terminé ».
+                // Le périmètre de lecture, c'est `issue_urls` : les sous-tickets
+                // du milestone que le manager surveille déjà.
+                //
+                // `None` quand l'agent par défaut est absent — une source
+                // manquante rend un rapport sans la section, jamais un cycle
+                // mort. Lecture seule : aucune autorité d'écriture ne passe par
+                // ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::flight_source::DbFlightSource::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::milestone_manager::FlightSource>
+                }),
+                // mika#2922 vol 1 — où chaque verdict est inscrit.
+                //
+                // Même handle, et la même raison qu'au-dessus : le conteneur n'a
+                // qu'une base. L'`agent_id` que ce handle porte **est** celui
+                // sous lequel la ligne d'audit sera écrite, parce que
+                // `AsyncDatabase::log_audit_event` clone son propre `agent_id`
+                // et ne l'accepte pas en paramètre — le périmètre par agent est
+                // donc structurel, non déclaré. C'est délibérément le même
+                // `agent_id` que celui de la source de vols, pour que le vol 2
+                // relise sous la clé où le vol 1 a écrit.
+                //
+                // `None` quand l'agent par défaut est absent — aucune ligne
+                // inscrite, un cycle intact, la sonde sur sa branche `unwired`.
+                // Lecture et écriture cantonnées à `audit_events` : aucune
+                // autorité sur la forge ne passe par ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::flight_verdict_ledger::DbFlightVerdictLedger::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::flight_verdict_ledger::FlightVerdictLedger>
+                }),
+                // mika#2958 vol 2b — par quoi part le geste de groom. Résolu
+                // au-dessus, hors du `match`, parce que la résolution n'a rien à
+                // voir avec `manager_config_from_env` : elle appartient au jeton,
+                // pas à la cible du manager.
+                groom_sender,
+                // mika#2958 vol 2d — par quoi le cycle voit qu'un groom est déjà
+                // en vol. Construite **ici** et pas dans `spawn.rs`, pour la même
+                // raison que les deux sources ci-dessus : elle tient un handle de
+                // base, que ni ce site d'appel ni `ManagerConfig` ne portent.
+                //
+                // Le périmètre de lecture est le **conteneur**, pas l'agent : la
+                // méthode est `list_groom_dispatches_in_container`, dont le nom dit
+                // le scope (mika#2792). C'est la direction qu'il faut : le groom que
+                // le manager ne doit pas relancer est une tâche de `mika-dev`, et
+                // l'agent par défaut n'est pas forcément celui-là — une lecture
+                // agent-scopée rendrait zéro ligne et ferait repartir un groom déjà
+                // en vol, exactement le défaut que le `DbFlightSource` ci-dessus a
+                // payé une fois.
+                //
+                // `None` quand l'agent par défaut est absent — le geste dit alors
+                // `no_in_flight_source` et ne déclenche rien, jamais un groom sur la
+                // foi d'un vide qu'il n'a pas mesuré. Lecture seule : la source lit
+                // `tasks`, et aucune autorité d'écriture ne passe par ce paramètre.
+                agents.get(&default_agent).map(|entry| {
+                    std::sync::Arc::new(crate::groom_in_flight::DbGroomInFlightSource::new(
+                        entry.value().db.clone(),
+                    ))
+                        as std::sync::Arc<dyn crate::milestone_manager::GroomInFlightSource>
+                }),
             ),
             Ok(None) => {
                 info!(
@@ -1813,7 +1990,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
     // 1. Register recurring tasks (heartbeat, reflection) if missing
     // 2. Run startup recovery (expire/recover in_progress, load heap)
     // 3. Spawn 1-second tick loop — collect JoinHandle for shutdown abort
-    // 4. Spawn background cleanup (pruning, vacuum, backfill) as a fire-and-forget task
+    // 4. Spawn background cleanup (pruning, compaction, backfill) as a fire-and-forget task
     let mut tick_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut total_tasks_loaded: usize = 0;
 
@@ -1834,6 +2011,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         if task_engine::heartbeat_enabled_for_agent(&agent_state.home_dir).await {
             task_engine::ensure_recurring_task(
                 &db,
+                &agent_state.home_dir,
                 "heartbeat",
                 HEARTBEAT_CRON,
                 r#"{"trigger":"heartbeat"}"#,
@@ -1846,6 +2024,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         {
             task_engine::ensure_recurring_task(
                 &db,
+                &agent_state.home_dir,
                 "reflection",
                 &cron,
                 r#"{"trigger":"reflection"}"#,
@@ -1869,6 +2048,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "auto_pull_groomed",
                     AUTO_PULL_CRON,
                     r#"{"trigger":"auto_pull_groomed"}"#,
@@ -1891,6 +2071,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "wip_rescue",
                     WIP_RESCUE_CRON,
                     r#"{"trigger":"wip_rescue"}"#,
@@ -1925,6 +2106,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "qa_review_reconcile",
                     QA_REVIEW_RECONCILE_CRON,
                     r#"{"trigger":"qa_review_reconcile"}"#,
@@ -1958,6 +2140,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             } else {
                 task_engine::ensure_recurring_task(
                     &db,
+                    &agent_state.home_dir,
                     "worktree_reap",
                     WORKTREE_REAP_CRON,
                     r#"{"trigger":"worktree_reap"}"#,
@@ -1977,6 +2160,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
                 .unwrap_or_else(|| CURATOR_REVIEW_CRON.to_string());
             task_engine::ensure_recurring_task(
                 &db,
+                &agent_state.home_dir,
                 "curator_review",
                 &curator_cron,
                 r#"{"trigger":"curator_review"}"#,
@@ -2098,6 +2282,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::SkillRegistry;
     use crate::task_engine::{TaskDispatcher, TaskEngine};
     use crate::test_utils::test_helpers::test_async_db;
     use axum::body::Body;
@@ -5557,6 +5742,27 @@ mod tests {
     // gateway le délivre, et lit le compteur du LLM bouchonné. Le jeton GitHub
     // est retiré explicitement : `Settings::load` lit le `MIKA_*` du processus,
     // et un `MIKA_GITHUB_TOKEN` exporté ferait lancer un `gh` réel aux handlers.
+    //
+    // **Tout test qui passe par `mika2675_run`/`mika2675_run_on` porte
+    // `#[serial_test::serial]`** (mika#2680). Deux états process-globaux le
+    // rendent nécessaire, et l'annotation doit couvrir les POISONNEURS autant
+    // que les lecteurs — un lecteur seul à être annoté laisse la course
+    // entière ouverte, `#[serial]` ne sérialisant que contre ses propres
+    // porteurs (`test_utils.rs` § `install_capturing_subscriber`) :
+    //
+    // 1. `MIKA_WEBHOOK_PREFILTER`, que `prefilter_enabled()` lit dans
+    //    l'environnement du processus et que le test AC5 de mika#2680 pose le
+    //    temps d'un tour. Un voisin qui attend un ÉCART pendant cette fenêtre
+    //    voit le pré-filtre désarmé et son tour avoir lieu.
+    // 2. L'`Interest` du callsite `webhook_turn_charged`, figé par le
+    //    dispatcher du thread qui l'enregistre le PREMIER. Un voisin qui
+    //    l'atteint sans abonné l'éteint globalement, et la capture des tests
+    //    mika#2680 rend 0.
+    //
+    // Mesuré sur la tête `6ba0762d` de la PR #2705, job `Check` : quatre
+    // échecs, un par état, les deux formes présentes. Les tests qui exercent
+    // la porte (`skip_turn`) directement sont hors de cette contrainte — ils
+    // reçoivent `enabled` en paramètre et n'atteignent aucun callsite capturé.
 
     fn mika2675_state() -> (AppState, Arc<mika_common::llm::mock::MockLlmProvider>) {
         use mika_common::llm::mock::{MockLlmProvider, text_response};
@@ -5655,12 +5861,14 @@ mod tests {
 
     /// AC1(a) — `check_suite` verte sur `main`, sans tâche : zéro appel LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_a_check_suite_verte_sur_main_aucun_appel_llm() {
         assert_eq!(mika2675_run(MIKA2675_GREEN_MAIN).await, (0, 1));
     }
 
     /// AC1(d) — label inerte : zéro appel LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_d_label_inerte_aucun_appel_llm() {
         assert_eq!(mika2675_run(MIKA2675_INERT_LABEL).await, (0, 1));
     }
@@ -5668,6 +5876,7 @@ mod tests {
     /// AC1(a), terme « sans tâche active liée à la branche » : avec une tâche,
     /// le tour a lieu.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_a_tache_active_sur_la_branche_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(&state, r#"{"claude_pilot":{"branch":"main"}}"#).await;
@@ -5681,21 +5890,33 @@ mod tests {
     /// atteignable sans jeton GitHub.
     #[tokio::test]
     async fn mika2675_texte_touche_par_un_handler_le_tour_a_lieu() {
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let live = webhook_prefilter::LiveState {
             db: &db,
             github_token: None,
             request_id: "r",
+            // Aucun de ces textes n'est de la population de (h) : le champ
+            // existe depuis mika#2854, et `None` s'y comporte comme une panne
+            // (fail-open), jamais comme une note.
+            llm: None,
+            // Idem : aucun n'est une fermeture, donc l'instantané d'AC4 n'a
+            // pas de sujet.
+            closure_snapshot: &webhook_prefilter::ClosureSnapshot::NotAClosure,
         };
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL] {
-            assert!(
-                !webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(true), "r", true)
-                    .await
+            assert_eq!(
+                webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(true), "r", true)
+                    .await,
+                Gate::Charged(Release::TextTouched),
+                "{text}"
             );
-            assert!(
+            assert_eq!(
                 webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(false), "r", true)
-                    .await
+                    .await,
+                Gate::Skipped,
+                "{text}"
             );
         }
     }
@@ -5712,12 +5933,20 @@ mod tests {
     /// AC4 — désarmé, rien n'est filtré.
     #[tokio::test]
     async fn mika2675_interrupteur_desarme_rien_nest_filtre() {
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let live = webhook_prefilter::LiveState {
             db: &db,
             github_token: None,
             request_id: "r",
+            // Aucun de ces textes n'est de la population de (h) : le champ
+            // existe depuis mika#2854, et `None` s'y comporte comme une panne
+            // (fail-open), jamais comme une note.
+            llm: None,
+            // Idem : aucun n'est une fermeture, donc l'instantané d'AC4 n'a
+            // pas de sujet.
+            closure_snapshot: &webhook_prefilter::ClosureSnapshot::NotAClosure,
         };
         let hold = webhook_prefilter::tests::review(
             "commented",
@@ -5725,16 +5954,11 @@ mod tests {
             "VERDICT: hold[review]",
         );
         for text in [MIKA2675_GREEN_MAIN, MIKA2675_INERT_LABEL, hold.as_str()] {
-            assert!(
-                !webhook_prefilter::skip_turn(
-                    &db,
-                    &live,
-                    text,
-                    mika2675_touched(false),
-                    "r",
-                    false
-                )
-                .await
+            assert_eq!(
+                webhook_prefilter::skip_turn(&db, &live, text, mika2675_touched(false), "r", false)
+                    .await,
+                Gate::Charged(Release::SwitchDisarmed),
+                "{text}"
             );
         }
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
@@ -5743,6 +5967,7 @@ mod tests {
     /// AC2 et mutations — contrôles négatifs : chaque événement légitime, et
     /// chaque terme de (a)/(d) rendu faux, déclenche le tour LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_evenements_legitimes_le_tour_a_lieu() {
         let pr = "senara-solutions/mika#2680 — fix(x): y (branch: fix/2675/x)\nhttps://github.com/senara-solutions/mika/pull/2680";
         let cases = [
@@ -5750,8 +5975,12 @@ mod tests {
             format!("[GitHub] PR synchronize: {pr}"),
             format!("[GitHub] PR ready_for_review: {pr}"),
             format!("[GitHub] PR review_requested: {pr}\nRequested reviewer: @mika-platform-qa"),
-            format!("[GitHub] PR closed: {pr}\nMerged: false"),
-            format!("[GitHub] PR closed: {pr}\nMerged: true"),
+            // Les deux `PR closed` sont sortis de cette liste avec mika#2680 :
+            // AC2 de mika#2675 les tenait légitimes PAR PRINCIPE, la classe (e)
+            // les mesure à n=2 (193 k puis 279 k tokens pour un tour sans
+            // tâche). Ils ont leurs propres tests, de part et d'autre de la
+            // seule chose qui les sépare désormais — une tâche de boucle active
+            // (`mika2680_e_*`, plus bas).
             // Les `check_suite` ROUGES sur `main` sont sorties de cette liste
             // avec mika#2683 : elles ont leur propre classe, et leurs propres
             // tests (`mika2683_a_*`).
@@ -5772,6 +6001,7 @@ mod tests {
 
     /// AC2 — un verdict `pass` du relecteur QA sur une PR avec tâche active.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_verdict_pass_qa_tache_active_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(
@@ -5784,6 +6014,40 @@ mod tests {
             "[GitHub] PR review (approved) on senara-solutions/mika#2680 (t) by @mika-platform-qa\nhttps://github.com/senara-solutions/mika/pull/2680#pullrequestreview-1\n\nVERDICT: pass",
         )
         .await;
+        assert!(mock.calls_made() >= 1);
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    // ---- mika#2680 vol 3 — classe (e) -------------------------------------
+    //
+    // Le chemin réel complet, là où les assertions inline de
+    // `webhook_prefilter` bouchonnent l'état : ici c'est `LiveState` qui lit
+    // `pr_has_active_task` en base. Les deux tests partagent leur texte et ne
+    // diffèrent que par la présence de la tâche.
+
+    const MIKA2680_PR_CLOSED: &str = "[GitHub] PR closed: senara-solutions/mika#2680 — fix(x): y (branch: fix/2675/x)\nhttps://github.com/senara-solutions/mika/pull/2680\nMerged: true";
+
+    /// (e) — `merged` sans tâche de boucle : zéro appel LLM, une ligne d'écart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_e_pr_mergee_sans_tache_aucun_appel_llm() {
+        let (calls, skipped) = mika2675_run(MIKA2680_PR_CLOSED).await;
+        assert_eq!(calls, 0, "aucun tour");
+        assert_eq!(skipped, 1, "une ligne d'écart");
+    }
+
+    /// Contrôle négatif du précédent : même texte, et la tâche de boucle qui
+    /// porte cette PR. Le tour a lieu, aucune ligne d'écart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_e_pr_mergee_avec_tache_le_tour_a_lieu() {
+        let (state, mock) = mika2675_state();
+        mika2675_seed_task(
+            &state,
+            r#"{"claude_pilot":{"pr_url":"https://github.com/senara-solutions/mika/pull/2680"}}"#,
+        )
+        .await;
+        mika2675_run_on(&state, MIKA2680_PR_CLOSED).await;
         assert!(mock.calls_made() >= 1);
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
     }
@@ -5803,6 +6067,7 @@ mod tests {
 
     /// AC1(c) — chaque terme textuel, sans tâche active : zéro appel LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_c_verdict_non_actionnable_aucun_appel_llm() {
         for (state, author, body) in [
             (
@@ -5821,6 +6086,7 @@ mod tests {
     /// AC1(c), terme « sans tâche active » : avec une tâche sur la PR, chaque
     /// verdict non actionnable garde son tour.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_c_tache_active_le_tour_a_lieu() {
         for (author, body) in [
             (MIKA2675_QA, "VERDICT: hold[review]"),
@@ -5843,6 +6109,7 @@ mod tests {
     /// illisible faute de jeton), revue-consigne sans ligne VERDICT, `hold`
     /// inconnu, `block[*]` d'une autre identité : le tour a lieu.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_c_evenements_legitimes_le_tour_a_lieu() {
         for (state, author, body) in [
             ("approved", MIKA2675_QA, "VERDICT: pass"),
@@ -5876,15 +6143,15 @@ mod tests {
     /// PR fermée ou mergée écarte, ouverte ou illisible laisse passer.
     #[tokio::test]
     async fn mika2675_c_etat_de_forge_sur_la_porte() {
-        use webhook_prefilter::{PrForgeState, tests::Stub};
+        use webhook_prefilter::{Gate, PrForgeState, Release, tests::Stub};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let text = mika2675_review("approved", MIKA2675_QA, "VERDICT: pass");
-        for (forge, skipped) in [
-            (Ok(PrForgeState::Merged), true),
-            (Ok(PrForgeState::Closed), true),
-            (Ok(PrForgeState::Open), false),
-            (Err("gh 401"), false),
+        for (forge, gate) in [
+            (Ok(PrForgeState::Merged), Gate::Skipped),
+            (Ok(PrForgeState::Closed), Gate::Skipped),
+            (Ok(PrForgeState::Open), Gate::Charged(Release::PrOpen)),
+            (Err("gh 401"), Gate::Charged(Release::StateUnreadable)),
         ] {
             let stub = Stub {
                 pr_task: Some(Ok(false)),
@@ -5894,7 +6161,7 @@ mod tests {
             let got =
                 webhook_prefilter::skip_turn(&db, &stub, &text, mika2675_touched(false), "r", true)
                     .await;
-            assert_eq!(got, skipped, "{forge:?}");
+            assert_eq!(got, gate, "{forge:?}");
         }
         let rows = db
             .get_audit_event_rows_by_tool_name(webhook_prefilter::PREFILTER_SKIPPED_TOOL)
@@ -5907,12 +6174,20 @@ mod tests {
     /// touche garde le tour ; le `verdict_handler` lui-même, non.
     #[tokio::test]
     async fn mika2675_c_texte_touche_apres_le_verdict_handler() {
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let live = webhook_prefilter::LiveState {
             db: &db,
             github_token: None,
             request_id: "r",
+            // Aucun de ces textes n'est de la population de (h) : le champ
+            // existe depuis mika#2854, et `None` s'y comporte comme une panne
+            // (fail-open), jamais comme une note.
+            llm: None,
+            // Idem : aucun n'est une fermeture, donc l'instantané d'AC4 n'a
+            // pas de sujet.
+            closure_snapshot: &webhook_prefilter::ClosureSnapshot::NotAClosure,
         };
         let text = mika2675_review("commented", MIKA2675_QA, "VERDICT: hold[review]");
         let touched = |after| webhook_prefilter::Touched {
@@ -5921,8 +6196,14 @@ mod tests {
             outside_ci_success_handler: true,
             outside_ci_failure_handler: true,
         };
-        assert!(!webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await);
-        assert!(webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await);
+        assert_eq!(
+            webhook_prefilter::skip_turn(&db, &live, &text, touched(true), "r", true).await,
+            Gate::Charged(Release::TextTouched)
+        );
+        assert_eq!(
+            webhook_prefilter::skip_turn(&db, &live, &text, touched(false), "r", true).await,
+            Gate::Skipped
+        );
     }
 
     // ---- mika#2675 phase 3 — classe (b) -----------------------------------
@@ -5966,6 +6247,7 @@ mod tests {
     /// DECISION-CORE et notifiée, que cet événement redécide : zéro appel LLM,
     /// une ligne d'audit nommée.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_b_tete_decidee_et_notifiee_aucun_appel_llm() {
         use webhook_prefilter::tests::{GREEN_PR, HEAD_A};
         let (state, mock) = mika2675_state();
@@ -5982,6 +6264,7 @@ mod tests {
     /// AC2, AC3 et mutations, de bout en bout : chaque terme rendu faux — et
     /// chaque événement hors population — déclenche le tour LLM.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2675_b_controles_negatifs_le_tour_a_lieu() {
         use webhook_prefilter::tests::{GREEN_PR, HEAD_A};
         let other_sha = "pr:senara-solutions/mika#2678@ffffffffffffffffffffffffffffffffffffffff";
@@ -6030,6 +6313,7 @@ mod tests {
     #[tokio::test]
     async fn mika2675_b_porte_texte_interrupteur_et_audit_illisible() {
         use webhook_prefilter::tests::{GREEN_PR, HEAD_A, Stub, hold};
+        use webhook_prefilter::{Gate, Release};
         let (state, _) = mika2675_state();
         let db = state.agents.get("mika").unwrap().value().db.clone();
         let decided = || Stub {
@@ -6043,10 +6327,20 @@ mod tests {
             outside_ci_success_handler: o,
             outside_ci_failure_handler: true,
         };
-        for (stub, touched, enabled, skipped) in [
-            (decided(), outside(false), true, true),
-            (decided(), outside(true), true, false),
-            (decided(), outside(false), false, false),
+        for (stub, touched, enabled, gate) in [
+            (decided(), outside(false), true, Gate::Skipped),
+            (
+                decided(),
+                outside(true),
+                true,
+                Gate::Charged(Release::TextTouched),
+            ),
+            (
+                decided(),
+                outside(false),
+                false,
+                Gate::Charged(Release::SwitchDisarmed),
+            ),
             (
                 Stub {
                     event_rows: Some(Err("db down")),
@@ -6054,12 +6348,12 @@ mod tests {
                 },
                 outside(false),
                 true,
-                false,
+                Gate::Charged(Release::StateUnreadable),
             ),
         ] {
             let got =
                 webhook_prefilter::skip_turn(&db, &stub, GREEN_PR, touched, "r", enabled).await;
-            assert_eq!(got, skipped, "{touched:?} / enabled={enabled}");
+            assert_eq!(got, gate, "{touched:?} / enabled={enabled}");
         }
     }
 
@@ -6077,6 +6371,7 @@ mod tests {
     /// AC(a) — `check_suite` rouge sur `main`, sans tâche active : zéro appel au
     /// modèle, une ligne d'audit de la classe.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_a_check_suite_rouge_sur_main_aucun_appel_llm() {
         for text in [MIKA2683_RED_MAIN, MIKA2683_TIMED_OUT_MAIN] {
             let (state, mock) = mika2675_state();
@@ -6093,6 +6388,7 @@ mod tests {
     /// AC(a), contrôle négatif du terme d'état : une tâche active sur `main` est
     /// un état que le modèle doit prendre en compte — le tour a lieu.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_a_tache_active_sur_main_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(&state, r#"{"claude_pilot":{"branch":"main"}}"#).await;
@@ -6143,6 +6439,7 @@ mod tests {
     /// AC(c) — branche de PR sans tâche : le handler a signalé pour adoption
     /// (notifié et audité en code), il ne reste rien à décider au modèle.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_pr_sans_tache_signalee_pour_adoption_aucun_appel_llm() {
         let (state, mock) = mika2675_state();
         mika2683_seed_handler_line(
@@ -6162,6 +6459,7 @@ mod tests {
 
     /// AC(c) — les deux autres sorties terminales, chacune sous sa classe.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_les_sorties_terminales_de_letape_3_aucun_appel_llm() {
         for (motive, class) in [
             (
@@ -6195,6 +6493,7 @@ mod tests {
     /// un correctif, c'est un état que le modèle doit prendre en compte. Le
     /// chemin de dispatch est inchangé — le tour a lieu, aucune ligne de skip.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_pr_avec_tache_in_progress_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_seed_task(
@@ -6218,10 +6517,1141 @@ mod tests {
     /// Sans lui, « la porte lit la trace » serait indistinguable de « la porte
     /// coupe tout ce qui est rouge hors branche par défaut ».
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika2683_c_sans_ligne_terminale_le_tour_a_lieu() {
         let (state, mock) = mika2675_state();
         mika2675_run_on(&state, MIKA2683_RED_PR).await;
         assert!(mock.calls_made() >= 1);
         assert_eq!(mika2675_skipped_rows(&state).await, 0);
+    }
+
+    // ---- mika#2680 vol 1 — le registre des tours webhook -------------------
+    //
+    // Les tests unitaires de `webhook_prefilter` épinglent la taxonomie ; ceux
+    // d'ici lisent la ligne `webhook_turn_charged` telle qu'un tour RÉEL
+    // l'émet, sur le chemin complet `run_agent_for_message`. C'est la seule
+    // forme qui peut établir la jointure d'AC1 : le `request_id` du registre
+    // et le `trace_id` du `turn_usage` du MÊME tour.
+    //
+    // La capture est celle de `kg::resolver_tick::tests`, et
+    // `install_capturing_subscriber` en est le seul site d'installation permis
+    // (mika#2646). Elle se pose par `set_default`, donc par thread, et
+    // l'`Interest` d'un callsite est figé par le PREMIER thread qui l'atteint :
+    // un voisin non sérialisé qui toucherait `turn_usage` sans abonné
+    // l'éteindrait globalement. D'où `#[serial_test::serial]` sur chacun des
+    // trois — c'est la moitié porteuse du dispositif, pas une précaution.
+
+    #[derive(Debug, Clone)]
+    struct Mika2680Event {
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    struct Mika2680Layer {
+        events: Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Mika2680Layer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::HashMap::new();
+            let mut visitor = Mika2680Visitor(&mut fields);
+            event.record(&mut visitor);
+            if let Ok(mut events) = self.events.lock() {
+                events.push(Mika2680Event { fields });
+            }
+        }
+    }
+
+    struct Mika2680Visitor<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for Mika2680Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn mika2680_capture() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Mika2680Layer {
+            events: Arc::clone(&events),
+        });
+        let guard = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        (guard, events)
+    }
+
+    /// Joue un tour webhook **avant** toute installation d'abonné, pour
+    /// enregistrer les callsites que la capture doit lire.
+    ///
+    /// `#[serial]` sur toute la famille ferme la course entre voisins, mais
+    /// pas celle-ci : un callsite ne s'enregistre qu'à sa PREMIÈRE atteinte
+    /// dans le processus, et son `Interest` est alors décidé par le dispatcher
+    /// du thread qui l'enregistre. `turn_usage` est atteint par n'importe quel
+    /// tour d'agent du crate, bien au-delà de cette famille — l'annoter
+    /// partout n'est pas une frontière qu'on puisse tenir.
+    ///
+    /// L'ordre « tour à blanc, PUIS capture » la rend sans objet :
+    /// l'enregistrement a lieu sans abonné, donc éteint, et le
+    /// `rebuild_interest_cache()` qu'`install_capturing_subscriber` appelle
+    /// juste après le rallume sous le nôtre — le rebuild réévalue les
+    /// callsites DÉJÀ enregistrés, et ne peut rien pour ceux qui le seront
+    /// après. La capture ne dépend donc plus de qui arrive premier.
+    ///
+    /// État distinct à chaque fois : ce tour-là compte un appel LLM et écrit
+    /// ses lignes d'audit, qu'aucune assertion ne doit voir.
+    async fn mika2680_warm_callsites() {
+        let (state, _) = mika2675_state();
+        mika2675_run_on(&state, MIKA2680_COMMENT).await;
+    }
+
+    fn mika2680_events_named(
+        events: &Arc<std::sync::Mutex<Vec<Mika2680Event>>>,
+        name: &str,
+    ) -> Vec<Mika2680Event> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.fields.get("event").map(String::as_str) == Some(name))
+            .cloned()
+            .collect()
+    }
+
+    /// Pose `MIKA_WEBHOOK_PREFILTER` le temps d'un test et le restaure — par
+    /// `Drop`, donc y compris sur panique : une restauration écrite en fin de
+    /// corps laisserait la variable posée pour toute la suite dès le premier
+    /// échec. Elle est process-globale, et `#[serial_test::serial]` est ce qui
+    /// empêche un voisin de la lire pendant qu'elle l'est.
+    struct Mika2680EnvGuard(Option<String>);
+
+    impl Mika2680EnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var(webhook_prefilter::PREFILTER_ENV).ok();
+            unsafe { std::env::set_var(webhook_prefilter::PREFILTER_ENV, value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for Mika2680EnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => unsafe {
+                    std::env::set_var(webhook_prefilter::PREFILTER_ENV, previous)
+                },
+                None => unsafe { std::env::remove_var(webhook_prefilter::PREFILTER_ENV) },
+            }
+        }
+    }
+
+    /// Un commentaire d'opérateur sur un ticket sans tâche de boucle : la
+    /// classe (h) de la mesure 2, 79 % de la fenêtre du 2026-10-08. Le tour a
+    /// bien lieu, ce qui en fait le porteur naturel d'AC1.
+    ///
+    /// **Depuis mika#2854 ce texte est DANS la population du pré-filtre** :
+    /// (h) le classe `human_text_no_task`, et l'interrupteur de triage étant
+    /// livré désarmé, la relâche est `triage_disarmed` et le tour est gardé.
+    /// Donc `candidate` est désormais PRÉSENT ici. La moitié d'AC6 qui demande
+    /// un champ ABSENT a déménagé sur [`MIKA2854_COMMENT_SANS_URL`] — le même
+    /// gabarit à la ligne d'URL près, seul écart qui sorte de la population.
+    /// Le fixture n'a pas bougé d'un octet : ce qui a changé est ce que le
+    /// dépôt sait en faire, et le test doit le dire plutôt que de choisir un
+    /// texte qui l'épargne.
+    const MIKA2680_COMMENT: &str = "[GitHub] New comment on senara-solutions/mika#2680 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2680\n\nrelance le groom";
+
+    /// Le même gabarit que [`MIKA2680_COMMENT`], sans sa ligne d'URL : (h) n'a
+    /// alors aucune clé à donner à `has_active_self_dev_task_for_issue`, donc
+    /// ne peut pas savoir si le ticket porte une tâche de boucle — et AC7
+    /// interdit de deviner. Hors population, `candidate` MANQUE.
+    const MIKA2854_COMMENT_SANS_URL: &str =
+        "[GitHub] New comment on senara-solutions/mika#2680 (t) by @samidarko\n\nrelance le groom";
+
+    /// AC1 — un tour webhook qui a lieu émet UNE ligne de registre, et son
+    /// `request_id` est le `trace_id` du `turn_usage` du même tour.
+    ///
+    /// C'est toute la jointure de l'instrument : sans elle, le registre dirait
+    /// « un tour a eu lieu » sans qu'on puisse lui attacher son coût, et le
+    /// chiffrage de vol 2 n'aurait aucun moyen de rapprocher les deux tables.
+    /// La non-vacuité est assertée aussi — deux champs vides sont égaux.
+    ///
+    /// AC6 s'y lit en passant, dans sa moitié PRÉSENTE depuis mika#2854 : le
+    /// texte est dans la population de (h), relâché `triage_disarmed`. La
+    /// moitié absente est sur
+    /// [`mika2854_hors_population_le_candidat_manque_toujours`].
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_le_registre_se_joint_au_cout_du_tour() {
+        mika2680_warm_callsites().await;
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2680_COMMENT).await;
+
+        assert!(mock.calls_made() >= 1, "le tour doit avoir lieu");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "une ligne de registre, et une seule");
+        let usage = mika2680_events_named(&events, "turn_usage");
+        assert!(!usage.is_empty(), "le tour facturé doit avoir un coût");
+
+        let request_id = charged[0].fields.get("request_id").expect("request_id");
+        let trace_id = usage[0].fields.get("trace_id").expect("trace_id");
+        assert!(
+            !request_id.is_empty(),
+            "une jointure sur du vide n'en est pas une"
+        );
+        assert_eq!(
+            request_id, trace_id,
+            "AC1 — la jointure du registre au coût"
+        );
+
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("issue_comment")
+        );
+        assert_eq!(
+            charged[0].fields.get("text_touched").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            charged[0]
+                .fields
+                .get("prefilter_enabled")
+                .map(String::as_str),
+            Some("true"),
+            "interrupteur armé par défaut"
+        );
+        assert_eq!(
+            charged[0].fields.get("candidate").map(String::as_str),
+            Some("human_text_no_task"),
+            "mika#2854 — (h) classe ce texte, et le tour est gardé quand même"
+        );
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("triage_disarmed"),
+            "mika#2854 — l'interrupteur de (h) est livré désarmé"
+        );
+    }
+
+    /// AC6, moitié ABSENTE — le contrôle négatif de la précédente.
+    ///
+    /// Sans les deux, « le champ est absent » et « le champ est toujours
+    /// absent » rendent les mêmes octets : un `emit_turn_charged` qui aurait
+    /// perdu son bras `Some` passerait la paire à moitié. Le texte est le même
+    /// gabarit qu'AC1 à la ligne d'URL près, pour que l'écart mesuré soit
+    /// l'extractibilité de l'URL et rien d'autre.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_hors_population_le_candidat_manque_toujours() {
+        mika2680_warm_callsites().await;
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2854_COMMENT_SANS_URL).await;
+
+        assert!(mock.calls_made() >= 1, "le tour doit avoir lieu");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "une ligne de registre, et une seule");
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("issue_comment"),
+            "contrôle positif : le tour a bien un déclencheur nommé"
+        );
+        assert!(
+            !charged[0].fields.contains_key("candidate"),
+            "AC6 — hors population, le champ MANQUE (motif mika#2331)"
+        );
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("not_classified")
+        );
+    }
+
+    /// AC4 — un tour écarté n'émet AUCUNE ligne de registre.
+    ///
+    /// Le registre compte les tours **payés** ; une ligne sur un tour écarté
+    /// ferait compter deux fois ce que `webhook_prefilter_skipped` compte déjà,
+    /// et sur une population disjointe de celle qu'il nomme.
+    ///
+    /// La ligne d'audit est assertée d'abord : sans elle, « aucune ligne de
+    /// registre » voudrait aussi bien dire « le tour n'a jamais été écarté »
+    /// que « le tour a été écarté et s'est tu » (classe mika#2205).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_un_tour_ecarte_nemet_aucune_ligne_de_registre() {
+        mika2680_warm_callsites().await;
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2675_GREEN_MAIN).await;
+
+        assert_eq!(mock.calls_made(), 0, "la classe (a) écarte ce tour");
+        assert_eq!(
+            mika2675_skipped_rows(&state).await,
+            1,
+            "contrôle positif : l'écart a bien eu lieu"
+        );
+
+        assert!(
+            mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT)
+                .is_empty(),
+            "AC4 — un tour écarté n'est pas un tour facturé"
+        );
+        assert!(
+            mika2680_events_named(&events, "turn_usage").is_empty(),
+            "et il n'a coûté aucun appel"
+        );
+    }
+
+    /// AC5 — interrupteur désarmé : le tour a lieu, le registre le dit, et il
+    /// dit aussi que l'interrupteur l'était.
+    ///
+    /// C'est la fenêtre qu'on veut précisément pouvoir mesurer : le même texte
+    /// qu'AC4 écarte traverse ici, et la ligne porte `prefilter_enabled=false`
+    /// — sans quoi un chiffrage lirait une flambée de tours sans pouvoir dire
+    /// qu'elle vient du désarmement plutôt que du trafic.
+    ///
+    /// `candidate` est PRÉSENT : l'événement est dans la population du
+    /// pré-filtre et a gardé son tour. C'est l'autre moitié d'AC6 — celle
+    /// qu'un champ toujours absent rendrait indistinguable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_linterrupteur_desarme_le_registre_le_dit() {
+        mika2680_warm_callsites().await;
+        let _env = Mika2680EnvGuard::set("0");
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        mika2675_run_on(&state, MIKA2675_GREEN_MAIN).await;
+
+        assert!(mock.calls_made() >= 1, "désarmé, rien n'est filtré");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0]
+                .fields
+                .get("prefilter_enabled")
+                .map(String::as_str),
+            Some("false"),
+            "AC5 — la ligne nomme l'état de l'interrupteur"
+        );
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("check_suite_default_branch")
+        );
+        assert_eq!(
+            charged[0].fields.get("candidate").map(String::as_str),
+            Some("green_default_branch"),
+            "dans la population, et le tour a quand même eu lieu"
+        );
+    }
+
+    /// Le `trigger` se lit sur le texte d'AVANT les handlers — **au site
+    /// d'appel**, et pas seulement dans `trigger_class`.
+    ///
+    /// La classe (f) du ticket : une revue sans ligne `VERDICT:` lisible, que
+    /// le `verdict_handler` remplace par son pré-digest. Ce pré-digest ouvre
+    /// sur sa propre balise, et `trigger_class` ne lit QUE la première ligne :
+    /// calculé sur `req.text`, le `trigger` dirait `other` — le terme de repli
+    /// qu'AC3 réserve à l'attrape-tout du gateway. Le chiffrage de vol 2
+    /// verserait dans `other` une population `pr_review` entière, et c'est la
+    /// seule assertion de la branche qui bouge : la mutation a été jouée, les
+    /// dix autres tests mika#2680 sont restés verts.
+    ///
+    /// Les tests unitaires de `webhook_prefilter` épinglent la fonction pure ;
+    /// aucun d'eux ne peut voir QUEL texte le site d'appel lui passe.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2680_le_site_dappel_classe_le_texte_davant_les_handlers() {
+        mika2680_warm_callsites().await;
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2675_state();
+        let text = mika2675_review(
+            "commented",
+            "samidarko",
+            "Renomme cette fonction, puis relance.",
+        );
+        mika2675_run_on(&state, &text).await;
+
+        assert!(mock.calls_made() >= 1, "le tour doit avoir lieu");
+        assert_eq!(mika2675_skipped_rows(&state).await, 0);
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "une ligne de registre, et une seule");
+        assert_eq!(
+            charged[0].fields.get("text_touched").map(String::as_str),
+            Some("true"),
+            "contrôle positif : sans réécriture, l'assertion suivante ne prouve rien"
+        );
+        assert_eq!(
+            charged[0].fields.get("trigger").map(String::as_str),
+            Some("pr_review"),
+            "le registre classe l'original, jamais le pré-digest du handler"
+        );
+
+        // Garde de non-vacuité : la mutation n'est observable que parce que la
+        // forme substituée ouvre sur la balise du handler. Si le pré-digest
+        // reprenait un jour la première ligne de l'original, ce test passerait
+        // des deux côtés de la mutation — et se tairait là-dessus.
+        assert_eq!(
+            webhook_prefilter::trigger_class("<verdict_handler>\nautre chose").as_str(),
+            "other",
+            "la forme que le handler substitue ne classe pas en pr_review"
+        );
+    }
+
+    // ---- mika#2855 vol d'instrument — le second terme du registre ----------
+    //
+    // Les tests unitaires de `webhook_turn_outcome` épinglent la lecture du
+    // marqueur ; celui d'ici lit la ligne telle qu'un tour RÉEL l'émet, sur le
+    // chemin complet `run_agent_for_message`. C'est la seule forme qui peut
+    // établir que le texte que le moteur a produit atteint le parseur : un
+    // appel direct à `parse_attestation` serait vert même si le site d'émission
+    // passait `None`.
+    //
+    // Aucun nouveau harnais : la capture, le réchauffage des callsites et le
+    // `#[serial]` sont ceux de mika#2680 juste au-dessus, pour la raison qui
+    // les a fait naître (l'`Interest` d'un callsite est figé par le premier
+    // thread qui l'atteint).
+
+    /// Un état dont le modèle rend `final_text` à chaque appel.
+    ///
+    /// L'attestation est un fait du **texte du modèle**, et `mika2675_state`
+    /// câble un mock qui dit « Noted. » — donc qui n'atteste rien. Un test bâti
+    /// sur lui n'aurait pu asserter que le repli `outcome_absent`, lequel est
+    /// aussi ce que rend un parseur cassé de bout en bout.
+    fn mika2855_state_repondant(final_text: &str) -> AppState {
+        use mika_common::llm::mock::{MockLlmProvider, text_response};
+        let (state, _) = mika2675_state();
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses((0..8).map(|_| text_response(final_text)).collect())
+                .build(),
+        );
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .llm = mock;
+        }
+        state
+    }
+
+    /// AC1 — un tour webhook qui a lieu émet la ligne d'ISSUE, elle porte ses
+    /// trois champs, et son `request_id` est celui de la ligne d'ENTRÉE du même
+    /// tour.
+    ///
+    /// La jointure par `request_id` est tout le dispositif : la ligne d'entrée
+    /// porte le coût et la `release`, celle de sortie porte l'issue, et c'est
+    /// leur rapprochement qui permet de chiffrer les arrêts par numéro. Deux
+    /// moitiés qu'on ne peut pas joindre ne mesurent rien.
+    ///
+    /// `agent_id` est asserté parce que
+    /// `scripts/measure-webhook-turn-cost:204` filtre **chaque** ligne du
+    /// corpus sur `--agent` : une ligne de sortie sans ce champ est écartée par
+    /// le lecteur, donc muette, sans que rien ne le dise.
+    ///
+    /// `outcome` est asserté sur une valeur ATTESTÉE, et non sur le repli :
+    /// `outcome_absent` est aussi ce que rendrait un site d'émission qui ne
+    /// passerait jamais le texte du tour. La valeur nommée est le contrôle de
+    /// non-vacuité du chemin complet.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2855_la_ligne_dissue_se_joint_a_la_ligne_dentree() {
+        mika2680_warm_callsites().await;
+        let (_guard, events) = mika2680_capture();
+        let state = mika2855_state_repondant("Dispatched the review.\n\nWebhook-Outcome: review");
+        mika2675_run_on(&state, MIKA2680_COMMENT).await;
+
+        assert_eq!(
+            mika2675_skipped_rows(&state).await,
+            0,
+            "le tour a bien lieu"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "contrôle positif : la ligne d'entrée");
+        let outcome = mika2680_events_named(
+            &events,
+            super::webhook_turn_outcome::WEBHOOK_TURN_OUTCOME_EVENT,
+        );
+        assert_eq!(outcome.len(), 1, "une ligne d'issue, et une seule");
+
+        let request_id = outcome[0].fields.get("request_id").expect("request_id");
+        assert!(
+            !request_id.is_empty(),
+            "une jointure sur du vide n'en est pas une"
+        );
+        assert_eq!(
+            Some(request_id),
+            charged[0].fields.get("request_id"),
+            "AC1 — les deux moitiés du registre portent le même tour"
+        );
+        assert_eq!(
+            outcome[0].fields.get("agent_id").map(String::as_str),
+            Some("mika"),
+            "le lecteur filtre chaque ligne sur l'agent"
+        );
+        assert_eq!(
+            outcome[0].fields.get("outcome").map(String::as_str),
+            Some("review"),
+            "AC1 — l'issue attestée par le modèle traverse jusqu'à la ligne"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // mika#2854 — la classe (h) de bout en bout
+    //
+    // Les tests unitaires de `webhook_prefilter` et de `comment_triage`
+    // épinglent le décideur et la grammaire sur des bouchons. Aucun d'eux ne
+    // peut voir ce que la classe fait d'un VRAI tour : que le triage est le
+    // premier appel LLM du tour et le seul quand la note gagne, que la note
+    // atteint la base de l'agent, qu'elle y est retrouvable, et que l'audit et
+    // le registre disent la même branche. C'est ce que ces tests mesurent, par
+    // le même harnais que mika#2675/#2680 — donc par `run_agent_for_message`,
+    // avec le `LiveState` de production et son `llm: Some(…)`.
+    // ---------------------------------------------------------------------
+
+    const MIKA2854_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/2854";
+
+    /// Un commentaire d'opérateur sur un ticket sans tâche de boucle, avec le
+    /// fragment `#issuecomment-…` que porte un vrai webhook : c'est lui que
+    /// C1 tronque à l'extraction, et sans cette troncature la clé d'état
+    /// n'aurait aucune chance de correspondre.
+    const MIKA2854_COMMENT: &str = "[GitHub] New comment on senara-solutions/mika#2854 (t) by @samidarko\nhttps://github.com/senara-solutions/mika/issues/2854#issuecomment-123\n\nlève operator-gated sur #2784, je valide le vol";
+
+    /// L'autre moitié de (h) — AC4, livrée par ce vol : la fermeture du même
+    /// ticket, **URL en ligne 2 comprise**.
+    ///
+    /// Cette URL est ce qui la fait entrer en population : une fermeture sans
+    /// elle reste hors population (§ D15 du plan), pour la même raison que la
+    /// moitié commentaire — aucune clé d'état n'en est extractible.
+    const MIKA2854_ISSUE_CLOSED: &str = "[GitHub] Issue closed: senara-solutions/mika#2854 — t\nhttps://github.com/senara-solutions/mika/issues/2854";
+
+    /// Le même état que [`mika2675_state`], dont la séquence de réponses est
+    /// reprogrammée : la **première** est le verdict du triage, les suivantes
+    /// servent le tour complet s'il a lieu.
+    ///
+    /// L'ordre est le contrat : le triage est consulté avant le tour, donc son
+    /// verdict est la réponse n° 1. Un test qui compte `calls_made()` mesure
+    /// exactement ça — `1` veut dire « le triage a parlé et le tour ne s'est
+    /// pas ouvert ».
+    fn mika2854_state(verdict: &str) -> (AppState, Arc<mika_common::llm::mock::MockLlmProvider>) {
+        use mika_common::llm::mock::text_response;
+        let (state, mock) = mika2675_state();
+        let mut responses = vec![text_response(verdict)];
+        responses.extend((0..8).map(|_| text_response("Noted.")));
+        mock.clear_and_set(responses);
+        (state, mock)
+    }
+
+    /// Une tâche de boucle vivante sur un ticket.
+    ///
+    /// La clé est `reference_url`, **pas** les métadonnées : c'est ce que lit
+    /// `find_active_self_dev_task_for_issue`, et une tâche semée par
+    /// [`mika2675_seed_task`] (qui laisse `reference_url` à `None`) serait
+    /// invisible à AC7 — le test passerait alors pour la mauvaise raison.
+    async fn mika2854_seed_issue_task(state: &AppState, issue_url: &str) {
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        db.create_task(crate::db::NewTask {
+            agent_id: db.agent_id.clone(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "self-dev".to_string(),
+            trigger_type: "manual".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "none".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: Some(issue_url.to_string()),
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Les lignes d'écart du tour, **nommées** — par `trace_id` plutôt que par
+    /// `tool_name`, parce que le premier rend des champs nommés là où le second
+    /// rend un quadruplet positionnel dont une permutation passerait au vert.
+    async fn mika2854_skipped_rows(state: &AppState) -> Vec<crate::db::AuditEvent> {
+        let agent_state = state.agents.get("mika").unwrap().value().clone();
+        agent_state
+            .db
+            .get_audit_events_by_trace_ids(vec!["rid-2675".to_string()])
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.tool_name == webhook_prefilter::PREFILTER_SKIPPED_TOOL)
+            .collect()
+    }
+
+    /// V1 — une note écarte le tour de bout en bout, et laisse ses deux traces.
+    ///
+    /// L'économie se lit sur `calls_made()` : **un** appel, celui du triage.
+    /// C'est le chiffre que le vol 2 comparera aux 13 tours / 1 007 748 tokens
+    /// de la mesure 3 — un test qui n'assertait que la ligne d'audit laisserait
+    /// « le tour a été écarté » et « le tour a été écarté après l'avoir payé »
+    /// rendre les mêmes octets.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v1_une_note_ecarte_le_tour_de_bout_en_bout() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: accusé de réception, rien à décider");
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+
+        assert_eq!(
+            mock.calls_made(),
+            1,
+            "V1 — le triage seul est payé, le tour complet ne s'ouvre pas"
+        );
+
+        let ecartees = mika2854_skipped_rows(&state).await;
+        assert_eq!(ecartees.len(), 1, "une ligne d'audit, et une seule");
+        assert_eq!(
+            ecartees[0].after_value.as_deref(),
+            Some(webhook_prefilter::PrefilterClass::CommentTriagedNote.as_str()),
+            "AC5 — la ligne porte la classe (h) et la branche prise"
+        );
+        assert_eq!(
+            ecartees[0].target_key,
+            format!("issue_comment:{MIKA2854_ISSUE_URL}"),
+            "la clé ne porte pas le fragment #issuecomment-… (C1)"
+        );
+
+        // AC4 du registre de mika#2680 : un tour écarté n'est pas facturé.
+        assert!(
+            mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT)
+                .is_empty(),
+            "un tour écarté par (h) n'émet aucune ligne de registre"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let notes = db.search_events("Triage webhook").await.unwrap();
+        assert_eq!(notes.len(), 1, "une note en mémoire, et une seule");
+        assert!(
+            notes[0].description.contains(MIKA2854_ISSUE_URL),
+            "la note nomme son ticket : {:?}",
+            notes[0].description
+        );
+        assert_eq!(
+            notes[0].context.as_deref(),
+            Some("accusé de réception, rien à décider"),
+            "le texte du verdict vit dans le contexte, pas dans la clé"
+        );
+
+        // V9, seconde moitié : une note qu'on ne retrouve pas est une note qui
+        // n'a pas été prise. L'indexation est ce qui la rend visible à
+        // `search_memory`, et rien dans l'écriture ne la garantit.
+        let trouvees = db.fts_search("Triage", 10, Some("event")).await.unwrap();
+        assert!(
+            !trouvees.is_empty(),
+            "V9 — la note doit être indexée, donc retrouvable"
+        );
+    }
+
+    /// V2 — une décision escalade vers le tour complet d'aujourd'hui, et le
+    /// registre nomme la branche prise.
+    ///
+    /// C'est le contrôle négatif central du ticket joué de bout en bout : le
+    /// texte porte un ordre d'opérateur, et rien ne l'a dégradé en note. Les
+    /// deux assertions sont solidaires — `calls_made() >= 2` dit que le tour a
+    /// eu lieu, zéro ligne d'audit dit qu'il n'a pas été écarté *aussi*.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v2_une_decision_escalade_vers_le_tour_complet() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("DECISION");
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+
+        assert!(
+            mock.calls_made() >= 2,
+            "V2 — le triage, puis le tour complet (vu : {})",
+            mock.calls_made()
+        );
+        assert!(
+            mika2854_skipped_rows(&state).await.is_empty(),
+            "aucun écart : l'ordre n'a pas été dégradé"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "l'invariant central — aucune note sur un ordre d'opérateur"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1, "une ligne de registre, et une seule");
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("triage_escalated"),
+            "AC5 — le registre nomme la branche, pas seulement le tour"
+        );
+        assert_eq!(
+            charged[0].fields.get("candidate").map(String::as_str),
+            Some("human_text_no_task")
+        );
+    }
+
+    /// AC3 de bout en bout — un verdict illisible rend le tour complet.
+    ///
+    /// Le mock de [`mika2675_state`] répond `"Noted."` : ni `DECISION`, ni
+    /// `NOTE:`. C'est la panne la plus probable en production (un modèle qui
+    /// préface), et c'est elle qui doit fail-open. Sans ce test, le fail-open
+    /// n'est épinglé que sur des bouchons qui court-circuitent la grammaire.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_un_verdict_illisible_rend_le_tour_complet() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("Voici mon analyse : c'est une note.");
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+
+        assert!(
+            mock.calls_made() >= 2,
+            "AC3 — illisible vaut tour complet (vu : {})",
+            mock.calls_made()
+        );
+        assert!(mika2854_skipped_rows(&state).await.is_empty());
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "AC3 — jamais la note"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("triage_unreadable"),
+            "la relâche distingue l'illisible de l'escalade — deux populations \
+             sous un même nom ne se soustraient pas (mika#2205)"
+        );
+    }
+
+    /// V7 — AC4 de bout en bout : une fermeture sur un ticket **sans** tâche de
+    /// boucle est triée comme un commentaire, et la note écarte le tour.
+    ///
+    /// `calls_made() == 1` est l'économie : le triage a parlé et le tour complet
+    /// ne s'est pas ouvert. C'est ce test qui remplace le contrôle de vol 1
+    /// (« une fermeture garde son tour, la moitié n'est pas livrée en douce ») —
+    /// la livraison l'a périmé, et le laisser vert aurait voulu dire qu'AC4
+    /// n'était pas câblée.
+    ///
+    /// La cible est `issue_closed:<url>` : c'est la seconde moitié de V2, lue
+    /// là où le vol la produit vraiment. Sans elle, les deux moitiés de (h)
+    /// seraient indiscernables dans le registre (mika#2205).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v7_une_fermeture_sans_tache_est_triee_de_bout_en_bout() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
+        mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
+
+        assert_eq!(
+            mock.calls_made(),
+            1,
+            "V7 — le triage seul est payé, le tour complet ne s'ouvre pas"
+        );
+
+        let ecartees = mika2854_skipped_rows(&state).await;
+        assert_eq!(ecartees.len(), 1, "une ligne d'audit, et une seule");
+        assert_eq!(
+            ecartees[0].after_value.as_deref(),
+            Some(webhook_prefilter::PrefilterClass::CommentTriagedNote.as_str()),
+            "AC5 — la ligne porte la classe (h) et la branche prise"
+        );
+        assert_eq!(
+            ecartees[0].target_key,
+            format!("issue_closed:{MIKA2854_ISSUE_URL}"),
+            "V2 — la cible nomme la moitié FERMETURE, pas `issue_comment`"
+        );
+
+        // L'audit et le registre disent la même branche : écartée ici, donc
+        // aucune ligne de facturation. Les deux ensemble séparent « écarté »
+        // de « écarté après avoir payé ».
+        assert!(
+            mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT)
+                .is_empty(),
+            "un tour écarté par (h) n'émet aucune ligne de registre"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let notes = db.search_events("Triage webhook").await.unwrap();
+        assert_eq!(notes.len(), 1, "une note en mémoire, et une seule");
+        assert!(
+            notes[0].description.contains(MIKA2854_ISSUE_URL),
+            "la note nomme son ticket : {:?}",
+            notes[0].description
+        );
+        assert_eq!(
+            notes[0].context.as_deref(),
+            Some("ticket livré, rien à décider"),
+            "le texte du verdict vit dans le contexte, pas dans la clé"
+        );
+    }
+
+    /// V6 — **AC7 avant le nettoyage** : une fermeture sur un ticket qui porte
+    /// une tâche de boucle vivante garde le tour complet.
+    ///
+    /// C'est le test du point dur du ticket, et le seul qui puisse le voir.
+    /// `upstream_close_handler::try_handle_upstream_close` tourne **avant** la
+    /// porte et marque terminales les lignes de suivi du ticket qu'on ferme ;
+    /// une garde AC7 qui lirait l'état depuis la porte lirait donc l'état
+    /// d'**après** ce nettoyage — `false` — et trierait un ticket qui a une
+    /// tâche vivante. L'instantané est pris bien plus tôt, juste après
+    /// `original_github_text`, et c'est ce que ces quatre assertions mesurent.
+    ///
+    /// Il rougit si quelqu'un déplace la capture après le handler, et il rougit
+    /// aussi si on l'approche « juste avant » lui : un handler inséré entre les
+    /// deux rouvrirait la classe en silence.
+    ///
+    /// Le bouchon est le contrôle de non-vacuité : il noterait tout si on
+    /// l'interrogeait, donc un tour complet ici ne peut pas venir d'un verdict
+    /// d'escalade. Et la tâche est semée par `reference_url` — c'est la clé que
+    /// lit `find_active_self_dev_task_for_issue`, et une tâche semée sans elle
+    /// laisserait le test vert pour la mauvaise raison.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v6_ac7_la_fermeture_lit_letat_davant_le_nettoyage() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
+        mika2854_seed_issue_task(&state, MIKA2854_ISSUE_URL).await;
+        mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
+
+        assert!(mock.calls_made() >= 1, "AC7 — le tour d'aujourd'hui a lieu");
+        assert!(
+            mika2854_skipped_rows(&state).await.is_empty(),
+            "AC7 — aucun écart : le ticket a une tâche vivante"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "AC7 — aucune note : le triage n'a pas été consulté"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("issue_task_active"),
+            "la relâche dit AC7, et non le désarmement, l'escalade ou \
+             l'instantané absent — c'est ce qui rougit si la capture a glissé \
+             après `upstream_close_handler`"
+        );
+    }
+
+    /// V8, moitié e2e — désarmée, la fermeture ne lit rien et garde son tour.
+    ///
+    /// La moitié unité (`webhook_prefilter`) assère que l'instantané rend
+    /// `Disarmed`, donc qu'aucune lecture de base n'a lieu. Celle-ci assère ce
+    /// que le tour en fait : `triage_disarmed`, pas `closure_snapshot_absent`.
+    /// Les deux termes sont distincts exprès — un désarmement et un câblage
+    /// cassé rendent tous deux le tour complet, et seul le nom les sépare.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v8_desarmee_la_fermeture_ne_lit_rien() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(false);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: ticket livré, rien à décider");
+        mika2675_run_on(&state, MIKA2854_ISSUE_CLOSED).await;
+
+        assert!(mock.calls_made() >= 1, "le tour complet a lieu");
+        assert!(mika2854_skipped_rows(&state).await.is_empty());
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "V8 — désarmée, la classe n'écrit aucune note"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("triage_disarmed"),
+            "le désarmement porte son propre nom, jamais celui de l'instantané \
+             absent"
+        );
+    }
+
+    /// V9 — la re-livraison d'un même webhook ne laisse qu'une note, et deux
+    /// lignes d'audit.
+    ///
+    /// Les deux chiffres sont le contrat, et ils divergent exprès : la ligne
+    /// d'audit est le registre des décisions du triage (une par événement, donc
+    /// chiffrable), la note est une courtoisie de lecture (une par ticket et par
+    /// jour, parce qu'un verdict de LLM n'est pas déterministe et qu'une
+    /// seconde ligne ne dirait rien de neuf). Asserter le même chiffre des deux
+    /// côtés serait choisir l'un des deux rôles au hasard.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v9_une_relivraison_ne_double_pas_la_note() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (state, mock) = mika2854_state("NOTE: accusé de réception");
+        // La seconde livraison consomme la réponse n° 2 : elle doit être un
+        // `NOTE:` aussi, sinon ce test mesurerait un changement de verdict.
+        mock.clear_and_set(vec![
+            mika_common::llm::mock::text_response("NOTE: accusé de réception"),
+            mika_common::llm::mock::text_response("NOTE: accusé, deuxième passage"),
+        ]);
+
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+
+        assert_eq!(mock.calls_made(), 2, "deux triages, un par livraison");
+        assert_eq!(
+            mika2854_skipped_rows(&state).await.len(),
+            2,
+            "V9 — deux décisions, donc deux lignes d'audit : le registre \
+             compte les événements, pas les tickets"
+        );
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        let notes = db.search_events("Triage webhook").await.unwrap();
+        assert_eq!(
+            notes.len(),
+            1,
+            "V9 — une note par (ticket, jour), le doublon est bénin"
+        );
+        assert_eq!(
+            notes[0].context.as_deref(),
+            Some("accusé de réception"),
+            "la première note gagne ; la seconde n'écrase rien"
+        );
+    }
+
+    /// V8 — l'interrupteur de (h) désarmé, rien n'est lu et le tour a lieu.
+    ///
+    /// C'est l'état que ce vol **livre**, donc la seule ligne de la table de
+    /// vérité qui décrive la production d'aujourd'hui. Le registre le nomme :
+    /// sans `release = triage_disarmed`, un chiffrage lirait une absence
+    /// d'économie sans pouvoir dire si c'est le désarmement ou l'escalade.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_v8_desarmee_la_classe_ne_lit_rien() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(false);
+        let (_guard, events) = mika2680_capture();
+        // Si le triage était consulté, il obtiendrait une note — donc ce
+        // bouchon est ce qui rend l'assertion non vacante : un tour qui a lieu
+        // ici ne peut pas l'être par un verdict d'escalade.
+        let (state, mock) = mika2854_state("NOTE: accusé de réception");
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+
+        assert!(mock.calls_made() >= 1, "le tour complet a lieu");
+        assert!(mika2854_skipped_rows(&state).await.is_empty());
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "V8 — désarmée, la classe n'écrit aucune note"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("triage_disarmed")
+        );
+    }
+
+    /// AC7 — un ticket **avec** tâche de boucle passe par le chemin
+    /// d'aujourd'hui, sans que le triage soit consulté.
+    ///
+    /// Le bouchon est le contrôle : il rendrait une note si on l'interrogeait.
+    /// Le tour a lieu quand même, donc l'état du ticket est consulté **avant**
+    /// le triage — ce qui est l'ordre qu'AC7 exige et que rien d'autre ne dit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2854_ac7_une_tache_de_boucle_vivante_garde_le_chemin_dhier() {
+        mika2680_warm_callsites().await;
+        let _env = comment_triage::TriageEnvGuard::armed(true);
+        let (_guard, events) = mika2680_capture();
+        let (state, mock) = mika2854_state("NOTE: accusé de réception");
+        mika2854_seed_issue_task(&state, MIKA2854_ISSUE_URL).await;
+        mika2675_run_on(&state, MIKA2854_COMMENT).await;
+
+        assert!(mock.calls_made() >= 1, "AC7 — le tour d'aujourd'hui a lieu");
+        assert!(mika2854_skipped_rows(&state).await.is_empty());
+
+        let db = state.agents.get("mika").unwrap().value().db.clone();
+        assert!(
+            db.search_events("Triage webhook").await.unwrap().is_empty(),
+            "AC7 — aucune note : le triage n'a pas été consulté"
+        );
+
+        let charged = mika2680_events_named(&events, webhook_prefilter::WEBHOOK_TURN_CHARGED_EVENT);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].fields.get("release").map(String::as_str),
+            Some("issue_task_active"),
+            "la relâche distingue AC7 du désarmement et de l'escalade"
+        );
+    }
+
+    // ---- mika#2876 — la chaîne complète d'un échec d'initialisation -------
+    //
+    // Le constat : `%` est un `Display`, et sur une erreur `anyhow` `Display`
+    // ne rend que le contexte le plus externe. Trente-sept lignes « failed to
+    // initialize agent » dans `/var/log/mika/server.log` ne portaient que
+    // « failed to resolve [kg] config for agent mika-litha », jamais la cause.
+    //
+    // Ce test lit la ligne telle qu'un échec RÉEL l'émet : `init_agent` est
+    // appelé pour de bon, sur un agent dont la config `[kg]` pointe vers un
+    // `docs_root` absent, et c'est la ligne capturée qui est jugée — pas une
+    // erreur reconstruite à la main.
+
+    const MIKA2876_AGENT: &str = "mika-test-2876";
+
+    /// Pose sur disque un agent dont le `docs_root` n'existe pas, et rend
+    /// l'`AppState` capable de le résoudre.
+    ///
+    /// La clé d'API est écrite dans le `.env` **de l'agent**, jamais dans
+    /// l'environnement du processus : depuis mika#2218 cette source est ajoutée
+    /// en DERNIER par `Settings::load_for_agent`, donc elle gagne sur tout le
+    /// reste, et le test n'a aucun état global à muter (`set_var` est `unsafe`
+    /// en édition 2024 et sa portée déborderait sur les voisins). La valeur
+    /// n'est pas de forme OAuth (`sk-ant-oat01-…`), donc `ClaudeClient::new`
+    /// ne consulte pas `resolve_home_dir()`. Le `.env` fixe aussi le
+    /// fournisseur, pour que la fixture ne dépende pas d'un `MIKA_LLM_PROVIDER`
+    /// qui traînerait dans l'environnement de la suite.
+    async fn mika2876_state() -> (AppState, tempfile::TempDir) {
+        let global = tempfile::TempDir::new().unwrap();
+        let agent_home = global.path().join("agents").join(MIKA2876_AGENT);
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        // Jamais créé : c'est la cause que le log doit nommer.
+        let absent = global.path().join("absent-2876");
+        std::fs::write(
+            agent_home.join("identity.toml"),
+            format!(
+                "name = \"{MIKA2876_AGENT}\"\n\n[kg]\nenabled = true\ndocs_root = \"{}\"\n",
+                absent.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_home.join(".env"),
+            "MIKA_LLM_PROVIDER=anthropic\nMIKA_ANTHROPIC_API_KEY=sk-ant-test-2876\n",
+        )
+        .unwrap();
+
+        let mut state = test_state();
+        state.global_home_dir = global.path().to_path_buf();
+        state
+            .dashboard_db
+            .register_agent(MIKA2876_AGENT, MIKA2876_AGENT, agent_home.to_str().unwrap())
+            .await
+            .unwrap();
+        (state, global)
+    }
+
+    /// AC1 + AC2 — le log d'un échec d'initialisation porte la cause interne.
+    ///
+    /// **Écart assumé au plan, à lire avant de « corriger » le site visé.** Le
+    /// plan désignait `"failed to initialize agent, skipping"`. Ce `warn!`-là
+    /// vit dans la boucle de démarrage de `run_server`, **hors**
+    /// d'`init_agent` : un test qui appellerait `init_agent` directement
+    /// recevrait son `Err` et n'émettrait aucune ligne — la capture serait
+    /// vide et l'assertion « exactement une ligne » fausse pour la mauvaise
+    /// raison. Les deux seules issues restantes étaient d'extraire un
+    /// auxiliaire d'émission (refusé par le plan, KTD1) ou de rejouer le
+    /// `warn!` dans le test (tautologique, refusé par KTD2). Le chemin
+    /// paresseux de mika#1399 est un **vrai** site de production qui enveloppe
+    /// `init_agent` et émet `"lazy agent construction failed"` ; les deux sites
+    /// portent le même `format!("{e:#}")`, et seul celui-ci est atteignable
+    /// sans démarrer un serveur complet. La garde de source de
+    /// `canonical_tokens` couvre l'autre site, qu'aucun test comportemental ne
+    /// voit.
+    ///
+    /// **Rouge-avant (AC2)** : avec `error = %e`, le champ capturé ne porte que
+    /// « failed to resolve [kg] config for agent mika-test-2876 », et
+    /// l'assertion sur « docs_root path does not exist » rougit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2876_un_docs_root_absent_dit_sa_cause_dans_le_log() {
+        let (state, _global) = mika2876_state().await;
+
+        // Tour de chauffe : enregistre le callsite SANS abonné, pour que le
+        // `rebuild_interest_cache()` d'`install_capturing_subscriber` puisse le
+        // rallumer sous le nôtre. Même raison que `mika2680_warm_callsites` —
+        // un callsite ne s'enregistre qu'à sa première atteinte, et son
+        // `Interest` est alors décidé par le dispatcher du thread qui
+        // l'enregistre. L'échec ne cache rien dans la carte des agents, donc le
+        // second appel rejoue le chemin paresseux entier.
+        assert!(state.resolve_agent(MIKA2876_AGENT).await.is_none());
+
+        let (_guard, events) = mika2680_capture();
+        assert!(
+            state.resolve_agent(MIKA2876_AGENT).await.is_none(),
+            "le comportement ne change pas : l'agent est toujours écarté"
+        );
+
+        let failures: Vec<Mika2680Event> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.fields.get("message").map(String::as_str)
+                    == Some("lazy agent construction failed")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(failures.len(), 1, "exactement une ligne d'échec");
+
+        let error = failures[0]
+            .fields
+            .get("error")
+            .expect("la ligne porte un champ `error`");
+        assert!(
+            error.contains("docs_root path does not exist"),
+            "AC1 — la cause interne doit être dans le message, pas seulement le \
+             contexte externe ; lu : {error}"
+        );
+        assert!(
+            error.contains("failed to resolve [kg] config for agent"),
+            "le contexte externe survit à l'aplatissement ; lu : {error}"
+        );
+        assert!(
+            failures[0].fields.contains_key("agent"),
+            "R3 — le champ structuré `agent` est inchangé"
+        );
     }
 }

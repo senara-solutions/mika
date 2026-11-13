@@ -745,7 +745,14 @@ struct ReaderResult {
 ///
 /// Includes diagnostic instrumentation (#900): per-invocation progress ticker at
 /// 30-second intervals logging stdout/stderr byte counts, plus a completion summary.
-async fn spawn_and_collect(
+///
+/// `pub(crate)` depuis mika#2715 : `gh_process::run_gh_tool` — la couture par
+/// laquelle passent désormais les trois sites `gh` de ce fichier — construit la
+/// `Command` puis **délègue ici** la lecture. Elle reste dans ce fichier plutôt
+/// que de déménager dans la couture parce qu'elle sert aussi `git` et un
+/// troisième outil : la couture est un point de passage pour `gh`, pas le
+/// propriétaire du collecteur.
+pub(crate) async fn spawn_and_collect(
     mut cmd: tokio::process::Command,
     tool_name: &str,
     install_hint: &str,
@@ -1862,6 +1869,31 @@ fn build_gh_read_command(args: &GhReadArgs) -> Vec<String> {
     }
 }
 
+/// À quoi une opération `gh_read` s'adresse (mika#2715).
+///
+/// Ici l'entrée est **structurée** — `op` + `target` — donc le sujet se lit
+/// dessus plutôt que dans l'`argv` : c'est plus sûr que
+/// `gh_process::gh_subject_from_argv`, qui ne sert que les sous-commandes
+/// libres de `run_gh`. Un `target` qui n'est pas un `u64` (une branche, un nom
+/// de label) n'est pas un numéro : il donne `Repo`.
+fn gh_read_subject(args: &GhReadArgs) -> crate::gh_process::GhSubject {
+    use crate::gh_process::GhSubject;
+    let num = args.target.as_deref().and_then(|t| {
+        if args.op == "pr_view" || args.op == "pr_diff" {
+            normalize_pr_identifier(t).parse::<u64>().ok()
+        } else {
+            t.parse::<u64>().ok()
+        }
+    });
+    match (args.op.as_str(), num) {
+        ("issue_view", Some(n)) => GhSubject::Issue(n),
+        ("pr_view" | "pr_diff", Some(n)) => GhSubject::Pr(n),
+        // `issue_list` et `file_view` s'adressent au dépôt, et un `target`
+        // non numérique est un filtre, pas un numéro.
+        _ => GhSubject::Repo,
+    }
+}
+
 /// Read-only GitHub CLI handler with structured errors.
 ///
 /// Input: `{"op": "issue_view", "target": "123", "repo": "owner/repo"}`
@@ -1878,20 +1910,13 @@ async fn gh_read(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput
     let start = std::time::Instant::now();
     let gh_cmd = build_gh_read_command(&args);
 
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(&gh_cmd);
-    // --repo is now per-op inside build_gh_read_command (file_view uses gh api
-    // which takes repo in the URL path, not as a --repo flag).
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
-
-    if let Some(token) = ctx.github_token {
-        // substrate-ok: an env() argument handed to a child process — it never
-        // enters a tool-result `content`, so no tier reads it.
-        cmd.env("GH_TOKEN", token);
-    }
-
-    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    // mika#2715 — le spawn passe par la couture `gh_process`. `repo: None` :
+    // `--repo` est déjà replié par-opération dans `build_gh_read_command`
+    // (file_view passe par `gh api`, qui prend le dépôt dans le chemin d'URL et
+    // non en drapeau).
+    let output =
+        crate::gh_process::run_gh_tool(ctx.github_token, gh_read_subject(&args), &gh_cmd, None)
+            .await;
     let latency_ms = start.elapsed().as_millis();
 
     // Compute is_err FIRST so the audit log reflects the content-prefix
@@ -2964,20 +2989,17 @@ async fn fetch_pr_wip_rescue_view(
     repo: Option<&str>,
     ctx: &ToolContext<'_>,
 ) -> Option<PrWipRescueView> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(["pr", "view", pr_num, "--json", "isDraft,labels,commits"]);
-    if let Some(repo) = repo {
-        cmd.arg("--repo").arg(repo);
-    }
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
-    if let Some(token) = ctx.github_token {
-        // substrate-ok: an env() argument handed to a child process — it never
-        // enters a tool-result `content`, so no tier reads it.
-        cmd.env("GH_TOKEN", token);
-    }
-
-    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    let gh_args: Vec<String> = ["pr", "view", pr_num, "--json", "isDraft,labels,commits"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    // mika#2715 — sujet `Pr` quand le numéro se lit, `Repo` sinon (un nom de
+    // branche est un identifiant valide pour `gh pr view`, pas un numéro).
+    let subject = match normalize_pr_identifier(pr_num).parse::<u64>() {
+        Ok(n) => crate::gh_process::GhSubject::Pr(n),
+        Err(_) => crate::gh_process::GhSubject::Repo,
+    };
+    let output = crate::gh_process::run_gh_tool(ctx.github_token, subject, &gh_args, repo).await;
     if output.is_error
         || output.content.starts_with("Exit code:")
         || output.content.starts_with("Killed by signal:")
@@ -3060,8 +3082,9 @@ async fn validate_dispatcher_not_reviewer(
     Err(ToolOutput::error(payload.to_string()))
 }
 
-/// Refuse, sur un tour **Webhook Fallthrough**, les verbes `run_gh` qui créent
-/// du travail (mika#2573).
+/// Refuse les verbes `run_gh` qui créent du travail : `issue create` sur un tour
+/// **Webhook Fallthrough** (mika#2573), la pose de `ready` sur **tout** tour
+/// (mika#2995).
 ///
 /// # Ce que ça ferme
 ///
@@ -3093,10 +3116,40 @@ async fn validate_dispatcher_not_reviewer(
 /// 1. **Fail-open à la détection.** Un argv qui n'est aucune des deux formes
 ///    n'est pas l'affaire de cette garde ⇒ `Ok(())`. `gh` dans son ensemble est
 ///    intouché et la surface reste bornée à deux verbes.
-/// 2. **Fail-closed après.** Forme reconnue **et**
-///    `ctx.is_webhook_fallthrough_turn` ⇒ refus. Hors tour Fallthrough,
-///    `Ok(())` — c'est la garantie de non-régression, et c'est un **terme du
-///    prédicat**, pas une branche de l'appelant.
+/// 2. **Fail-closed après**, sur la population que
+///    [`crate::evidence::guards::work_creation_is_refused`] donne au motif.
+///    `ReadyLabelAdd` ⇒ refus sur **tout** tour (mika#2995) ; `IssueCreate` ⇒
+///    refus sur les tours Fallthrough seulement, sa borne de mika#2573
+///    intacte. Le terme de classe de tour reste un **paramètre du prédicat**,
+///    pas une branche de l'appelant : « hors tour Fallthrough, `gh issue
+///    create` ne change pas » est une propriété testable de `guards.rs`, et ce
+///    site ne la ré-énonce pas (mika#2201).
+///
+/// # Les deux populations, et pourquoi elles diffèrent (mika#2995)
+///
+/// La borne « tours Fallthrough seulement » de mika#2573 ne pouvait pas tenir
+/// pour `ready` : l'incident du 2026-10-31 sur mika#2958 s'est produit sur un
+/// tour **ordinaire**, où mika-dev a posé lui-même le label qui lève la garde
+/// de consentement de mika#2772, avec le `GH_TOKEN` du moteur. `ready` est le
+/// consentement positif de l'**opérateur** au dispatch autonome (mika#841) :
+/// une identité qui peut l'écrire se donne le consentement que la garde existe
+/// pour exiger d'un humain. Retirer l'écriture au moteur est ce qui rend ce
+/// self-consent impossible plutôt qu'improbable — une consigne de prompt
+/// demandant de s'abstenir ne l'aurait rendu qu'improbable.
+///
+/// Le `reason` et le `remedy` sont donc **par motif**. Servir le texte
+/// Fallthrough à un refus de `ready` hors tour Fallthrough affirmerait de ce
+/// tour ce qu'il n'est pas (classe mika#2304), et le `remedy` de mika#2573
+/// renvoie à la lecture de l'issue, pas à la question de la promotion.
+///
+/// # Le coût, nommé plutôt que découvert
+///
+/// Un opérateur qui demande en conversation « pose le label `ready` sur
+/// \#2562 » se voit désormais refuser aussi. C'est le prix de voie B et il est
+/// délibéré : une exception « quand un humain le demande » serait une
+/// exception que l'agent déclare lui-même, donc pas une exception. La
+/// promotion se fait depuis la surface opérateur — l'UI GitHub ou le `gh` de
+/// l'opérateur — et le `remedy` le dit.
 ///
 /// # L'asymétrie qui décide du sens du fail-safe
 ///
@@ -3110,6 +3163,15 @@ async fn validate_dispatcher_not_reviewer(
 /// détruisait du travail, ici l'action *est* la création de travail non
 /// autorisé. **L'arbitrage est local et ne se transporte pas.**
 ///
+/// **Depuis mika#2995 ce calcul se refait hors du domaine Fallthrough, pour
+/// `ready` seulement, et il tombe du même côté.** Le faux positif y coûte une
+/// promotion que l'agent ne fait pas et qu'un opérateur fait en une seconde —
+/// un geste qui lui appartient déjà. Le faux négatif y coûte la garde de
+/// mika#2772 en entier. Et sur la population nominale le geste était déjà
+/// inerte : le ticket qui atteint le callback de groom porte **déjà** `ready`,
+/// rien dans la bibliothèque de dispatch ne le retire, et GitHub n'émet
+/// `labeled` que sur une transition (mika#2323).
+///
 /// Pas d'interrupteur d'environnement, et c'est un choix avec son précédent :
 /// mika#1646, la garde sœur la plus proche, n'en a pas non plus. Un
 /// désarmement par variable sur un chemin de création de travail serait un
@@ -3122,6 +3184,7 @@ async fn validate_fallthrough_work_creation(
 ) -> Result<(), ToolOutput> {
     use crate::evidence::guards::{
         FALLTHROUGH_WORK_CREATION_AUDIT_TOOL, WorkCreationAction, detect_fallthrough_work_creation,
+        work_creation_is_refused,
     };
 
     // Disposition 1 — fail-open : ce n'est pas le sujet de cette garde.
@@ -3129,10 +3192,12 @@ async fn validate_fallthrough_work_creation(
         return Ok(());
     };
 
-    // Disposition 2 — le terme de classe de tour est DANS le prédicat, jamais
-    // une branche de l'appelant : « hors tour Fallthrough, rien ne change »
-    // devient une propriété de cette fonction, avec son propre test.
-    if !ctx.is_webhook_fallthrough_turn {
+    // Disposition 2 — la population de chaque motif vit dans `guards.rs`, et le
+    // terme de classe de tour y entre en PARAMÈTRE. « Hors tour Fallthrough,
+    // `gh issue create` ne change pas » et « la pose de `ready` est refusée sur
+    // tout tour » sont deux propriétés testables là-bas ; ce site ne les
+    // ré-énonce pas (mika#2201 — un seul lecteur).
+    if !work_creation_is_refused(&action, ctx.is_webhook_fallthrough_turn) {
         return Ok(());
     }
 
@@ -3151,10 +3216,21 @@ async fn validate_fallthrough_work_creation(
         motif = %motif,
         verb = %verb,
         label = label.unwrap_or("—"),
+        turn_is_fallthrough = ctx.is_webhook_fallthrough_turn,
         repo = %repo.unwrap_or("unknown"),
-        "refused work creation on a Webhook Fallthrough turn (mika#2517 + mika#2573)"
+        "refused work creation (mika#2517 + mika#2573 + mika#2995)"
     );
 
+    // Le nom d'événement ne change PAS, et `turn_is_fallthrough` est un champ
+    // plutôt qu'un second nom : depuis mika#2995 la population a deux motifs,
+    // mais elle reste **une** mesure — « un refus de création de travail ».
+    // Deux noms ne se soustraient pas (mika#2205), et le `trace_id` qui joint
+    // cette ligne à `webhook_fallthrough_turn` (mika#2517) ne joindrait plus
+    // qu'une moitié. Le champ est ce qui rend les deux sous-populations
+    // séparables sans les séparer : `GROUP BY motif, turn_is_fallthrough`.
+    // Il porte le booléen tel qu'il a été lu — jamais `marker_class`, que ce
+    // booléen ne transporte pas.
+    //
     // La ligne ne porte pas de `marker_class` : le booléen ne la transporte pas,
     // et l'inventer serait un champ qui affirme ce qu'on n'a pas mesuré (classe
     // mika#2304). `webhook_fallthrough_turn` (mika#2517) porte déjà le
@@ -3181,27 +3257,61 @@ async fn validate_fallthrough_work_creation(
         );
     }
 
-    // Le `remedy` nomme les deux sorties correctes que le prompt possède déjà —
+    // Le `remedy` nomme les sorties correctes que le prompt possède déjà —
     // accuser réception et s'arrêter, ou alerter l'opérateur — et **ne nomme
     // aucun contournement** : un refus qui donne le gabarit est une fuite avec
-    // une étape de plus (doctrine mika#2520).
-    Err(ToolOutput::error(
-        serde_json::json!({
-            "error": "fallthrough_work_creation_refused",
-            "doctrine": "mika#2517 + mika#2573",
-            "action": motif,
-            "reason": format!(
+    // une étape de plus (doctrine mika#2520). Celui de `ready` ne nomme donc
+    // PAS le `remove → add` que la surface opérateur connaît : c'est exactement
+    // le geste que l'incident du 2026-10-31 a rejoué depuis le texte d'un
+    // refus, et ce texte-ci est lu par l'agent.
+    //
+    // Les deux motifs ont leurs propres textes. La branche `IssueCreate` garde
+    // les siens **mot pour mot** : ce qu'elle refuse et pourquoi n'a pas bougé.
+    let (doctrine, reason, remedy) = match &action {
+        WorkCreationAction::IssueCreate => (
+            "mika#2517 + mika#2573",
+            format!(
                 "This turn is a Webhook Fallthrough turn: an informational GitHub event \
                  that is not a trigger to start new work. `gh {verb}` creates work, and \
                  no work may be created here."
             ),
-            "remedy":
-                "Two exits, and they are the only two. (1) Acknowledge the event and stop \
-                 — reading the issue is still permitted, so `gh issue view <n> --json labels` \
-                 remains available if you need to correlate. (2) If this event deserves a \
-                 human decision, say so to the operator with `send_message` and stop. Do not \
-                 look for another route: this refusal is not lifted by retrying under a \
-                 different shape.",
+            "Two exits, and they are the only two. (1) Acknowledge the event and stop \
+             — reading the issue is still permitted, so `gh issue view <n> --json labels` \
+             remains available if you need to correlate. (2) If this event deserves a \
+             human decision, say so to the operator with `send_message` and stop. Do not \
+             look for another route: this refusal is not lifted by retrying under a \
+             different shape."
+                .to_string(),
+        ),
+        WorkCreationAction::ReadyLabelAdd { label } => (
+            "mika#2517 + mika#2573 + mika#2995",
+            format!(
+                "The `{label}` label is the operator's positive consent to autonomous \
+                 dispatch (mika#841), and the mika#2772 consent gate reads only its \
+                 presence. An identity that can write it grants itself the consent that \
+                 gate exists to require of a human, so `gh {verb}` is refused here — on \
+                 every turn, not only on a Webhook Fallthrough one."
+            ),
+            "Promoting a ticket belongs to the operator; it is not a gesture you perform, \
+             under any shape, and no turn class lifts this. Three exits, and they are the \
+             only three. (1) Report what you found and stop — reading stays permitted, so \
+             `gh issue view <n> --json labels` remains available. (2) If this ticket needs \
+             a human decision, say so to the operator with `send_message` and stop. \
+             (3) If what it needs is grooming, an explicit groom request traverses the \
+             consent gate instead of lifting it (mika#1173) — that request is the \
+             operator's to make, so ask for it rather than manufacturing the consent it \
+             requires."
+                .to_string(),
+        ),
+    };
+
+    Err(ToolOutput::error(
+        serde_json::json!({
+            "error": "fallthrough_work_creation_refused",
+            "doctrine": doctrine,
+            "action": motif,
+            "reason": reason,
+            "remedy": remedy,
         })
         .to_string(),
     ))
@@ -3487,9 +3597,10 @@ async fn report_pr_ready_undraft_refusal(
     }
 }
 
-/// Destructive-action grounding gate (mika#1646) — refuses `gh pr close` /
-/// `gh issue close` that cannot show it is founded on the target's CURRENT
-/// state, and refuses a *repeat* close that does not acknowledge the prior one.
+/// Destructive-action grounding gate (mika#1646) — refuses `gh pr close` that
+/// cannot show it is founded on the target's CURRENT state, refuses a *repeat*
+/// close that does not acknowledge the prior one, and since mika#3056 refuses
+/// every `gh issue close` outright.
 ///
 /// # Why this runs here and not at EndTurn
 ///
@@ -3500,6 +3611,27 @@ async fn report_pr_ready_undraft_refusal(
 /// PR is already closed and re-prompting can only annotate an accomplished
 /// fact. So this gate sits in `run_gh`'s pre-subprocess chain, next to
 /// mika#1196 / mika#1682 / mika#1167, and refuses before any side effect.
+///
+/// # Le bras issue, et pourquoi il précède les couches (mika#3056)
+///
+/// Bearing de Prime du 2026-11-06 : « mika-dev ne ferme que ce qu'un merge
+/// approuvé ferme. » Fermer un ticket est un **verdict**, pas un fait d'état —
+/// une lecture de la cible, même juste et même citée, ne le fonde donc pas. Les
+/// deux couches ci-dessous demandent une preuve ; pour une issue, ce qui manque
+/// n'est pas une preuve, c'est un merge. Aucune des deux ne peut rendre ce
+/// refus, parce qu'aucune ne porte sur la bonne grandeur.
+///
+/// Le bras est donc en **tête** de la garde, au-dessus de la couche B, et il ne
+/// lit rien : ni base, ni forge, ni historique des appels. Il ne peut défaillir
+/// pour aucune des raisons qui font défaillir A et B (mesuré : sur 9 tentatives
+/// du 10/09 au 06/11, 3 fermetures ont été autorisées après 1 à 3 refus, une
+/// fois que la relecture et la citation satisfaisaient la couche A). La voie que
+/// son remède prescrit — écrire `Closes #N` dans un corps de PR — passe par
+/// `gh pr create` / `gh pr edit`, que le détecteur ne reconnaît pas et que cette
+/// garde ne touche pas.
+///
+/// `gh pr close` garde ses deux couches : une PR n'est pas un ticket, et sa
+/// fermeture par un agent est hors du périmètre de mika#3056.
 ///
 /// # The two layers
 ///
@@ -3525,7 +3657,11 @@ async fn report_pr_ready_undraft_refusal(
 ///
 /// Detection is **fail-open**: an argv this does not recognize as a close is
 /// none of its business, so the gate never becomes a blanket refusal of `gh`.
-/// Everything after recognition is **fail-closed**: once the call IS a
+/// Everything after recognition is **fail-closed**, and since mika#3056 the
+/// fail-closed half begins **before the first read** for the issue case: the
+/// issue arm needs no substrate at all, so there is no state of the world in
+/// which it fails to refuse. For `pr close`, fail-closed keeps its original
+/// meaning — once the call IS a
 /// recognized destructive action, any inability to prove it founded — missing
 /// grounding, unreadable history, tool-call persistence disabled, DB error —
 /// yields a refusal. That inverts the deliberately fail-open policy of
@@ -3542,7 +3678,7 @@ async fn validate_destructive_action_grounding(
     ctx: &ToolContext<'_>,
 ) -> Result<(), ToolOutput> {
     use crate::evidence::guards::{
-        DESTRUCTIVE_ACTION_AUDIT_TOOL, destructive_comment_cites_evidence,
+        DESTRUCTIVE_ACTION_AUDIT_TOOL, DestructiveTargetKind, destructive_comment_cites_evidence,
         destructive_grounding_satisfied, destructive_repeat_acknowledged,
         detect_destructive_action, repeat_action_window_secs,
     };
@@ -3616,6 +3752,30 @@ async fn validate_destructive_action_grounding(
             .await),
             None => Err(ToolOutput::error(body.to_string())),
         }
+    }
+
+    // mika#3056 — une fermeture d'issue ne se fonde pas, elle se mérite par un
+    // merge. Ce bras est en tête de la garde et ne lit rien : il ne peut donc
+    // défaillir pour aucune des raisons qui font défaillir les couches A et B.
+    // Il partage la clôture `refuse` ci-dessus, donc sa décision s'écrit sur la
+    // MÊME ligne d'audit que les autres (AC1) — c'est elle que la sonde AC5 lit
+    // par `GROUP BY after_value`. `diagnostic = None` : rien n'est indisponible.
+    if action.kind == DestructiveTargetKind::Issue {
+        return refuse(
+            ctx,
+            &target_key,
+            "block[issue_close_not_by_merge]",
+            "issue close is not an engine gesture — no reading of the target founds it",
+            "Closing a ticket is not an engine gesture. It comes from the `Closes` line of \
+             a pull request whose merge has been approved, or it comes from Vincent. No \
+             re-reading, no citation and no rewording of this close lifts this refusal: \
+             what is missing is not evidence, it is a merge. If the work is done, the pull \
+             request carries it and its merge closes the ticket. If the ticket must be \
+             closed without a pull request, Vincent is the one who does it — tell Vincent \
+             and leave the ticket open.",
+            None,
+        )
+        .await;
     }
 
     // --- Layer B first: "you are repeating yourself" is the more specific and
@@ -4029,6 +4189,453 @@ async fn validate_pr_review_flag_coherence(
     Err(ToolOutput::error(body.to_string()))
 }
 
+/// Refuse a `gh pr review` whose verdict is `block[pipeline]` while its body
+/// cites no guard that actually ran and exited non-zero (mika#2687), or whose
+/// verdict is `pass` while its body carries no `PIPELINE:` section at all
+/// (mika#2961).
+///
+/// # What gates it
+///
+/// Four fail-open terms, in this order: **a** gate
+/// (`MIKA_PIPELINE_GROUNDING_GATE` for the `block[pipeline]` member,
+/// `MIKA_QA_PASS_EVIDENCE_GATE` for the `pass` one), a readable `--body`, a
+/// verdict inside the population, and the pure predicate. Any term the guard
+/// cannot read is a **pass**, never a refusal — same arithmetic as mika#2455 and
+/// mika#2519: a false negative leaves today's already-paid cost in place, a
+/// false positive makes a legitimate review impossible to post **and** pushes a
+/// genuinely broken PR across the merge gate.
+///
+/// The two gates are **independent**, and their polarity is deliberately
+/// opposite: the `block[pipeline]` one is armed by default, the `pass` one is
+/// not (mika#2961 § 4.5 — the measured regime is 261 out of 261, and opening it
+/// is the operator's call).
+///
+/// Deliberately **not** gated on `required_tool_arg_suffixes`, like its three
+/// siblings: its subject is the body itself, not the active skill.
+///
+/// # Why the population is these two classes
+///
+/// Those are the classes mika#2685 and mika#2961 measured, and the only ones
+/// whose grounding has a named, executable source of truth
+/// (`scripts/verify-pipeline.sh` and the `PIPELINE:` section Step 2E
+/// prescribes). `hold[review]`, `block[ac]`, `block[ci]`, `block[security]` and
+/// `block[dependency]` are grounded in other evidence, each of which would need
+/// its own measurement. Everything outside the population traverses intact.
+///
+/// # Which way it fails
+///
+/// Audit-wise it does not fail at all: a row is written on **every** outcome,
+/// including `Allowed`. An `audit_events` table empty of
+/// `pipeline_grounding_guard` says the link is unreached, not that it refuses
+/// nothing (mika#2205 positive control).
+///
+/// # The name is one member behind
+///
+/// `validate_pipeline_block_grounding` was exact while the population had a
+/// single member. It is now two members and three refusal classes behind, and
+/// the rename to `validate_pipeline_evidence` did **not** travel with mika#2961's
+/// flight 2/2 either, where this comment said it would — for a reason that is a
+/// perimeter fact rather than a preference: the function's single call site sits
+/// inside `run_gh`'s body, which mika#2966 was modifying in parallel on
+/// 2026-10-30, and that flight's written scope constraint keeps every line of
+/// `run_gh` out of its diff. A rename whose call site cannot move is not a
+/// rename. Plan: `docs/plans/2026-10-30-001-fix-2961-la-ligne-negative-test-plan.md`
+/// § 0. Tracked in the follow-up ticket named in that flight's PR body, whose
+/// precondition is the merge of mika#2966.
+async fn validate_pipeline_block_grounding(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    validate_pipeline_block_grounding_gated(
+        crate::evidence::guards::pipeline_grounding_gate_enabled(),
+        crate::evidence::guards::pass_evidence_gate_armed(),
+        args,
+        repo,
+        ctx,
+    )
+    .await
+}
+
+/// The body of the guard, with both gates passed as **facts** rather than read.
+///
+/// Same convention as [`crate::evidence::guards::classify_dependabot_verdict`],
+/// which takes `verdict_is_pipeline_block: bool` rather than the `Verdict`: the
+/// decision point stays testable without the resolver. Here the resolver is an
+/// env var cached in a `OnceLock` — resolved once per process, by construction —
+/// so a test that wanted to exercise the disarmed branch by setting the
+/// variable would depend on being the first test in the binary to touch it.
+/// Passing the bit instead makes both branches deterministic, and keeps exactly
+/// one site reading the environment. `pass_gate_enabled` is the second bit,
+/// mika#2961, and it is passed for the same reason — with the added one that its
+/// default is the *disarmed* branch, so that branch is the one a test must be
+/// able to reach without being first in the binary.
+async fn validate_pipeline_block_grounding_gated(
+    gate_enabled: bool,
+    pass_gate_enabled: bool,
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        PipelineGroundingOutcome, classify_pipeline_block_grounding, pr_review_target,
+    };
+    use crate::server::verdict::{Verdict, parse_verdict};
+
+    if !gate_enabled && !pass_gate_enabled {
+        return Ok(());
+    }
+
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+
+    // Read the verdict class **exactly as `verdict_handler` reads it** —
+    // case-folded, no `trim`. A guard stricter than the consumer it protects
+    // would abstain on the very forms the consumer acts upon
+    // (`guard-parser-must-be-as-permissive-as-downstream-consumer`).
+    //
+    // Each member is conjoined with **its own** gate here rather than later: a
+    // disarmed member must be out of population, not merely allowed, so that it
+    // pays neither the DB read nor an audit row.
+    let verdict = parse_verdict(&body);
+    let verdict_is_pipeline_block = gate_enabled
+        && matches!(
+            verdict,
+            Verdict::Block(ref kind) if kind.eq_ignore_ascii_case("pipeline")
+        );
+    let verdict_is_pass = pass_gate_enabled && matches!(verdict, Verdict::Pass);
+    if !verdict_is_pipeline_block && !verdict_is_pass {
+        return Ok(());
+    }
+
+    let target = pr_review_target(args).unwrap_or_else(|| "unknown".to_string());
+    let target_key = format!("pr_review:{}#{}", repo.unwrap_or("__default__"), target);
+
+    // The DB read is paid **here**, after the verdict class is known: the
+    // population of `block[pipeline]` calls is rare, so the query costs nothing
+    // on the nominal path and no extra population predicate is needed to keep
+    // it that way.
+    //
+    // It stays **reserved to the `block[pipeline]` member** (mika#2961 § 5.2):
+    // the `pass` member's term is the presence of the section alone, and `pass`
+    // is the most frequent verdict of the fleet — paying a query per approval
+    // for a fact the classification never reads would be a cost with no
+    // decision behind it. `true` is the value `classify_…` never observes on
+    // that path, and it is also the fail-open side.
+    let guard_execution_observed = if verdict_is_pipeline_block {
+        observe_pipeline_guard_execution(ctx, &target_key).await
+    } else {
+        true
+    };
+
+    // The outcome is bound rather than matched inline because the `pass` member
+    // now has **two** refusal classes and each one gets its own remedy below.
+    // Binding it keeps that second branch typed — a `reason` string comparison
+    // would drift silently the day the token is renamed.
+    let outcome = classify_pipeline_block_grounding(
+        verdict_is_pipeline_block,
+        verdict_is_pass,
+        &body,
+        guard_execution_observed,
+    );
+
+    let (reason, reasoning) = match outcome {
+        PipelineGroundingOutcome::Allowed => {
+            // The positive control, and the reason this branch writes a row
+            // rather than returning early: a population of zero allowed
+            // calls is how a guard that never runs looks exactly like a
+            // guard that never has to refuse (mika#2205).
+            audit_pipeline_grounding(
+                ctx,
+                &target_key,
+                "allowed",
+                if verdict_is_pass {
+                    "pass carries a PIPELINE: section"
+                } else {
+                    "block[pipeline] carries a PIPELINE: section citing a guard that exited \
+                     non-zero, and a guard was actually invoked in this session"
+                },
+            )
+            .await;
+            return Ok(());
+        }
+        PipelineGroundingOutcome::RefusedSectionAbsent => (
+            "section_absent",
+            "block[pipeline] with no PIPELINE: section anywhere in the body",
+        ),
+        PipelineGroundingOutcome::RefusedNoFailingGuardCited => (
+            "no_failing_guard_cited",
+            "block[pipeline] whose PIPELINE: section cites no guard at a non-zero exit",
+        ),
+        PipelineGroundingOutcome::RefusedNoGuardExecuted => (
+            "no_guard_executed",
+            "block[pipeline] whose body cites a failing guard, while this session's tool \
+             ledger records shell calls and none of them invoked a pipeline guard",
+        ),
+        PipelineGroundingOutcome::RefusedPassSectionAbsent => (
+            "pass_section_absent",
+            "pass with no PIPELINE: section anywhere in the body",
+        ),
+        PipelineGroundingOutcome::RefusedPassNegativeTestAbsent => (
+            "pass_negative_test_absent",
+            "pass with no NEGATIVE-TEST: line anywhere in the body",
+        ),
+    };
+
+    // Two **separate** event names, one per member, and the choice is
+    // deliberate: `pipeline_block_refused` is already a wire token in the
+    // operator docs and in the greps that read `server.log`, and a `pass` refusal
+    // filed under it would silently widen a published population (mika#2131).
+    // Within each name, `reason` stays the discriminant.
+    let event_name = if verdict_is_pass {
+        "pass_evidence_refused"
+    } else {
+        "pipeline_block_refused"
+    };
+    tracing::warn!(
+        event = %event_name,
+        agent_id = %ctx.db.agent_id(),
+        session_id = %ctx.session_id,
+        target = %target_key,
+        verdict = if verdict_is_pass { "pass" } else { "block[pipeline]" },
+        reason = %reason,
+        "refused a review whose pipeline evidence is absent from its body (mika#2687, mika#2961)"
+    );
+    audit_pipeline_grounding(ctx, &target_key, "refused", reasoning).await;
+
+    // The remedy names BOTH correct ways out, like its mika#2237 neighbour and
+    // for the same reason: naming only "add the section" would push the model
+    // to fabricate a section under the verdict it already chose, which is the
+    // measured defect with one more step. The guard cannot adjudicate which
+    // verdict is right, so it says what evidence a `block[pipeline]` is made of
+    // and leaves the choice.
+    //
+    // No line of this text may START with the verdict label: `VERDICT_RE` is
+    // anchored on that line prefix, and a stray line would be re-read as a
+    // verdict by the next consumer of this payload. The tokens are named in
+    // plain prose for that reason.
+    if outcome == PipelineGroundingOutcome::RefusedPassNegativeTestAbsent {
+        // The second refusal class of the `pass` member (mika#2961, flight 2/2)
+        // gets its own remedy for the same reason the member got one from
+        // mika#2687's: the section remedy below talks about running a guard and
+        // posting its output, which is a non-sequitur here — the section is
+        // already there, and what is missing is a line about the diff's negative
+        // assertion. One wrong remedy costs a turn and teaches the model the
+        // wrong lesson.
+        //
+        // **Three of the prompt's four forms are named, and the fourth is named
+        // as refused.** `missing` is only consistent with `block[ac]`, and the
+        // downstream merge handler rejects a `pass` that carries it
+        // (`self-dev-webhook-qa`, mika#2264) — so a remedy that listed all four
+        // would hand the model a one-token way out of this gate that costs it
+        // the merge one hop later. The sentence says so rather than hiding it:
+        // a perverse incentive named is one the next reader can measure.
+        //
+        // No line of this text may START with a verdict label (`VERDICT_RE` is
+        // anchored there), and — new with this flight — none may START with the
+        // token this gate reads either: a remedy carrying its own anchored line
+        // would satisfy the very guard it explains if the model pasted the
+        // refusal into its next body. The token is therefore cited mid-sentence,
+        // and the test module asserts that property over every line of this
+        // payload rather than trusting the author.
+        let body = serde_json::json!({
+            "error": "pass_negative_test_absent",
+            "doctrine": "mika#2961",
+            "target": target_key,
+            "reason": reason,
+            "remedy": "This approval carries a pipeline section but no NEGATIVE-TEST: line, and \
+                       the prompt you are running requires exactly one such top-level line in \
+                       every verdict body. Add it, naming the invariant and what holds it: the \
+                       satisfied form when the diff carries a test asserting the invariant (name \
+                       the invariant, then the test file and symbol); the mechanical form when \
+                       the perimeter has no behavior change to assert against; the n/a form when \
+                       the PR is out of perimeter altogether. A fourth form exists in the prompt \
+                       and is not a way out of this refusal: the missing form is consistent only \
+                       with a blocking verdict on acceptance criteria, and the downstream merge \
+                       handler rejects an approval that carries it, so writing it here costs the \
+                       merge one hop later instead of buying it. Do not weaken your conclusion to \
+                       fit this refusal either — if no negative assertion exists and the \
+                       perimeter does change behavior, that is a finding about the diff, and the \
+                       verdict that states it is the blocking one.",
+        });
+        return Err(ToolOutput::error(body.to_string()));
+    }
+
+    if verdict_is_pass {
+        // The `pass` member gets its **own** remedy, and that is the whole point
+        // of writing one: mika#2687's text says "run the guard and quote its
+        // failure", which is a non-sequitur under a `pass` — an approval cites
+        // no failure by construction. This one names the two outputs the prompt
+        // actually prescribes for an approval, Step 2E and Step 2D, and nothing
+        // else. Naming only one of them would push the model to write the other
+        // from memory, which is the measured defect with one more step.
+        //
+        // The two forms are **described, never quoted verbatim**: a remedy
+        // carrying its own anchored `PIPELINE:` line would satisfy this very
+        // gate if the model pasted the refusal into its next body — the guard
+        // would then be reading its own text as the reviewer's evidence.
+        let body = serde_json::json!({
+            "error": "pass_evidence_absent",
+            "doctrine": "mika#2961",
+            "target": target_key,
+            "reason": reason,
+            "remedy": "This approval carries no PIPELINE: section, and Step 2E requires one in \
+                       every verdict that reached it. There are exactly two correct outputs, \
+                       both prescribed by the prompt you are running. (a) The repository has a \
+                       pipeline guard: run it as Step 2B prescribes and post the section Step 2E \
+                       shows — the opening line, then each guard, its exit code, and its output \
+                       as printed. On a clean repository that reads as a pipeline line stating \
+                       the result for this repo, with the guard at exit 0 and the line it \
+                       printed. (b) The repository has no executable guard: post the \
+                       not-applicable form of Step 2D, naming the repo and the guard paths you \
+                       checked. What is refused is neither of those two: an approval that says \
+                       nothing about the guard at all. Do not write the section from memory, and \
+                       do not change your conclusion to fit this refusal — the guard's own \
+                       output is the only evidence this gate accepts, and if it refused \
+                       something then the pipeline is what is wrong rather than this call.",
+        });
+        return Err(ToolOutput::error(body.to_string()));
+    }
+
+    let body = serde_json::json!({
+        "error": "pipeline_block_ungrounded",
+        "doctrine": "mika#2687",
+        "target": target_key,
+        "reason": reason,
+        "remedy": "A block[pipeline] verdict is made of one thing only: a pipeline guard that \
+                   actually ran and exited non-zero. There are exactly two correct ways out. \
+                   (a) Run the repository's pipeline guard as Step 2B prescribes and post its \
+                   PIPELINE: section verbatim — each guard, its exit code, and its output as \
+                   printed. (b) If no guard rejected anything, then the pipeline is not what is \
+                   wrong: the verdict is pass, hold[review], or block[ac] per the other steps. \
+                   Do not restate a rule a guard already carries, and do not write a PIPELINE: \
+                   section from memory — the guard's own output is the only evidence this gate \
+                   accepts. On reason no_guard_executed the section you posted is well formed, \
+                   and that is precisely the point: this session's tool ledger records shell \
+                   calls and not one of them invoked a pipeline guard, so the section was \
+                   written rather than observed. Run Step 2B in this session, then post what it \
+                   prints.",
+    });
+    Err(ToolOutput::error(body.to_string()))
+}
+
+/// Write one `audit_events` row for a pipeline-grounding decision.
+///
+/// Warn-and-continue, on **every** outcome — allowed, refused, abstained.
+/// Losing the ledger row must not change the guard's verdict in either
+/// direction, and an empty table must keep meaning "the link was never
+/// reached", never "nothing was refused" (mika#2205).
+async fn audit_pipeline_grounding(
+    ctx: &ToolContext<'_>,
+    target_key: &str,
+    outcome: &str,
+    reasoning: &str,
+) {
+    use crate::evidence::guards::PIPELINE_GROUNDING_AUDIT_TOOL;
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            PIPELINE_GROUNDING_AUDIT_TOOL,
+            target_key,
+            None,
+            Some(outcome),
+            Some(reasoning),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to write pipeline-grounding audit row");
+    }
+}
+
+/// Did a `run_shell` call of **this session** invoke a pipeline guard?
+///
+/// The engine fact behind `PipelineGroundingOutcome::RefusedNoGuardExecuted`,
+/// read on the B3 pattern of mika#2565: three states, and the third is the one
+/// that matters.
+///
+/// | ledger says | returned | why |
+/// |---|---|---|
+/// | a shell call names a guard script | `true` | the guard ran |
+/// | shell calls exist, none names a guard | `false` | **the refusal** — the ledger is alive and says this session ran no guard |
+/// | the read failed | `true` + abstention | a failed read is not a `false` |
+/// | zero shell calls at all | `true` + abstention | ledger disarmed, or a resumed session |
+///
+/// **The abstention is partial and it is said.** Partial, because returning
+/// early would remove the two body predicates from the decision as well —
+/// the exact shape mika#2565 had to correct on `abstain_b3`. Said, because the
+/// last row is the real false positive the plan names: a review resumed on a
+/// build callback runs under a brand-new `session_id`
+/// (`dispatcher.rs`, `format!("{session_prefix}-{}")`), so the guard's
+/// `run_shell` belongs to the session before it. Nothing in the ledger
+/// separates that from `MIKA_STORE_TOOL_CALLS` being disarmed, and both are
+/// silence rather than accusation — so both abstain, under
+/// `PipelineGroundingAbstention::NO_SHELL_CALL_RECORDED`, and
+/// `pipeline_grounding_abstained` is what makes the population countable
+/// before anyone tightens this.
+async fn observe_pipeline_guard_execution(ctx: &ToolContext<'_>, target_key: &str) -> bool {
+    use crate::evidence::guards::{
+        PIPELINE_GROUNDING_SHELL_TOOL, PIPELINE_GROUNDING_WINDOW_SECS, PipelineGroundingAbstention,
+        shell_invocation_runs_pipeline_guard,
+    };
+
+    async fn abstain(ctx: &ToolContext<'_>, target_key: &str, reason: &'static str) -> bool {
+        tracing::warn!(
+            event = "pipeline_grounding_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#2687: could not read the guard-execution term — the execution proof abstains \
+             and the body predicates still decide"
+        );
+        audit_pipeline_grounding(ctx, target_key, "abstained", reason).await;
+        true
+    }
+
+    match ctx
+        .db
+        .find_recent_tool_invocation(
+            ctx.db.agent_id(),
+            ctx.session_id,
+            PIPELINE_GROUNDING_SHELL_TOOL,
+            PIPELINE_GROUNDING_WINDOW_SECS,
+        )
+        .await
+    {
+        Err(e) => {
+            tracing::warn!(
+                event = "pipeline_grounding_ledger_unreadable",
+                error = %e,
+                target = %target_key,
+                "mika#2687: the tool ledger did not answer"
+            );
+            abstain(
+                ctx,
+                target_key,
+                PipelineGroundingAbstention::TOOL_LEDGER_UNREADABLE,
+            )
+            .await
+        }
+        Ok(rows) if rows.is_empty() => {
+            abstain(
+                ctx,
+                target_key,
+                PipelineGroundingAbstention::NO_SHELL_CALL_RECORDED,
+            )
+            .await
+        }
+        Ok(rows) => rows.iter().any(|row| {
+            row.input
+                .as_deref()
+                .is_some_and(shell_invocation_runs_pipeline_guard)
+        }),
+    }
+}
+
 /// Refuse a `gh pr review` whose body says `VERDICT: pass` while a **required**
 /// check is red on the PR's head (mika#2455).
 ///
@@ -4090,6 +4697,14 @@ async fn validate_qa_ci_coherence(
 ///
 /// Public because `tests/eval/` is a separate crate. It has exactly one
 /// production caller, [`validate_qa_ci_coherence`].
+///
+/// # Le jeton, depuis mika#2963
+///
+/// Le troisième paramètre du lecteur est un [`mika_common::ci_read::CiReadToken`]
+/// et non plus une `String` : c'est ce qui rend la **divergence** observable dans
+/// un test. Au même `ToolContext`, [`gh_exec_token`] rend le PAT — qui poste le
+/// `pr review` — et ce lecteur reçoit le jeton d'App. Un test portant sur un seul
+/// des deux resterait vert le jour où ils se confondraient à nouveau.
 pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
     args: &[String],
     repo: Option<&str>,
@@ -4097,7 +4712,7 @@ pub async fn validate_qa_ci_coherence_with_reader<F, Fut>(
     read_checks: F,
 ) -> Result<(), ToolOutput>
 where
-    F: FnOnce(u64, String, String) -> Fut,
+    F: FnOnce(u64, String, mika_common::ci_read::CiReadToken) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
     use crate::evidence::guards::pr_review_target;
@@ -4181,7 +4796,14 @@ where
 
     // -- Read, bounded --
 
-    let read = read_checks(pr_number, repo.to_string(), token.to_string());
+    // mika#2963 — App d'abord, PAT en repli. L'abstention `NO_TOKEN` ci-dessus
+    // reste conditionnée au PAT : sans lui, le repli n'existe pas, et un jeton
+    // d'App seul suffirait à lire mais pas à poster la revue qui suit.
+    let read = read_checks(
+        pr_number,
+        repo.to_string(),
+        crate::tools::pr_merge_with_gate::ci_read_token_or_pat(ctx.ci_read_token, token),
+    );
     let raw = match tokio::time::timeout(
         std::time::Duration::from_secs(QA_CI_READ_TIMEOUT_SECS),
         read,
@@ -4601,7 +5223,7 @@ where
     let build_observed = if is_pass && is_cargo_dependency_pr(&files) {
         match ctx
             .db
-            .find_recent_build_invocation(
+            .find_recent_tool_invocation(
                 ctx.db.agent_id(),
                 ctx.session_id,
                 BUILD_TOOL,
@@ -4821,6 +5443,25 @@ where
     }
 }
 
+/// Le jeton d'**exécution** `gh` : le PAT, et rien d'autre (mika#2963, voie (i)).
+///
+/// Mêmes octets que `ctx.github_token`, mais un nom. Il existe pour que la
+/// divergence soit nommable : depuis mika#2963 le contexte porte **deux** jetons,
+/// et un `pr review` posté avec le jeton d'App serait signé
+/// `mika-platform-bot[bot]` au lieu de `mika-platform-qa`, ce que sept modules
+/// lisent par login (`qa_review_reconcile`, `qa_head_supersession`,
+/// `server::verdict`, `deadline_verdict`, `skills::matcher`,
+/// `task_engine::dispatcher`, `server::sync_debounce`). La lecture de CI prend
+/// l'autre chemin, par [`crate::tools::pr_merge_with_gate::ci_read_token_or_pat`].
+///
+/// C'est le site que T1 épingle : `gh_exec_token` et le lecteur CI reçoivent des
+/// valeurs **différentes** d'un même `ToolContext`, et c'est cette divergence qui
+/// est l'observable — un test sur l'un des deux seuls resterait vert si les deux
+/// se confondaient à nouveau.
+fn gh_exec_token<'a>(ctx: &'a ToolContext<'_>) -> Option<&'a str> {
+    ctx.github_token
+}
+
 /// Execute a GitHub CLI (`gh`) command with safe argument passing.
 ///
 /// Input: `{"command": ["pr", "list", "--state", "open"], "repo": "owner/repo"}`
@@ -4848,10 +5489,13 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         return err;
     }
 
-    // Fallthrough work-creation gate (mika#2573): on a Webhook Fallthrough turn,
-    // refuse the two `gh` verbs that create work — `issue create` and
-    // `issue edit --add-label ready`. Placed here, before the first gate that
-    // makes a network call: the chain runs from the most local to the most
+    // Work-creation gate (mika#2573 + mika#2995): refuse the two `gh` verbs that
+    // create work. `issue create` is refused on a Webhook Fallthrough turn;
+    // posting the dispatch-trigger label is refused on **every** turn, because
+    // the engine writing it is the engine consenting for the operator. Each
+    // motif's population lives in `work_creation_is_refused`, never here.
+    // Placed here, before the first gate that makes a network call: the chain
+    // runs from the most local to the most
     // engaging, and this one is pure argv plus a turn-class boolean. Refuses
     // rather than withholds `run_gh`, because the prompt's own verification
     // gesture (`issue view --json labels`) is a `run_gh` read.
@@ -4978,6 +5622,27 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         return err;
     }
 
+    // Verdict↔guard-citation coherence (mika#2687): refuse a `block[pipeline]`
+    // whose body carries no `PIPELINE:` section, or one citing no guard at a
+    // non-zero exit. Placed immediately after mika#2237 and BEFORE mika#2455,
+    // because it is the last link in the chain that reads neither the network
+    // nor the database — the chain runs from the most local to the most
+    // committing, and spending a `gh pr checks` on a review this link is about
+    // to refuse would be paying for a decision already taken.
+    //
+    // Upstream of mika#2519 on purpose. On a dependabot PR carrying a
+    // sectionless `block[pipeline]`, both guards would refuse; this one answers
+    // first, names the nearer cause (the missing evidence rather than the
+    // author), and needs no network read to do it. mika#2519's B1 remains the
+    // sole guard for a section that is present AND grounded by an automated
+    // author. Like its three siblings it is NOT gated on
+    // `required_tool_arg_suffixes`: its subject is the body itself.
+    if let Err(err) =
+        validate_pipeline_block_grounding(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
+        return err;
+    }
+
     // CI↔verdict coherence (mika#2455): refuse a `pr review` whose body says
     // `pass` while a required check is red on the PR's head. Placed immediately
     // after mika#2237, and last in the chain, for two reasons. (a) It is the
@@ -5025,30 +5690,19 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         );
     }
 
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(&gh_args.args);
-
-    if let Some(ref repo) = gh_args.repo {
-        cmd.arg("--repo").arg(repo);
-    }
-
-    cmd.env("GH_PROMPT_DISABLED", "1");
-    super::executor::scrub_mika_env_vars(&mut cmd);
-
-    // Inject platform GitHub token for agent identity separation AFTER scrub.
-    // scrub_mika_env_vars removes GH_TOKEN (defense-in-depth against .env leak),
-    // so we must re-add the correct platform token here. See #380.
-    if let Some(token) = ctx.github_token {
-        // substrate-ok: an env() argument handed to a child process — it never
-        // enters a tool-result `content`, so no tier reads it.
-        cmd.env("GH_TOKEN", token);
-    }
-
     // Diagnostic instrumentation (#900): log the exact gh subcommand, env key set
     // (keys only, never values), and token presence for timeout forensics.
     // substrate-ok: env-var NAMES for a tracing field (keys only, never values) —
     // this array reaches the log, never a tool-result `content`.
-    let env_keys_set: &[&str] = match ctx.github_token {
+    //
+    // mika#2715 — l'événement reste **au site** et non dans la couture : il lit
+    // `ctx.session_id`/`ctx.github_token`, que `gh_process` ne connaît pas. Les
+    // clés qu'il nomme sont celles que la couture pose, dans l'ordre de #380.
+    //
+    // mika#2963 — le jeton se lit par `gh_exec_token` : `run_gh` **exécute**
+    // (`pr review`, `pr merge`, `pr comment`), donc il reste sur le PAT.
+    let exec_token = gh_exec_token(ctx);
+    let env_keys_set: &[&str] = match exec_token {
         Some(_) => &["GH_PROMPT_DISABLED", "GH_TOKEN"],
         None => &["GH_PROMPT_DISABLED"],
     };
@@ -5057,11 +5711,20 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
         argv = ?&gh_args.args,
         repo = ?&gh_args.repo,
         env_keys_set = ?env_keys_set,
-        has_github_token = ctx.github_token.is_some(),
+        has_github_token = exec_token.is_some(),
         "run_gh invocation"
     );
 
-    let output = spawn_and_collect(cmd, "gh", "Is the GitHub CLI installed?").await;
+    // mika#2715 — le spawn passe par la couture. Le sujet se lit dans l'`argv`,
+    // parce que `run_gh` sert des sous-commandes libres : il n'y a pas de champ
+    // d'entrée structuré où le lire.
+    let output = crate::gh_process::run_gh_tool(
+        exec_token,
+        crate::gh_process::gh_subject_from_argv(&gh_args.args),
+        &gh_args.args,
+        gh_args.repo.as_deref(),
+    )
+    .await;
 
     // On success, record that a PR review was posted (both per-turn and session-scoped).
     //
@@ -5153,7 +5816,12 @@ fn make_pr_dedup_key(args: &[String], repo: Option<&str>) -> String {
 /// places, which is the mika#2158 shape: two readers of one format drift, and
 /// here the drift is silent in both directions — a missed match posts a
 /// duplicate review, a false match leaves the PR silent.
-pub(crate) fn format_pr_dedup_key(repo: Option<&str>, pr_identifier: &str) -> String {
+///
+/// `pub` depuis mika#2943 vol 2 : le test de bout en bout de la déduplication
+/// (`tests/eval/test_max_steps_verdict_2943.rs`) doit *écrire* dans le registre
+/// la clé que le handler écrirait, et une clé recomposée dans le test en ferait
+/// un troisième lecteur du format — le reproche exact de la ligne ci-dessus.
+pub fn format_pr_dedup_key(repo: Option<&str>, pr_identifier: &str) -> String {
     format!("{}|{}", repo.unwrap_or("__default__"), pr_identifier)
 }
 
@@ -6772,6 +7440,358 @@ mod tests {
         );
     }
 
+    // --- mika#3056 — le bras issue, et les quatre états où il ne lit rien ----
+
+    // Les prédicats des couches A et B, importés ici parce que les témoins de
+    // non-vacuité ci-dessous les appellent : un test qui affirme « la couche A
+    // était satisfaite » doit le lui demander, pas le supposer. La garde elle
+    // les importe dans son propre corps.
+    use crate::evidence::guards::{
+        DESTRUCTIVE_ACTION_AUDIT_TOOL, destructive_comment_cites_evidence,
+        destructive_grounding_satisfied, destructive_repeat_acknowledged,
+        detect_destructive_action, repeat_action_window_secs,
+    };
+
+    /// Le libellé que le bras issue écrit, épelé une fois.
+    const MIKA3056_LABEL: &str = "block[issue_close_not_by_merge]";
+
+    /// Un commentaire de fermeture qui cite une relecture — il satisfait
+    /// `destructive_comment_cites_evidence` par deux marqueurs (`state:` et
+    /// `no commits`). C'est la forme qui PASSAIT : les 3 fermetures autorisées
+    /// du 10/09 au 06/11 l'ont obtenue après 1 à 3 refus.
+    const MIKA3056_CITING_COMMENT: &str =
+        "read back state: OPEN, no commits on the branch — superseded";
+
+    /// The argv of an issue close the mika#1646 detector recognises (mika#3056).
+    fn mika3056_issue_close_args(comment: &str) -> Vec<String> {
+        ["issue", "close", "42", "--comment", comment]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Les quatre états que AC2 énumère, et l'invariant qui ne dépend d'aucun :
+    /// le refus tombe, et il porte le libellé du bras issue — jamais celui d'une
+    /// couche que le bras précède.
+    ///
+    /// `tier` est un paramètre parce que le quatrième état se mesure là : c'est
+    /// le palier qui ROUTE le diagnostic de la couche A (mika#1964), donc c'est
+    /// le seul endroit où l'on peut voir que le bras issue n'en route aucun. Il
+    /// passe `diagnostic = None` — rien n'est indisponible — donc aucun palier
+    /// n'écrit de ligne `substrate_unavailable`.
+    async fn assert_issue_close_refused(
+        h: &TestHarness,
+        etat: &str,
+        tier: mika_common::home::AgentTier,
+        comment: &str,
+    ) {
+        let ctx = h.ctx_with_tier_and_brave(tier, None);
+        let args = mika3056_issue_close_args(comment);
+        let Err(refusal) = validate_destructive_action_grounding(&args, None, &ctx).await else {
+            panic!("[{etat}] une fermeture d'issue doit être refusée");
+        };
+
+        assert!(refusal.is_error, "[{etat}] le refus doit être une erreur");
+        let body: serde_json::Value = serde_json::from_str(&refusal.content)
+            .unwrap_or_else(|e| panic!("[{etat}] corps illisible ({e}): {}", refusal.content));
+        assert_eq!(
+            body["error"], MIKA3056_LABEL,
+            "[{etat}] libellé de bloc inattendu: {}",
+            refusal.content
+        );
+        assert_eq!(
+            body["target"], "issue:close:42",
+            "[{etat}] {}",
+            refusal.content
+        );
+        // Le bras ne lit aucun substrat, donc il n'en nomme aucun : le nom du
+        // réglage de persistance appartient à la couche A seule.
+        assert!(
+            !refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "[{etat}] le bras issue a emprunté le diagnostic de la couche A: {}",
+            refusal.content
+        );
+
+        // AC1 — le remède nomme la seule voie, et n'en propose aucune autre.
+        let remedy = body["remedy"]
+            .as_str()
+            .unwrap_or_else(|| panic!("[{etat}] remède absent: {}", refusal.content));
+        for nomme in ["Closes", "merge", "Vincent"] {
+            assert!(
+                remedy.contains(nomme),
+                "[{etat}] le remède ne nomme pas « {nomme} »: {remedy}"
+            );
+        }
+        for contournement in ["retry", "read the", "cite", "--comment"] {
+            assert!(
+                !remedy.contains(contournement),
+                "[{etat}] le remède propose « {contournement} », donc un contournement: {remedy}"
+            );
+        }
+
+        // AC1 — une décision, une ligne, sous le même `tool_name` que les
+        // autres : c'est elle que la sonde AC5 compte par `GROUP BY after_value`.
+        let events =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+        let blocks: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == DESTRUCTIVE_ACTION_AUDIT_TOOL)
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "[{etat}] une décision doit écrire une ligne et une seule: {events:?}"
+        );
+        assert_eq!(
+            blocks[0].after_value.as_deref(),
+            Some(MIKA3056_LABEL),
+            "[{etat}] {events:?}"
+        );
+        assert_eq!(
+            blocks[0].target_key, "issue:close:42",
+            "[{etat}] {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.tool_name == "substrate_unavailable"),
+            "[{etat}] le bras issue ne déclare aucun substrat indisponible: {events:?}"
+        );
+    }
+
+    /// AC2, état 1 — la relecture est là et le commentaire la cite. C'est
+    /// exactement l'état qui autorisait la fermeture avant mika#3056, et le
+    /// seul des quatre où la couche A est satisfaite : d'où le témoin de
+    /// non-vacuité ci-dessous, sans lequel ce test ne mesurerait que l'état 2.
+    #[tokio::test]
+    async fn mika3056_une_fermeture_dissue_relue_et_citee_est_refusee() {
+        let h = TestHarness::new();
+        let trace_id = h.ctx().trace_id.to_string();
+        // La relecture de la cible, enregistrée par l'écrivain de production
+        // (mika#2565) et portée par la trace du tour — donc vue de la couche A.
+        h.db.save_tool_call(
+            &format!("tc-{}", uuid::Uuid::new_v4()),
+            "test-session",
+            Some(&trace_id),
+            None,
+            1,
+            "run_gh",
+            "builtin",
+            Some("github"),
+            Some(
+                &serde_json::json!({
+                    "command": ["issue", "view", "42", "--json", "state,comments"]
+                })
+                .to_string(),
+            ),
+            Some(r#"{"state":"OPEN","comments":[]}"#),
+            true,
+            false,
+            12,
+            None,
+        )
+        .await
+        .expect("la ligne de relecture doit être enregistrée");
+
+        // Témoin : les deux moitiés de la couche A sont réellement satisfaites.
+        let action = detect_destructive_action(&mika3056_issue_close_args(MIKA3056_CITING_COMMENT))
+            .expect("le détecteur reconnaît cette fermeture");
+        let rows =
+            h.db.query_tool_calls_by_trace(&trace_id)
+                .await
+                .expect("query_tool_calls_by_trace");
+        assert!(
+            destructive_grounding_satisfied(
+                &action,
+                rows.iter()
+                    .map(|r| (r.tool_name.as_str(), r.input.as_deref().unwrap_or("")))
+            ),
+            "la fixture doit satisfaire la couche A, sinon le test ne mesure rien: {rows:?}"
+        );
+        assert!(
+            destructive_comment_cites_evidence(action.comment.as_deref()),
+            "la fixture doit satisfaire la citation de la couche A"
+        );
+
+        assert_issue_close_refused(
+            &h,
+            "relecture présente et citée",
+            mika_common::home::AgentTier::Default,
+            MIKA3056_CITING_COMMENT,
+        )
+        .await;
+    }
+
+    /// AC2, état 2 — aucune relecture. La couche A refuserait aussi, mais sous
+    /// son libellé et avec son diagnostic ; le helper garde les deux faits.
+    #[tokio::test]
+    async fn mika3056_une_fermeture_dissue_sans_relecture_est_refusee() {
+        let h = TestHarness::new();
+        assert_issue_close_refused(
+            &h,
+            "relecture absente",
+            mika_common::home::AgentTier::Default,
+            "superseded",
+        )
+        .await;
+    }
+
+    /// AC2, état 3 — répétition. Une fermeture antérieure de la même cible dans
+    /// la fenêtre fait tirer la couche B ; le libellé rendu est quand même celui
+    /// du bras issue, et c'est la preuve qu'il est en TÊTE de la garde.
+    #[tokio::test]
+    async fn mika3056_une_repetition_porte_le_libelle_du_bras_pas_celui_de_la_couche_b() {
+        let h = TestHarness::new();
+        h.db.save_tool_call(
+            &format!("tc-{}", uuid::Uuid::new_v4()),
+            "test-session",
+            None,
+            None,
+            1,
+            "run_gh",
+            "builtin",
+            Some("github"),
+            Some(
+                &serde_json::json!({
+                    "command": ["issue", "close", "42", "--comment", "superseded"]
+                })
+                .to_string(),
+            ),
+            Some("closed"),
+            true,
+            false,
+            12,
+            None,
+        )
+        .await
+        .expect("la fermeture antérieure doit être enregistrée");
+
+        // Témoin : la couche B voit bien cette répétition.
+        let prior =
+            h.db.find_recent_destructive_actions(
+                h.db.agent_id(),
+                "issue",
+                "42",
+                repeat_action_window_secs(),
+            )
+            .await
+            .expect("find_recent_destructive_actions");
+        assert!(
+            !prior.is_empty(),
+            "la fixture doit être visible de la couche B, sinon l'état 3 n'est pas joué"
+        );
+        assert!(
+            !destructive_repeat_acknowledged(Some("superseded")),
+            "le commentaire ne doit PAS se déclarer, sinon la couche B ne tirerait pas"
+        );
+
+        assert_issue_close_refused(
+            &h,
+            "répétition",
+            mika_common::home::AgentTier::Default,
+            "superseded",
+        )
+        .await;
+
+        let events =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.after_value.as_deref() == Some("block[destructive_repeat_unreviewed]")),
+            "la couche B a rendu la décision, donc le bras n'est pas en tête: {events:?}"
+        );
+    }
+
+    /// AC2, état 4 — persistance des appels désactivée. Au moteur, cet état se
+    /// présente comme un tour sans appel enregistré : c'est la branche
+    /// `turn_calls.is_empty()` de la couche A, celle qui route son diagnostic
+    /// vers l'opérateur sur le palier Family (mika#1964). Le bras issue n'a
+    /// besoin d'aucun substrat, donc il n'en déclare aucun indisponible.
+    #[tokio::test]
+    async fn mika3056_persistance_desactivee_le_refus_tombe_sans_router_de_diagnostic() {
+        let h = TestHarness::new();
+        assert_issue_close_refused(
+            &h,
+            "persistance désactivée",
+            mika_common::home::AgentTier::Family,
+            "superseded",
+        )
+        .await;
+    }
+
+    /// AC3, dans le même appel qu'AC1 — l'issue prend le refus de mika#3056, la
+    /// PR garde ses couches A et B. Les deux décisions s'écrivent sous le même
+    /// `tool_name` d'audit, donc sur la même ligne au sens d'AC1 : la sonde AC5
+    /// les sépare par `after_value`, pas par table.
+    #[tokio::test]
+    async fn mika3056_lissue_prend_le_nouveau_refus_la_pr_garde_le_sien() {
+        let h = TestHarness::new();
+        assert_issue_close_refused(
+            &h,
+            "AC3 — volet issue",
+            mika_common::home::AgentTier::Default,
+            "superseded",
+        )
+        .await;
+
+        let ctx = h.ctx();
+        let Err(pr_refusal) =
+            validate_destructive_action_grounding(&mika1964_ungrounded_close_args(), None, &ctx)
+                .await
+        else {
+            panic!("une fermeture de PR non fondée doit rester refusée par la couche A");
+        };
+        // Sur le palier par défaut, la couche A APPEND son diagnostic opérateur
+        // après le corps JSON au lieu de le router (mika#1964) : le contenu
+        // n'est donc pas un seul document JSON. On en prend la tête, ce qui
+        // garde l'assertion stricte sans supposer l'absence de la queue.
+        let body = serde_json::Deserializer::from_str(&pr_refusal.content)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("le refus PR doit commencer par un corps JSON")
+            .expect("corps de refus PR parseable");
+        assert_eq!(
+            body["error"], "block[destructive_grounding]",
+            "la PR doit garder le libellé de ses couches: {}",
+            pr_refusal.content
+        );
+        assert_eq!(body["target"], "pr:close:42", "{}", pr_refusal.content);
+        // La couche A garde son diagnostic : le bras issue ne l'a pas remplacée.
+        assert!(
+            pr_refusal.content.contains("MIKA_STORE_TOOL_CALLS"),
+            "la couche A a perdu son diagnostic sur la PR: {}",
+            pr_refusal.content
+        );
+
+        let events =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events");
+        let decisions: Vec<_> = events
+            .iter()
+            .filter(|e| e.tool_name == DESTRUCTIVE_ACTION_AUDIT_TOOL)
+            .map(|e| (e.target_key.as_str(), e.after_value.as_deref()))
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            2,
+            "deux décisions, deux lignes, un seul `tool_name`: {events:?}"
+        );
+        assert!(
+            decisions.contains(&("issue:close:42", Some(MIKA3056_LABEL))),
+            "{decisions:?}"
+        );
+        assert!(
+            decisions.contains(&("pr:close:42", Some("block[destructive_grounding]"))),
+            "{decisions:?}"
+        );
+    }
+
     #[test]
     fn test_truncate_output_short() {
         let mut output = ToolOutput::success("short content");
@@ -7345,6 +8365,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            ci_read_token: None,
             gateway_url: Some(gateway_url),
             internal_token: None,
             skills_dirty: &SKILLS_DIRTY,
@@ -7390,6 +8411,7 @@ mod tests {
             embedding_client: None,
             brave_api_key: None,
             github_token: None,
+            ci_read_token: None,
             gateway_url: Some(gateway_url),
             internal_token: Some(token),
             skills_dirty: &SKILLS_DIRTY,
@@ -7411,6 +8433,101 @@ mod tests {
             deployment: mika_common::home::Deployment::Unknown,
             scope_task_id: None,
         }
+    }
+
+    /// **T1 (AC2) — la voie (i) : on lit avec l'App, on poste avec le PAT.**
+    ///
+    /// Les deux assertions sont dans le **même** test, et ce n'est pas une
+    /// commodité : c'est leur **divergence** qui est l'observable. Deux tests
+    /// séparés — l'un pinçant `gh_exec_token`, l'autre le jeton du lecteur —
+    /// passeraient tous les deux, verts, sur un arbre où les deux chemins
+    /// lisent la *même* valeur. Or c'est exactement l'arbre d'avant ce ticket,
+    /// et exactement celui qu'une simplification future produirait en
+    /// « nettoyant » `gh_exec_token` pour revenir à `ctx.github_token`.
+    ///
+    /// Ce que l'assertion sur `gh_exec_token` protège : un `pr review` posté
+    /// avec le jeton d'installation serait signé `mika-platform-bot[bot]` et non
+    /// `mika-platform-qa`, login que sept modules lisent pour reconnaître leur
+    /// propre revue (`qa_review_reconcile`, `qa_head_supersession`,
+    /// `server::verdict`, `deadline_verdict`, `skills::matcher`,
+    /// `task_engine::dispatcher`, `server::sync_debounce`). Le basculement
+    /// serait silencieux : la revue serait bien postée.
+    ///
+    /// Le lecteur injecté rend `Err` — le garde s'abstient alors et laisse
+    /// passer, ce qui est son contrat fail-open. L'observable n'est pas sa
+    /// décision, c'est **le jeton qu'il a tenu**, donc l'abréger ici est exact
+    /// plutôt qu'économe.
+    #[tokio::test]
+    async fn mika2963_ac2_le_lecteur_prend_lapp_et_le_pr_review_garde_le_pat() {
+        use mika_common::ci_read::{CiReadToken, CiReadTokenSource};
+
+        const PAT: &str = "pat-mika2963";
+        const APP: &str = "app-mika2963";
+
+        let harness = TestHarness::new();
+        let jeton_app = CiReadToken::new(APP, CiReadTokenSource::App);
+        let mut ctx = harness.ctx();
+        ctx.github_token = Some(PAT);
+        ctx.ci_read_token = Some(&jeton_app);
+
+        // Premier terme : le jeton d'EXÉCUTION de `run_gh`, donc celui qui
+        // signera le `pr review`, est le PAT — alors même que l'App est là.
+        assert_eq!(
+            gh_exec_token(&ctx),
+            Some(PAT),
+            "mika#2963 AC2 — `run_gh` doit exécuter avec le PAT. Avec le jeton d'App, la \
+             revue serait postée par `mika-platform-bot[bot]` et les sept modules qui \
+             reconnaissent `mika-platform-qa` par login cesseraient de voir leur propre \
+             revue — sans qu'aucune erreur ne soit levée."
+        );
+
+        // Second terme : au MÊME contexte, le lecteur CI tient l'autre jeton.
+        let vu = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
+        let plume = vu.clone();
+        let argv: Vec<String> = vec![
+            "pr".into(),
+            "review".into(),
+            "2963".into(),
+            "--approve".into(),
+            "--body".into(),
+            "VERDICT: pass\nDEPTH: code-level\nREASON: tous les AC sont tenus.".into(),
+        ];
+        validate_qa_ci_coherence_with_reader(
+            &argv,
+            Some("senara-solutions/mika"),
+            &ctx,
+            move |_pr, _repo, token| async move {
+                *plume.lock().unwrap() = Some((
+                    token.token().to_string(),
+                    token.source().as_str().to_string(),
+                ));
+                Err("lecture abrégée : l'observable est le jeton, pas la décision".to_string())
+            },
+        )
+        .await
+        .expect("le garde est fail-open sur un échec de lecture (mika#2455)");
+
+        let (jeton_vu, source_vue) = vu.lock().unwrap().clone().expect(
+            "mika#2963 AC2 — le lecteur CI n'a jamais été appelé : le garde s'est abstenu \
+                    en amont, et ce test ne mesure plus rien (mika#2103)",
+        );
+        assert_eq!(
+            jeton_vu, APP,
+            "mika#2963 AC2 — le lecteur CI doit tenir le jeton d'App résolu par \
+             `Settings::resolve_ci_read_token`. Avec le PAT, la lecture échoue sur \
+             `statusCheckRollup` et le garde s'abstient — les 55 `gh_failed` mesurés."
+        );
+        assert_eq!(
+            source_vue, "app",
+            "mika#2963 AC4 — la source portée par le jeton doit dire `app`, sinon la sonde \
+             AC5 lit un repli là où l'App a servi"
+        );
+        assert_ne!(
+            jeton_vu, PAT,
+            "mika#2963 AC2 — les deux chemins se sont reconfondus : c'est précisément la \
+             régression que ce test existe pour voir, et une assertion sur un seul des deux \
+             jetons serait restée verte."
+        );
     }
 
     #[tokio::test]
@@ -13189,5 +14306,1146 @@ mod mika2667_dispatcher_review_tests {
             );
         }
         assert_eq!(refusals(&h).await, 0);
+    }
+}
+
+/// Layer B — the wiring. Without it, a predicate that decides well would stay
+/// compatible with a guard nobody calls (mika#2687).
+#[cfg(test)]
+mod mika2687_pipeline_grounding_tests {
+    use super::{run_gh, validate_pipeline_block_grounding_gated};
+    use crate::evidence::guards::PIPELINE_GROUNDING_AUDIT_TOOL;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    const REPO: &str = "senara-solutions/mika";
+    const TARGET: &str = "pr_review:senara-solutions/mika#2685";
+    const SINCE: &str = "1970-01-01T00:00:00Z";
+
+    /// The second member's gate (mika#2961), **disarmed** — its default, and the
+    /// state in which every case of this module was written. Named rather than
+    /// written `false` for the same reason as `GUARD_RAN` next door: it is the
+    /// only change the arrival of the `pass` member makes to these tests, and
+    /// not one of their expectations moves.
+    const PASS_GATE_DISARMED: bool = false;
+
+    /// Review 2 on mika#2685, `0a53b5f0`, 2026-10-13 17:03Z — no `PIPELINE:`
+    /// section, and a reason `verify-pipeline.sh` does not carry.
+    const MEASURED_BODY: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\npipeline-exempt label \
+                                 present but PR contains non-docs files (Cargo.lock, deny.toml), \
+                                 so label bypass does not apply.\n";
+
+    /// The blocking shape Step 2E prescribes — a guard that ran and refused.
+    const GROUNDED_BODY: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\nPIPELINE: block \
+                                 (mika)\n- scripts/verify-pipeline.sh → exit 1\n  \
+                                 [pipeline-exempt: none] REJECT: code-only PR: source changes \
+                                 present but no plan/solution doc\n  Verification FAILED: 1 \
+                                 missing artifact(s).\n";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The per-session dedup map (mika#821), which `run_gh` `debug_assert!`s on
+    /// for any production `pr review` call — our link sits downstream of that
+    /// assertion, so a `run_gh`-level test has to carry one. Empty: seeding it
+    /// would make the mika#821 guard answer first and never reach ours.
+    type PostedMap = std::sync::Arc<dashmap::DashMap<String, std::collections::HashSet<String>>>;
+
+    fn posted_map() -> PostedMap {
+        std::sync::Arc::new(dashmap::DashMap::new())
+    }
+
+    /// Rows this guard wrote for one outcome. Read on `after_value` rather than
+    /// counted on the tool name alone: the operator probe of § Observabilité is
+    /// a `GROUP BY target_key, after_value`, and a test that only counted rows
+    /// would stay green on a guard that wrote the wrong outcome.
+    async fn rows(h: &TestHarness, outcome: &str) -> usize {
+        h.db.get_audit_events("test-session")
+            .await
+            .expect("get_audit_events")
+            .iter()
+            .filter(|e| {
+                e.tool_name == PIPELINE_GROUNDING_AUDIT_TOOL
+                    && e.target_key == TARGET
+                    && e.after_value.as_deref() == Some(outcome)
+            })
+            .count()
+    }
+
+    /// The whole population, whatever the outcome — so an assertion of "no row"
+    /// cannot be satisfied by a row carrying an outcome the test forgot.
+    async fn all_rows(h: &TestHarness) -> i64 {
+        h.db.count_recent_audit_events_for_target(PIPELINE_GROUNDING_AUDIT_TOOL, TARGET, SINCE)
+            .await
+            .unwrap()
+    }
+
+    /// The refusal reaches the caller, and it reaches it **before any
+    /// subprocess**: `run_gh` returns the structured error without spawning
+    /// `gh`. That is the whole reason the guard lives in this chain rather than
+    /// in `verdict_handler` — by the time a post-publication arm ran, the PR
+    /// would already carry its `changes_requested`.
+    #[tokio::test]
+    async fn the_measured_body_is_refused_before_any_subprocess() {
+        let h = TestHarness::with_agent("mika-qa");
+        let posted = posted_map();
+        let mut ctx = h.ctx();
+        ctx.pr_reviews_posted = Some(&posted);
+        let out = run_gh(
+            &serde_json::json!({
+                "command": ["pr", "review", "2685", "--comment", "--body", MEASURED_BODY],
+                "repo": REPO,
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("pipeline_block_ungrounded"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("mika#2687"), "{}", out.content);
+        assert_eq!(rows(&h, "refused").await, 1, "the refusal leaves one row");
+    }
+
+    /// The remedy names BOTH ways out, and carries no line starting with the
+    /// verdict label — `VERDICT_RE` is anchored on that prefix, so a stray line
+    /// would be re-read as a verdict by the next consumer of this payload.
+    #[tokio::test]
+    async fn the_refusal_teaches_both_exits_without_forging_a_verdict_line() {
+        let h = TestHarness::with_agent("mika-qa");
+        let posted = posted_map();
+        let mut ctx = h.ctx();
+        ctx.pr_reviews_posted = Some(&posted);
+        let out = run_gh(
+            &serde_json::json!({
+                "command": ["pr", "review", "2685", "--comment", "--body", MEASURED_BODY],
+                "repo": REPO,
+            }),
+            &ctx,
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("Step 2B"), "{}", out.content);
+        assert!(out.content.contains("hold[review]"), "{}", out.content);
+        for line in out.content.lines() {
+            assert!(
+                !line.trim_start().starts_with("VERDICT:"),
+                "a remedy line would be re-read as a verdict: {line:?}"
+            );
+        }
+    }
+
+    /// Record one `run_shell` row through `save_tool_call` — the production
+    /// writer — rather than a hand-rolled INSERT: a fabricated row could
+    /// satisfy a query the real writer never produces (motif mika#2565).
+    async fn record_a_shell_call(h: &TestHarness, command: &str) {
+        h.db.save_tool_call(
+            &format!("tc-{}", uuid::Uuid::new_v4()),
+            "test-session",
+            None,
+            None,
+            3,
+            crate::evidence::guards::PIPELINE_GROUNDING_SHELL_TOOL,
+            "builtin",
+            Some("qa-review"),
+            Some(&serde_json::json!({ "command": command }).to_string()),
+            Some("GUARD: scripts/verify-pipeline.sh exit=1"),
+            true,
+            false,
+            42,
+            None,
+        )
+        .await
+        .expect("the shell row must be recorded");
+    }
+
+    /// Positive control: the shape Step 2E prescribes traverses, and leaves the
+    /// `allowed` row that distinguishes "refuses nothing" from "never runs"
+    /// (mika#2205).
+    ///
+    /// The session records a real Step 2B invocation, so the vol-2 execution
+    /// proof is **acquired** rather than abstained — which is what makes the
+    /// single `allowed` row the whole population here.
+    #[tokio::test]
+    async fn a_grounded_block_traverses_and_leaves_its_allowed_row() {
+        let h = TestHarness::with_agent("mika-qa");
+        record_a_shell_call(&h, "bash scripts/verify-pipeline.sh origin/main").await;
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                true,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(rows(&h, "allowed").await, 1);
+        assert_eq!(all_rows(&h).await, 1);
+    }
+
+    /// **The vol-2 class.** A body Step 2E would sign off on, in a session
+    /// whose ledger records shell calls and not one of them ran a guard. The
+    /// two body predicates are satisfied; only the engine fact refuses.
+    #[tokio::test]
+    async fn a_well_formed_block_whose_session_ran_no_guard_is_refused() {
+        let h = TestHarness::with_agent("mika-qa");
+        record_a_shell_call(&h, "git diff --stat origin/main").await;
+        record_a_shell_call(&h, "cargo test -p mika-agent").await;
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
+        let err = validate_pipeline_block_grounding_gated(
+            true,
+            PASS_GATE_DISARMED,
+            &args,
+            Some(REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("a section written rather than observed must not publish");
+        assert!(err.content.contains("no_guard_executed"), "{}", err.content);
+        assert!(err.content.contains("Step 2B"), "{}", err.content);
+        assert_eq!(rows(&h, "refused").await, 1);
+        assert_eq!(
+            rows(&h, "abstained").await,
+            0,
+            "the ledger answered — this is a refusal, not an abstention"
+        );
+    }
+
+    /// The false positive the plan names, and it **abstains out loud**. An
+    /// empty ledger has two causes no query separates — `MIKA_STORE_TOOL_CALLS`
+    /// disarmed, or a review resumed on a build callback under a brand-new
+    /// `session_id`. Both are silence, so the execution proof steps aside and
+    /// the body predicates still decide.
+    #[tokio::test]
+    async fn an_empty_tool_ledger_abstains_rather_than_refusing() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", GROUNDED_BODY]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                true,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "an unreadable term must not turn a grounded review into a refusal"
+        );
+        assert_eq!(rows(&h, "abstained").await, 1, "the abstention is SAID");
+        assert_eq!(
+            rows(&h, "allowed").await,
+            1,
+            "and it is PARTIAL — the body predicates still reached their verdict"
+        );
+    }
+
+    /// The abstention does not resurrect the vol-1 classes. A session with no
+    /// ledger at all still refuses the two measured bodies of mika#2685 —
+    /// otherwise a disarmed `MIKA_STORE_TOOL_CALLS` would silently disarm the
+    /// whole gate.
+    #[tokio::test]
+    async fn abstaining_on_execution_does_not_disarm_the_body_predicates() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", MEASURED_BODY]);
+        let err = validate_pipeline_block_grounding_gated(
+            true,
+            PASS_GATE_DISARMED,
+            &args,
+            Some(REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("the measured body is refused whatever the ledger says");
+        assert!(err.content.contains("section_absent"), "{}", err.content);
+        assert_eq!(rows(&h, "abstained").await, 1);
+        assert_eq!(rows(&h, "refused").await, 1);
+    }
+
+    /// Out of population: nothing but `block[pipeline]` is this guard's
+    /// business, and an out-of-population call leaves **no** row at all — the
+    /// `allowed` population must stay readable as "a grounded pipeline block",
+    /// not as "any review that went past".
+    #[tokio::test]
+    async fn the_other_verdicts_traverse_and_leave_nothing() {
+        let h = TestHarness::with_agent("mika-qa");
+        for (flag, body) in [
+            (
+                "--approve",
+                "DEPTH: full\n\nVERDICT: pass\n\nAll ACs met.\n",
+            ),
+            (
+                "--comment",
+                "DEPTH: full\n\nVERDICT: block[ac]\n\nAC3 is untested.\n",
+            ),
+            (
+                "--comment",
+                "DEPTH: full\n\nVERDICT: hold[review]\n\nWaiting on CI.\n",
+            ),
+        ] {
+            let args = argv(&["pr", "review", "2685", flag, "--body", body]);
+            assert!(
+                validate_pipeline_block_grounding_gated(
+                    true,
+                    PASS_GATE_DISARMED,
+                    &args,
+                    Some(REPO),
+                    &h.ctx()
+                )
+                .await
+                .is_ok(),
+                "{body:?}"
+            );
+        }
+        assert_eq!(all_rows(&h).await, 0);
+    }
+
+    /// The STOP switch actually stops: the very body that is refused when the
+    /// gate is armed traverses when it is disarmed, and leaves no row.
+    #[tokio::test]
+    async fn a_disarmed_gate_lets_the_measured_body_through() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body", MEASURED_BODY]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                false,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "MIKA_PIPELINE_GROUNDING_GATE=0 must be a real STOP"
+        );
+        assert_eq!(all_rows(&h).await, 0);
+    }
+
+    /// Fail-open on an unreadable body: `--body-file` is not read by this
+    /// guard, so the call traverses rather than being refused on a term the
+    /// guard cannot see.
+    #[tokio::test]
+    async fn an_unreadable_body_is_an_abstention_not_a_refusal() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "2685", "--comment", "--body-file", "b.md"]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                true,
+                PASS_GATE_DISARMED,
+                &args,
+                Some(REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(rows(&h, "refused").await, 0);
+    }
+}
+
+/// Layer B du second membre — le câblage du `pass` (mika#2961).
+///
+/// Son frère ci-dessus prouve la **position dans la chaîne** par un appel
+/// `run_gh` complet : le refus revient à l'appelant sans qu'aucun subprocess ne
+/// soit lancé. Ce module-ci ne le reprouve pas, et ne peut pas : l'interrupteur
+/// du `pass` est **désarmé par défaut**, donc un appel `run_gh` traverserait le
+/// lien et irait chercher `gh`. Les deux membres entrent dans le **même** appel
+/// à `validate_pipeline_block_grounding_gated`, au même point de la chaîne — la
+/// position est partagée par construction, et ce qui reste à attester ici est le
+/// câblage du second bit, de son armement à sa ligne d'audit.
+#[cfg(test)]
+mod mika2961_pass_evidence {
+    use super::validate_pipeline_block_grounding_gated;
+    use crate::evidence::guards::PIPELINE_GROUNDING_AUDIT_TOOL;
+    use crate::test_utils::test_helpers::TestHarness;
+
+    const CM_REPO: &str = "senara-solutions/control-monitor";
+    const CM_TARGET: &str = "pr_review:senara-solutions/control-monitor#217";
+    const MIKA_REPO: &str = "senara-solutions/mika";
+    const SINCE: &str = "1970-01-01T00:00:00Z";
+
+    /// Le gate du `pass`, armé — l'état que l'opérateur ouvrira, et le seul dans
+    /// lequel ce module a un sujet.
+    const PASS_GATE_ARMED: bool = true;
+    /// Son défaut.
+    const PASS_GATE_DISARMED: bool = false;
+    /// Le gate de mika#2687, désarmé : chaque cas de ce module isole le second
+    /// membre, pour qu'un vert ne puisse pas venir du premier.
+    const BLOCK_GATE_DISARMED: bool = false;
+    /// Et armé, pour le seul cas qui vérifie que les deux cohabitent.
+    const BLOCK_GATE_ARMED: bool = true;
+
+    /// La tête de la revue APPROVED de control-monitor#217 du
+    /// 2026-10-29T14:26:24Z — mesurée : 30 lignes, aucune ligne `PIPELINE:`
+    /// ancrée, `contains("PIPELINE:")` faux. Dépôt sans garde exécutable et
+    /// merge manuel : c'est le cas d'origine du ticket.
+    const MEASURED_CM217: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
+                                  /messages on client_ref with detached delivery, reconcile \
+                                  command, and 5 ACs all verified against \
+                                  source.\n\nBUILD VERIFICATION: skipped (control-monitor PR — \
+                                  build_mika does not apply; cm CI gates are the build \
+                                  verification)\n\nFINDINGS: none\n";
+
+    /// Le même corps, plus la ligne que Step 2D prescrivait à ce dépôt-là —
+    /// verbatim de `system_prompt.md:275`. Un seul changement entre lui et le
+    /// corps mesuré, et c'est le **premier** terme du garde.
+    ///
+    /// C'était le contrôle positif du vol 1. Depuis le vol 2/2 il est la fixture
+    /// du **second** refus : la section y est, la ligne de test négatif n'y est
+    /// pas, et c'est exactement la forme que le vol 1 laissait passer. Le
+    /// contrôle positif est devenu [`CM217_CONFORME`].
+    const CM217_WITH_STEP_2D: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
+                                      /messages on client_ref with detached delivery, reconcile \
+                                      command, and 5 ACs all verified against \
+                                      source.\n\nPIPELINE: not-applicable (no executable guard \
+                                      found in senara-solutions/control-monitor: checked \
+                                      scripts/verify-pipeline.sh, \
+                                      scripts/plan-doc-check.sh)\n\nFINDINGS: none\n";
+
+    /// Le corps **conforme** : la section de Step 2D *et* la ligne de test
+    /// négatif dans la forme `n/a` de `system_prompt.md:412` — ce que la revue
+    /// de control-monitor#217 devait porter, et le contrôle positif du membre
+    /// `pass` depuis le vol 2/2.
+    ///
+    /// Un seul changement le sépare de [`CM217_WITH_STEP_2D`], et c'est le
+    /// second terme du garde. Les deux moitiés sont verbatim du prompt ; leur
+    /// assemblage ne l'est pas, parce qu'aucun des 260 `pass` mesurés le
+    /// 2026-10-30 ne portait les deux.
+    const CM217_CONFORME: &str = "VERDICT: pass\nDEPTH: code-level\nREASON: Idempotent POST \
+                                  /messages on client_ref with detached delivery, reconcile \
+                                  command, and 5 ACs all verified against \
+                                  source.\n\nPIPELINE: not-applicable (no executable guard \
+                                  found in senara-solutions/control-monitor: checked \
+                                  scripts/verify-pipeline.sh, \
+                                  scripts/plan-doc-check.sh)\n\nNEGATIVE-TEST: n/a — PR out of \
+                                  perimeter\n\nFINDINGS: none\n";
+
+    /// Un `block[pipeline]` fondé, pour le seul cas qui fait cohabiter les deux
+    /// membres. Copie de `GROUNDED_BODY` du module voisin — recopiée plutôt
+    /// qu'empruntée parce que ce qu'elle vérifie ici n'est pas le prédicat du
+    /// corps mais que l'arrivée du second bit ne déplace pas le premier.
+    const GROUNDED_BLOCK: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\nPIPELINE: block \
+                                  (mika)\n- scripts/verify-pipeline.sh → exit 1\n  \
+                                  [pipeline-exempt: none] REJECT: code-only PR\n  Verification \
+                                  FAILED: 1 missing artifact(s).\n";
+
+    /// Le corps mesuré de mika#2685, hors section — le cas de mika#2687, pour la
+    /// moitié `block` du test de cohabitation.
+    const MEASURED_BLOCK: &str = "DEPTH: full\n\nVERDICT: block[pipeline]\n\npipeline-exempt \
+                                  label present but PR contains non-docs files.\n";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cm_argv(body: &str) -> Vec<String> {
+        argv(&["pr", "review", "217", "--approve", "--body", body])
+    }
+
+    /// Lignes que le garde a écrites pour une issue donnée, lues sur
+    /// `after_value` — même raison que chez le voisin : un test qui compterait
+    /// les lignes sur le seul nom d'outil resterait vert sur un garde qui écrit
+    /// la mauvaise issue.
+    async fn rows(h: &TestHarness, target: &str, outcome: &str) -> usize {
+        h.db.get_audit_events("test-session")
+            .await
+            .expect("get_audit_events")
+            .iter()
+            .filter(|e| {
+                e.tool_name == PIPELINE_GROUNDING_AUDIT_TOOL
+                    && e.target_key == target
+                    && e.after_value.as_deref() == Some(outcome)
+            })
+            .count()
+    }
+
+    async fn all_rows(h: &TestHarness, target: &str) -> i64 {
+        h.db.count_recent_audit_events_for_target(PIPELINE_GROUNDING_AUDIT_TOOL, target, SINCE)
+            .await
+            .unwrap()
+    }
+
+    /// V3 — le corps mesuré est refusé, sous **son** motif et **sa** doctrine.
+    ///
+    /// Les deux jetons comptent : `pass_evidence_absent` et `mika#2961`
+    /// séparent ce refus de celui de mika#2687 dans tout ce qui lit cette charge
+    /// utile, à commencer par le modèle qui la reçoit. Un refus du `pass` classé
+    /// sous `pipeline_block_ungrounded` élargirait en silence une population déjà
+    /// publiée (motif mika#2131).
+    #[tokio::test]
+    async fn le_corps_mesure_de_cm217_est_refuse_sous_son_propre_motif() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(MEASURED_CM217),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("une approbation sans aucune preuve pipeline n'est plus postable");
+        assert!(
+            err.content.contains("pass_evidence_absent"),
+            "{}",
+            err.content
+        );
+        assert!(err.content.contains("mika#2961"), "{}", err.content);
+        assert!(
+            err.content.contains("pass_section_absent"),
+            "le motif discriminant du membre : {}",
+            err.content
+        );
+        assert_eq!(rows(&h, CM_TARGET, "refused").await, 1);
+        assert_eq!(
+            rows(&h, CM_TARGET, "abstained").await,
+            0,
+            "le membre `pass` ne lit pas le ledger, donc ne peut pas s'abstenir \
+             dessus"
+        );
+    }
+
+    /// V7 — et deux propriétés du texte du remedy, qui sont deux pièges
+    /// distincts.
+    #[tokio::test]
+    async fn le_remedy_nomme_les_deux_sorties_sans_se_satisfaire_lui_meme() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(MEASURED_CM217),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("refusé");
+
+        // Les deux sorties correctes sont nommées. N'en nommer qu'une pousserait
+        // le modèle à écrire l'autre de mémoire, ce qui est le défaut mesuré
+        // avec une étape de plus.
+        assert!(err.content.contains("Step 2E"), "{}", err.content);
+        assert!(err.content.contains("Step 2D"), "{}", err.content);
+
+        for line in err.content.lines() {
+            // Piège 1, celui de mika#2687 : `VERDICT_RE` est ancré sur ce
+            // préfixe de ligne, donc une ligne du remedy qui l'ouvrirait serait
+            // relue comme un verdict par le prochain consommateur.
+            assert!(
+                !line.trim_start().starts_with("VERDICT:"),
+                "une ligne du remedy serait relue comme un verdict : {line:?}"
+            );
+            // Piège 2, propre à ce membre : un remedy portant sa propre ligne
+            // `PIPELINE:` **ancrée** satisferait ce garde-ci si le modèle
+            // recollait le refus dans son corps suivant. Le garde lirait alors
+            // son propre texte comme la preuve du relecteur. C'est pourquoi les
+            // deux formes sont décrites et jamais citées verbatim.
+            assert!(
+                !crate::evidence::guards::pipeline_section_present(line),
+                "le remedy porte une ligne de section qui satisferait ce garde : \
+                 {line:?}"
+            );
+            // Piège 3, ajouté par le vol 2/2 : le second terme est une ligne
+            // ancrée aussi, donc le même recollage satisferait le second terme
+            // avec le texte du premier refus.
+            assert!(
+                !crate::evidence::guards::negative_test_line_present(line),
+                "le remedy porte une ligne de test négatif qui satisferait le \
+                 second terme de ce garde : {line:?}"
+            );
+        }
+    }
+
+    /// V7′ — les mêmes pièges sur le remedy du **second** refus, plus la
+    /// propriété qui lui est propre : il nomme trois des quatre formes du
+    /// prompt, et nomme la quatrième comme refusée.
+    ///
+    /// Les deux remedys sont deux textes distincts, donc deux surfaces
+    /// distinctes : asserter l'un ne dit rien de l'autre, et c'est le second qui
+    /// court le risque neuf — celui de porter lui-même la ligne qu'il réclame.
+    #[tokio::test]
+    async fn le_remedy_de_la_ligne_nomme_les_formes_sans_offrir_la_sortie_contradictoire() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(CM217_WITH_STEP_2D),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("refusé");
+
+        // Les trois formes compatibles avec une approbation sont nommées.
+        for forme in ["satisfied", "mechanical", "n/a"] {
+            assert!(
+                err.content.contains(forme),
+                "la forme `{forme}` doit être nommée, sinon le modèle l'écrit de \
+                 mémoire : {}",
+                err.content
+            );
+        }
+        // Et la quatrième est nommée comme refusée, jamais offerte : un `pass`
+        // qui la porte est rejeté par le handler de merge en aval (mika#2264),
+        // donc la lister sans le dire achèterait un tour contre un merge.
+        assert!(
+            err.content.contains("missing"),
+            "la forme contradictoire doit être NOMMÉE — une incitation perverse \
+             passée sous silence est une incitation qu'on ne peut pas mesurer : {}",
+            err.content
+        );
+        assert!(
+            err.content.contains("rejects"),
+            "et dite comme refusée en aval, dans la même phrase : {}",
+            err.content
+        );
+
+        for line in err.content.lines() {
+            assert!(
+                !line.trim_start().starts_with("VERDICT:"),
+                "une ligne du remedy serait relue comme un verdict : {line:?}"
+            );
+            assert!(
+                !crate::evidence::guards::negative_test_line_present(line),
+                "le remedy porte la ligne même qu'il réclame — il satisferait \
+                 donc le garde qu'il explique : {line:?}"
+            );
+            assert!(
+                !crate::evidence::guards::pipeline_section_present(line),
+                "et il ne porte pas davantage de ligne de section : {line:?}"
+            );
+        }
+    }
+
+    /// V4′ — le corps qui portait la section et rien d'autre : refusé par le
+    /// **second** terme, sous son propre motif et sa propre ligne d'audit.
+    ///
+    /// C'est le test qui atteste le vol 2/2 de bout en bout côté câblage : au
+    /// vol 1 ce même corps traversait avec une ligne `allowed`, et c'est le
+    /// basculement de cette assertion qui dit que le second terme est réellement
+    /// branché — pas seulement classé.
+    #[tokio::test]
+    async fn un_pass_sans_ligne_de_test_negatif_est_refuse_sous_son_propre_motif() {
+        let h = TestHarness::with_agent("mika-qa");
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_DISARMED,
+            PASS_GATE_ARMED,
+            &cm_argv(CM217_WITH_STEP_2D),
+            Some(CM_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("la section seule ne suffit plus depuis le vol 2/2");
+        assert!(
+            err.content.contains("pass_negative_test_absent"),
+            "le motif ET la clé d'erreur du second refus — un refus de ligne \
+             classé sous `pass_evidence_absent` serait indistinguable du premier \
+             dans les greps qui lisent cette charge utile (motif mika#2131) : {}",
+            err.content
+        );
+        assert!(
+            !err.content.contains("pass_evidence_absent"),
+            "et il ne porte pas la clé du premier : {}",
+            err.content
+        );
+        assert!(err.content.contains("mika#2961"), "{}", err.content);
+        assert_eq!(rows(&h, CM_TARGET, "refused").await, 1);
+        assert_eq!(
+            all_rows(&h, CM_TARGET).await,
+            1,
+            "une ligne, et une seule : le membre `pass` ne lit pas le ledger, \
+             donc n'écrit pas de ligne d'abstention à côté"
+        );
+    }
+
+    /// V4 — le contrôle positif, et sa ligne `allowed`.
+    ///
+    /// Un seul changement sépare ce corps du précédent : la ligne de test
+    /// négatif. La ligne `allowed` est ce qui distingue « le garde n'a rien
+    /// refusé » de « le garde n'a jamais été atteint » (mika#2205) — sans elle,
+    /// une table vide a deux causes de signe opposé. Et sans ce cas, un garde
+    /// qui refuserait **tout** `pass` resterait vert sur tout le reste du
+    /// module.
+    #[tokio::test]
+    async fn un_pass_conforme_traverse_et_laisse_sa_ligne() {
+        let h = TestHarness::with_agent("mika-qa");
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_DISARMED,
+                PASS_GATE_ARMED,
+                &cm_argv(CM217_CONFORME),
+                Some(CM_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "la sortie que Step 2D et Step 2.5.5 prescrivent ensemble à un dépôt \
+             sans garde est la bonne"
+        );
+        assert_eq!(rows(&h, CM_TARGET, "allowed").await, 1);
+        assert_eq!(
+            all_rows(&h, CM_TARGET).await,
+            1,
+            "une ligne, et une seule : le membre `pass` ne paie pas la lecture \
+             du ledger, donc n'écrit pas de ligne d'abstention à côté"
+        );
+    }
+
+    /// V5 — l'interrupteur arrête vraiment : le corps qui est refusé armé
+    /// traverse désarmé, et ne laisse rien.
+    ///
+    /// C'est l'état **par défaut** du vol, donc ce test décrit ce que la flotte
+    /// fait à la livraison : rien. L'ouverture revient à l'opérateur (AC4).
+    #[tokio::test]
+    async fn le_gate_desarme_laisse_passer_le_corps_mesure() {
+        let h = TestHarness::with_agent("mika-qa");
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_DISARMED,
+                PASS_GATE_DISARMED,
+                &cm_argv(MEASURED_CM217),
+                Some(CM_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "désarmé, le garde est hors circuit"
+        );
+        assert_eq!(
+            all_rows(&h, CM_TARGET).await,
+            0,
+            "et hors circuit veut dire hors population : pas de ligne, pas de \
+             requête"
+        );
+    }
+
+    /// Hors population, gate armé : seul le `pass` est l'affaire de ce membre.
+    ///
+    /// L'assertion porte sur l'**absence totale** de ligne, et pas sur l'absence
+    /// de refus : la population `allowed` doit rester lisible comme « une
+    /// approbation portant sa section », jamais comme « une revue qui est
+    /// passée ».
+    #[tokio::test]
+    async fn les_autres_verdicts_traversent_et_ne_laissent_rien() {
+        let h = TestHarness::with_agent("mika-qa");
+        for body in [
+            "VERDICT: block[ac]\n\nAC3 n'est pas testé.\n",
+            "VERDICT: hold[review]\n\nEn attente de la CI.\n",
+            "VERDICT: block[pipeline]\n\nAucune section.\n",
+        ] {
+            let args = argv(&["pr", "review", "217", "--comment", "--body", body]);
+            assert!(
+                validate_pipeline_block_grounding_gated(
+                    BLOCK_GATE_DISARMED,
+                    PASS_GATE_ARMED,
+                    &args,
+                    Some(CM_REPO),
+                    &h.ctx()
+                )
+                .await
+                .is_ok(),
+                "{body:?}"
+            );
+        }
+        assert_eq!(all_rows(&h, CM_TARGET).await, 0);
+    }
+
+    /// Les deux membres cohabitent, et armer le second ne déplace pas le
+    /// premier.
+    ///
+    /// Les 32 tests de mika#2687 le disent déjà avec le second bit **désarmé** —
+    /// ce qui est leur contrôle de non-régression, et pas celui-ci. Ici les deux
+    /// gates sont armés en même temps, le seul état que ces 32 tests ne
+    /// traversent pas, et chaque membre rend son propre motif sur le corps de sa
+    /// propre classe.
+    #[tokio::test]
+    async fn les_deux_membres_armes_rendent_chacun_son_motif() {
+        let h = TestHarness::with_agent("mika-qa");
+        let target = "pr_review:senara-solutions/mika#2685";
+
+        let args = argv(&[
+            "pr",
+            "review",
+            "2685",
+            "--comment",
+            "--body",
+            MEASURED_BLOCK,
+        ]);
+        let err = validate_pipeline_block_grounding_gated(
+            BLOCK_GATE_ARMED,
+            PASS_GATE_ARMED,
+            &args,
+            Some(MIKA_REPO),
+            &h.ctx(),
+        )
+        .await
+        .expect_err("le chemin mika#2687 est intact");
+        assert!(
+            err.content.contains("pipeline_block_ungrounded"),
+            "{}",
+            err.content
+        );
+        assert!(err.content.contains("mika#2687"), "{}", err.content);
+        assert!(
+            !err.content.contains("mika#2961"),
+            "un refus de `block[pipeline]` ne porte pas la doctrine du `pass` : {}",
+            err.content
+        );
+
+        let args = argv(&[
+            "pr",
+            "review",
+            "2685",
+            "--comment",
+            "--body",
+            GROUNDED_BLOCK,
+        ]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_ARMED,
+                PASS_GATE_ARMED,
+                &args,
+                Some(MIKA_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok(),
+            "et un `block[pipeline]` fondé passe toujours, les deux gates armés"
+        );
+        assert_eq!(rows(&h, target, "refused").await, 1);
+        assert_eq!(rows(&h, target, "allowed").await, 1);
+    }
+
+    /// Ce que ce module ne prouve pas par un tour, et ce qui le tient : le bit
+    /// que la chaîne `run_gh` passe réellement est l'**interrupteur**, pas un
+    /// `false` en dur.
+    ///
+    /// Tous les cas ci-dessus passent le bit en paramètre, donc aucun d'eux ne
+    /// rougirait si `validate_pipeline_block_grounding` — le seul appelant que
+    /// `run_gh` atteint — figeait son second argument à `false`. Le garde serait
+    /// alors mort sur toute la flotte, interrupteur ouvert ou non, et chaque
+    /// assertion de comportement resterait verte : c'est la classe mika#2158.
+    /// Un scan de source le refuse, sur le même `ProductionScanner` que le
+    /// lecteur unique de mika#2687.
+    ///
+    /// L'interrupteur a **deux** lecteurs de production, un par rôle, et les
+    /// deux sont exigés : la décision (ici) et la ligne de démarrage qui dit
+    /// qu'il est désarmé (`log_pass_evidence_gate_state`, dans `guards.rs`) —
+    /// la seconde moitié d'AC4. Le scan tient les deux rôles plutôt qu'un
+    /// compte : zéro lecteur de décision est un garde mort, zéro lecteur de
+    /// démarrage est un réglage qu'on ne peut pas observer (mika#2293), et un
+    /// troisième site serait une seconde résolution à côté du `OnceLock`.
+    #[test]
+    fn linterrupteur_a_un_lecteur_de_production_par_role() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut readers: Vec<String> = Vec::new();
+        scanner.for_each(|path, production| {
+            for (i, text) in production.lines().enumerate() {
+                if text.contains("pass_evidence_gate_armed()") && !text.contains("fn ") {
+                    let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+                    readers.push(format!("{rel}:{}: {}", i + 1, text.trim()));
+                }
+            }
+        });
+        readers.sort();
+        assert_eq!(
+            readers.len(),
+            2,
+            "mika#2961 : l'interrupteur a exactement DEUX lecteurs de production, \
+             un par rôle — la décision dans `skills/builtin_handlers.rs` et la \
+             ligne de démarrage dans `evidence/guards.rs`. Un de moins est un \
+             rôle perdu en silence ; un de plus est une seconde résolution à côté \
+             du `OnceLock`. Trouvés : {readers:#?}"
+        );
+        assert!(
+            readers[0].starts_with("evidence/guards.rs:"),
+            "le lecteur de démarrage (AC4) doit rester dans `guards.rs`, avec \
+             l'interrupteur — trouvé : {}",
+            readers[0]
+        );
+        assert!(
+            readers[1].starts_with("skills/builtin_handlers.rs:"),
+            "le lecteur de décision reste l'enveloppe non gatée de cette chaîne, \
+             celle que `run_gh` atteint — trouvé : {}",
+            readers[1]
+        );
+    }
+
+    /// Les deux jetons ancrés n'ont **qu'un** site littéral chacun en
+    /// production : leur `const`.
+    ///
+    /// La classe que ce scan ferme est celle du vol entier, retournée contre
+    /// lui-même. Un site qui écrirait `body.contains("NEGATIVE-TEST:")` — ou le
+    /// jeton de section — au lieu de passer par le prédicat ancré rendrait
+    /// exactement le fail-open mesuré : la prose de la revue de PR #2967
+    /// compterait pour la ligne qu'elle dit reportée. Aucune assertion de
+    /// comportement de ce module ne devient fausse dans ce cas, parce qu'aucune
+    /// ne traverse ce site-là : c'est la classe mika#2158, et elle se referme en
+    /// scannant la source.
+    ///
+    /// Le prédicat anchore sur le **littéral entier entre guillemets** et pas
+    /// sur le jeton nu, pour une raison qui est tout l'intérêt du scan : les
+    /// deux remedys citent les deux jetons en pleine phrase, et c'est prescrit —
+    /// un refus qui ne nomme pas ce qu'il réclame ne s'explique pas. Ce qui est
+    /// refusé est la *comparaison en dur*, pas la mention.
+    #[test]
+    fn les_deux_jetons_ancres_nont_quun_site_litteral_de_production() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let needles = [
+            crate::evidence::guards::PIPELINE_SECTION_LINE_PREFIX,
+            crate::evidence::guards::NEGATIVE_TEST_LINE_PREFIX,
+        ];
+        let mut sites: Vec<String> = Vec::new();
+        scanner.for_each(|path, production| {
+            for (i, text) in production.lines().enumerate() {
+                let t = text.trim_start();
+                if t.starts_with("//") || t.starts_with("///") || t.starts_with("* ") {
+                    continue;
+                }
+                for needle in needles {
+                    // Le littéral entier, guillemets comprises. `format!` plutôt
+                    // qu'une chaîne écrite ici : le jeton ne doit vivre qu'au
+                    // site de sa `const`, celui-ci compris.
+                    if text.contains(&format!("\"{needle}\"")) {
+                        let rel = path.strip_prefix(&src_root).unwrap_or(path).display();
+                        sites.push(format!("{rel}:{}: {}", i + 1, t));
+                    }
+                }
+            }
+        });
+        sites.sort();
+        assert_eq!(
+            sites.len(),
+            2,
+            "mika#2961 : chacun des deux jetons ancrés n'a qu'UN site littéral de \
+             production, sa `const` dans `evidence/guards.rs`. Un second site est \
+             une comparaison en dur qui contourne le prédicat ancré — quand ce \
+             test rougit, router le site par `line_prefix_present`, ne pas \
+             ajouter de ligne (doctrine mika#2201). Trouvés : {sites:#?}"
+        );
+        for site in &sites {
+            assert!(
+                site.starts_with("evidence/guards.rs:") && site.contains("const "),
+                "le seul site littéral autorisé est la déclaration de la `const` — \
+                 trouvé : {site}"
+            );
+        }
+    }
+
+    /// Un corps que ce garde ne lit pas ne devient pas un refus : `--body-file`
+    /// est hors de sa portée, donc l'appel traverse.
+    ///
+    /// C'est le côté sûr de l'arithmétique de mika#2455, et il compte plus pour
+    /// ce membre-ci que pour son voisin : un faux refus sur un `pass` tue le
+    /// tour **sans aucune revue postée**, sur la population la plus fréquente de
+    /// la flotte.
+    #[tokio::test]
+    async fn un_corps_illisible_traverse_plutot_que_detre_refuse() {
+        let h = TestHarness::with_agent("mika-qa");
+        let args = argv(&["pr", "review", "217", "--approve", "--body-file", "b.md"]);
+        assert!(
+            validate_pipeline_block_grounding_gated(
+                BLOCK_GATE_DISARMED,
+                PASS_GATE_ARMED,
+                &args,
+                Some(CM_REPO),
+                &h.ctx()
+            )
+            .await
+            .is_ok()
+        );
+        assert_eq!(all_rows(&h, CM_TARGET).await, 0);
+    }
+}
+
+/// mika#2995 — le câblage : la pose de `ready` est refusée **hors** tour
+/// Fallthrough, et `gh issue create` y passe toujours.
+///
+/// Frère unitaire de `evidence::guards::tests::mika2995`, et il mesure autre
+/// chose. Là-bas, `work_creation_is_refused` rend un booléen sur les quatre
+/// cases de la table (motif × tour) ; ici la garde tourne à sa position de
+/// production dans `run_gh`, avec un `ToolContext` réel, et c'est le seul
+/// niveau où un prédicat correct mais **jamais appelé** se voit. Le vol a
+/// changé la ligne qui l'appelle : c'est elle que ce module épingle.
+#[cfg(test)]
+mod mika2995_work_creation_wiring {
+    use super::validate_fallthrough_work_creation;
+    use crate::test_utils::test_helpers::TestHarness;
+    use crate::tools::ToolContext;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// L'argv **mesuré** le 2026-10-31 à 16:51:37Z dans la trace
+    /// `0104d923`, mot pour mot. Pas un équivalent : c'est l'appel qui a
+    /// posé `ready` sur mika#2958 avec le `GH_TOKEN` du moteur, et ce test
+    /// existe pour que cet appel-là, cinq jetons compris, soit refusé.
+    fn largv_de_lincident() -> Vec<String> {
+        argv(&["issue", "edit", "2958", "--add-label", "ready"])
+    }
+
+    async fn refus(args: &[String], ctx: &ToolContext<'_>) -> serde_json::Value {
+        let err = validate_fallthrough_work_creation(args, Some("senara-solutions/mika"), ctx)
+            .await
+            .expect_err("cet appel doit être refusé");
+        serde_json::from_str(&err.content).expect("le refus est un objet JSON")
+    }
+
+    /// **Le test du ticket.** Tour ordinaire — `is_webhook_fallthrough_turn`
+    /// est faux, comme il l'était le 2026-10-31 — et la pose de `ready` est
+    /// refusée.
+    ///
+    /// C'est la seule assertion de ce fichier qui dit quelque chose que
+    /// l'arbre d'avant mika#2995 ne disait pas : sur ce tour-là, la garde
+    /// de mika#2573 rendait `Ok(())` et l'agent se donnait le consentement
+    /// que la garde de mika#2772 exige d'un humain.
+    #[tokio::test]
+    async fn largv_de_lincident_est_refuse_hors_tour_fallthrough() {
+        let h = TestHarness::new();
+        let ctx = h.ctx();
+        assert!(
+            !ctx.is_webhook_fallthrough_turn,
+            "la prémisse du test : l'incident n'était PAS un tour Fallthrough. \
+                 Si ce booléen est vrai, le test ne mesure plus le défaut."
+        );
+
+        let payload = refus(&largv_de_lincident(), &ctx).await;
+        assert_eq!(payload["error"], "fallthrough_work_creation_refused");
+        assert_eq!(
+            payload["action"], "ready_label_add",
+            "le motif est le format de fil sur lequel l'opérateur fait son GROUP BY"
+        );
+    }
+
+    /// Sur un tour Fallthrough, rien ne change : le refus que mika#2573
+    /// livrait tient, sous le même identifiant.
+    #[tokio::test]
+    async fn la_pose_de_ready_reste_refusee_sur_un_tour_fallthrough() {
+        let h = TestHarness::new();
+        let mut ctx = h.ctx();
+        ctx.is_webhook_fallthrough_turn = true;
+
+        let payload = refus(&largv_de_lincident(), &ctx).await;
+        assert_eq!(payload["error"], "fallthrough_work_creation_refused");
+        assert_eq!(payload["action"], "ready_label_add");
+    }
+
+    /// **Contrôle négatif, et le plus porteur des trois.** mika#2995 retire
+    /// une capacité au moteur, il n'en retire pas deux : `gh issue create`
+    /// garde sa borne de mika#2573 — tours Fallthrough seulement.
+    ///
+    /// Sans lui, « la population dépend du motif » serait indistinguable de
+    /// « la garde refuse tout, partout », c'est-à-dire d'un élargissement
+    /// silencieux qui casserait la création d'issue sur les tours de
+    /// conversation où elle est le travail nominal de mika-dev.
+    #[tokio::test]
+    async fn issue_create_passe_toujours_hors_tour_fallthrough() {
+        let h = TestHarness::new();
+        let args = argv(&["issue", "create", "--title", "Re-groom mika#2958"]);
+        assert!(
+            validate_fallthrough_work_creation(&args, Some("senara-solutions/mika"), &h.ctx())
+                .await
+                .is_ok(),
+            "hors tour Fallthrough, `gh issue create` n'est pas l'affaire de cette garde"
+        );
+    }
+
+    /// Et sur un tour Fallthrough il reste refusé, **avec sa doctrine
+    /// inchangée**. Les deux citations de mika#2573 sont ce qu'un opérateur
+    /// grep ; les renommer casserait la jointure avec le ticket.
+    #[tokio::test]
+    async fn issue_create_reste_refuse_sur_un_tour_fallthrough() {
+        let h = TestHarness::new();
+        let mut ctx = h.ctx();
+        ctx.is_webhook_fallthrough_turn = true;
+
+        let args = argv(&["issue", "create", "--title", "Re-groom mika#2958"]);
+        let payload = refus(&args, &ctx).await;
+        assert_eq!(payload["action"], "issue_create");
+        assert_eq!(payload["doctrine"], "mika#2517 + mika#2573");
+        assert!(
+            payload["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Webhook Fallthrough turn"),
+            "le `reason` de ce motif est celui de mika#2573, mot pour mot : {}",
+            payload["reason"]
+        );
+    }
+
+    /// **AC3 au niveau de ce refus-ci.** Le remède de `ready` ne prescrit
+    /// pas le geste qu'il refuse, et ne nomme pas le gabarit `remove → add`
+    /// que la surface opérateur connaît.
+    ///
+    /// Le `reason`, lui, **a le droit** de nommer `gh issue edit
+    /// --add-label` : un refus qui ne dit pas ce qu'il refuse ne s'explique
+    /// pas. L'assertion porte donc sur le `remedy` seul, et cette asymétrie
+    /// est la décision (mika#2520 interdit le gabarit de contournement, pas
+    /// la désignation de l'interdit).
+    #[tokio::test]
+    async fn le_remede_de_ready_ne_prescrit_aucun_geste_de_promotion() {
+        let h = TestHarness::new();
+        let payload = refus(&largv_de_lincident(), &h.ctx()).await;
+        let remedy = payload["remedy"].as_str().expect("remedy est une chaîne");
+
+        for gabarit in ["--add-label", "--remove-label", "remove"] {
+            assert!(
+                !remedy.contains(gabarit),
+                "le remède est lu par l'agent même qu'on retient : il ne doit porter \
+                     aucun geste de promotion ni de bascule. Trouvé « {gabarit} » dans : \
+                     {remedy}"
+            );
+        }
+        assert!(
+            remedy.contains("belongs to the operator"),
+            "le remède doit ATTRIBUER la promotion à l'opérateur, pas seulement se \
+                 taire : {remedy}"
+        );
+        assert!(
+            remedy.contains("send_message"),
+            "et nommer la sortie correcte, sans quoi le refus se contourne au jugé \
+                 (mika#2520) : {remedy}"
+        );
+    }
+
+    /// La ligne d'audit est comptable sous son motif, sur un tour ordinaire.
+    ///
+    /// Le `warn!` n'est pas observable d'ici ; la ligne d'audit l'est, et
+    /// c'est elle que la sonde AC5 agrège. Un refus qui n'écrirait pas sa
+    /// ligne laisserait le `GROUP BY` de l'opérateur sous-compter
+    /// exactement la population que mika#2995 ouvre.
+    #[tokio::test]
+    async fn le_refus_hors_fallthrough_ecrit_sa_ligne_daudit() {
+        use crate::evidence::guards::FALLTHROUGH_WORK_CREATION_AUDIT_TOOL;
+
+        let h = TestHarness::new();
+        let _ = refus(&largv_de_lincident(), &h.ctx()).await;
+
+        let rows: Vec<_> =
+            h.db.get_audit_events("test-session")
+                .await
+                .expect("get_audit_events")
+                .into_iter()
+                .filter(|e| e.tool_name == FALLTHROUGH_WORK_CREATION_AUDIT_TOOL)
+                .collect();
+        assert_eq!(rows.len(), 1, "une ligne par refus : {rows:?}");
+        assert_eq!(rows[0].after_value.as_deref(), Some("ready_label_add"));
+        assert!(
+            rows[0]
+                .reasoning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("label=ready"),
+            "la ligne nomme le label tel qu'il a été écrit : {:?}",
+            rows[0].reasoning
+        );
     }
 }

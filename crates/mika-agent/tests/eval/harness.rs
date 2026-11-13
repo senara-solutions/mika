@@ -82,6 +82,20 @@ pub struct EvalHarness {
     /// threads it into `AgentParams.stream_ctx` so `process_tool_calls`
     /// emits `ToolCallStart` / `ToolCallResult` frames on tool dispatch.
     pub stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    /// Le texte de l'événement webhook d'AVANT les handlers de `server/`
+    /// (mika#3004). `None` tant que `.webhook_event_text()` n'a pas été appelé,
+    /// donc tout scénario pré-existant est octet pour octet identique.
+    ///
+    /// Un champ du harnais et non un quatrième point d'entrée, pour la raison
+    /// qu'`user_images` a déjà écrite : les trois sites de `run` doivent
+    /// s'accorder sur ce qu'un tour porte, et un quatrième est un quatrième
+    /// endroit où l'oublier.
+    ///
+    /// C'est ce champ qui rend la fixture mika#3004 possible du tout : elle doit
+    /// porter **deux** textes à la fois — l'événement brut que le gateway a
+    /// émis, et le pré-digest de `verdict_handler` que le modèle reçoit — parce
+    /// que c'est leur divergence qui est le défaut.
+    pub webhook_event_text: Option<String>,
 }
 
 impl EvalHarness {
@@ -142,6 +156,7 @@ impl EvalHarness {
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
             stream_ctx: self.stream_ctx.clone(),
+            webhook_event_text: self.webhook_event_text.as_deref(), // mika#3004
         };
 
         let output = run_agent(&params).await?;
@@ -202,6 +217,7 @@ impl EvalHarness {
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
             stream_ctx: self.stream_ctx.clone(),
+            webhook_event_text: self.webhook_event_text.as_deref(), // mika#3004
         };
 
         let output = run_agent_with_deadline(&params, deadline).await?;
@@ -271,6 +287,7 @@ impl EvalHarness {
             internal: self.internal,
             pr_reviews_posted: self.pr_reviews_posted.as_ref(),
             stream_ctx: self.stream_ctx.clone(),
+            webhook_event_text: self.webhook_event_text.as_deref(), // mika#3004
         };
 
         let output = run_agent(&params).await?;
@@ -291,6 +308,7 @@ pub struct EvalHarnessBuilder {
     internal: bool,
     family_tier: bool,
     deployment: mika_common::home::Deployment,
+    fabrication_p0_notify: bool,
     provider_name: Option<String>,
     model_name: Option<String>,
     supports_vision: Option<bool>,
@@ -306,6 +324,7 @@ pub struct EvalHarnessBuilder {
     session_isolated: bool,
     pr_reviews_posted: Option<Arc<DashMap<String, HashSet<String>>>>,
     stream_ctx: Option<Arc<mika_a2a::streaming::ToolCallStreamContext>>,
+    webhook_event_text: Option<String>,
 }
 
 impl Default for EvalHarnessBuilder {
@@ -322,6 +341,7 @@ impl Default for EvalHarnessBuilder {
             internal: false,
             family_tier: false,
             deployment: mika_common::home::Deployment::Unknown,
+            fabrication_p0_notify: false,
             provider_name: None,
             model_name: None,
             supports_vision: None,
@@ -336,6 +356,7 @@ impl Default for EvalHarnessBuilder {
             session_isolated: false,
             pr_reviews_posted: None,
             stream_ctx: None,
+            webhook_event_text: None,
         }
     }
 }
@@ -433,6 +454,20 @@ impl EvalHarnessBuilder {
         self
     }
 
+    /// Arm the `fabrication-detected` P0 notification (mika#2867). Default:
+    /// `false` — the shipped default, and the one the closed-gate control
+    /// asserts: with the gate shut the transport must observe nothing, so a
+    /// test that forgot to call this would pass for the wrong reason.
+    ///
+    /// Mutates the `Settings::test_defaults()` the harness builds, rather than
+    /// threading a fourth argument: the gate is resolved from `Settings` at the
+    /// three `run_loop` entry points, so arming it anywhere else would exercise
+    /// a path production does not have.
+    pub fn fabrication_p0_notify(mut self, armed: bool) -> Self {
+        self.fabrication_p0_notify = armed;
+        self
+    }
+
     /// Set the mock provider name. Default: `"mock"`.
     pub fn provider_name(mut self, name: impl Into<String>) -> Self {
         self.provider_name = Some(name.into());
@@ -507,6 +542,19 @@ impl EvalHarnessBuilder {
     /// broadcast to any subscriber of the underlying `broadcast::Sender`.
     pub fn stream_ctx(mut self, ctx: Arc<mika_a2a::streaming::ToolCallStreamContext>) -> Self {
         self.stream_ctx = Some(ctx);
+        self
+    }
+
+    /// Déclare le texte de l'événement webhook d'AVANT les handlers de `server/`
+    /// pour tous les tours de ce harnais (mika#3004). Défaut : `None`.
+    ///
+    /// À régler **en plus** du message du tour, pas à la place : un scénario de
+    /// tour webhook post-handler en porte deux, et c'est leur divergence qui est
+    /// le sujet. Les régler à la même valeur reproduit un tour qu'aucun handler
+    /// n'a réécrit — ce qui est le cas du label `ready`, et donc exactement la
+    /// forme du contrôle négatif.
+    pub fn webhook_event_text(mut self, text: impl Into<String>) -> Self {
+        self.webhook_event_text = Some(text.into());
         self
     }
 
@@ -618,7 +666,11 @@ impl EvalHarnessBuilder {
 
         let trace_id = uuid::Uuid::new_v4().as_simple().to_string();
 
-        let settings = Settings::test_defaults();
+        let mut settings = Settings::test_defaults();
+        // mika#2867 — la porte vit dans `Settings` en production ; le harness la
+        // pose au même endroit pour que le test traverse le même chemin de
+        // résolution (`is_some_and` aux trois points d'entrée de `run_loop`).
+        settings.fabrication_p0_notify = self.fabrication_p0_notify;
 
         Ok(EvalHarness {
             db: async_db,
@@ -647,6 +699,7 @@ impl EvalHarnessBuilder {
             session_isolated: self.session_isolated,
             pr_reviews_posted: self.pr_reviews_posted,
             stream_ctx: self.stream_ctx,
+            webhook_event_text: self.webhook_event_text,
         })
     }
 }

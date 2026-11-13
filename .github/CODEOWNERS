@@ -13,5 +13,14 @@
 # champs-là sont une assertion humaine, et c'est cette ligne qui les fait relire.
 /docs/egress/                                       @samidarko
 
+# Spécifications des agents bien connus (mika#2888) — la réserve de mika#1580
+# (« #1580 reste la seule entrée vers l'auteur de skills ») vit ici sous la forme
+# de quatre `allow_authoring = false`. Un test les épingle par valeur, mais ce
+# test vit DANS le fichier qu'il protège : une PR qui ouvre l'écriture de skills
+# édite le littéral ET le test dans le même diff, et repart verte. Le test dit
+# QU'UNE valeur a changé ; cette ligne décide SI elle avait le droit. La seule
+# issue légitime est la PR de mika#1580, décision de Vincent citée.
+/crates/mika-agent/src/well_known_agents.rs         @samidarko
+
 # Self-référence : CODEOWNERS se possède lui-même
 /.github/CODEOWNERS                                 @samidarko

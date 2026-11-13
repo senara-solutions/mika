@@ -73,7 +73,7 @@
 //! STOP opérateur.
 //!
 //! C'est l'**inverse** du fail-open retenu ailleurs dans `auto_pull`
-//! (`gh_list_open_pr_closing_issues` échoue en ensemble vide « to preserve
+//! (`gh_list_open_pr_issue_numbers` échoue en ensemble vide « to preserve
 //! pre-fix behavior on infra glitches »). Diverger ici est délibéré : ce
 //! fail-open-là élargit un filtre dont l'échec fait *rater* une exclusion ;
 //! celui-ci gouverne une écriture dont l'échec fait *agir*.
@@ -96,6 +96,7 @@ use tracing::{info, warn};
 use mika_common::label_write::LabelWriteToken;
 
 use crate::async_db::AsyncDatabase;
+use crate::gh_process::{GhSubject, run_gh};
 
 /// Le label gouverné par ce module. Écrit **une seule fois** dans la crate, ici.
 pub(crate) const READY_LABEL: &str = "ready";
@@ -127,6 +128,103 @@ pub(crate) const READY_LABEL_SESSION_ID: &str = "ready-label";
 
 /// `tool_name` des lignes d'audit de refus-pour-park (AC8).
 pub(crate) const READY_LABEL_PARK_TOOL_NAME: &str = "ready_label_park";
+
+// ──────── Le discriminant de parente, et les noms de la relecture ────────
+//
+// mika#2995, tranche du 2026-11-03 : le consentement est lu à l'ENTRÉE de la
+// file (le webhook `labeled ready` crée la tâche parente) et n'était jamais
+// relu à la SORTIE, au moment où le wrapper différé promu part en tour. Les
+// trois noms ci-dessous sont les sites de définition uniques de cette
+// relecture (AC-T4) ; aucun ne contient `noop` nu, déjà pris par
+// `deferred_dispatch_noop_completion` (mika#1124) et par le vocabulaire de
+// mika#2169.
+
+/// Préfixe du label des tâches parentes créées par le feeder `ready-label`.
+///
+/// **SITE DE DÉFINITION UNIQUE** (doctrine mika#2158, classe `grooming_marker`) :
+/// le producteur (`server/ready_label_handler.rs`) **compose** par cette
+/// constante, et le prédicat de la garde mika#2995 **lit** par elle. Deux
+/// littéraux pour le même fait dériveraient en silence, et la dérive serait
+/// invisible des deux côtés — le label continuerait d'être produit, la garde
+/// cesserait simplement de reconnaître ses parentes.
+pub(crate) const READY_LABEL_TASK_PREFIX: &str = "ready-label:";
+
+/// Motif terminal écrit sur le wrapper différé **et** sur sa parente quand le
+/// consentement a été retiré entre la création de la file et le départ du tour.
+///
+/// **Le même littéral des deux côtés, délibérément** : c'est un seul fait, et
+/// deux motifs pour un fait sont deux populations qu'on ne peut plus rapprocher
+/// (classe mika#2205). Il ne recouvre ni `phantom_aged_out`, ni
+/// `callback_no_pr_*`, ni `dispatch_halt_*`, ni
+/// `stuck_pending_no_deferred_wrapper` — chacun garde sa propre issue.
+pub(crate) const READY_CONSENT_WITHDRAWN_REASON: &str = "ready_consent_withdrawn";
+
+/// `tool_name` de la ligne d'audit de la relecture de consentement.
+///
+/// Frère de [`READY_LABEL_PARK_TOOL_NAME`] ci-dessus, et distinct de lui : le
+/// park est une **écriture refusée**, la relecture est un **dispatch refusé**.
+/// Les agréger sous un nom rendrait les deux non soustractibles.
+pub(crate) const READY_CONSENT_RECHECK_TOOL_NAME: &str = "ready_label_consent_recheck";
+
+// ──────── Les noms de la relecture AVANT un ré-armement (mika#3050) ────────
+//
+// mika#2995 garde la **promotion** d'un lanceur différé ; le **ré-armement**
+// d'une parente déjà en file ne l'était pas. Les deux gardes portent des raisons
+// terminales distinctes, exprès : deux populations sous un nom ne sont plus
+// soustractibles (mika#2205), et la cible d'AC4 est précisément un compte.
+
+/// Motif terminal de la parente dont le ticket ne porte plus `ready` à l'instant
+/// du ré-armement. Le littéral est celui qu'AC1 de mika#3050 exige.
+pub(crate) const READY_ABSENT_AT_REARM_REASON: &str = "ready_absent_at_rearm";
+
+/// Motif terminal de la parente dont le ticket a été **fermé** avant le
+/// ré-armement. Littéral exigé par AC1 de mika#3050.
+pub(crate) const ISSUE_CLOSED_AT_REARM_REASON: &str = "issue_closed_at_rearm";
+
+/// `tool_name` de la ligne d'audit de la relecture de ré-armement.
+///
+/// Distinct de [`READY_CONSENT_RECHECK_TOOL_NAME`] : celui-là nomme un *dispatch*
+/// refusé à la promotion, celui-ci un *ré-armement* refusé 45 min plus tard. Les
+/// agréger sous un nom rendrait les deux greps d'AC4 illisibles.
+pub(crate) const REARM_CONSENT_RECHECK_TOOL_NAME: &str = "ready_label_rearm_recheck";
+
+/// `"ready-label: senara-solutions/mika#3002"` → `("senara-solutions/mika", 3002)`.
+///
+/// # Pourquoi les coordonnées se lisent dans le LABEL
+///
+/// La traversée `parent_issue_coordinates` (`task_engine/dispatcher.rs`) existe
+/// et fonctionne, mais elle passe par `parse_repo_issue_from_url`, qui rend le
+/// **repo nu** (`"mika"`) — alors que [`read_ready_label_timeline`] interpole
+/// `repos/{repo}/issues/{issue}/timeline` et exige `owner/repo`. Re-préfixer
+/// `senara-solutions/` serait un littéral d'organisation codé en dur dans le
+/// dispatcher. Le label, lui, porte déjà `location.owner_repo()` : l'information
+/// exacte, à sa source, sans devinette.
+///
+/// # Pourquoi `None` est le discriminant, et non une erreur
+///
+/// `None` veut dire « cette parente ne vient pas du feeder `ready-label` », et
+/// c'est le cas d'AC-T3 : groom, revue, dispatch manuel, parente absente. Un
+/// label qui porte le préfixe mais dont les coordonnées ne se lisent pas tombe
+/// dans le même sac, et c'est **structurellement sans population** : le
+/// producteur unique compose par [`READY_LABEL_TASK_PREFIX`] avec cette forme
+/// exacte, et `parse_le_label_du_producteur_fait_laller_retour` épingle
+/// l'aller-retour.
+pub(crate) fn parse_ready_label_task_label(label: &str) -> Option<(String, u64)> {
+    let rest = label.strip_prefix(READY_LABEL_TASK_PREFIX)?.trim();
+    // `rsplit_once` et non `split_once` : un `#` dans un nom de dépôt est
+    // impossible, mais la dernière occurrence est celle qui sépare le numéro
+    // quoi qu'il arrive.
+    let (repo, number) = rest.rsplit_once('#')?;
+    let repo = repo.trim();
+    // `owner/repo` est exigé — un repo nu ferait une URL d'API fausse, qui
+    // rendrait un 404 que D4 lirait comme une timeline illisible, donc un
+    // report sans fin plutôt qu'un refus de parenté.
+    if !repo.contains('/') {
+        return None;
+    }
+    let issue = number.trim().parse::<u64>().ok()?;
+    Some((repo.to_string(), issue))
+}
 
 // ───────────────────── Le prédicat (D2), pur ─────────────────────
 
@@ -375,20 +473,18 @@ impl<'a> GhTimelineFetcher<'a> {
 #[async_trait::async_trait]
 impl TimelinePageFetcher for GhTimelineFetcher<'_> {
     async fn fetch(&self, repo: &str, issue: u64, page: u32) -> Result<String, String> {
-        let mut cmd = tokio::process::Command::new("gh");
-        cmd.args([
-            "api",
-            &format!(
-                "repos/{repo}/issues/{issue}/timeline?per_page={TIMELINE_PER_PAGE}&page={page}"
-            ),
-        ]);
-        cmd.env("GH_TOKEN", self.token);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        let output = cmd.output().await.map_err(|e| e.to_string())?;
+        let output = run_gh(
+            self.token,
+            GhSubject::Issue(issue),
+            &[
+                "api",
+                &format!(
+                    "repos/{repo}/issues/{issue}/timeline?per_page={TIMELINE_PER_PAGE}&page={page}"
+                ),
+            ],
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -431,6 +527,246 @@ pub(crate) async fn read_ready_label_timeline_with<F: TimelinePageFetcher + ?Siz
     Err(TimelineReadError::Truncated {
         pages_read: MAX_TIMELINE_PAGES,
     })
+}
+
+/// Le verdict de parc d'une issue, en une lecture (mika#2995).
+///
+/// `Ok(None)` = non parqué. `Ok(Some((parked_by, parked_at)))` = parqué, avec
+/// l'acteur et l'instant du retrait, pour que l'appelant les journalise **sans
+/// relire**. `Err` = la timeline ne se lit pas (D4), et c'est à l'appelant de
+/// décider ; ici le refus est une valeur retournée, jamais un échec avalé
+/// (leçon mika#2199).
+///
+/// Ce composeur existe pour que la garde du dispatcher ne recopie pas la
+/// séquence `read_ready_label_timeline_with` → `is_parked` → `events.last()`.
+/// Trois lignes recopiées, c'est trois lignes qui dérivent le jour où `is_parked`
+/// change de contrat.
+pub(crate) async fn park_verdict_for_issue_with<F: TimelinePageFetcher + ?Sized>(
+    fetcher: &F,
+    repo: &str,
+    issue: u64,
+    machine: &MachineIdentities,
+) -> Result<Option<(Option<String>, String)>, TimelineReadError> {
+    let events = read_ready_label_timeline_with(fetcher, repo, issue).await?;
+    if !is_parked(&events, machine) {
+        return Ok(None);
+    }
+    let last = events.last().expect("is_parked is false on an empty set");
+    Ok(Some((last.actor.clone(), last.created_at.clone())))
+}
+
+// ────────── L'état du ticket avant un ré-armement (mika#3050 D2) ──────────
+
+/// Ce que la forge répond quand on relit un ticket juste avant de **ré-armer**
+/// une parente `ready-label` (mika#3050 AC1).
+///
+/// Trois états, et un quatrième que ce type ne porte **pas** : la relecture en
+/// erreur, qui est le `Err` du `Result`. Une panne de forge n'est pas un état du
+/// ticket, et l'écrire comme tel ferait classer une indisponibilité en retrait
+/// de consentement — donc poserait un terminal sur une parente parfaitement
+/// consentante (mika#2131, mika#2331 : une absence n'est pas un zéro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RearmConsent {
+    /// Ouvert, et portant `ready` : le consentement tient, le ré-armement suit.
+    Held,
+    /// Ouvert, mais `ready` n'y est plus — retiré depuis la mise en file.
+    ReadyAbsent,
+    /// Fermé depuis la mise en file.
+    Closed,
+}
+
+/// Pourquoi la garde de ré-armement a tranché comme elle l'a fait (mika#3050 D1).
+///
+/// Vocabulaire **clos** de ce que la garde de `reread_consent_before_rearm`
+/// observe, de la parente introuvable jusqu'au consentement qui tient. C'est le
+/// verdict que porte la ligne de recensement `rearm_consent_checked`, un par
+/// branche de la garde, **branche saine comprise** : le motif de
+/// `kg_budget_resolved` (mika#1833) et de `team_stop_topic_inheritance`
+/// (mika#1926) — *un recensement qui ne compte que les anomalies n'a pas de
+/// dénominateur.*
+///
+/// Huit variantes et non trois, parce que chaque absence a sa cause et que les
+/// fusionner les rend non-soustractibles (mika#2205) :
+///
+/// - [`Held`](Self::Held) est le **dénominateur d'AC4** — les ré-armements de
+///   parentes `ready-label` effectivement partis.
+/// - [`ReadyAbsent`](Self::ReadyAbsent) et [`IssueClosed`](Self::IssueClosed)
+///   sont les deux refus d'AC1, qui portent déjà des raisons d'audit distinctes
+///   (`ready_absent_at_rearm` / `issue_closed_at_rearm`) et qu'un verdict
+///   commun aurait re-fusionnées.
+/// - [`ParentUnreadable`](Self::ParentUnreadable),
+///   [`RereadFailed`](Self::RereadFailed) et [`NoToken`](Self::NoToken) sont les
+///   trois fail-closed d'AC2, chacun sous son nom.
+/// - [`OtherClass`](Self::OtherClass) est la population d'AC3, **comptable** au
+///   lieu d'inférable par soustraction.
+/// - [`ParentAbsent`](Self::ParentAbsent) est la parente que la base ne rend
+///   plus, et qui n'est ni un refus ni un consentement.
+///
+/// Les coordonnées sont portées par la variante plutôt qu'à côté d'elle, parce
+/// que les trois premières n'en ont **pas** : la classe de la parente n'est
+/// connue qu'après [`parse_ready_label_task_label`], donc un `repo: String`
+/// commun aurait dû valoir `""` sur ces branches — et `""` se lit comme une
+/// coordonnée dans un log (mika#2331 : une absence n'est pas un zéro).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RearmConsentCensus {
+    /// La base ne rend plus la parente : rien à ré-armer, et rien à refuser.
+    ParentAbsent,
+    /// La lecture de la parente a échoué — fail-closed, sans coordonnées parce
+    /// que c'est la ligne de la parente qui manque.
+    ParentUnreadable,
+    /// La parente n'est pas de la classe `ready-label` : la garde ne la regarde
+    /// pas, et son ré-armement suit le chemin d'avant #3052 (AC3).
+    OtherClass,
+    /// Parente `ready-label`, mais aucun token de forge : fail-closed avant tout
+    /// appel réseau.
+    NoToken { repo: String, issue: u64 },
+    /// La relecture à la forge a échoué : fail-closed, et surtout **pas** un
+    /// retrait de consentement.
+    RereadFailed { repo: String, issue: u64 },
+    /// Ouvert et portant `ready` : le consentement tient, le ré-armement part.
+    Held { repo: String, issue: u64 },
+    /// Ouvert, mais `ready` a été retiré depuis la mise en file.
+    ReadyAbsent { repo: String, issue: u64 },
+    /// Fermé depuis la mise en file.
+    IssueClosed { repo: String, issue: u64 },
+}
+
+impl RearmConsentCensus {
+    /// L'étiquette que lit l'opérateur dans le champ `verdict` de la ligne.
+    ///
+    /// Le `match` est exhaustif **sans bras `_ =>`** (mika#2290, mika#2413) :
+    /// une neuvième branche de la garde ne compilera pas sans se nommer ici, et
+    /// ne pourra donc pas se faire compter sous une étiquette qui décrit autre
+    /// chose.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::ParentAbsent => "parent_absent",
+            Self::ParentUnreadable => "parent_unreadable",
+            Self::OtherClass => "other_class",
+            Self::NoToken { .. } => "no_token",
+            Self::RereadFailed { .. } => "reread_failed",
+            Self::Held { .. } => "held",
+            Self::ReadyAbsent { .. } => "ready_absent",
+            Self::IssueClosed { .. } => "issue_closed",
+        }
+    }
+
+    /// Le `owner/repo` du ticket relu, ou `None` quand la branche n'en a pas.
+    ///
+    /// `None` et non `""` : le champ doit être **absent** du log, pas vide
+    /// (mika#2331). L'`impl Value for Option<T>` de `tracing` s'en charge dès
+    /// lors que c'est bien un `Option` qu'on lui passe.
+    pub(crate) fn repo(&self) -> Option<&str> {
+        match self {
+            Self::ParentAbsent | Self::ParentUnreadable | Self::OtherClass => None,
+            Self::NoToken { repo, .. }
+            | Self::RereadFailed { repo, .. }
+            | Self::Held { repo, .. }
+            | Self::ReadyAbsent { repo, .. }
+            | Self::IssueClosed { repo, .. } => Some(repo.as_str()),
+        }
+    }
+
+    /// Le numéro du ticket relu, ou `None` quand la branche n'en a pas.
+    ///
+    /// `None` et non `0` : `0` n'est pas un numéro de ticket, mais il en a la
+    /// forme, et un `jq` qui l'additionne ne s'en apercevra pas.
+    pub(crate) fn issue(&self) -> Option<u64> {
+        match self {
+            Self::ParentAbsent | Self::ParentUnreadable | Self::OtherClass => None,
+            Self::NoToken { issue, .. }
+            | Self::RereadFailed { issue, .. }
+            | Self::Held { issue, .. }
+            | Self::ReadyAbsent { issue, .. }
+            | Self::IssueClosed { issue, .. } => Some(*issue),
+        }
+    }
+}
+
+/// Relit l'état d'un ticket à la forge : ouvert, et portant `ready` ? (D2)
+///
+/// Frère du prédicat de parc ci-dessus, et volontairement **pas le même** : le
+/// parc lit la *timeline* pour savoir **qui** a retiré `ready` et **quand** ;
+/// ici on ne lit que l'**état courant**, parce que la question qu'AC1 pose est
+/// « le consentement tient-il à cet instant ? » et non « qui l'a retiré ? ». Une
+/// timeline de 20 pages pour répondre à une question d'état serait un
+/// amplificateur d'appels API sur chaque tick de reaper.
+///
+/// Pourquoi pas `server::ready_label_handler::fetch_issue_body_and_labels_via_gh`,
+/// que le ticket cite : il ne rend **pas** `state`, donc il ne peut pas répondre
+/// à la moitié « ouvert » du prédicat ; et il vit dans un module de handler HTTP,
+/// que le moteur de tâches n'a aucune raison d'atteindre.
+///
+/// **Fail-closed champ par champ** (D3). Tout ce qui n'est pas lisible selon le
+/// contrat rend `Err` plutôt qu'un état : `state` absent ou hors du couple
+/// `OPEN`/`CLOSED`, `labels` absent ou non-tableau. En particulier `labels`
+/// absent n'est **jamais** [`RearmConsent::ReadyAbsent`] — « le champ n'est pas
+/// là » et « le label n'est pas posé » sont deux faits distincts, et les
+/// confondre terminerait une parente sur une réponse tronquée.
+pub(crate) async fn reread_issue_consent_via_gh(
+    token: &str,
+    owner_repo: &str,
+    number: u64,
+) -> Result<RearmConsent, String> {
+    let output = run_gh(
+        token,
+        GhSubject::Issue(number),
+        &[
+            "issue",
+            "view",
+            &number.to_string(),
+            "--repo",
+            owner_repo,
+            "--json",
+            "state,labels",
+        ],
+    )
+    .await
+    .map_err(|e| format!("gh issue view ne s'est pas lancé pour {owner_repo}#{number} : {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh issue view a échoué pour {owner_repo}#{number} : {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_rearm_consent(&String::from_utf8_lossy(&output.stdout), owner_repo, number)
+}
+
+/// Le cœur de [`reread_issue_consent_via_gh`] : la lecture du JSON, sans réseau.
+///
+/// Séparé du fetch pour la raison qui a fait séparer [`parse_timeline_page`] :
+/// c'est ici que vit le contrat fail-closed, donc c'est ici que les cas se
+/// testent — un par champ, sans passer par un double d'appel `gh`.
+fn parse_rearm_consent(
+    stdout: &str,
+    owner_repo: &str,
+    number: u64,
+) -> Result<RearmConsent, String> {
+    let raw: serde_json::Value = serde_json::from_str(stdout).map_err(|e| {
+        format!("réponse de gh issue view illisible pour {owner_repo}#{number} : {e}")
+    })?;
+    let state = raw["state"]
+        .as_str()
+        .ok_or_else(|| format!("pas de champ `state` pour {owner_repo}#{number}"))?;
+    if state.eq_ignore_ascii_case("CLOSED") {
+        return Ok(RearmConsent::Closed);
+    }
+    if !state.eq_ignore_ascii_case("OPEN") {
+        return Err(format!(
+            "`state` hors contrat pour {owner_repo}#{number} : {state:?}"
+        ));
+    }
+    let labels = raw["labels"]
+        .as_array()
+        .ok_or_else(|| format!("pas de tableau `labels` pour {owner_repo}#{number}"))?;
+    if labels
+        .iter()
+        .any(|l| l["name"].as_str() == Some(READY_LABEL))
+    {
+        Ok(RearmConsent::Held)
+    } else {
+        Ok(RearmConsent::ReadyAbsent)
+    }
 }
 
 // ───────────────────── Les identités machine (D3) ─────────────────────
@@ -501,15 +837,9 @@ pub(crate) async fn machine_identities(token: &str) -> &'static MachineIdentitie
 
 /// Le login du compte auquel appartient le token courant.
 async fn gh_current_login(token: &str) -> Result<Option<String>, String> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(["api", "user", "-q", ".login"]);
-    cmd.env("GH_TOKEN", token);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let output = cmd.output().await.map_err(|e| e.to_string())?;
+    let output = run_gh(token, GhSubject::Repo, &["api", "user", "-q", ".login"])
+        .await
+        .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -698,8 +1028,64 @@ async fn refuse_unreadable(
     ReadyApplyOutcome::RefusedUnreadable { reason }
 }
 
+/// Les fixtures de timeline, partagées par les deux modules qui en ont besoin.
+///
+/// Promues ici par mika#2995 (tranche du 2026-11-03) depuis le `mod tests`
+/// voisin, où elles vivaient depuis mika#2315 : la garde du dispatcher injecte
+/// une timeline par le même trait [`TimelinePageFetcher`], donc elle a besoin
+/// des mêmes gabarits JSON. **Un seul site de fixture de timeline pour la
+/// crate** — un second gabarit recopié dériverait du premier le jour où la
+/// forme de l'API change, et les deux modules croiraient tester la même chose.
+#[cfg(test)]
+pub(crate) mod timeline_fixtures {
+    use super::TimelinePageFetcher;
+
+    /// Un fournisseur de pages fixées.
+    pub(crate) struct FixturePages(pub(crate) Vec<String>);
+
+    #[async_trait::async_trait]
+    impl TimelinePageFetcher for FixturePages {
+        async fn fetch(&self, _repo: &str, _issue: u64, page: u32) -> Result<String, String> {
+            Ok(self
+                .0
+                .get(page as usize - 1)
+                .cloned()
+                .unwrap_or_else(|| "[]".to_string()))
+        }
+    }
+
+    /// Construit une page de `n` événements `commented` suivis des `extras`.
+    pub(crate) fn page_of(filler: usize, extras: &[&str]) -> String {
+        let mut items: Vec<String> = (0..filler)
+            .map(|i| {
+                format!(
+                    r#"{{"event":"commented","actor":{{"login":"someone"}},"created_at":"2026-09-01T00:{:02}:00Z"}}"#,
+                    i % 60
+                )
+            })
+            .collect();
+        items.extend(extras.iter().map(|s| s.to_string()));
+        format!("[{}]", items.join(","))
+    }
+
+    pub(crate) fn labeled_json(actor: &str, at: &str) -> String {
+        format!(
+            r#"{{"event":"labeled","label":{{"name":"ready"}},"actor":{{"login":"{actor}"}},"created_at":"{at}"}}"#
+        )
+    }
+
+    /// Le frère de [`labeled_json`] — le retrait, celui que la garde mika#2995
+    /// doit voir en dernier pour refuser un tour.
+    pub(crate) fn unlabeled_json(actor: &str, at: &str) -> String {
+        format!(
+            r#"{{"event":"unlabeled","label":{{"name":"ready"}},"actor":{{"login":"{actor}"}},"created_at":"{at}"}}"#
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::timeline_fixtures::*;
     use super::*;
 
     fn machine() -> MachineIdentities {
@@ -859,41 +1245,105 @@ mod tests {
         );
     }
 
-    // ── Tests 11–12 : la pagination (B1) ──
+    // ── mika#2995 — le discriminant de parente et le composeur de verdict ──
 
-    /// Un fournisseur de pages fixées.
-    struct FixturePages(Vec<String>);
+    /// **L'aller-retour producteur → parseur.**
+    ///
+    /// La forme composée ici est celle de `server/ready_label_handler.rs`, qui
+    /// compose par [`READY_LABEL_TASK_PREFIX`] depuis mika#2995. C'est ce test
+    /// qui rend le « structurellement sans population » du doc-comment de
+    /// [`parse_ready_label_task_label`] vérifiable plutôt que postulé : si la
+    /// forme du producteur dérivait, le parseur rendrait `None` et la garde
+    /// cesserait silencieusement de reconnaître ses parentes.
+    #[test]
+    fn mika2995_le_label_du_producteur_fait_laller_retour() {
+        let produit = format!(
+            "{READY_LABEL_TASK_PREFIX} {}#{}",
+            "senara-solutions/mika", 3002
+        );
+        assert_eq!(
+            parse_ready_label_task_label(&produit),
+            Some(("senara-solutions/mika".to_string(), 3002)),
+            "le parseur doit lire exactement ce que le producteur compose"
+        );
+    }
 
-    #[async_trait::async_trait]
-    impl TimelinePageFetcher for FixturePages {
-        async fn fetch(&self, _repo: &str, _issue: u64, page: u32) -> Result<String, String> {
-            Ok(self
-                .0
-                .get(page as usize - 1)
-                .cloned()
-                .unwrap_or_else(|| "[]".to_string()))
+    /// Les quatre formes que le discriminant refuse, chacune pour sa raison.
+    #[test]
+    fn mika2995_une_parente_hors_prefixe_ou_malformee_nest_pas_un_ready_label() {
+        for (label, pourquoi) in [
+            ("manual self_dev parent", "aucun préfixe — le cas d'AC-T3"),
+            (
+                "long_running:run_claude_pilot_groom",
+                "une parente de groom",
+            ),
+            (
+                "ready-label: mika#3002",
+                "repo nu : l'URL d'API serait fausse, et son 404 se lirait comme \
+                 une timeline illisible",
+            ),
+            (
+                "ready-label: senara-solutions/mika#trois",
+                "numéro d'issue illisible",
+            ),
+        ] {
+            assert_eq!(
+                parse_ready_label_task_label(label),
+                None,
+                "`{label}` ne doit pas être lu comme une parente `ready-label` ({pourquoi})"
+            );
         }
     }
 
-    /// Construit une page de `n` événements `commented` suivis des `extras`.
-    fn page_of(filler: usize, extras: &[&str]) -> String {
-        let mut items: Vec<String> = (0..filler)
-            .map(|i| {
-                format!(
-                    r#"{{"event":"commented","actor":{{"login":"someone"}},"created_at":"2026-09-01T00:{:02}:00Z"}}"#,
-                    i % 60
-                )
-            })
-            .collect();
-        items.extend(extras.iter().map(|s| s.to_string()));
-        format!("[{}]", items.join(","))
+    /// Le composeur rend l'acteur et l'instant du retrait, **sans relire**.
+    #[tokio::test]
+    async fn mika2995_le_composeur_rend_lacteur_et_linstant_du_retrait() {
+        let pages = FixturePages(vec![page_of(
+            0,
+            &[
+                &labeled_json("samidarko", "2026-11-01T13:00:00Z"),
+                &unlabeled_json("samidarko", "2026-11-01T14:08:43Z"),
+            ],
+        )]);
+
+        let verdict =
+            park_verdict_for_issue_with(&pages, "senara-solutions/mika", 3002, &machine())
+                .await
+                .expect("la timeline est lisible");
+
+        assert_eq!(
+            verdict,
+            Some((
+                Some("samidarko".to_string()),
+                "2026-11-01T14:08:43Z".to_string()
+            )),
+            "le parc doit porter qui a retiré et quand — l'appelant les journalise sans \
+             payer une seconde lecture"
+        );
     }
 
-    fn labeled_json(actor: &str, at: &str) -> String {
-        format!(
-            r#"{{"event":"labeled","label":{{"name":"ready"}},"actor":{{"login":"{actor}"}},"created_at":"{at}"}}"#
-        )
+    /// Contrôle négatif du composeur, sur la même fixture à un événement près :
+    /// un `labeled` final rend `Ok(None)`.
+    #[tokio::test]
+    async fn mika2995_le_composeur_rend_none_quand_le_consentement_tient() {
+        let pages = FixturePages(vec![page_of(
+            0,
+            &[
+                &labeled_json("samidarko", "2026-11-01T13:00:00Z"),
+                &unlabeled_json("samidarko", "2026-11-01T14:08:43Z"),
+                &labeled_json("samidarko", "2026-11-01T15:32:14Z"),
+            ],
+        )]);
+
+        let verdict =
+            park_verdict_for_issue_with(&pages, "senara-solutions/mika", 3002, &machine())
+                .await
+                .expect("la timeline est lisible");
+
+        assert_eq!(verdict, None, "un `labeled` en dernier n'est pas un parc");
     }
+
+    // ── Tests 11–12 : la pagination (B1) ──
 
     /// **Test 11 — la régression B1, nommée et épinglée.**
     ///
@@ -1078,6 +1528,1192 @@ mod tests {
              n'appelle pas `ready_label::apply_ready` n'interroge pas le park : un STOP opérateur \
              ne tiendrait plus, et rien ne casserait. Appelez `apply_ready`.\n{}",
             offenders.join("\n")
+        );
+    }
+
+    // ── mika#2995 vol 2 — D1 : la surface d'outil n'atteint pas l'applicateur ──
+    //
+    // **Deux détecteurs et non un seul, et le test 13 reste intact.** Les trois
+    // populations diffèrent, et deux populations sous un même nom ne se
+    // soustraient pas (mika#2205) : le test 13 refuse une écriture de `ready`
+    // hors de ce module, D1 refuse qu'une *surface d'outil* atteigne
+    // l'applicateur même gouverné, D2 (plus bas) refuse qu'une écriture de forme
+    // argv ne soit pas déclarée. Chacun porte sa propre disposition.
+
+    /// Les quatre noms par lesquels `ready` s'écrit, l'applicateur unique de
+    /// mika#2315 et les deux poseurs de label qu'il appelle.
+    ///
+    /// L'ordre est porteur : `apply_ready_with_timeline` avant `apply_ready`,
+    /// pour qu'un offender soit nommé par le plus spécifique des deux.
+    const READY_APPLICATORS: &[&str] = &[
+        "apply_ready_with_timeline",
+        "apply_ready",
+        "gh_apply_label",
+        "add_label_to_issue",
+    ];
+
+    /// `true` si `rel` (relatif à `src/`) appartient à **la surface depuis
+    /// laquelle un tour LLM agit** : les handlers d'outils et les deux fichiers
+    /// de la porte de dispatch de compétences.
+    ///
+    /// C'est la population de D1, et c'est aussi exactement celle où le défaut
+    /// mesuré du 2026-10-31 vivait : `run_gh` est un handler de cette surface.
+    fn est_surface_doutil(rel: &str) -> bool {
+        rel.starts_with("tools/")
+            || rel == "skills/builtin_handlers.rs"
+            || rel == "skills/executor.rs"
+    }
+
+    /// Les **appels** à l'un des [`READY_APPLICATORS`] dans une moitié de
+    /// production, rendus en `"<fichier>: <ligne>"`.
+    ///
+    /// # Appeler, et non nommer
+    ///
+    /// Trois formes nomment l'applicateur sans l'appeler, et les trois sont
+    /// muettes, chacune pour une raison distincte :
+    ///
+    /// - **doc-comment et commentaire de bloc** — retirés par
+    ///   [`crate::source_scan::strip_comment_lines`], dont le doc-comment porte
+    ///   le prédicat et ses bornes. La prose *à propos* du geste n'est pas le
+    ///   geste : c'est la forme du précédent mika#2425, et
+    ///   `builtin_handlers.rs:3095` en porte une ;
+    /// - **ligne de `use`** — muette par la parenthèse exigée : la syntaxe
+    ///   `use` n'en porte jamais. C'est pour cela qu'il n'y a pas de branche
+    ///   `starts_with("use ")` ici — une branche morte dirait au lecteur qu'un
+    ///   import pourrait matcher ;
+    /// - **ligne de définition** — écartée par le `fn <nom>(` : `pub(crate)
+    ///   async fn apply_ready(` déclare l'applicateur, il ne l'appelle pas.
+    ///
+    /// # Pourquoi aucun numéro de ligne
+    ///
+    /// Le dépouillement des commentaires **décale** la numérotation, et un
+    /// numéro faux dans un message d'échec envoie le lecteur sur une ligne
+    /// innocente. Le texte de la ligne est rendu à la place : il est grep-able,
+    /// et il est vrai.
+    fn appels_a_lapplicateur(rel: &str, prod: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in crate::source_scan::strip_comment_lines(prod).lines() {
+            for app in READY_APPLICATORS {
+                if !line.contains(&format!("{app}(")) {
+                    continue;
+                }
+                if line.contains(&format!("fn {app}(")) {
+                    continue;
+                }
+                out.push(format!("{rel}: {}", line.trim()));
+                break;
+            }
+        }
+        out
+    }
+
+    /// **L'allowlist de D1, livrée VIDE — et elle le reste.**
+    ///
+    /// `(fichier, ticket)`. Elle est livrée vide **parce que la population est
+    /// vide** : les quatre appelants de l'applicateur vivent dans `auto_pull.rs`
+    /// (phases 0, 1 et 2) et dans `server/milestone_context_handler.rs` (cascade
+    /// M4), aucun sous la surface d'outil.
+    ///
+    /// Quand D1 tire, on **retire l'appel** ; on n'ajoute pas une ligne ici. Une
+    /// exception nommée serait un handler d'outil qui atteint l'applicateur
+    /// « parce qu'il est gouverné » — or il est gouverné pour le **parc**, jamais
+    /// pour le tour LLM : le parc dit *ce ticket est-il dé-promu*, il ne dit
+    /// jamais *qui demande*. C'est la doctrine mika#2201 : quand un détecteur
+    /// tire, on retire l'appel, on n'ajoute pas une ligne d'allowlist.
+    const TOOL_SURFACE_APPLICATOR_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// **L'assertion sœur d'auto-vacuité de D1.**
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction. Celle-ci rougit à la première entrée, et c'est ce qui empêche
+    /// D1 de se remplir en silence — le mode de mensonge d'une allowlist vide que
+    /// la Fire-Disposition du plan nomme en premier.
+    #[test]
+    fn mika2995_lallowlist_de_surface_est_vide() {
+        assert!(
+            TOOL_SURFACE_APPLICATOR_EXCEPTIONS.is_empty(),
+            "une exception a été ajoutée à D1 : {:?}. La disposition de ce détecteur est de \
+             RETIRER l'appel, pas de l'allowlister (mika#2201). Un handler d'outil qui atteint \
+             l'applicateur rend la voie B de mika#2995 fausse : le moteur retrouve, dans un tour \
+             LLM, la capacité d'écrire le `ready` qui lève la garde de mika#2772.",
+            TOOL_SURFACE_APPLICATOR_EXCEPTIONS
+        );
+    }
+
+    /// **D1 — aucune surface d'outil n'atteint l'applicateur de `ready`
+    /// (AC2 de mika#2995, voie B).**
+    ///
+    /// # Ce qu'il refuse
+    ///
+    /// Qu'un handler d'outil, demain, appelle l'applicateur gouverné. La voie B
+    /// tient parce que la capacité d'écrire `ready` est **hors d'atteinte d'un
+    /// tour LLM** : `run_gh` la refuse depuis le vol 1
+    /// (`builtin_handlers.rs`, attestations de population dans `guards.rs`), et
+    /// l'applicateur unique n'a que quatre appelants, tous dans un corps de tick
+    /// ou un handler webhook. Cette seconde moitié est aujourd'hui vraie **par
+    /// accident** : rien ne la refuse. Ce test la rend structurelle.
+    ///
+    /// # Pourquoi un scan de source et pas un test de comportement
+    ///
+    /// Un handler qui appellerait `apply_ready` demain ne rendrait **aucune
+    /// décision fausse**. Le parc continuerait de répondre, la garde de mika#2772
+    /// continuerait de discriminer, les sept assertions de
+    /// `mod mika2772_consentement_force` resteraient vertes — et l'agent
+    /// retrouverait le geste du 2026-10-31. C'est la classe mika#2158 : seul un
+    /// scan structurel la voit.
+    ///
+    /// # Disposition si ce détecteur fire
+    ///
+    /// **Retirer l'appel**, jamais l'allowlister, jamais `#[ignore]`. Voir
+    /// [`TOOL_SURFACE_APPLICATOR_EXCEPTIONS`], et surfacer le site au corps de PR
+    /// sous `Fire-Disposition: cinquième applicateur découvert`.
+    #[test]
+    fn mika2995_aucune_surface_doutil_natteint_lapplicateur_de_ready() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut vus: Vec<String> = Vec::new();
+
+        for (rel, prod) in crate::source_scan::production_files() {
+            if !est_surface_doutil(&rel) {
+                continue;
+            }
+            scanned += 1;
+            vus.push(rel.clone());
+            for site in appels_a_lapplicateur(&rel, &prod) {
+                if TOOL_SURFACE_APPLICATOR_EXCEPTIONS
+                    .iter()
+                    .any(|(f, _)| *f == rel)
+                {
+                    continue;
+                }
+                offenders.push(site);
+            }
+        }
+
+        // Deuxième mode de mensonge d'une allowlist vide : le scan pourrait
+        // n'avoir rien scanné. L'idiome du test 13, resserré — « au moins un
+        // fichier » resterait vrai si les deux gros fichiers étaient renommés et
+        // que seuls les `tools/` restaient, donc les deux sont nommés.
+        assert!(
+            scanned > 2,
+            "D1 n'a scanné que {scanned} fichier(s) — la population est cassée, et un \
+             détecteur qui ne scanne rien ne refuse rien (mika#2578)"
+        );
+        for attendu in ["skills/builtin_handlers.rs", "skills/executor.rs"] {
+            assert!(
+                vus.iter().any(|v| v == attendu),
+                "`{attendu}` n'est plus dans la population de D1 — renommé ou déplacé. \
+                 Mettez `est_surface_doutil` à jour plutôt que de laisser le détecteur se \
+                 rendormir en silence. Vus : {vus:?}"
+            );
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2995 — une surface d'outil atteint l'applicateur de `ready`. L'applicateur \
+             est gouverné pour le PARC, pas pour le tour LLM : le parc dit « ce ticket est-il \
+             dé-promu », jamais « qui demande ». Un handler qui l'appelle redonne à l'agent, \
+             dans son tour, la capacité d'écrire le `ready` qui lève la garde de mika#2772 — \
+             c'est le défaut mesuré le 2026-10-31 à 16:51:37Z, par une autre porte. Retirez \
+             l'appel ; ne l'allowlistez pas.\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// **Le contrôle de bonne foi de D1 — le scan rougit sur un appel planté.**
+    ///
+    /// Troisième mode de mensonge d'une allowlist vide : le scan pourrait être
+    /// vert pour avoir **cessé de reconnaître sa forme**. Aucune assertion sur
+    /// l'arbre réel ne peut voir ça — elle passerait. Ce test plante donc un
+    /// appel et exige qu'il soit vu, puis quatre formes qui nomment
+    /// l'applicateur sans l'appeler et exige le silence sur chacune.
+    #[test]
+    fn mika2995_le_scan_de_surface_rougit_sur_un_appel_plante() {
+        let plante = "\
+async fn handler_doutil(db: &AsyncDatabase, req: ReadyRequest) -> Outcome {
+    ready_label::apply_ready(db, req).await
+}
+";
+        let vus = appels_a_lapplicateur("tools/plante.rs", plante);
+        assert_eq!(
+            vus.len(),
+            1,
+            "le scan doit voir l'appel planté, sinon il est vert pour avoir cessé de \
+             reconnaître sa forme : {vus:?}"
+        );
+        assert!(
+            vus[0].contains("tools/plante.rs") && vus[0].contains("apply_ready(db, req)"),
+            "l'offender doit nommer le fichier et rendre la ligne grep-able : {vus:?}"
+        );
+
+        // Les quatre formes muettes, chacune pour sa raison (cf. doc de
+        // `appels_a_lapplicateur`).
+        let muet = "\
+/// Un doc-comment qui cite apply_ready(db, req) pour expliquer pourquoi ce
+/// handler ne l'appelle pas — la forme de mika#2425.
+/*
+ * Un bloc qui cite gh_apply_label(auth, n, READY_LABEL) de la même façon.
+ */
+use crate::ready_label::{apply_ready, apply_ready_with_timeline};
+pub(crate) async fn add_label_to_issue(token: &str, n: u64) -> Result<(), String> {
+    Ok(())
+}
+";
+        let muets = appels_a_lapplicateur("tools/muet.rs", muet);
+        assert!(
+            muets.is_empty(),
+            "nommer l'applicateur n'est pas l'appeler : doc-comment, commentaire de bloc, \
+             ligne de `use` et ligne de définition doivent rester muets, sinon D1 rougit sur \
+             du code sain et finit par être désarmé — {muets:?}"
+        );
+    }
+
+    // ── mika#2995 vol 2 — D2 : une écriture de `ready` en forme argv est déclarée ──
+
+    /// Le drapeau `gh` qui ne peut **qu'**ajouter : celui d'`issue edit`.
+    ///
+    /// Nu, et non cité : il est déjà sans ambiguïté, et cela couvre
+    /// `--add-label=ready` du même coup.
+    const ARGV_ADD_LABEL_FLAG: &str = "--add-label";
+
+    /// Les drapeaux d'étiquette **ambigus** : ceux d'`issue create`, qui sont
+    /// aussi ceux d'`issue list`.
+    ///
+    /// `gh issue create --label ready` écrit le consentement ; `gh issue list
+    /// --label ready` lit le bassin. Le drapeau est le même — seul le verbe
+    /// tranche, et c'est [`ARGV_READ_VERBS`] qui le fait. Sans ce second
+    /// prédicat, D2 rougirait sur `milestone_manager/reader.rs:273`, qui compte
+    /// le bassin `ready` du dépôt et n'écrit rien.
+    ///
+    /// # Pourquoi des jetons cités
+    ///
+    /// `-l` nu apparaît dans des dizaines de mots ordinaires ; `"-l"` cité
+    /// n'apparaît que là où un argv est construit. Même raison pour
+    /// `"--label"`. `--label=` porte son `=` : c'est la forme collée, et la
+    /// seule qui puisse naître d'un `format!`.
+    ///
+    /// # Ce n'est pas la liste de `guards.rs`
+    ///
+    /// [`crate::evidence::guards::ADD_LABEL_FLAGS`] liste les drapeaux tels que
+    /// `gh` les reçoit, pour les **lire** dans un argv à l'exécution. Celles-ci
+    /// listent les formes telles qu'un *fichier source* les écrit, pour les lire
+    /// dans du texte Rust. Les deux populations n'ont ni le même alphabet ni le
+    /// même lecteur — les réunir rendrait l'une des deux fausse en silence.
+    const ARGV_AMBIGUOUS_LABEL_FLAGS: &[&str] = &["\"--label\"", "--label=", "\"-l\""];
+
+    /// Les verbes `gh` qui **lisent** une étiquette au lieu de l'écrire.
+    ///
+    /// La polarité est fail-closed, et c'est la décision : un drapeau ambigu
+    /// compte comme une écriture **sauf** si l'argv nomme explicitement un verbe
+    /// de lecture. Un `--label=ready` dont aucun verbe n'est lisible dans sa
+    /// fenêtre est donc refusé plutôt qu'excusé — l'exemption se mérite, et un
+    /// site qui ne dit pas ce qu'il fait est exactement celui qu'il faut lire.
+    const ARGV_READ_VERBS: &[&str] = &["\"list\"", "\"view\""];
+
+    /// Le rayon de la fenêtre de D2, en lignes autour de la ligne du drapeau.
+    ///
+    /// La forme argv sépare le drapeau de sa valeur — `args.push("--add-label")`
+    /// puis `args.push(READY_LABEL)` — et c'est exactement ce qui la rend
+    /// invisible au test 13, qui exige les deux sur la **même** ligne. Deux
+    /// lignes de part et d'autre couvrent la forme réelle de `pool_writer`, un
+    /// `format!` coupé par rustfmt, et un commentaire intercalé ; au-delà, la
+    /// fenêtre commencerait à happer des constantes voisines sans rapport.
+    const FENETRE_ARGV: usize = 2;
+
+    /// Le rayon de la fenêtre du **verbe**, plus large que celle de la valeur.
+    ///
+    /// Le verbe ouvre l'argv et le drapeau vient après ses options : dans
+    /// `reader.rs`, `"list"` précède `"--label"` de cinq lignes, et un `--repo`
+    /// ou un `--state` de plus les écarterait encore. Huit lignes couvrent un
+    /// argv `gh` complet sans atteindre l'argv suivant de la même fonction.
+    const FENETRE_VERBE: usize = 8;
+
+    /// `true` si `line` porte le **jeton du label** `ready`.
+    ///
+    /// Deux écritures comptent, et une troisième est délibérément écartée :
+    ///
+    /// - `"ready"` **cité en entier** : la paire de guillemets est ce qui sépare
+    ///   le label de `"ready_label_add"`, le motif d'audit de `guards.rs:2816` ;
+    /// - `READY_LABEL` **non suivi d'un caractère d'identifiant** : c'est la
+    ///   constante de ce module. `WORK_CREATION_MOTIF_READY_LABEL_ADD` nomme
+    ///   autre chose et reste muet, sans quoi D2 rougirait sur le lecteur du
+    ///   vol 1 — le site même qui refuse l'écriture.
+    ///
+    /// Le découpage passe par [`str::split`] plutôt que par un index d'octet :
+    /// `scripts/check-byte-slices.sh` refuse la seconde forme, et pour une bonne
+    /// raison (mika#764).
+    fn porte_le_jeton_de_ready(line: &str) -> bool {
+        if line.contains("\"ready\"") {
+            return true;
+        }
+        line.split("READY_LABEL")
+            .skip(1)
+            .any(|apres| !apres.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    }
+
+    /// Les `rayon` lignes de part et d'autre de `lines[i]`, elle comprise.
+    fn fenetre<'a>(lines: &'a [&'a str], i: usize, rayon: usize) -> &'a [&'a str] {
+        let debut = i.saturating_sub(rayon);
+        let fin = (i + rayon + 1).min(lines.len());
+        &lines[debut..fin]
+    }
+
+    /// Les **écritures de `ready` en forme argv** dans une moitié de production,
+    /// rendues en `"<fichier>: <ligne du drapeau>"`.
+    ///
+    /// Trois conditions, dans cet ordre :
+    ///
+    /// 1. la ligne porte un drapeau d'étiquette — c'est lui qui ancre les deux
+    ///    fenêtres. Une ligne de `use crate::ready_label::READY_LABEL;` seule ne
+    ///    déclenche donc rien : importer la constante est le geste normal de tout
+    ///    *lecteur* du label ;
+    /// 2. le jeton du label est dans sa fenêtre ([`FENETRE_ARGV`]) — un
+    ///    `--add-label` portant un autre label n'est pas une écriture de `ready` ;
+    /// 3. si le drapeau est ambigu ([`ARGV_AMBIGUOUS_LABEL_FLAGS`]), aucun verbe
+    ///    de lecture n'est dans sa fenêtre ([`FENETRE_VERBE`]).
+    ///
+    /// Les commentaires sont retirés d'abord — la prose *à propos* du geste n'est
+    /// pas le geste (mika#2425), et `guards.rs` en porte quatre lignes qui citent
+    /// `--add-label=ready` pour expliquer ce qu'elle refuse.
+    fn ecritures_argv_de_ready(rel: &str, prod: &str) -> Vec<String> {
+        let depouille = crate::source_scan::strip_comment_lines(prod);
+        let lines: Vec<&str> = depouille.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let ambigu = if line.contains(ARGV_ADD_LABEL_FLAG) {
+                false
+            } else if ARGV_AMBIGUOUS_LABEL_FLAGS.iter().any(|f| line.contains(f)) {
+                true
+            } else {
+                continue;
+            };
+
+            if !fenetre(&lines, i, FENETRE_ARGV)
+                .iter()
+                .any(|w| porte_le_jeton_de_ready(w))
+            {
+                continue;
+            }
+
+            if ambigu
+                && fenetre(&lines, i, FENETRE_VERBE)
+                    .iter()
+                    .any(|w| ARGV_READ_VERBS.iter().any(|v| w.contains(v)))
+            {
+                continue;
+            }
+
+            out.push(format!("{rel}: {}", line.trim()));
+        }
+        out
+    }
+
+    /// **Les écritures de `ready` en forme argv qui sont DÉCLARÉES — une seule.**
+    ///
+    /// `(chemin depuis la racine du dépôt, ticket, le fait précis)`. Le chemin
+    /// porte son préfixe `src/` pour qu'un `grep` depuis la racine du dépôt tombe
+    /// sur cette entrée ; la population, elle, est relative à `src/` (c'est ce
+    /// que rend [`crate::source_scan::production_files`]), d'où le `src/{rel}` au
+    /// site de comparaison.
+    ///
+    /// Cette entrée n'est **pas** un contournement toléré : c'est le fait du
+    /// § 3.2 du plan, pré-déclaré. `admit_pool_tickets` décide `--add-label ready`
+    /// et `--milestone` d'un seul geste, hors applicateur **par conception**
+    /// (propriété 4 du doc de module de `pool_writer`), donc aveugle au parc.
+    /// `MIKA_MANAGER_POOL_WRITE` est OFF par défaut : il n'existe aujourd'hui
+    /// aucune écriture non parquée par cette porte. Router ce site par le parc
+    /// changerait un comportement voulu — c'est une **décision d'opérateur**, et
+    /// l'ouverture de l'interrupteur est ce qui la rend due.
+    const ARGV_READY_WRITERS_DECLARED: &[(&str, &str, &str)] = &[(
+        "src/milestone_manager/pool_writer.rs",
+        "mika#2995",
+        "admit_pool_tickets : décision groupée --add-label ready + --milestone, \
+         hors applicateur par conception (propriété 4 du doc de module), donc \
+         AVEUGLE AU PARC. MIKA_MANAGER_POOL_WRITE OFF par défaut : aucune écriture \
+         non parquée aujourd'hui. Router ce site par le parc changerait un \
+         comportement voulu — décision d'opérateur, pré-déclarée sous \
+         `Fire-Disposition: cinquième applicateur découvert`.",
+    )];
+
+    /// **D2 — toute écriture de `ready` en forme argv est déclarée (AC2c de
+    /// mika#2995, voie B).**
+    ///
+    /// # Ce qu'il refuse, et que le test 13 ne peut pas voir
+    ///
+    /// Le test 13 exige `"ready"` et le nom d'un poseur sur la **même ligne**.
+    /// La forme argv les sépare :
+    ///
+    /// ```text
+    /// args.push("--add-label");
+    /// args.push(READY_LABEL);
+    /// ```
+    ///
+    /// Aucune ligne ne porte les deux, donc le test 13 est vert sur une écriture
+    /// réelle — et il l'est aujourd'hui, sur `pool_writer.rs:156`. Ce n'est pas un
+    /// défaut du test 13 : sa population et sa question sont autres, et deux
+    /// populations sous un même nom ne se soustraient pas (mika#2205). D2 est
+    /// l'autre question, et il la pose sur toute la production sauf ce module.
+    ///
+    /// # L'assertion auto-nettoyante
+    ///
+    /// Chaque entrée déclarée doit **encore porter la forme argv**. Si
+    /// `pool_writer` est un jour routé par l'applicateur, supprimé ou réécrit,
+    /// l'entrée devient stale et ce test rougit en demandant son retrait. Le geste
+    /// qui rend l'exception inutile est celui qui la fait expirer : c'est ce qui
+    /// sépare une déclaration d'une allowlist, et c'est ce que mika#2309 condamne
+    /// quand il manque.
+    ///
+    /// # Disposition si un site NON déclaré apparaît
+    ///
+    /// Router le site par l'applicateur unique de mika#2315, jamais ajouter une
+    /// ligne ici. Une entrée nouvelle est une décision d'opérateur, et elle se
+    /// surface au corps de PR sous `Fire-Disposition: cinquième applicateur
+    /// découvert`.
+    #[test]
+    fn mika2995_une_ecriture_de_ready_en_forme_argv_est_declaree() {
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut vus: Vec<String> = Vec::new();
+        let mut declares_encore_porteurs: Vec<&str> = Vec::new();
+
+        for (rel, prod) in crate::source_scan::production_files() {
+            // Ce module EST l'applicateur : il porte le littéral et sa propre
+            // écriture gouvernée. Sa population est celle du test 13.
+            if rel == "ready_label.rs" {
+                continue;
+            }
+            scanned += 1;
+            vus.push(rel.clone());
+
+            let sites = ecritures_argv_de_ready(&rel, &prod);
+            if sites.is_empty() {
+                continue;
+            }
+            let depuis_la_racine = format!("src/{rel}");
+            match ARGV_READY_WRITERS_DECLARED
+                .iter()
+                .find(|(f, _, _)| *f == depuis_la_racine)
+            {
+                Some((f, _, _)) => declares_encore_porteurs.push(f),
+                None => offenders.extend(sites),
+            }
+        }
+
+        // Un détecteur qui ne scanne rien ne refuse rien (mika#2578/#2752). Les
+        // deux fichiers nommés sont ceux où un faux positif guetterait : le
+        // lecteur argv du vol 1, et le poseur générique de labels.
+        assert!(
+            scanned > 50,
+            "D2 n'a scanné que {scanned} fichier(s) de production — la population est cassée"
+        );
+        for attendu in ["evidence/guards.rs", "auto_pull.rs"] {
+            assert!(
+                vus.iter().any(|v| v == attendu),
+                "`{attendu}` n'est plus dans la population de D2 — renommé ou déplacé. \
+                 Remettez-le dans la population plutôt que de laisser le détecteur se \
+                 rendormir en silence."
+            );
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2995 — une écriture de `ready` en forme argv n'est pas déclarée. Le test 13 \
+             ne la voit pas : il exige le label et le poseur sur la MÊME ligne, et la forme \
+             argv les sépare. Un site qui écrit `ready` hors de l'applicateur unique \
+             (mika#2315) est aveugle au parc — il crée un consentement que personne n'a donné, \
+             et c'est le consentement que la garde de mika#2772 exige d'un humain. Routez le \
+             site par l'applicateur ; n'ajoutez une entrée que sur décision d'opérateur.\n{}",
+            offenders.join("\n")
+        );
+
+        // L'auto-nettoyage : une entrée dont le site a changé est retirée, pas
+        // conservée « au cas où ».
+        for (f, ticket, fait) in ARGV_READY_WRITERS_DECLARED {
+            assert!(
+                declares_encore_porteurs.contains(f),
+                "l'entrée `{f}` ({ticket}) ne porte plus de forme argv de `ready` — le site a \
+                 été routé par l'applicateur, supprimé ou renommé. RETIREZ L'ENTRÉE : une \
+                 déclaration qui survit à son site est l'allowlist que mika#2309 condamne. \
+                 Fait déclaré : {fait}"
+            );
+        }
+    }
+
+    /// **Le contrôle de bonne foi de D2 — le scan rougit sur une écriture
+    /// plantée.**
+    ///
+    /// D2 est vert sur l'arbre réel avec exactement une entrée déclarée. Ce vert
+    /// a trois causes possibles et une seule est bonne : il pourrait aussi venir
+    /// d'un scan qui a cessé de reconnaître sa forme. Aucune assertion sur
+    /// l'arbre ne peut le voir. Ce test plante donc les **trois** syntaxes,
+    /// chacune poussée sur deux lignes comme la forme réelle, et exige que
+    /// chacune soit vue — puis deux formes saines, et exige le silence.
+    #[test]
+    fn mika2995_le_scan_argv_rougit_sur_une_ecriture_plantee() {
+        // Les trois syntaxes que `gh` accepte, dans leur forme Rust réelle : le
+        // drapeau et la valeur sur deux lignes distinctes.
+        for (syntaxe, plante) in [
+            (
+                "--add-label",
+                "    args.push(\"--add-label\");\n    args.push(READY_LABEL);\n",
+            ),
+            (
+                "--label=",
+                "    let flag = format!(\"--label={}\",\n        READY_LABEL);\n",
+            ),
+            (
+                "-l",
+                "    args.push(\"-l\");\n    args.push(READY_LABEL);\n",
+            ),
+        ] {
+            let vus = ecritures_argv_de_ready("plante.rs", plante);
+            assert_eq!(
+                vus.len(),
+                1,
+                "D2 ne voit pas la syntaxe `{syntaxe}` poussée sur deux lignes — il serait \
+                 vert pour avoir cessé de reconnaître sa forme, et c'est exactement la forme \
+                 que le test 13 laisse passer : {vus:?}"
+            );
+        }
+
+        // Importer la constante est le geste de tout lecteur du label, et il
+        // n'écrit rien. Le drapeau est requis.
+        let import = "\
+use crate::ready_label::READY_LABEL;
+
+fn lit_seulement(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == READY_LABEL)
+}
+";
+        let muets = ecritures_argv_de_ready("import.rs", import);
+        assert!(
+            muets.is_empty(),
+            "un `use READY_LABEL` sans drapeau n'est pas une écriture — D2 rougirait sur tous \
+             les lecteurs du label et finirait désarmé : {muets:?}"
+        );
+
+        // La forme de `wip_rescue.rs` : le même drapeau, un autre label. Le
+        // jeton du label est requis, pas seulement le drapeau.
+        let autre_label = "\
+    let add_label = [
+        \"pr\",
+        \"edit\",
+        \"--add-label\",
+        HUMAN_REVIEW_LABEL,
+    ];
+";
+        let muets = ecritures_argv_de_ready("autre.rs", autre_label);
+        assert!(
+            muets.is_empty(),
+            "un `--add-label` portant un AUTRE label n'est pas une écriture de `ready` — D2 \
+             rougirait sur tout poseur de label du dépôt : {muets:?}"
+        );
+
+        // La forme de `milestone_manager/reader.rs:273` : le drapeau ambigu
+        // d'`issue create` est aussi celui d'`issue list`, et le verbe tranche.
+        // Sans ce cas, le prédicat du verbe pourrait être retiré sans qu'aucun
+        // test ne le dise — alors que c'est lui qui empêche D2 d'appeler
+        // « écriture » le comptage du bassin `ready`.
+        let lecture = "\
+    let ready_json = runner
+        .run(&[
+            \"issue\",
+            \"list\",
+            \"--state\",
+            \"open\",
+            \"--label\",
+            READY_LABEL,
+        ])
+        .await?;
+";
+        let muets = ecritures_argv_de_ready("lecture.rs", lecture);
+        assert!(
+            muets.is_empty(),
+            "`gh issue list --label ready` LIT le bassin, il n'écrit rien — D2 rougirait sur \
+             le compteur de la porte de place et serait désarmé pour cette raison : {muets:?}"
+        );
+    }
+
+    // ── mika#2995, AC-T4 — un site de définition unique pour chaque nom ──────
+    //
+    // Troisième détecteur de ce module, et sa population est encore une autre :
+    // le test 13 refuse une *écriture* de `ready` hors du module, D1 refuse
+    // qu'une surface d'outil atteigne l'applicateur, D2 refuse une écriture de
+    // forme argv non déclarée — et D3 refuse qu'un **nom** de la relecture de
+    // consentement ait deux sites. Deux populations sous un même nom ne se
+    // soustraient pas (mika#2205), donc chacun porte sa disposition.
+
+    /// Les exceptions de D3. **Née vide, et destinée à le rester.**
+    ///
+    /// Trois champs : le fichier, le nom, et la raison. La raison est exigée
+    /// parce qu'une allowlist dont les entrées n'ont pas à se justifier est une
+    /// allowlist qui se remplit (mika#2309).
+    const CONSENT_RECHECK_NAME_EXCEPTIONS: &[(&str, &str, &str)] = &[];
+
+    /// Les sept noms de la relecture de consentement, et le fichier qui
+    /// porte leur site unique.
+    ///
+    /// Les deux premiers sont les constantes d'AC-T4 au sens littéral — le
+    /// motif du terminal et le nom de l'outil d'audit. Les deux suivants sont
+    /// les noms d'événement des deux sondes, inclus parce qu'ils répondent à la
+    /// même question : un second émetteur de
+    /// `deferred_dispatch_consent_recheck_deferred` rendrait son compte
+    /// illisible exactement comme un second site du motif rendrait le terminal
+    /// ambigu.
+    ///
+    /// Les trois derniers sont la part de mika#3050, qui a doté le site de
+    /// **promotion** du prédicat d'état (ticket ouvert, et portant `ready`) :
+    /// sa ligne de recensement, et les deux motifs d'audit de ses deux refus
+    /// terminaux. Ces deux motifs sont les constantes du vol 1 — le site de
+    /// promotion les consomme **par la constante** et n'en écrit aucun littéral,
+    /// donc la déclaration vaut « le `const` de ce module est leur seul site ».
+    /// Les y déclarer est la disposition du § 5 du plan : ne pas le faire
+    /// laisserait D3 se rendormir sur une population incomplète, le mode de
+    /// mensonge que son propre doc-comment nomme.
+    const CONSENT_RECHECK_NAMES: &[(&str, &str)] = &[
+        (READY_CONSENT_WITHDRAWN_REASON, "ready_label.rs"),
+        (READY_CONSENT_RECHECK_TOOL_NAME, "ready_label.rs"),
+        (
+            "deferred_dispatch_refused_consent_withdrawn",
+            "task_engine/dispatcher.rs",
+        ),
+        (
+            "deferred_dispatch_consent_recheck_deferred",
+            "task_engine/dispatcher.rs",
+        ),
+        ("promotion_consent_checked", "task_engine/dispatcher.rs"),
+        (READY_ABSENT_AT_REARM_REASON, "ready_label.rs"),
+        (ISSUE_CLOSED_AT_REARM_REASON, "ready_label.rs"),
+    ];
+
+    /// Les lignes de production de `rel` où `nom` apparaît **comme littéral de
+    /// chaîne**.
+    ///
+    /// `"{nom}"` avec ses guillemets, et non le nom nu : un `use` de la
+    /// constante, un `match` sur elle ou une prose qui la cite ne sont pas des
+    /// sites de définition, et un prédicat sur le nom nu rougirait sur tous ses
+    /// lecteurs — donc finirait désarmé.
+    fn sites_du_nom(rel: &str, prod: &str, nom: &str) -> Vec<String> {
+        let litteral = format!("\"{nom}\"");
+        crate::source_scan::strip_comment_lines(prod)
+            .lines()
+            .filter(|l| l.contains(&litteral))
+            .map(|l| format!("{rel} — {}", l.trim()))
+            .collect()
+    }
+
+    /// **L'assertion sœur d'auto-vacuité de D3.**
+    ///
+    /// Une allowlist née vide est un emplacement où déposer la prochaine
+    /// infraction. Celle-ci rougit à la première entrée.
+    #[test]
+    fn mika2995_lallowlist_des_noms_de_relecture_est_vide() {
+        assert!(
+            CONSENT_RECHECK_NAME_EXCEPTIONS.is_empty(),
+            "une exception a été ajoutée à D3 : {:?}. La disposition de ce détecteur est de \
+             ROUTER le second site par la constante, pas de l'allowlister (mika#2201).",
+            CONSENT_RECHECK_NAME_EXCEPTIONS
+        );
+    }
+
+    /// **D3 — le motif du terminal et l'événement d'audit ont chacun un site de
+    /// définition unique, et aucun ne porte `noop` nu (AC-T4 de mika#2995).**
+    ///
+    /// # Ce qu'il refuse
+    ///
+    /// Qu'un second site écrive l'un de ces quatre noms en clair. C'est la
+    /// classe mika#2158 : une seconde copie ne rend **aucune décision fausse**
+    /// le jour où elle est écrite, et rate le premier renommage — après quoi
+    /// deux moitiés de la même population portent deux motifs, et le `grep` qui
+    /// répond « combien de wrappers ont été refusés pour consentement retiré »
+    /// en rend une seule sans dire qu'il en manque.
+    ///
+    /// # Pourquoi `noop` est interdit dans ces noms
+    ///
+    /// `deferred_dispatch_noop_completion` (mika#1124) et le statut `expired`
+    /// de mika#2169 occupent déjà ce mot pour « le tour a eu lieu et n'a rien
+    /// dispatché ». Ici le tour **n'a pas eu lieu**, ce qui est strictement
+    /// moins — et un nom partagé ferait des deux une seule population
+    /// (mika#2205).
+    ///
+    /// # Disposition si ce détecteur fire
+    ///
+    /// **Router le second site par la constante**, jamais l'allowlister. Voir
+    /// [`CONSENT_RECHECK_NAME_EXCEPTIONS`], et surfacer le site au corps de PR
+    /// sous `Fire-Disposition: second site d'un nom de relecture`.
+    #[test]
+    fn mika2995_le_motif_et_levenement_ont_un_site_de_definition_unique() {
+        for (nom, _) in CONSENT_RECHECK_NAMES {
+            assert!(
+                !nom.contains("noop"),
+                "`{nom}` porte `noop` nu, déjà pris par mika#1124 et mika#2169 pour « le tour a \
+                 eu lieu et n'a rien dispatché ». Ici le tour n'a pas eu lieu."
+            );
+        }
+
+        let fichiers = crate::source_scan::production_files();
+        assert!(
+            fichiers.len() > 100,
+            "D3 n'a scanné que {} fichier(s) — la population est cassée, et un détecteur qui \
+             ne scanne rien ne refuse rien (mika#2578)",
+            fichiers.len()
+        );
+
+        let mut offenders = Vec::new();
+        for (nom, attendu) in CONSENT_RECHECK_NAMES {
+            let mut sites = Vec::new();
+            for (rel, prod) in &fichiers {
+                if CONSENT_RECHECK_NAME_EXCEPTIONS
+                    .iter()
+                    .any(|(f, n, _)| f == rel && n == nom)
+                {
+                    continue;
+                }
+                sites.extend(sites_du_nom(rel, prod, nom));
+            }
+            // Zéro site est une infraction au même titre que deux : le nom
+            // aurait été renommé dans le code sans l'être ici, et D3 se serait
+            // rendormi en silence sur un nom qui n'existe plus.
+            if sites.len() != 1 {
+                offenders.push(format!(
+                    "`{nom}` a {} site(s) (attendu : 1, dans `{attendu}`) :\n  {}",
+                    sites.len(),
+                    sites.join("\n  ")
+                ));
+                continue;
+            }
+            if !sites[0].starts_with(*attendu) {
+                offenders.push(format!(
+                    "`{nom}` a bien un site unique, mais il a déménagé : attendu `{attendu}`, \
+                     vu `{}`",
+                    sites[0]
+                ));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2995 AC-T4 — un nom de la relecture de consentement n'a plus un site unique. \
+             Routez le second site par la constante ; ne l'allowlistez pas.\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// **Le contrôle de bonne foi de D3 — le scan rougit sur un second site.**
+    ///
+    /// Le scan pourrait être vert pour avoir **cessé de reconnaître sa forme**.
+    /// Aucune assertion sur l'arbre réel ne peut voir ça — elle passerait. Ce
+    /// test plante donc un second site et exige qu'il soit vu, puis trois
+    /// formes qui nomment la constante sans la définir et exige le silence sur
+    /// chacune.
+    #[test]
+    fn mika2995_le_scan_des_noms_rougit_sur_un_second_site() {
+        let plante = "\
+async fn un_autre_terminal(db: &AsyncDatabase, id: &str) {
+    db.mark_deferred_wrapper_noop(id, \"ready_consent_withdrawn\").await.ok();
+}
+";
+        let vus = sites_du_nom("second.rs", plante, READY_CONSENT_WITHDRAWN_REASON);
+        assert_eq!(
+            vus.len(),
+            1,
+            "le scan doit voir le second site planté, sinon il est vert pour avoir cessé de \
+             reconnaître sa forme : {vus:?}"
+        );
+        assert!(
+            vus[0].contains("second.rs") && vus[0].contains("mark_deferred_wrapper_noop"),
+            "l'offender doit nommer le fichier et rendre la ligne grep-able : {vus:?}"
+        );
+
+        // Les trois formes muettes, chacune pour sa raison : un commentaire qui
+        // cite le motif pour expliquer le site (la forme de mika#2425), un
+        // `use` de la constante, et une consommation de la constante — c'est
+        // exactement ce que le dispatcher fait, et D3 rougirait sur lui.
+        let muet = "\
+/// Le terminal est écrit sous \"ready_consent_withdrawn\", défini dans ready_label.
+use crate::ready_label::READY_CONSENT_WITHDRAWN_REASON;
+async fn consomme(db: &AsyncDatabase, id: &str) {
+    db.mark_deferred_wrapper_noop(id, READY_CONSENT_WITHDRAWN_REASON).await.ok();
+}
+";
+        let muets = sites_du_nom("muet.rs", muet, READY_CONSENT_WITHDRAWN_REASON);
+        assert!(
+            muets.is_empty(),
+            "citer ou consommer la constante n'est pas la définir — D3 rougirait sur tous ses \
+             lecteurs et finirait désarmé : {muets:?}"
+        );
+    }
+
+    // ───── mika#3050 — le prédicat d'état avant un ré-armement (D2/D3) ─────
+
+    /// Une réponse `gh issue view --json state,labels` canée.
+    fn relecture(state: &str, labels: &[&str]) -> String {
+        let labels = labels
+            .iter()
+            .map(|l| format!(r#"{{"name":"{l}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"state":"{state}","labels":[{labels}]}}"#)
+    }
+
+    #[test]
+    fn mika3050_ouvert_et_portant_ready_rend_le_consentement_tenu() {
+        assert_eq!(
+            parse_rearm_consent(&relecture("OPEN", &["ready", "type:bug"]), "x/y", 1),
+            Ok(RearmConsent::Held),
+            "le contrôle positif : les 4 premiers cas du tableau de mesure"
+        );
+    }
+
+    #[test]
+    fn mika3050_ouvert_sans_ready_rend_ready_absent() {
+        assert_eq!(
+            parse_rearm_consent(&relecture("OPEN", &["type:bug"]), "x/y", 1),
+            Ok(RearmConsent::ReadyAbsent),
+            "la forme de 74130014/#3002 : ouvert, mais `ready` retiré entre-temps"
+        );
+    }
+
+    #[test]
+    fn mika3050_un_ticket_ferme_rend_closed_quel_que_soit_le_label() {
+        // `ready` encore posé ET fermé : le `state` décide d'abord, sinon un
+        // ticket fermé sans nettoyage de label ré-armerait.
+        assert_eq!(
+            parse_rearm_consent(&relecture("CLOSED", &["ready"]), "x/y", 1),
+            Ok(RearmConsent::Closed),
+        );
+        // La casse de l'API n'est pas un contrat : `closed` se lit aussi.
+        assert_eq!(
+            parse_rearm_consent(&relecture("closed", &[]), "x/y", 1),
+            Ok(RearmConsent::Closed),
+        );
+    }
+
+    #[test]
+    fn mika3050_un_state_hors_contrat_est_une_erreur_pas_un_etat() {
+        let v = parse_rearm_consent(&relecture("MERGED", &["ready"]), "x/y", 7);
+        let e = v.expect_err("un `state` inconnu ne doit pas se replier sur OPEN");
+        assert!(
+            e.contains("hors contrat") && e.contains("x/y#7") && e.contains("MERGED"),
+            "la cause doit nommer la valeur refusée, c'est elle qu'un opérateur grep : {e}"
+        );
+        // Un `state` absent est du même côté : fail-closed, jamais `Held`.
+        assert!(
+            parse_rearm_consent(r#"{"labels":[{"name":"ready"}]}"#, "x/y", 7).is_err(),
+            "pas de `state` ⇒ pas de verdict d'ouverture"
+        );
+    }
+
+    #[test]
+    fn mika3050_labels_absent_est_une_erreur_jamais_ready_absent() {
+        // Le cœur de D3 : « le champ n'est pas là » et « le label n'est pas
+        // posé » sont deux faits distincts. Les confondre poserait un terminal
+        // `ready_absent_at_rearm` sur une parente consentante, sur la foi d'une
+        // réponse tronquée (mika#2131, mika#2331).
+        let v = parse_rearm_consent(r#"{"state":"OPEN"}"#, "x/y", 7);
+        let e = v.expect_err("`labels` absent n'est pas un `ready` absent");
+        assert!(
+            e.contains("labels") && e.contains("x/y#7"),
+            "la cause doit nommer le champ manquant et le ticket : {e}"
+        );
+        assert!(
+            parse_rearm_consent("ceci n'est pas du json", "x/y", 7).is_err(),
+            "une charge illisible est une erreur, pas un état"
+        );
+    }
+
+    /// La commande émise, mot pour mot — c'est elle que la couture d'appel route
+    /// par motif d'argv (`"issue view"`, mika#3047), et c'est `--json
+    /// state,labels` qui rend les deux moitiés du prédicat lisibles. Un champ
+    /// retiré de ce `--json` ferait rendre `Err` à tous les tickets sains : la
+    /// garde deviendrait un `NotNow` permanent, et la file ne tournerait plus.
+    #[tokio::test]
+    async fn mika3050_la_relecture_demande_state_et_labels_sur_le_bon_depot() {
+        let n = 990_350u64;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture("OPEN", &["ready"]),
+        );
+
+        let v = reread_issue_consent_via_gh("fake-token", "senara-solutions/mika", n).await;
+        assert_eq!(v, Ok(RearmConsent::Held));
+
+        let argv = crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect::<Vec<_>>();
+        assert_eq!(argv.len(), 1, "une relecture, un appel : {argv:?}");
+        assert_eq!(
+            argv[0],
+            format!("issue view {n} --repo senara-solutions/mika --json state,labels"),
+        );
+    }
+
+    // ───── mika#3050 D1 — le vocabulaire du recensement de ré-armement ─────
+
+    /// Les huit variantes, une par branche de la garde, dans l'ordre du type.
+    ///
+    /// Énumérées **à la main** et non dérivées : c'est la liste que le `match`
+    /// de `as_str` doit couvrir, et une liste calculée depuis le type ne
+    /// refuserait rien de plus que le compilateur.
+    fn les_huit_verdicts() -> Vec<RearmConsentCensus> {
+        vec![
+            RearmConsentCensus::ParentAbsent,
+            RearmConsentCensus::ParentUnreadable,
+            RearmConsentCensus::OtherClass,
+            RearmConsentCensus::NoToken {
+                repo: "x/y".to_string(),
+                issue: 1,
+            },
+            RearmConsentCensus::RereadFailed {
+                repo: "x/y".to_string(),
+                issue: 2,
+            },
+            RearmConsentCensus::Held {
+                repo: "x/y".to_string(),
+                issue: 3,
+            },
+            RearmConsentCensus::ReadyAbsent {
+                repo: "x/y".to_string(),
+                issue: 4,
+            },
+            RearmConsentCensus::IssueClosed {
+                repo: "x/y".to_string(),
+                issue: 5,
+            },
+        ]
+    }
+
+    /// **D1 — les huit étiquettes sont deux à deux distinctes, et portent leurs
+    /// coordonnées ou leur absence.**
+    ///
+    /// Ce que ce test refuse : deux branches de la garde comptées sous la même
+    /// étiquette. Un `verdict` partagé entre `ready_absent` et `issue_closed`,
+    /// ou entre les trois fail-closed, rendrait leurs comptes non-soustractibles
+    /// (mika#2205) — et c'est exactement le défaut que le § 1 du plan reproche
+    /// aux trois lignes `*_rearmed`, qui ne disent pas la classe de la parente.
+    ///
+    /// Il refuse aussi une coordonnée **vide** : `repo = ""` et `issue = 0` ont
+    /// la forme d'une réponse et n'en sont pas une (mika#2331). Les trois
+    /// branches sans coordonnées rendent `None`, que `tracing` traduit par un
+    /// champ absent du log ; les cinq autres rendent ce qu'elles ont lu.
+    #[test]
+    fn mika3050_les_huit_verdicts_portent_des_etiquettes_distinctes() {
+        let verdicts = les_huit_verdicts();
+        let etiquettes: Vec<&str> = verdicts.iter().map(|v| v.as_str()).collect();
+
+        let mut triees = etiquettes.clone();
+        triees.sort_unstable();
+        triees.dedup();
+        assert_eq!(
+            triees.len(),
+            8,
+            "deux branches de la garde partagent une étiquette, donc leurs comptes \
+             ne se soustraient plus : {etiquettes:?}"
+        );
+
+        for e in &etiquettes {
+            assert!(
+                !e.is_empty()
+                    && e.chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "`{e}` n'est pas une étiquette `snake_case` : un `jq` sur `verdict` \
+                 la groupe, donc sa forme est un contrat de lecture"
+            );
+        }
+
+        // Les trois sans coordonnées : la classe de la parente n'est pas encore
+        // connue, ou la parente elle-même manque.
+        for v in verdicts.iter().take(3) {
+            assert_eq!(
+                (v.repo(), v.issue()),
+                (None, None),
+                "`{}` n'a pas de coordonnées : elles doivent être ABSENTES, \
+                 jamais \"\" ni 0 (mika#2331)",
+                v.as_str()
+            );
+        }
+        // Les cinq autres les portent, et les rendent telles quelles.
+        for (i, v) in verdicts.iter().skip(3).enumerate() {
+            assert_eq!(
+                (v.repo(), v.issue()),
+                (Some("x/y"), Some(i as u64 + 1)),
+                "`{}` doit rendre les coordonnées qu'il porte",
+                v.as_str()
+            );
+        }
+    }
+
+    /// **Les écrivains de `rearm_consent_checked` qui sont DÉCLARÉS — aucun.**
+    ///
+    /// `(chemin depuis la racine du dépôt, ticket, le fait précis)`. L'événement
+    /// est créé par ce vol : son unique site est celui que ce vol écrit, donc il
+    /// n'existe aucune violation préexistante à déclarer.
+    ///
+    /// Elle est assurée vide plutôt que supposée vide (test ci-dessous) : y
+    /// ajouter une entrée exige de rougir ce test et d'y écrire la donnée
+    /// précise, son ticket de suivi et sa raison. C'est ce qui sépare une
+    /// déclaration d'une allowlist (mika#2309).
+    const CENSUS_WRITER_DECLARED: &[(&str, &str, &str)] = &[];
+
+    /// **Fire-Disposition option (a) — l'allowlist d'écrivain est livrée VIDE.**
+    ///
+    /// Le scan d'écrivain unique du § 9 exige **exactement un** site émettant
+    /// `rearm_consent_checked`. Son allowlist est vide à la livraison, et ce
+    /// test fixe ce fait pour qu'une entrée future soit un geste explicite plutôt
+    /// qu'une dérive silencieuse.
+    ///
+    /// Disposition si un second écrivain apparaît : ramener l'émission au site
+    /// unique de `reread_consent_before_rearm`, jamais ajouter une ligne ici.
+    /// Deux sites doubleraient le dénominateur d'AC4 sans que rien ne le dise.
+    #[test]
+    fn mika3050_lallowlist_decrivain_du_recensement_est_vide() {
+        assert!(
+            CENSUS_WRITER_DECLARED.is_empty(),
+            "l'allowlist d'écrivain de `rearm_consent_checked` n'est plus vide : {:?}. \
+             Un second écrivain double le dénominateur d'AC4 — ramenez l'émission au \
+             site unique au lieu de la déclarer.",
+            CENSUS_WRITER_DECLARED
+        );
+    }
+
+    /// Le nom de l'événement, tel que la production l'écrit. C'est un **littéral**
+    /// à son site d'émission : le scan ci-dessous cherche donc la même forme.
+    const CENSUS_EVENT_LITERAL: &str = "rearm_consent_checked";
+
+    /// Les sites qui émettent `rearm_consent_checked`, un par ligne non-commentaire
+    /// portant le littéral.
+    ///
+    /// Paramétré par ses fichiers plutôt que les lisant lui-même : c'est ce qui
+    /// rend le contrôle de bonne foi possible. Un scan qui lit le disque ne peut
+    /// pas être mis à l'épreuve sans écrire dans l'arbre.
+    ///
+    /// Les commentaires sont retirés d'abord ([`crate::source_scan::strip_comment_lines`])
+    /// — le doc-comment de l'enveloppe nomme l'événement pour dire qu'elle en est
+    /// le seul écrivain, et une prose qui *décrit* le motif ne doit pas se lire
+    /// comme une violation de celui-ci (classe mika#2323). Le numéro de ligne
+    /// n'est donc pas rapporté : après la coupe, il ne désigne plus rien dans le
+    /// fichier d'origine, et un numéro faux dans un message d'échec envoie le
+    /// lecteur au mauvais endroit.
+    fn census_writers_in(files: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, prod) in files {
+            let hits = crate::source_scan::strip_comment_lines(prod)
+                .lines()
+                .filter(|l| l.contains(CENSUS_EVENT_LITERAL))
+                .count();
+            for _ in 0..hits {
+                out.push(format!("src/{rel}"));
+            }
+        }
+        out
+    }
+
+    /// **Un seul écrivain du recensement, et c'est une égalité.**
+    ///
+    /// AC4 compte des ré-armements à partir de cette ligne, donc le dénominateur
+    /// qu'elle fournit n'est juste que si elle est émise **une fois par passage**.
+    /// Un second site l'émettrait sur un sous-ensemble des branches, et le
+    /// quotient qu'un opérateur en tire serait faux sans que rien ne l'en avertisse
+    /// — un instrument qui compte deux fois ne se signale pas, il se lit.
+    ///
+    /// L'assertion est une **égalité**, pas un `<=` : zéro écrivain est une
+    /// régression aussi réelle que deux. Supprimer la ligne rendrait tous les
+    /// tests de `RearmOutcome` de #3052 verts, et AC4 muette.
+    #[test]
+    fn mika3050_levenement_de_recensement_a_un_ecrivain_unique() {
+        let writers = census_writers_in(&crate::source_scan::production_files());
+        assert_eq!(
+            writers.len(),
+            1,
+            "`{CENSUS_EVENT_LITERAL}` doit avoir exactement un écrivain de \
+             production ; trouvés : {writers:?}. Deux sites doublent le \
+             dénominateur d'AC4, zéro la rend muette. Ramenez l'émission à \
+             l'enveloppe `reread_consent_before_rearm` plutôt que d'ajouter une \
+             entrée à `CENSUS_WRITER_DECLARED`."
+        );
+        assert_eq!(
+            writers[0], "src/skills/executor.rs",
+            "l'écrivain doit être l'enveloppe de la garde, pas un autre module"
+        );
+    }
+
+    /// Le contrôle de bonne foi du scan ci-dessus : il rougit bien sur un second
+    /// site.
+    ///
+    /// Sans ce contrôle, un scan dont le prédicat ne trouve plus rien — littéral
+    /// renommé, coupe de commentaires trop large — passe au vert en comptant zéro
+    /// puis *un*, et l'égalité le masquerait. Le fichier synthétique porte aussi
+    /// une **prose** nommant l'événement, pour que la coupe des commentaires soit
+    /// attestée en même temps que la détection.
+    #[test]
+    fn mika3050_le_scan_decrivain_rougit_sur_un_second_site() {
+        let synthetic = vec![
+            (
+                "skills/executor.rs".to_string(),
+                "    info!(event = \"rearm_consent_checked\", verdict = c.as_str());\n".to_string(),
+            ),
+            (
+                "task_engine/engine.rs".to_string(),
+                "    // Cette prose nomme `rearm_consent_checked` sans l'émettre.\n\
+                 /// Et ce doc-comment aussi : `rearm_consent_checked`.\n\
+                 info!(event = \"rearm_consent_checked\", verdict = \"held\");\n"
+                    .to_string(),
+            ),
+        ];
+        assert_eq!(
+            census_writers_in(&synthetic),
+            vec!["src/skills/executor.rs", "src/task_engine/engine.rs"],
+            "le scan doit voir les deux sites et aucune des deux proses"
+        );
+    }
+
+    /// **L'enveloppe émet sans condition — c'est ce qui fait les huit branches.**
+    ///
+    /// Les cinq tests de capture de `skills::executor::tests::mika3050_recensement`
+    /// atteignent sept des huit branches par un chemin réel. La huitième, et plus
+    /// généralement la propriété « *toutes* les branches », n'est pas une somme de
+    /// tests : c'est une propriété du **corps** de l'enveloppe, qui appelle
+    /// `reread_consent_verdict` puis émet, sans rien examiner entre les deux.
+    ///
+    /// Un `if` ajouté là — « n'émettons pas sur la branche saine, elle est
+    /// bruyante » — redonnerait exactement le défaut que ce vol ferme : un
+    /// numérateur sans dénominateur. Aucun test de comportement ne le verrait,
+    /// puisque les sept autres branches resteraient recensées.
+    ///
+    /// Ce test n'est pas au § 5 du plan ; il y est ajouté parce que le
+    /// doc-comment de l'enveloppe promet cette absence d'embranchement et qu'une
+    /// promesse non gardée s'érode.
+    #[test]
+    fn mika3050_lenveloppe_emet_sans_condition() {
+        let (_, prod) = crate::source_scan::production_files()
+            .into_iter()
+            .find(|(rel, _)| rel == "skills/executor.rs")
+            .expect("le site de la garde doit être un fichier de production");
+        let (_, body) = crate::source_scan::fn_bodies(&prod)
+            .into_iter()
+            .find(|(name, _)| name == "reread_consent_before_rearm")
+            .expect("l'enveloppe de la garde doit être trouvable par son nom");
+
+        for keyword in ["if", "match", "else"] {
+            let branching: Vec<&str> = body
+                .lines()
+                .filter(|l| crate::source_scan::occurs_at_boundary(l, keyword, true))
+                .collect();
+            assert!(
+                branching.is_empty(),
+                "le corps de `reread_consent_before_rearm` porte un `{keyword}` : \
+                 {branching:?}. L'émission inconditionnelle EST la propriété « les \
+                 huit branches sont recensées » ; un embranchement ici rend AC4 \
+                 partielle sans qu'aucun test de comportement ne rougisse."
+            );
+        }
+        assert!(
+            body.contains(CENSUS_EVENT_LITERAL),
+            "…et le corps doit bien porter l'émission : un corps vide passerait \
+             l'assertion ci-dessus"
         );
     }
 }

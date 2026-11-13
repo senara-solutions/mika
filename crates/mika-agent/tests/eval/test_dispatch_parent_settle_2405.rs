@@ -92,6 +92,24 @@ fn test_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
     })
 }
 
+/// Le même dispatcher, en mode **démon**.
+///
+/// mika#3042 : les six balayages terminaux de parentes `self_dev` sont réservés
+/// au démon, donc le seul test de ce fichier qui attend un fauchage par la
+/// faucheuse #871 — `self_dev_orphan_is_still_failed_by_its_own_reaper` — doit
+/// porter un moteur de démon. Les cinq autres gardent `test_dispatcher` : leur
+/// sujet est `settle_dispatch_parents`, qui reste hors garde, et l'un d'eux
+/// (`defers_while_a_sibling_is_merely_completed`) sème un enfant `completed`
+/// non livré que `dispatch_undelivered_callbacks` dispatcherait pour de vrai en
+/// mode démon.
+fn daemon_dispatcher(db: AsyncDatabase) -> Arc<TaskDispatcher> {
+    let cli = test_dispatcher(db);
+    Arc::new(TaskDispatcher {
+        cli_mode: false,
+        ..Arc::try_unwrap(cli).ok().expect("un seul détenteur")
+    })
+}
+
 /// La row de suivi que la Delegation Rule fait ouvrir : `manual` / `none`, sans
 /// `process_id` propre, `in_progress`. `source` reste `None` — c'est la forme
 /// exacte que `tools/create_task.rs` écrit hors des chemins self-dev, et c'est
@@ -431,7 +449,8 @@ async fn defers_while_a_sibling_is_merely_completed() {
 async fn self_dev_orphan_is_still_failed_by_its_own_reaper() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let db = test_db().await;
-        let dispatcher = test_dispatcher(db.clone());
+        // mika#3042 : moteur de démon — c'est lui qui fauche.
+        let dispatcher = daemon_dispatcher(db.clone());
         let mut engine = TaskEngine::new(db.clone(), dispatcher);
 
         let parent = seed_tracking_parent(&db, "suivi self_dev sans PR", Some("self_dev")).await;

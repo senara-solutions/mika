@@ -84,6 +84,19 @@ jobs:
       - name: Dispatch-lib assertion suite (mika#1772)
         run: make test-dispatch-lib
 
+      # La grammaire des jetons de `_parse_disposition` (mika#1272) — 67
+      # assertions sur les cinq tiers. Elle tournait dans
+      # `dispatch-lib-offline-suites`, qui ne construit rien, jusqu'à la bascule
+      # de mika#2194 (vol 5) : depuis, les deux lecteurs délèguent à `mika
+      # arch-disposition`, donc la suite a une dépendance de fabrication et doit
+      # tourner APRÈS `cargo test`, ici, où `target/debug/mika` existe.
+      #
+      # Elle skippe bruyamment sans le binaire plutôt que de rougir — ce qui est
+      # le bon comportement en dev et serait un vert sur rien en CI. C'est la
+      # raison du déplacement, et pas l'économie d'un build.
+      - name: The token grammar of _parse_disposition (mika#1272, mika#2194)
+        run: bash skills/bundled/_shared/tests/test_parse_disposition.sh
+
       # mika#2312: the permission-policy plugin suite — including the AST guard
       # that refuses the registry any filesystem/network capability — ran in no
       # workflow at all, so a carve-out could merge green past the very guard
@@ -108,10 +121,81 @@ jobs:
       - name: Handler crash-step naming + trap placement (mika#2532)
         run: make test-handler-crash-step
 
-      - name: Pilot sandbox secret-channel guards (mika#2039)
+      - name: Webhook-turn register reader — the turn is a SUM (mika#2680)
+        run: make test-measure-webhook-turn-cost
+
+      # La sonde S3 décide (seuil 500 ms, code 3), donc elle doit être exercée
+      # aux DEUX polarités — mika#2578 : une garde que le pipeline ne lance pas
+      # ne refuse rien. La suite fabrique son propre `mika` : aucun binaire,
+      # aucun réseau, aucun jeton.
+      - name: S3 probe — both threshold polarities, derived site count (mika#2194)
+        run: make test-measure-mika-subcommand-cost
+
+      # mika#2578, une troisième fois : `make test-egress-push-bound` existait
+      # dans le Makefile depuis mika#2736 et aucun fichier de `.github/` ne
+      # l'appelait, donc les douze cas de la borne `git-receive-pack`
+      # gataient zéro PR. Un garde que le pipeline ne lance pas ne refuse rien.
+      # Les deux moitiés du resserrement de mika#2751 arrivent ensemble, et
+      # c'est délibéré : `test-egress-push-bound` mesure le LECTEUR (il écrit
+      # les entrées de périmètre à la main) et resterait vert si le lanceur
+      # n'en déclarait jamais aucune, `test-egress-push-scope-staging` mesure
+      # le PRODUCTEUR. Une seule des deux est une PR verte sous une borne
+      # statique qui se croit resserrée.
+      - name: Pilot sandbox secret-channel guards (mika#2039, mika#2716, mika#2724, mika#2736, mika#2751)
         run: |
           make test-sandbox-secret-argv
           make verify-no-secret-in-setenv
+          make test-egress-sentinel-staging
+          make test-egress-sentinel-enforcement
+          make test-egress-push-bound
+          make test-egress-push-scope-staging
+
+      # mika#2077 (reprise de mika#2057) — l'entrypoint Phase 2b sérialisait
+      # l'argv du pilote avec `printf '%q'`, un builtin bash dont la sortie
+      # ANSI-C `$'...'` n'est pas lue par dash, et rien ne garantit que le shell
+      # d'entrypoint soit bash : un argument multi-ligne arrivait silencieusement
+      # DIFFÉRENT au pilote. La suite mesure la traversée octet pour octet hors
+      # bwrap, et compte les deux sites. Elle est câblée ICI parce que mika#2578
+      # l'a enseigné trois fois : un garde que le pipeline ne lance pas passe la
+      # revue, passe le CI par construction, et laisse partir le défaut.
+      - name: Phase 2b entrypoint passes the pilot argv positionally (mika#2077)
+        run: make test-pilot-phase2b-argv
+
+      # mika#2108 — le bac à sable ne monte que le worktree, mais depuis
+      # mika#2178 le corps du ticket et ses commentaires arrivent VERBATIM dans
+      # le prompt, chemins hôte compris : quatre séances mesurées ont dépensé
+      # leurs premiers tours à chercher un checkout jamais monté, puis sont
+      # allées vers la forme large qui tue la session (cpp#128). La suite tient
+      # la POSITION du bloc d'orientation — après la réassignation
+      # ITERATION_CTX, avant l'injection du contexte du ticket — parce qu'un
+      # avertissement qui SUIT les chemins console au lieu d'inoculer, et elle
+      # porte son anti-vacuité (copie régressée où l'ordre est inversé).
+      # Câblée ICI parce que mika#2578 l'a enseigné : un garde que le pipeline
+      # ne lance pas refuse rien. Ni bwrap, ni réseau, ni token.
+      - name: The pilot is situated before it reads the ticket's host paths (mika#2108)
+        run: make test-pilot-orientation-block
+
+      # mika#2077 (reprise de mika#2032) — le chemin GROOMED de dispatch-lib
+      # retirait la ligne `PIPELINE FAILURE:` d'un bloc d'échec de plusieurs
+      # lignes, livrant `Session:`, `Halt class:` et le paragraphe orphelins :
+      # un diagnostic tronqué exactement quand il compte, et sur le chemin de
+      # SUCCÈS du grooming, donc sur tout groom convergé. La suite mesure la
+      # démotion sur les messages réels du fichier et porte sa propre
+      # anti-vacuité (deux copies régressées, comptes d'échecs exacts). Câblée
+      # ICI parce que mika#2578 et mika#2752 l'ont enseigné : un garde que le
+      # pipeline ne lance pas passe la revue, passe le CI par construction, et
+      # laisse partir le défaut. Ni bwrap, ni réseau, ni token.
+      - name: A stale PIPELINE FAILURE block is demoted, not decapitated (mika#2077)
+        run: make test-demote-pipeline-failure
+
+      # mika#2578 again, same lesson as the step below: `make test-sandbox-gh-usable`
+      # was local-only, so the guard that pins the VALUE `--setenv GH_TOKEN`
+      # carries — now the egress sentinel (mika#2716) — gated nothing on a PR.
+      # It is the suite that owns the real-bwrap half of the sentinel's contract
+      # and the de-anchoring precondition (`removed == 1`), and it skips cleanly
+      # when bwrap or gh is absent, so it is safe on a hosted runner.
+      - name: gh usable inside the pilot sandbox (mika#2572, mika#2716)
+        run: make test-sandbox-gh-usable
 
       # mika#2578: this suite was in `make test` — a local target CI does not
       # call — so its guards gated nothing on a PR. It now carries the scan that
@@ -122,6 +206,44 @@ jobs:
       - name: GitHub token host-reachable / sandbox-absent (mika#2056, mika#2578)
         run: make test-github-token-not-in-sandbox
 
+      # mika#2793 — the last four of the twenty-five. They land HERE, and not in
+      # one of the two hosted jobs added for this ticket, because this is the
+      # only runner that carries both `cargo` and a real `bwrap`, next to the
+      # two real-sandbox suites above. Anywhere else they would be green by
+      # PERMANENT SKIP — decorative, which is the mika#2103 defect one layer up.
+      # Each degrades to a clean skip rather than a failure when its
+      # precondition is missing, the property ci.yml already accepts for the two
+      # steps above; here the point is the opposite, that the precondition is
+      # PRESENT so the assertions actually execute. A green job does not tell
+      # the two apart: read the log and check each of these four prints a
+      # non-zero assertion count and not `⊘ skipped`.
+      # Precondition: `cargo fmt` on PATH.
+      - name: The rescue leaves a formatted tree (mika#2348)
+        run: bash skills/bundled/_shared/tests/test_rescue_fmt_clean.sh
+      # The same suite with no `rustup default` and an empty HOME — this
+      # runner's own state, reproduced so it holds on any machine. The fixture
+      # crate sits outside rust-toolchain.toml; red here means the suite went
+      # back to relying on a default toolchain (mika#2826).
+      - name: The rescue fmt suite without a default toolchain (mika#2826)
+        run: bash skills/bundled/_shared/tests/test_rescue_fmt_clean_without_default_toolchain.sh
+      # 0600 relay socket, minimal relay launch environment, and reachability
+      # from a real bwrap pilot — the third point is the one the canary cannot
+      # give. Precondition: a real bwrap.
+      - name: Relay socket, relay env, and reachability from a real sandbox (mika#2578)
+        run: bash skills/bundled/_shared/tests/test_egress_relay_socket_and_env.sh
+      # git usable inside the pilot sandbox, plus the containment that bounds
+      # it. Preconditions: a real bwrap AND a root it can add a worktree to —
+      # it skips in a nested dispatch worktree, which is why its state had to be
+      # established on the runner rather than locally (mika#2793).
+      - name: git usable inside the pilot sandbox, and still contained (mika#2141)
+        run: bash skills/bundled/_shared/tests/test_sandbox_git_usable.sh
+      # The pilot's session-log directory is writable from inside the sandbox
+      # while the incident-diagnosis surface stays out. Was red 11/5 until
+      # mika#2793: its refusal probe died on a failed redirection instead of
+      # reporting `refused`, so it went red precisely when the isolation worked.
+      - name: The session-log bind, and what stays outside it (mika#2165)
+        run: bash skills/bundled/_shared/tests/test_sandbox_log_dir_bound.sh
+
       - name: Test (with telemetry feature)
         run: cargo test --workspace --features telemetry
 
@@ -131,6 +253,46 @@ jobs:
           MIKA_ANTHROPIC_API_KEY: "sk-ant-test-dummy-key-for-smoke"
           MIKA_INTERNAL_TOKEN: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
           MIKA_ROUTING_URL: "http://localhost:19999"
+
+  darwin-check:
+    name: Darwin Check (${{ matrix.target }})
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show  # reads rust-toolchain.toml
+          rustup target add "$TARGET"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        with:
+          prefix-key: v1-darwin-check
+          key: ${{ matrix.target }}
+          # Sauvegarde sur main seulement : le cache Actions est à 8,30 Go sur 10, les PR ne doivent pas évincer celui de Check (mika#2902 AC3).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `rust-embed` lit ce répertoire au build ; release.yml fait le même geste.
+      - name: Create dashboard dist placeholder
+        run: mkdir -p dashboard/dist
+
+      # `cargo check` et non `cargo build` : la classe de défaut visée est une
+      # erreur de RÉSOLUTION DE NOMS (E0433), qui tombe avant le link. `check`
+      # la voit entièrement, pour une fraction du temps d'un build release.
+      # `--locked` pour que le job échoue si `Cargo.lock` a bougé, comme release.yml.
+      # `-p mika-agent -p mika-cli` : les deux crates qui portent les binaires
+      # construits par release.yml (`mika-spirit` et `mika`).
+      - name: Check both darwin targets
+        run: cargo check --locked --target "$TARGET" -p mika-agent -p mika-cli
 
   dashboard:
     name: Dashboard
@@ -190,8 +352,7 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'pull_request' &&
-       !startsWith(github.head_ref, 'release/') &&
-       !startsWith(github.head_ref, 'release-please--'))
+       !startsWith(github.head_ref, 'release/'))
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: Check crate-local docs are in sync
@@ -395,6 +556,212 @@ jobs:
       - name: Pin the guard's negative behaviour
         run: bash scripts/test-check-pilot-turn-ceiling-labels.sh
 
+  root-files-lint:
+    name: Root File Declaration Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # A pilot work draft committed at the root is read by nobody, referenced by
+      # nothing, and every dispatch worktree carries it along from `main` — three
+      # did, one of them for five months (mika#2760). No rescue exclusion stops
+      # the one the pilot commits itself, inside its own PR.
+      - name: Reject a tracked root file that root-files-declared.txt does not declare (mika#2760)
+        run: bash scripts/check-root-files.sh
+      # A guard nobody has watched go red is a decoration (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-root-files.sh
+
+  suite-wiring-lint:
+    name: Suite Wiring Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # A suite on disk that no workflow reaches refuses nothing: it passes
+      # review, it passes CI by construction, and the defect it was written to
+      # catch lands in production. mika#2578 once, mika#2752 twice; the doctrine
+      # existed from the first occurrence and nothing enforced it. This step is
+      # also the lint's own wiring — it is the first subject of its own rule.
+      - name: Reject a suite neither reached by CI nor declared (mika#2761)
+        run: bash scripts/check-suite-wiring.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # dispatch-seats-lint above (mika#2103). The anti-vacuity suite is what
+      # makes the four directions D1–D4 more than an intention: each is seen red
+      # on a fixture tree AND green once the fixture is repaired.
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-suite-wiring.sh
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The guards of the repository's own tooling — written, reviewed, merged, and
+  # then left without a launcher. mika#2761 delivered the REFUSAL (the job
+  # above); this job is the catch-up (mika#2793). Every suite below runs offline
+  # in seconds: no cargo, no bwrap, no network, no token. They were not outside
+  # CI for a reason — nobody had wired them, and nothing said so out loud until
+  # the registry made the backlog countable.
+  #
+  # Three of them were ALREADY RED when this job was written, and one was not
+  # hermetic. That is what mika#2578 costs in practice: a guard the pipeline
+  # does not run refuses nothing, and while it refuses nothing it rots with no
+  # witness. One step per suite, deliberately: the step name is what a reader of
+  # the Checks page sees when a suite goes red, and a grouped `run: |` block
+  # makes "which one" invisible without opening the log.
+  # ───────────────────────────────────────────────────────────────────────────
+  offline-script-suites:
+    name: Offline Script Suites
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # Guard + proof-of-guard, in that order, through the existing `make`
+      # target: the target already encodes the ordering, and duplicating it in
+      # YAML would create a second site of truth for it. mika#1801 wrote that
+      # "the fifteen scripts/check-*.sh are all wired"; this pair is why that
+      # sentence stopped being true — the exact situation of check-cta-primitives.sh,
+      # "the only exception in its family, which is precisely why nobody looked
+      # for it".
+      - name: Release profile keeps the line tables a wedged binary needs (mika#1719)
+        run: make check-release-debuginfo
+      # release.yml publishes `--prerelease --latest=false` on this answer, and
+      # install.sh installs `releases/latest`: a candidate classified final would
+      # be served to the family.
+      - name: A release candidate tag is classified prerelease (mika#2890)
+        run: make check-release-tag
+      # The other half of the same promise: from v1.0 a breaking change ships as
+      # a major version with a migration guide, and `curl … | sh` is exactly the
+      # path that would carry someone from 1.x to 2.x without a word. The suite
+      # intercepts curl and reads its call log, so "nothing was replaced" is
+      # measured rather than inferred from a successful install.
+      - name: install.sh stops before a major change and names the migration guide (mika#2897)
+        run: make check-install-major-gate
+      # The load-bearing invariant of the mika#893 factorisation: dev-pilot and
+      # dev-groom differ only by their entry slash command. Pure structural diff
+      # over two tracked files.
+      - name: dev-pilot and dev-groom differ only by their entry command (mika#893)
+        run: bash scripts/test-dispatch-symmetry.sh
+      # Keeps the empty-turn measurement from counting the guardrails constant
+      # as the event.
+      - name: The empty-turn measure does not count the guardrails as the event (mika#1910)
+        run: bash scripts/test-measure-empty-turns.sh
+      # Same class one measure over: the anchor must be derived from the
+      # producer, never reverse-engineered from a log, or 2349 of 2352 sessions
+      # read as silent. This suite was red on `0170f5cd` — the measured script
+      # was committed 100644 while the suite requires 100755 (mika#2793).
+      - name: The cycle-emptiness anchor comes from the producer (mika#1950)
+        run: bash scripts/test-measure-pilot-cycle-emptiness.sh
+      # The mika-arch-groom-milestone bundle's scaffold and its registration
+      # sites. Also red on `0170f5cd`: it asserted a per-skill LLM override site
+      # that mika#949 removed eleven months ago.
+      - name: The groom-milestone bundle and its registration sites (mika#879)
+        run: bash scripts/test-mika-groom-milestone.sh
+      # AC4 of the search smoke — a 404 `search_upstream_not_configured` must
+      # exit non-zero. Its own header states it was built to run in CI with no
+      # gateway, no database, no token and no upstream request; it was unwired
+      # anyway, which is the mika#2578 shape at its purest.
+      - name: A search upstream that answers 404 is not a healthy smoke (mika#2407)
+        run: bash scripts/test-smoke-search-substrate.sh
+      # The webhook-chain probe's decision table AND its silence on a healthy
+      # chain. Two throwaway `python3 -m http.server` stand-ins; every curl call
+      # stays on loopback.
+      - name: The webhook-chain probe's decision table and its silence (mika#2135)
+        run: bash scripts/test-smoke-webhook-chain.sh
+      # The offline half of the `operator` entry that stays in the registry: it
+      # fakes `gh` and replays both topology states, so the operator script's own
+      # logic is guarded even though the operator script itself cannot be.
+      - name: The dependabot topology verifier's own logic, with gh faked (mika#1997)
+        run: bash scripts/test-verify-dependabot-topology.sh
+      # AC2 of mika#2939: a review only rules on a head that existed when it was
+      # submitted. The #2920 case is replayed against a faked `gh` — on the forge
+      # the pre-force-push state no longer exists, so this is the only place the
+      # property is establishable, and it is offline by construction. The suite
+      # carries its own redness control: the handler stripped of its `>=
+      # $first_seen` term must return the antedated review.
+      - name: A review predating its head is no evidence, with gh faked (mika#2939)
+        run: bash scripts/test-qa-head-reviews-handler.sh
+      # The harness of the script every flight is required to end on. mika#2516
+      # is what its absence from CI has already cost once: a guard announced
+      # inside verify-pipeline.sh, never delivered, and nobody saw it. It was
+      # also non-hermetic until mika#2793 — 29 commits on an inherited git
+      # identity, which would have failed on this very runner.
+      - name: The harness of verify-pipeline.sh, the script every flight ends on (mika#861)
+        run: bash scripts/verify-pipeline-test.sh
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # The other half of the mika#2793 catch-up: the guards of the plumbing EVERY
+  # flight of the autonomous loop goes through — WIP rescue, push/rebase retry,
+  # the seat stamped on a dispatched issue, the gate before a PR is published,
+  # transcript redaction. When one of these breaks, a pilot is wedged and the
+  # operator reads the suite's output to find out why; it is precisely the code
+  # that most needs a launcher, and it had none.
+  #
+  # The split from `offline-script-suites` above follows the root (`scripts/` vs
+  # `skills/bundled/_shared/`), which is also a split of nature: repository
+  # tooling on one side, dispatch plumbing on the other. Two parallel hosted
+  # jobs add nothing to the critical path.
+  #
+  # None of these touches the network, a token, cargo or bwrap. The seven that
+  # build git fixtures declare their own `user.email`/`user.name` on the fixture
+  # repo; the four others never commit — checked, because inheriting the host's
+  # global identity is the exact non-hermeticity mika#2793 had to repair in
+  # scripts/verify-pipeline-test.sh.
+  # ───────────────────────────────────────────────────────────────────────────
+  dispatch-lib-offline-suites:
+    name: Dispatch-lib Offline Suites
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      # The redaction applied to pilot transcripts before they are written. Its
+      # header gave the bare `bash` invocation as the only way to run it.
+      - name: Redaction applied to pilot transcripts before they are written (mika#903)
+        run: bash skills/bundled/_shared/test-trace-redaction.sh
+      # The gate dispatch-lib applies before it publishes a PR. `gh` is faked.
+      - name: The gate applied before a PR is published (mika#1941)
+        run: bash skills/bundled/_shared/tests/test_finalize_pr_gate.sh
+      # The refusal of a force-push from a dispatch worktree.
+      - name: A force-push from a dispatch worktree is refused (mika#1318)
+        run: bash skills/bundled/_shared/tests/test_force_push_guard.sh
+      # `test_parse_disposition.sh` A QUITTÉ CE JOB (mika#2194, vol 5) et tourne
+      # désormais dans `Check`, après `cargo test`. Son ancien commentaire ici
+      # disait « a pure function over strings. Nothing in this repository is
+      # cheaper to run in CI » — et c'était vrai jusqu'à la bascule. Depuis,
+      # `_parse_disposition` et `_parse_verdict` appellent `mika
+      # arch-disposition` : la suite a une DÉPENDANCE DE FABRICATION, et ce job
+      # ne construit rien. Elle skipperait proprement (le helper le dit), donc
+      # elle ne rougirait pas — elle ne mesurerait plus rien, en vert.
+      #
+      # La ligne est laissée ici plutôt que retirée : sans elle, le prochain qui
+      # voudra économiser le temps de build la ramènera dans ce job, où elle a
+      # l'air d'être à sa place.
+      # The push/rebase retry loop, against local repositories.
+      - name: The push/rebase retry loop (mika#1857)
+        run: bash skills/bundled/_shared/tests/test_push_with_rebase_retry.sh
+      # The cause token the WIP rescue stamps on the draft it opens.
+      - name: The cause token stamped on a rescue draft (mika#2539)
+        run: bash skills/bundled/_shared/tests/test_rescue_cause_token.sh
+      # A rescue draft never carries a `Closes` line: a rescued WIP must not
+      # close the ticket it failed to finish.
+      - name: A rescue draft carries no Closes line (mika#2157)
+        run: bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
+      # The rescue commit does not silently bypass the hooks.
+      - name: The rescue commit does not bypass the hooks (mika#1685)
+        run: bash skills/bundled/_shared/tests/test_rescue_commit_no_verify.sh
+      # .pilot-scratch/ never reaches a published commit — the invariant every
+      # dispatch rule about scratch files rests on.
+      - name: .pilot-scratch never reaches a published commit (mika#1282)
+        run: bash skills/bundled/_shared/tests/test_rescue_scratch_not_published.sh
+      # A rescue draft is never opened on a head whose tree is already main's.
+      # Four such drafts opened between 2026-09-04 and 2026-11-04, each less than
+      # 20 minutes after a merge of a PR on its own branch; the squash is what
+      # makes the three-dot diff show the already-merged work again. Offline: real
+      # temp git repositories with a local bare `origin`, only `gh` is faked.
+      - name: A rescue draft is not opened on a tree already in main (mika#3038)
+        run: bash skills/bundled/_shared/tests/test_rescue_tree_equals_main.sh
+      # The two invariants of worktree command seeding: never overwrite a
+      # command the branch tracks, never dirty `git status`. Their breach was
+      # the dirty-worktree cause behind mika#1414.
+      - name: The two invariants of worktree command seeding (mika#1415)
+        run: bash skills/bundled/_shared/tests/test_seed_worktree_slash_commands.sh
+      # The seat stamped on a dispatched issue. `gh` is faked.
+      - name: The seat stamped on a dispatched issue (mika#2155)
+        run: bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
+
   issue-annotation-guard-lint:
     name: Issue Annotation Guard Lint
     runs-on: ubuntu-22.04
@@ -479,6 +846,18 @@ jobs:
       - name: Exercise the post-publish verification, AC1 and AC2 included (mika#2566)
         run: bash scripts/test-verify-npm-publish.sh
 
+  pilot-instruction-paths-lint:
+    name: Pilot Instruction Paths Lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Reject host-workspace paths in the pilot's auto-loaded surface (mika#2108)
+        run: bash scripts/check-pilot-instruction-paths.sh
+      # A guard nobody has watched go red is a decoration — same discipline as
+      # byte-slice-lint above (mika#2103).
+      - name: Pin the guard's negative behaviour
+        run: bash scripts/test-check-pilot-instruction-paths.sh
+
   loop-select-lint:
     name: Loop Select Lint
     runs-on: ubuntu-22.04
@@ -556,6 +935,8 @@ jobs:
         run: bash scripts/verify-egress-no-log.sh
       - name: Pin the egress no-log guard's negative behaviour (mika#2054)
         run: bash scripts/test-verify-egress-no-log.sh
+      - name: Pin the egress audit's declared search_* event list (mika#2788)
+        run: bash scripts/test-audit-egress-no-log.sh
 
   egress-manifest-lint:
     name: Egress Manifest Lint
@@ -619,7 +1000,6 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       !startsWith(github.head_ref, 'release/') &&
-      !startsWith(github.head_ref, 'release-please--') &&
       !startsWith(github.head_ref, 'dependabot/')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6

@@ -149,7 +149,7 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                     },
                     agents: vec![],
                 };
-                print!("{}", serde_yaml::to_string(&report)?);
+                print!("{}", yaml_serde::to_string(&report)?);
             }
             OutputFormat::Text => {
                 println!("\n  KG state summary (0 agents)\n");
@@ -237,7 +237,7 @@ fn run_status(global_home: &Path, db_path: &Path, args: &KgStatusArgs) -> Result
                 summary,
                 agents: agent_states,
             };
-            print!("{}", serde_yaml::to_string(&report)?);
+            print!("{}", yaml_serde::to_string(&report)?);
         }
         OutputFormat::Text => {
             println!();
@@ -608,7 +608,7 @@ fn run_list_agents(global_home: &Path, db_path: &Path, args: &KgListAgentsArgs) 
             println!("{}", serde_json::to_string_pretty(&listings)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&listings)?);
+            print!("{}", yaml_serde::to_string(&listings)?);
         }
         OutputFormat::Text => {
             if listings.is_empty() {
@@ -809,7 +809,7 @@ fn run_validate(db_path: &Path, args: &KgValidateArgs) -> Result<()> {
         }
         OutputFormat::Yaml => {
             let report = KgValidateReport { checks, summary };
-            print!("{}", serde_yaml::to_string(&report)?);
+            print!("{}", yaml_serde::to_string(&report)?);
         }
         OutputFormat::Text => {
             println!();
@@ -1035,7 +1035,7 @@ fn run_purge(global_home: &Path, db_path: &Path, args: &KgPurgeArgs) -> Result<(
             println!("{}", serde_json::to_string_pretty(&counts)?);
         }
         OutputFormat::Yaml => {
-            print!("{}", serde_yaml::to_string(&counts)?);
+            print!("{}", yaml_serde::to_string(&counts)?);
         }
         OutputFormat::Text => {
             println!("  Purging... done.");

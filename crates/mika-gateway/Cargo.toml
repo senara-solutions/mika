@@ -64,6 +64,12 @@ url = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
+# mika#2212 — the routing↔handlers coherence guard in `src/github.rs` (`mod
+# tests`) parses the qa-review family's `skill.toml` from disk to read
+# `[triggers].keywords`. Parsing, not substring search: a comment naming an
+# action would satisfy a raw substring, which is the false green the guard
+# exists to exclude. Dev-only — the gateway binary reads no skill manifest.
+toml = { workspace = true }
 http-body-util = { workspace = true }
 mika-common = { workspace = true, features = ["test-utils"] }
 jsonwebtoken = { workspace = true }

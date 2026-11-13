@@ -186,6 +186,30 @@ pub fn classify_anyhow_error(err: &anyhow::Error) -> Cow<'static, str> {
         .map_or(Cow::Borrowed(error_class::OTHER), LlmError::error_class)
 }
 
+/// Le 402 d'un fournisseur signifie « cette requête dépasserait ton crédit » :
+/// un budget épuisé, pas une panne (mika#2944).
+///
+/// Lu sur la **variante**, jamais sur le message — doctrine mika#2331 : le texte
+/// d'un fournisseur n'est pas un contrat, et « This request would exceed your
+/// available credits » est une phrase d'OpenRouter d'aujourd'hui, pas un
+/// invariant du protocole. Le statut, lui, en est un.
+///
+/// La classe de fil reste `http_402` : aucun renommage, aucune scission du
+/// vocabulaire que les opérateurs `GROUP BY` (mika#2205). Ce prédicat **lit**
+/// cette population, il ne la redécoupe pas.
+#[must_use]
+pub fn is_credit_exhausted(err: &LlmError) -> bool {
+    matches!(err, LlmError::HttpError { status: 402, .. })
+}
+
+/// Variante qui descend la chaîne `anyhow`, par symétrie avec
+/// [`classify_anyhow_error`] : l'erreur remonte du tour enveloppée (mika#2944).
+#[must_use]
+pub fn is_credit_exhausted_anyhow(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LlmError>()
+        .is_some_and(is_credit_exhausted)
+}
+
 impl From<reqwest::Error> for LlmError {
     fn from(e: reqwest::Error) -> Self {
         LlmError::Transport(e.to_string())
@@ -407,6 +431,102 @@ mod tests {
         assert_eq!(
             classify_transport_message("connection refused"),
             error_class::TRANSPORT
+        );
+    }
+
+    // ── crédit épuisé (mika#2944) ──
+
+    /// Le message exact d'OpenRouter le 2026-10-28, tâche 26b8d5c7 — présent
+    /// pour qu'un lecteur rencontre l'incident, **jamais** lu par le prédicat.
+    const INCIDENT_402: &str =
+        "This request would exceed your available credits. Please add more credits.";
+
+    #[test]
+    fn mika2944_un_402_est_un_credit_epuise() {
+        let err = LlmError::HttpError {
+            status: 402,
+            message: INCIDENT_402.into(),
+            retryable: true,
+        };
+        assert!(is_credit_exhausted(&err));
+        assert_eq!(
+            err.error_class(),
+            "http_402",
+            "la classe de fil ne bouge pas : le prédicat lit la population, il ne la scinde pas"
+        );
+    }
+
+    /// Contrôle négatif — c'est lui qui tient AC3 : un 429 et un 5xx gardent
+    /// l'échelle de mika#2179, et une panne de transport aussi.
+    #[test]
+    fn mika2944_controle_negatif_429_500_503_transport_parse() {
+        let autres = vec![
+            LlmError::HttpError {
+                status: 429,
+                message: "rate limited".into(),
+                retryable: true,
+            },
+            LlmError::HttpError {
+                status: 500,
+                message: "upstream".into(),
+                retryable: true,
+            },
+            LlmError::HttpError {
+                status: 503,
+                message: "unavailable".into(),
+                retryable: true,
+            },
+            LlmError::Transport(INCIDENT_TRANSPORT_TIMEOUT.into()),
+            LlmError::ParseError("bad json".into()),
+            LlmError::ProviderError("provider bad".into()),
+        ];
+        for err in autres {
+            assert!(
+                !is_credit_exhausted(&err),
+                "seul le 402 est une retenue de crédit, pas {err}"
+            );
+        }
+    }
+
+    /// Le texte ne décide rien : un 429 qui *parle* de crédit reste un 429.
+    /// Sans ce test, une implémentation par `contains()` passerait les autres.
+    #[test]
+    fn mika2944_le_message_ne_decide_pas() {
+        let err = LlmError::HttpError {
+            status: 429,
+            message: INCIDENT_402.into(),
+            retryable: true,
+        };
+        assert!(
+            !is_credit_exhausted(&err),
+            "doctrine mika#2331 : la variante décide, pas le texte du fournisseur"
+        );
+    }
+
+    /// L'erreur remonte du tour enveloppée : deux couches de `context` entre le
+    /// `LlmError` et la racine, et le prédicat doit encore la voir.
+    #[test]
+    fn mika2944_la_chaine_anyhow_est_descendue() {
+        let wrapped = anyhow::Error::new(LlmError::HttpError {
+            status: 402,
+            message: INCIDENT_402.into(),
+            retryable: true,
+        })
+        .context("resume_agent run failed")
+        .context("callback delivery");
+        assert!(is_credit_exhausted_anyhow(&wrapped));
+
+        let other = anyhow::Error::new(LlmError::HttpError {
+            status: 429,
+            message: "rate limited".into(),
+            retryable: true,
+        })
+        .context("resume_agent run failed");
+        assert!(!is_credit_exhausted_anyhow(&other));
+
+        assert!(
+            !is_credit_exhausted_anyhow(&anyhow::anyhow!("not an LLM failure at all")),
+            "une erreur qui n'est pas un LlmError n'est pas une retenue de crédit"
         );
     }
 }

@@ -71,6 +71,15 @@ The CLI one-shot command now only marks the task complete. It does not run any a
 
 ### Phase 2: TUI Polls and Delivers
 
+> **Note (2026-11-11, mika#1727 flight V2b-3b):** the ~5s timer below is no
+> longer the default delivery path. When the TUI holds a `CallbackFeed` seam
+> following the **current** agent, delivery comes from the task-events thread,
+> and the sweep described here fires only on the thread's catch-up signal or on
+> a session change the drain detects itself. The timer still sweeps with no
+> seam, and when the seam follows another agent (after an agent switch — the
+> seam is not reopened). See `drain_callback_deliveries` in
+> `crates/mika-cli/src/tui/app.rs`.
+
 ```
 TUI tick loop (every ~5s when idle)
   → poll_callback_tasks()

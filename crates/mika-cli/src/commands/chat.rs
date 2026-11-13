@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::commands::chat_turn;
+use crate::commands::tasks::CallbackFeed;
 use crate::commands::team_outcome::TeamOutcome;
 use crate::init::{self, AppContext};
 use crate::tui::app::{
@@ -24,26 +26,23 @@ use crate::tui::app::{
 use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
-use mika_agent::agent::{self, AgentParams, check_onboarding};
+use mika_agent::agent;
 use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
-use mika_agent::task_engine::{self, TaskDispatcher, TaskEngine};
+use mika_agent::skills::assembly::assemble_agent_registry;
 use mika_agent::teams::types::TeamEvent;
 use mika_agent::tools;
-use mika_common::claude::ThinkingConfig;
 use mika_common::config::Settings;
-use mika_common::llm::LlmImage;
 use mika_common::team;
 use std::path::Path;
 
-/// Holds the agent worker supervisor handle, poller handle, the AppContext (for DB shutdown),
+/// Holds the agent worker supervisor handle, the AppContext (for DB shutdown),
 /// and the shutdown-initiated flag the supervisor reads to distinguish operator-driven
 /// shutdown from worker death (mika#1149).
 struct AgentWorker {
     /// Supervisor task — owns the worker's JoinHandle and forwards unexpected exits
     /// as `AgentResponse::WorkerCrashed` events.
     supervisor_handle: JoinHandle<()>,
-    poller_handle: JoinHandle<()>,
     /// Set to `true` before tearing down the worker (Quit, agent switch, /restart)
     /// so the supervisor exits silently on the resulting `Ok(())` from the worker loop.
     shutdown_initiated: Arc<AtomicBool>,
@@ -53,7 +52,7 @@ struct AgentWorker {
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
 async fn spawn_agent_worker(
     ctx: AppContext,
-    _agent_name: &str,
+    agent_name: &str,
     http_client: &reqwest::Client,
     session_id: Option<&str>,
 ) -> Result<(
@@ -134,24 +133,19 @@ async fn spawn_agent_worker(
     {
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
-    let mut skill_registry = SkillRegistry::from_dir(&skills_dir);
-    if let Some(ref allowlist) = identity.skills.allowlist {
-        skill_registry.apply_identity_allowlist(allowlist);
-    }
-    if let Ok(overrides) = ctx
+    // Same assembler as the server init and as the two hot reloads below
+    // (mika#2889) — the TUI no longer carries its own copy of the sequence.
+    let overrides = ctx
         .async_db
         .get_skill_overrides(&ctx.async_db.agent_id)
         .await
-    {
-        skill_registry.apply_overrides(&overrides);
-    }
-    // Phase 2 (mika#1798): testimony-grade ban.
-    skill_registry.apply_testimony_grade_ban();
-    skill_registry.apply_load_safety_check();
-    // Runtime allowlist↔required_tools coherence guard (mika#1576).
-    skill_registry.apply_required_tools_coherence_check(ctx.async_db.agent_id());
-    skill_registry.log_summary();
-    let skill_registry = Arc::new(skill_registry);
+        .unwrap_or_default();
+    let skill_registry = Arc::new(assemble_agent_registry(
+        &skills_dir,
+        &identity,
+        &overrides,
+        ctx.async_db.agent_id(),
+    ));
     let skills_dirty = Arc::new(AtomicBool::new(false));
     let embedding_client = ctx.settings.make_embedding_client();
     let message_sender = crate::init::make_message_sender(
@@ -179,92 +173,15 @@ async fn spawn_agent_worker(
     // the posed hosting fact is read, once.
     let cli_deployment = mika_common::home::Deployment::from_env();
 
-    // Set up task engine for background tasks (reminders, reflection)
-    let dispatcher = Arc::new(TaskDispatcher {
-        db: ctx.async_db.clone(),
-        tier: cli_tier,
-        deployment: cli_deployment,
-        llm: ctx.llm.clone(),
-        tools: tool_registry.clone(),
-        skills: skill_registry.clone(),
-        home_dir: ctx.home_dir.clone(),
-        // mika#2329 — le home global porte le fichier sentinelle du STOP à chaud.
-        // `auto_pull` ne tourne pas en mode CLI, mais le champ décrit le
-        // dispatcher, pas le scan : le renseigner faussement ici ferait mentir
-        // n'importe quel futur lecteur.
-        global_home_dir: ctx.global_home.clone(),
-        message_sender: message_sender.clone(),
-        embedding_client: embedding_client.clone(),
-        brave_api_key: brave_api_key.clone(),
-        github_token: github_token.clone(),
-        gateway_url: ctx.settings.routing_url.clone(),
-        internal_token: ctx
-            .settings
-            .internal_token
-            .as_ref()
-            .map(|s| s.expose_secret().to_string()),
-        github_app: ctx.github_app.clone(),
-        skills_dirty: skills_dirty.clone(),
-        // CLI mode: no agent_lock passed. The task engine may run heartbeat/reflection
-        // concurrently with user message processing (both use the same AsyncDatabase,
-        // which serializes at the DB thread level). Concurrent Claude API calls are
-        // accepted in CLI mode; rate-limit errors are handled by the Claude client.
-        agent_lock: None,
-        // CLI mode: the TUI's poll_callback_tasks() handles callback delivery with
-        // session-scoped queries and atomic claiming. Skip engine dispatch to prevent
-        // the engine from stealing callbacks. See #264.
-        cli_mode: true,
-        settings: ctx.settings.clone(),
-        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-        auto_pull_stop_armed: AtomicBool::new(false),
-        worktree_reap_stop_armed: AtomicBool::new(false),
-        proactive_budget_reported: std::sync::Mutex::new(None),
-    });
-    let task_engine = Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
-        ctx.async_db.clone(),
-        dispatcher,
-    )));
-
-    // Register recurring built-in tasks and run startup recovery
-    if task_engine::heartbeat_enabled_for_agent(&ctx.home_dir).await {
-        task_engine::ensure_recurring_task(
-            &ctx.async_db,
-            "heartbeat",
-            "0 0 * * * *",
-            r#"{"trigger":"heartbeat"}"#,
-        )
-        .await;
-    } else if let Err(e) = ctx
-        .async_db
-        .cancel_recurring_task_by_label("heartbeat")
-        .await
-    {
-        tracing::warn!(error = %e, "failed to cancel stale heartbeat task");
-    }
-    if let Some(cron) = task_engine::reflection_cron_for_agent(&ctx.home_dir, &ctx.async_db).await {
-        task_engine::ensure_recurring_task(
-            &ctx.async_db,
-            "reflection",
-            &cron,
-            r#"{"trigger":"reflection"}"#,
-        )
-        .await;
-    } else if let Err(e) = ctx
-        .async_db
-        .cancel_recurring_task_by_label("reflection")
-        .await
-    {
-        tracing::warn!(error = %e, "failed to cancel stale reflection task");
-    }
-    {
-        let mut eng = task_engine.lock().await;
-        if let Err(e) = eng.startup_recovery().await {
-            tracing::warn!(error = %e, "task engine startup recovery failed");
-        }
-    }
-    // Prune completed tasks older than 30 days to prevent unbounded DB growth
-    task_engine::prune_old_tasks(&ctx.async_db).await;
-    let poller_handle = TaskEngine::spawn_tick_loop(task_engine);
+    // mika#1727 vol V2a — la TUI ne construit plus de moteur de tâches. Le
+    // `TaskDispatcher`, le `TaskEngine`, la boucle de tick, `startup_recovery`,
+    // la purge des tâches anciennes et l'enregistrement des récurrentes
+    // `heartbeat` / `reflection` vivaient ici ; ils étaient un second
+    // exemplaire, divergent par construction, de ce que le daemon possède
+    // déjà. Le daemon (`mika-agent/src/server/mod.rs`) est désormais le seul
+    // enregistreur des récurrentes de l'agent, ce qui éteint la course de
+    // mika#2351. Le détecteur qui refuse le retour du geste vit dans le module
+    // `tests` de `commands/chat_turn.rs`.
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<AgentRequest>();
     let (agent_tx, agent_rx) = mpsc::unbounded_channel::<AgentResponse>();
@@ -293,6 +210,9 @@ async fn spawn_agent_worker(
     let worker_dirty = skills_dirty.clone();
     let mut worker_mcp = mcp_manager;
     let worker_global_home = ctx.global_home.clone();
+    // mika#1727 V1 — l'agent visé par l'endpoint A2A du tour. C'est le nom tel
+    // que l'opérateur l'a lancé, le même que `commands::ask` met dans son URL.
+    let worker_agent_name = agent_name.to_string();
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -301,102 +221,70 @@ async fn spawn_agent_worker(
                     images,
                     thinking_budget,
                 } => {
-                    // Hot-reload skills if the dirty flag was set by a previous turn
+                    // Hot-reload skills if the dirty flag was set by a previous
+                    // turn. A reload is an assembly, so it goes through the single
+                    // assembler (mika#2889).
                     let mut skills_reloaded = false;
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
-                        let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
                         let reload_identity = mika_agent::prompt::load_identity(&worker_home);
-                        if let Some(ref allowlist) = reload_identity.skills.allowlist {
-                            registry.apply_identity_allowlist(allowlist);
-                        }
-                        if let Ok(overrides) =
-                            worker_db.get_skill_overrides(&worker_db.agent_id).await
-                        {
-                            registry.apply_overrides(&overrides);
-                        }
-                        // Phase 2 (mika#1798): testimony-grade ban.
-                        registry.apply_testimony_grade_ban();
-                        registry.log_summary();
-                        worker_skills = Arc::new(registry);
+                        let overrides = worker_db
+                            .get_skill_overrides(&worker_db.agent_id)
+                            .await
+                            .unwrap_or_default();
+                        worker_skills = Arc::new(assemble_agent_registry(
+                            &worker_home.join("skills"),
+                            &reload_identity,
+                            &overrides,
+                            &worker_db.agent_id,
+                        ));
                         skills_reloaded = true;
                     }
 
-                    let thinking = thinking_budget.map(|budget| ThinkingConfig::Enabled {
-                        budget_tokens: budget,
-                    });
-
-                    // Convert ImageAttachments to provider-agnostic LlmImage
-                    let image_sources: Vec<LlmImage> = images
-                        .into_iter()
-                        .map(|img| LlmImage {
-                            media_type: img.media_type,
-                            data: img.base64_data,
+                    // mika#1727 V1 § D3 — les entrées qui cessent d'atteindre le
+                    // tour se disent à voix haute, une fois par tour, chacune
+                    // nommant le geste qui l'éteint (mika#1883). L'avis est émis
+                    // ici, dans le worker, parce que c'est l'unique point où
+                    // atterrissent les DEUX expéditeurs d'`AgentRequest::Message`
+                    // (la saisie de `tui/app.rs` et le coup unique de `/think`
+                    // dans `tui/commands/handlers.rs`).
+                    let dropped: Vec<chat_turn::DroppedImage> = images
+                        .iter()
+                        .map(|img| chat_turn::DroppedImage {
+                            media_type: img.media_type.clone(),
+                            payload_bytes: img.base64_data.len(),
                         })
                         .collect();
+                    if let Some(notice) = chat_turn::inertia_notice(thinking_budget, &dropped)
+                        && agent_tx
+                            .send(AgentResponse::Notice { content: notice })
+                            .is_err()
+                    {
+                        break;
+                    }
 
-                    let is_onboarding = check_onboarding(&worker_db).await;
-                    let result = agent::run_agent(&AgentParams {
-                        db: &worker_db,
-                        tier: cli_tier,
-                        deployment: cli_deployment,
-                        llm: worker_llm.as_ref(),
-                        tools: &worker_tools,
-                        skills: &worker_skills,
-                        user_message: &text,
-                        channel_type: "cli",
-                        session_id: &worker_session,
-                        home_dir: &worker_home,
-                        is_onboarding,
-                        message_sender: worker_sender.clone(),
-                        skip_compaction: false,
-                        embedding_client: worker_embedding.as_ref(),
-                        thinking,
-                        user_images: &image_sources,
-                        brave_api_key: worker_brave_key.as_deref(),
-                        github_token: worker_github_token.as_deref(),
-                        gateway_url: worker_gateway_url.as_deref(),
-                        internal_token: worker_internal_token.as_deref(),
-                        github_app: worker_github_app.as_deref(),
-                        skills_dirty: &worker_dirty,
-                        skill_nudge: None, // mika#1583: nudges apply in server mode only
-                        mcp_manager: worker_mcp.as_ref(),
-                        global_home_dir: Some(&worker_global_home),
-                        is_callback_turn: false,
-                        settings: Some(&worker_settings),
-                        // mika#2304: `mika chat --model` is applied in-process by
-                        // `AppContext::override_model`, so `worker_llm` already
-                        // *is* the caller's model. There is no server-side
-                        // override for a skill's `[llm]` section to displace, and
-                        // the #463 precedence is unchanged on this path.
-                        caller_model_override: false,
-                        session_isolated: false,
-                        trace_id: None,
-                        correlated_task_id: None,
-                        internal: false,
-                        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
-                    })
-                    .await;
+                    // mika#1727 V1 § D1 — le tour part vers mika-spirit, qui
+                    // possède la boucle, la session et les outils. Plus rien de ce
+                    // bras ne fait tourner `agent::run_agent`.
+                    let result =
+                        chat_turn::send_turn_to_spirit(&text, &worker_agent_name, &worker_session)
+                            .await;
 
                     // If the dirty flag is set after this turn, rebuild now so we
                     // can send the updated registry to the TUI for autocomplete.
                     if worker_dirty.load(Ordering::Acquire) {
                         worker_dirty.store(false, Ordering::Release);
-                        let mut registry = SkillRegistry::from_dir(&worker_home.join("skills"));
                         let reload_identity2 = mika_agent::prompt::load_identity(&worker_home);
-                        if let Some(ref allowlist) = reload_identity2.skills.allowlist {
-                            registry.apply_identity_allowlist(allowlist);
-                        }
-                        if let Ok(overrides) =
-                            worker_db.get_skill_overrides(&worker_db.agent_id).await
-                        {
-                            registry.apply_overrides(&overrides);
-                        }
-                        // Phase 2 (mika#1798): testimony-grade ban.
-                        registry.apply_testimony_grade_ban();
-                        registry.log_summary();
-                        worker_skills = Arc::new(registry);
+                        let overrides = worker_db
+                            .get_skill_overrides(&worker_db.agent_id)
+                            .await
+                            .unwrap_or_default();
+                        worker_skills = Arc::new(assemble_agent_registry(
+                            &worker_home.join("skills"),
+                            &reload_identity2,
+                            &overrides,
+                            &worker_db.agent_id,
+                        ));
                         skills_reloaded = true;
                     }
 
@@ -407,11 +295,14 @@ async fn spawn_agent_worker(
                     };
 
                     let response = match result {
-                        Ok(output) => AgentResponse::Reply {
-                            content: output.text.unwrap_or_default(),
+                        Ok(reply) => AgentResponse::Reply {
+                            content: reply.content,
                             is_error: false,
-                            thinking: output.thinking,
-                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens as u32),
+                            // § D3 — un tour A2A synchrone ne rend aucun bloc de
+                            // pensée : la part `thinking` ne voyage pas sur le
+                            // fil. L'avis d'inertie ci-dessus l'a déjà dit.
+                            thinking: None,
+                            input_tokens: reply.input_tokens,
                             updated_skills,
                         },
                         Err(e) => AgentResponse::Reply {
@@ -462,8 +353,12 @@ async fn spawn_agent_worker(
                         is_failed,
                     );
 
-                    let is_onboarding = check_onboarding(&worker_db).await;
-                    let callback_result = agent::run_agent(&AgentParams {
+                    // mika#1727 V1 — chemin par le module, et non par un import de
+                    // tête : le bras `Message` n'appelle plus rien de `agent`, et
+                    // un import nu de ces deux noms survivrait au vol V2 qui
+                    // emporte ce bras. Le corps du bras est inchangé par ailleurs.
+                    let is_onboarding = agent::check_onboarding(&worker_db).await;
+                    let callback_result = agent::run_agent(&agent::AgentParams {
                         db: &worker_db,
                         tier: cli_tier,
                         deployment: cli_deployment,
@@ -499,6 +394,9 @@ async fn spawn_agent_worker(
                         correlated_task_id: None,
                         internal: false,
                         pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
+                        // mika#3004: see the sibling construction above — a callback
+                        // turn on the CLI path has no pre-handler webhook text either.
+                        webhook_event_text: None,
                         stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
                     })
                     .await;
@@ -604,7 +502,6 @@ async fn spawn_agent_worker(
 
     let worker = AgentWorker {
         supervisor_handle,
-        poller_handle,
         shutdown_initiated,
         _ctx: ctx,
     };
@@ -662,6 +559,20 @@ pub async fn run(
         start_in_audit_mode,  // audit mode launch (#773)
         is_singleton_session, // single-session-by-nature (mika#1401)
     );
+
+    // La souscription au fil des tâches (mika#1727, vol V2b-2b-4). Le fil se
+    // rouvre de lui-même, donc un daemon à terre au lancement n'est plus
+    // définitif. Un jeton absent, lui, n'ouvre toujours rien : c'est le seul cas
+    // où `callback_feed` reste `None`, et `poll_callback_tasks` couvre alors,
+    // comme il couvre ce que le fil manque pendant une coupure. `run_team`
+    // n'appelle pas ce chemin.
+    if let Ok(token) = crate::commands::dashboard::auth_token() {
+        app.callback_feed = Some(CallbackFeed::open_for(
+            agent_name,
+            crate::commands::dashboard::spirit_url(),
+            token,
+        ));
+    }
 
     // Load recent conversation history so the user sees prior messages on restart.
     // In inbox mode (default), internal messages are filtered at the DB level.
@@ -743,7 +654,34 @@ pub async fn run(
     app.last_seen_msg_id = worker._ctx.async_db.max_message_id().await.unwrap_or(0);
 
     // One-time dashboard status check at startup (no periodic polling).
-    app.dashboard_running = crate::commands::dashboard::is_dashboard_running().await;
+    //
+    // mika#1727 V1 § D4 — la même sonde répond à deux questions depuis que le
+    // tour passe par mika-spirit : le tableau de bord est-il servi, et le spirit
+    // répond-il **tout court**. `is_dashboard_running()` écrase les deux en un
+    // `bool`, donc un daemon à terre y est indistinguable d'un tableau de bord
+    // simplement désactivé. On lit l'option, et un `None` est dit AVANT le
+    // premier tour plutôt que découvert par son échec.
+    let dashboard_status = crate::commands::dashboard::query_dashboard_status().await;
+    app.dashboard_running = dashboard_status.is_some_and(|(enabled, _, _)| enabled);
+    if dashboard_status.is_none() {
+        // La cause n'est pas résolue ici : la sonde rend `None` pour un daemon
+        // injoignable comme pour un shell sans jeton, et en désigner une seule
+        // serait une fausse provenance. Les deux sont nommées, et avec elles le
+        // geste qui les lève.
+        app.messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: format!(
+                "\u{26a0} mika#1727 — mika-spirit n'a pas répondu sur {}. Depuis ce vol, \
+                 chaque tour de la TUI y est envoyé : sans lui, le prochain message \
+                 échouera en nommant l'endpoint. Démarre le daemon (`mika-spirit`), ou \
+                 vérifie `MIKA_INTERNAL_TOKEN` dans ce shell — la sonde rend la même \
+                 absence dans les deux cas.",
+                crate::commands::dashboard::spirit_url()
+            ),
+            rendered: None,
+            channel: None,
+        });
+    }
 
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
@@ -820,7 +758,6 @@ pub async fn run(
             // window expires.
             let _ = app.agent_tx.send(AgentRequest::Quit);
 
-            worker.poller_handle.abort();
             let old_supervisor = std::mem::replace(
                 &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
@@ -927,7 +864,6 @@ pub async fn run(
             }
 
             worker.shutdown_initiated.store(true, Ordering::Release);
-            worker.poller_handle.abort();
             let old_supervisor = std::mem::replace(
                 &mut worker.supervisor_handle,
                 tokio::spawn(async {}), // placeholder
@@ -1025,9 +961,6 @@ pub async fn run(
     {
         tracing::warn!(error = %e, "failed to end session");
     }
-
-    // Stop the reminder poller
-    worker.poller_handle.abort();
 
     // Wait for the supervisor (which owns the worker JoinHandle). It exits
     // silently because shutdown_initiated was set in the Quit branch above

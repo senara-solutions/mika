@@ -278,6 +278,84 @@ assert_mentions "NPM_TOKEN placeholder: names NPM_TOKEN" "NPM_TOKEN" "$R"
 
 # ============================================================================
 echo ""
+echo "Test: the exempted VARIABLE list is closed by name (mika#2716)"
+echo "----------------------------------------------------------------"
+# Since mika#2716 the GH_TOKEN exemption accepts a variable as well as the
+# literal, because the egress sentinel is drawn per spawn. A variable cannot be
+# inspected by value, so the acceptance is by NAME and the list holds exactly
+# one — otherwise `--setenv GH_TOKEN "$ANYTHING"` would pass unexamined.
+F=$(fixture "setenv-gh-token-other-credential.sh")
+perl -pi -e 's/--setenv GH_TOKEN "\$_PILOT_EGRESS_SENTINEL"/--setenv GH_TOKEN "\$MIKA_GITHUB_TOKEN"/' "$F"
+R=$(run_lint "$F")
+assert_exit "another credential variable in place of the sentinel: exit 1" "1" "$R"
+
+# And not merely credential-SHAPED names: a harmless-looking variable is refused
+# too, because by-value inspection is what the exemption gave up.
+F=$(fixture "setenv-gh-token-innocent-variable.sh")
+perl -pi -e 's/--setenv GH_TOKEN "\$_PILOT_EGRESS_SENTINEL"/--setenv GH_TOKEN "\$HOME"/' "$F"
+R=$(run_lint "$F")
+assert_exit "an unlisted but harmless variable: exit 1" "1" "$R"
+assert_mentions "unlisted variable: names the one variable that is exempt" "_PILOT_EGRESS_SENTINEL" "$R"
+
+# ============================================================================
+echo ""
+echo "Test: the sentinel's provenance — rule 3 (mika#2716)"
+echo "------------------------------------------------------"
+# 3a — the variable may not be SET from a credential, wherever that happens.
+# Appended at file scope on purpose: the property is position-independent, so a
+# seeding line outside the producer must fail just the same.
+F=$(fixture "sentinel-seeded-from-the-token.sh")
+printf '_PILOT_EGRESS_SENTINEL="$GH_TOKEN"\n' >> "$F"
+R=$(run_lint "$F")
+assert_exit "sentinel seeded from GH_TOKEN at file scope: exit 1" "1" "$R"
+assert_mentions "seeded sentinel: says it is drawn, never copied" "DRAWN, never copied" "$R"
+
+# 3b — the producer must exist. The exemption is on the variable NAME, so it
+# outlives the function that fills it; deleting the draw is precisely when the
+# name would wave something else through.
+F=$(fixture "sentinel-producer-renamed-away.sh")
+perl -pi -e 's/^_stage_pilot_egress_sentinel\(\) \{/_stage_pilot_egress_sentinel_disabled() {/' "$F"
+R=$(run_lint "$F")
+assert_exit "the producer function renamed away: exit 1" "1" "$R"
+assert_mentions "missing producer: names it" "_stage_pilot_egress_sentinel()" "$R"
+
+# 3b — and the producer may not read a credential. The tempting edit is to seed
+# the sentinel from the token "so the proxy can match it"; that turns the
+# sentinel into the credential it stands for.
+F=$(fixture "sentinel-producer-reads-the-token.sh")
+perl -0pi -e 's/(\n    local _mode\n)/\n    local _tok; _tok=\$(cat "\$_PILOT_GH_TOKEN_FILE")\n$1/' "$F"
+R=$(run_lint "$F")
+assert_exit "the producer reading the host token file: exit 1" "1" "$R"
+
+# 3c — the sentinel may not flow INTO a credential name. This is mika#2716's R7:
+# `export GH_TOKEN="$_PILOT_EGRESS_SENTINEL"` host-side has
+# _stage_pilot_gh_token stage the sentinel AS the real token, the addon injects
+# it, and every pilot call 401s — a refusal from GitHub naming nothing of the
+# mechanism that caused it. Rule 3a cannot see it: that line sets the
+# credential, not the sentinel.
+F=$(fixture "sentinel-exported-as-the-host-token.sh")
+printf 'export GH_TOKEN="$_PILOT_EGRESS_SENTINEL"\n' >> "$F"
+R=$(run_lint "$F")
+assert_exit "sentinel exported into the host GH_TOKEN: exit 1" "1" "$R"
+assert_mentions "exported sentinel: names the 401 it would cause" "401" "$R"
+
+# Anti-vacuity: it must be RULE 3 that refuses the four fixtures above, not
+# rule 2 catching them for an unrelated reason. Build the lint without rule 3
+# and show the sharpest of them passes it — same discipline as the undelimited
+# PAT mutant earlier in this file.
+NO_RULE3_LINT="$TMPROOT/verify-without-rule-3.sh"
+perl -0pe 's/\n# --- Rule 3:.*?\ndone\n/\n/s' "$LINT" > "$NO_RULE3_LINT"
+if ! grep -q "Rule 3: provenance" "$NO_RULE3_LINT" && grep -q "Rule 2: name-shape" "$NO_RULE3_LINT"; then
+    rc=0; out=$(bash "$NO_RULE3_LINT" "$F" 2>&1) || rc=$?
+    assert_exit "without rule 3, the exported sentinel passes: exit 0" "0" "$rc|$out"
+else
+    FAIL=$((FAIL + 1))
+    echo "  ✗ could not build the rule-3-less mutant — the anti-vacuity"
+    echo "    assertion would be meaningless, so this is a failure, not a skip."
+fi
+
+# ============================================================================
+echo ""
 echo "Test: prose mentioning --setenv does not trip the lint"
 echo "-------------------------------------------------------"
 # This file explains itself in comments. A doc line naming the very pattern it

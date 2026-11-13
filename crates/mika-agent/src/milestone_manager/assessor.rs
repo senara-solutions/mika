@@ -11,8 +11,12 @@
 //! Silence threshold in JOURS drives the `AlertKind::Silence` alert (rule fires when
 //! `last_activity_at` is older than the threshold).
 
+use super::pool;
+use super::reader::TIMELINE_PAGE_SIZE;
+use super::relief;
 use super::types::{
-    Alert, AlertKind, Assessment, IssueState, MilestoneState, Recommendation, Severity, SubIssue,
+    Alert, AlertKind, Assessment, IssueState, MergedPrReading, MilestoneState, Recommendation,
+    Severity, SubIssue,
 };
 use chrono::{DateTime, Utc};
 
@@ -67,6 +71,27 @@ impl Assessor {
         let recommendation = pick_next_action(state, &alerts);
         let severity = classify_severity(state, &alerts);
 
+        // Les candidats du milestone sont projetés **une seule fois** : le
+        // bassin et la relève doivent juger la même lecture. Deux appels à
+        // `milestone_pool_candidates` seraient deux projections du même état —
+        // identiques aujourd'hui, et exactement le genre d'écart qu'aucune
+        // assertion ne verrait le jour où la projection cesse d'être pure.
+        let milestone_candidates = milestone_pool_candidates(state);
+        let pool_verdict = pool::assess_pool(
+            &state.ready_pool,
+            &milestone_candidates,
+            &state.outside_candidates,
+            &state.plan_sizes,
+        );
+        // La relève dérive du verdict qu'on vient de poser, pas d'un second
+        // jugement du bassin (mika#2700 vol 1, décision 1). `relief::name_relief`
+        // est pure et ne refiltre rien.
+        let relief = relief::name_relief(
+            &pool_verdict,
+            &milestone_candidates,
+            &state.outside_candidates,
+        );
+
         Assessment {
             severity,
             recommendation,
@@ -75,8 +100,38 @@ impl Assessor {
             // Phase 1 is read-only, so there is nothing to contend for yet.
             // Populated by the Phase 2 dispatch path (mika#1948).
             contention_events: Vec::new(),
+            // Le verdict du bassin `ready` (mika#2699 Phase 2 (a), vols 1 à 3).
+            // `assess_pool` reste pure : tout ce que l'assesseur fait ici est
+            // de lui passer les trois lectures et de poser le résultat. Toujours
+            // `Some` — un cycle qui arrive ici a lu le bassin, et `None` est
+            // réservé aux blobs antérieurs au champ.
+            pool: Some(pool_verdict),
+            // L'assesseur ne voit pas les vols : il ne lit que l'état du
+            // milestone. Les verdicts sont posés par la cadence, qui tient la
+            // `FlightSource` et la borne du cycle précédent (mika#2698).
+            flight_verdicts: Vec::new(),
+            // La relève du **même** bassin que celui posé juste au-dessus
+            // (mika#2700 Phase 2 (c) vol 1). Toujours `Some` pour la même
+            // raison que `pool` : un cycle qui arrive ici a lu le bassin, et
+            // `None` est réservé aux blobs antérieurs au champ.
+            relief: Some(relief),
         }
     }
+}
+
+/// Les `sub_issues` du milestone cible, vues comme candidats au bassin.
+///
+/// Une projection et rien d'autre : la décision d'admission vit dans
+/// [`pool::assess_pool`], qui est pure. Elle est ici plutôt qu'au reader parce
+/// que `sub_issues` sert à tout le reste de l'assesseur sous sa forme complète.
+///
+/// `pub(super)` depuis mika#2699 vol 3 : le reader doit désigner les candidats
+/// dont il ira lire le plan, et il doit les désigner **sur la même projection**
+/// que celle que l'assesseur jugera au cycle suivant. Une seconde projection
+/// écrite au reader serait identique aujourd'hui et muette le jour où celle-ci
+/// change — exactement l'écart que le commentaire ci-dessus refuse déjà.
+pub(super) fn milestone_pool_candidates(state: &MilestoneState) -> Vec<pool::PoolCandidate> {
+    state.sub_issues.iter().map(Into::into).collect()
 }
 
 /// Detect blockers that point to a closed sub-issue in this same milestone —
@@ -157,6 +212,130 @@ pub fn detect_silence(
     }
 }
 
+/// Le sous-ticket que le **palier 1** nommerait, ou `None` (mika#2924, vol 2).
+///
+/// Extrait du corps de [`pick_next_action`] sans toucher ni au prédicat ni au
+/// tri : les sept tests de paliers déjà au dossier sont la preuve que rien n'a
+/// bougé. Existe pour que [`timeline_probe_target`] puisse poser la question
+/// « le palier 1 l'emporte-t-il ? » sans la rejouer.
+fn tier1_pick(state: &MilestoneState) -> Option<&SubIssue> {
+    let mut tier1: Vec<&SubIssue> = state
+        .sub_issues
+        .iter()
+        .filter(|s| s.state == IssueState::Open && s.pr_number.is_some() && !s.is_hard_blocked())
+        .collect();
+    tier1.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
+    tier1.first().copied()
+}
+
+/// Le sous-ticket que le **palier 2** nommerait, ou `None` (mika#2924, vol 2).
+///
+/// Même extraction, même preuve que [`tier1_pick`].
+fn tier2_pick(state: &MilestoneState) -> Option<&SubIssue> {
+    let mut tier2: Vec<&SubIssue> = state
+        .sub_issues
+        .iter()
+        .filter(|s| {
+            s.state == IssueState::Open
+                && s.plan_present
+                && s.pr_number.is_none()
+                && !s.is_hard_blocked()
+        })
+        .collect();
+    tier2.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
+    tier2.first().copied()
+}
+
+/// Le ticket dont la sonde de timeline décidera du libellé « Next » de ce
+/// cycle — au plus un, et `None` quand le palier 2 ne décide pas (mika#2924,
+/// vol 2).
+///
+/// Désigné **ici**, au même endroit qu'au jugement, et pour la même raison que
+/// la lecture 6 du `Reader` : rejouer le filtre côté lecture rendrait les deux
+/// réponses identiques aujourd'hui et muettes le jour où l'une des deux change.
+///
+/// `None` quand le palier 1 l'emporte — un milestone en vol ne paie **aucun**
+/// appel de plus.
+pub(super) fn timeline_probe_target(state: &MilestoneState) -> Option<u64> {
+    if tier1_pick(state).is_some() {
+        return None;
+    }
+    tier2_pick(state).map(|s| s.number)
+}
+
+/// Combien de PR le libellé « Next » nomme au plus (mika#2924, vol 2).
+///
+/// Trois : l'opérateur veut savoir où en est le **dernier vol**, pas
+/// l'histoire complète du ticket. #2698 en portait six le 2026-10-27, et une
+/// ligne de rapport qui les énumère toutes cesse d'être lue.
+const NEXT_LABEL_PR_MAX: usize = 3;
+
+/// Le libellé « Next » du palier 2, dérivé de ce que la sonde de timeline a dit
+/// (mika#2924, vol 2).
+///
+/// Cinq branches, et c'est la seule fonction de ce vol qui change un octet du
+/// rapport :
+///
+/// - **des PR mergées citent le ticket** — le libellé les nomme. Il dit
+///   « merged PRs already cite it » et **jamais** « livré » :
+///   `cross-referenced` est plus large que « la PR qui délivre ce ticket »
+///   (#2929 et #2931 citent #2698 sans le livrer), et le ticket reste bien le
+///   « Next » — c'est la *raison* qui cesse de mentir, pas la recommandation
+///   qui disparaît.
+/// - **page pleine** / **échec de lecture** — deux libellés distincts, parce
+///   que les remèdes sont opposés : paginer d'un côté, réparer la forge de
+///   l'autre. Ni l'un ni l'autre ne dit « no PR », qui serait une affirmation
+///   que la lecture n'a pas faite.
+/// - **`NoneCiting`** — la timeline a été lue en entier, aucune PR mergée : le
+///   texte historique est vrai, il reste **mot pour mot**.
+/// - **`None`** — la sonde n'a pas été émise (palier 1 vainqueur, ticket non
+///   désigné, ou blob d'un binaire antérieur au vol). Le texte historique, là
+///   aussi : un binaire antérieur garde son libellé, il n'hérite pas d'une
+///   incertitude qu'il n'a pas mesurée (motif mika#2340).
+///
+/// `Citing` vide est traité comme `NoneCiting` — le composeur ne le produit
+/// pas, et une branche qui rendrait une liste de PR vide dirait moins que rien.
+fn tier2_rationale(s: &SubIssue) -> String {
+    let n = s.number;
+    match &s.merged_prs {
+        Some(MergedPrReading::Citing(prs)) if !prs.is_empty() => format!(
+            "#{n} has a plan and merged PRs already cite it ({}) — check what \
+             remains before implementing",
+            name_merged_prs(prs)
+        ),
+        Some(MergedPrReading::IndeterminatePageFull) => format!(
+            "#{n} has a plan; its timeline is truncated ({TIMELINE_PAGE_SIZE} events read) \
+             — PR state indeterminate, verify by hand before implementing"
+        ),
+        Some(MergedPrReading::IndeterminateFetchFailed) => format!(
+            "#{n} has a plan; its timeline could not be read — PR state \
+             indeterminate, verify by hand before implementing"
+        ),
+        Some(MergedPrReading::NoneCiting) | Some(MergedPrReading::Citing(_)) | None => {
+            format!("#{n} has a plan but no PR — implementation is the next step")
+        }
+    }
+}
+
+/// Les PR les plus récemment mergées, au plus [`NEXT_LABEL_PR_MAX`], et le
+/// reste compté (mika#2924, vol 2).
+///
+/// Le reste est **compté et non tu** : « trois PR mergées » et « six dont on
+/// vous montre trois » sont deux états différents du ticket, et la troncature
+/// silencieuse est ce qui ferait lire le second comme le premier.
+fn name_merged_prs(prs: &[u64]) -> String {
+    let shown: Vec<String> = prs
+        .iter()
+        .take(NEXT_LABEL_PR_MAX)
+        .map(|p| format!("#{p}"))
+        .collect();
+    let mut out = format!("PR {}", shown.join(", "));
+    if let Some(rest) = prs.len().checked_sub(NEXT_LABEL_PR_MAX).filter(|r| *r > 0) {
+        out.push_str(&format!(" (+{rest} more)"));
+    }
+    out
+}
+
 /// Pick the next actionable sub-issue.
 ///
 /// Ranking (higher priority first):
@@ -169,13 +348,7 @@ pub fn detect_silence(
 /// then issue number ascending.
 pub fn pick_next_action(state: &MilestoneState, _alerts: &[Alert]) -> Recommendation {
     // Tier 1: in-flight with a PR.
-    let mut tier1: Vec<&SubIssue> = state
-        .sub_issues
-        .iter()
-        .filter(|s| s.state == IssueState::Open && s.pr_number.is_some() && !s.is_hard_blocked())
-        .collect();
-    tier1.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
-    if let Some(s) = tier1.first() {
+    if let Some(s) = tier1_pick(state) {
         return Recommendation {
             next_sub_issue: Some(s.number),
             rationale: format!(
@@ -187,24 +360,10 @@ pub fn pick_next_action(state: &MilestoneState, _alerts: &[Alert]) -> Recommenda
     }
 
     // Tier 2: open + plan + no PR.
-    let mut tier2: Vec<&SubIssue> = state
-        .sub_issues
-        .iter()
-        .filter(|s| {
-            s.state == IssueState::Open
-                && s.plan_present
-                && s.pr_number.is_none()
-                && !s.is_hard_blocked()
-        })
-        .collect();
-    tier2.sort_by_key(|s| (s.priority_rank.unwrap_or(u8::MAX), s.number));
-    if let Some(s) = tier2.first() {
+    if let Some(s) = tier2_pick(state) {
         return Recommendation {
             next_sub_issue: Some(s.number),
-            rationale: format!(
-                "#{} has a plan but no PR — implementation is the next step",
-                s.number
-            ),
+            rationale: tier2_rationale(s),
         };
     }
 
@@ -274,14 +433,20 @@ mod tests {
 
     fn base_issue(number: u64) -> SubIssue {
         SubIssue {
+            missing_grooming_signals: None,
             number,
             title: format!("issue {number}"),
             state: IssueState::Open,
             priority_rank: None,
             plan_present: false,
+            plan_reading: None,
+            dormancy: None,
             branch_present: false,
             pr_number: None,
             pr_state: None,
+            pr_url: None,
+            pr_link_source: None,
+            merged_prs: None,
             ci_state: CiState::None,
             blockers: vec![],
             updated_at: "2026-08-20T00:00:00Z".into(),
@@ -309,6 +474,11 @@ mod tests {
                 subject: "#1801".into(),
             }],
             executor_healthy: None,
+            ready_pool: vec![],
+            outside_candidates: vec![],
+            outside_read_truncated: None,
+            plan_sizes: Default::default(),
+            milestone_read_audit: None,
         }
     }
 
@@ -629,5 +799,367 @@ mod tests {
         assert_eq!(a.severity, Severity::Attention);
         // Cross-cutting always empty in Phase 1.
         assert!(a.cross_cutting.is_empty());
+    }
+
+    /// Cas 14 (mika#2699) — l'assesseur passe les **trois** lectures à
+    /// `assess_pool` et pose le verdict, sans rien décider lui-même.
+    ///
+    /// Le fixture rend chaque oubli distinguable : le bassin contient un ticket
+    /// en vol (famine), le milestone un candidat groomé en p1, et le hors
+    /// milestone un candidat groomé en p1 lui aussi. Un assesseur qui aurait
+    /// oublié `state.ready_pool` donnerait une profondeur nulle ; un qui aurait
+    /// oublié `state.sub_issues` admettrait le seul candidat du dehors ; un qui
+    /// aurait oublié `state.outside_candidates` (le vol 1, littéralement)
+    /// admettrait le seul candidat du milestone. C'est pour ça que les trois
+    /// sont peuplées, et que les deux candidats partagent la même priorité :
+    /// seul le rang de provenance les sépare, donc l'ordre obtenu dit laquelle
+    /// des trois lectures a voyagé.
+    #[test]
+    fn mika2699_lassesseur_pose_le_verdict_du_bassin() {
+        let mut candidat = base_issue(1802);
+        candidat.plan_present = true;
+        candidat.priority_rank = Some(1);
+        let mut state = base_state(vec![candidat]);
+        state.ready_pool = vec![pool::ReadyTicket {
+            number: 2699,
+            labels: vec!["ready".into(), "dispatch:loop".into()],
+        }];
+        state.outside_candidates = vec![pool::PoolCandidate {
+            missing_grooming_signals: None,
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: true,
+            plan_reading: None,
+            dormancy: None,
+            labels: vec!["p1-important".into()],
+        }];
+
+        let a = Assessor::new(AssessorConfig {
+            silence_threshold_days: 90,
+        })
+        .assess(&state);
+
+        let verdict = a
+            .pool
+            .expect("un cycle qui a lu le bassin porte un verdict");
+        assert_eq!(
+            verdict.depth.ready_total, 1,
+            "le bassin lu est pris en compte"
+        );
+        assert_eq!(verdict.depth.in_flight, 1);
+        assert_eq!(verdict.band, pool::PoolBand::Starved);
+        assert_eq!(
+            verdict.admit,
+            vec![
+                pool::Admission {
+                    number: 1802,
+                    origin: pool::CandidateOrigin::Milestone,
+                    size: pool::PlanSizeReading::Unread(pool::UnreadCause::NotMeasured),
+                },
+                pool::Admission {
+                    number: 1700,
+                    origin: pool::CandidateOrigin::Outside,
+                    size: pool::PlanSizeReading::Unread(pool::UnreadCause::NotMeasured),
+                },
+            ],
+            "les deux ensembles sont candidats, le milestone d'abord à priorité égale"
+        );
+        // Et le verdict reste exactement ce que la fonction pure produit —
+        // l'assesseur n'ajoute ni ne retire rien.
+        assert_eq!(
+            verdict,
+            pool::assess_pool(
+                &state.ready_pool,
+                &state
+                    .sub_issues
+                    .iter()
+                    .map(pool::PoolCandidate::from)
+                    .collect::<Vec<_>>(),
+                &state.outside_candidates,
+                &state.plan_sizes,
+            )
+        );
+    }
+
+    /// Cas 11 (mika#2700) — l'assesseur pose la relève **du bassin qu'il vient
+    /// de poser**, pas celle d'un second jugement.
+    ///
+    /// C'est la seule propriété que ni `relief.rs` ni `pool.rs` ne peuvent
+    /// voir : un assesseur qui rappellerait `assess_pool` pour la relève
+    /// produirait aujourd'hui le même verdict, et l'écart n'apparaîtrait que le
+    /// jour où la projection des candidats cesse d'être pure — sans qu'aucune
+    /// assertion de comportement rougisse. L'égalité est donc écrite contre le
+    /// verdict **lu dans l'`Assessment`**, pas contre un verdict reconstruit.
+    ///
+    /// Le fixture rend l'oubli d'une lecture distinguable, comme celui du
+    /// cas 14 : un candidat du milestone et un du dehors, tous deux non
+    /// groomés, à priorité égale — seul le rang de provenance les sépare, donc
+    /// l'ordre obtenu dit laquelle des deux lectures a voyagé jusqu'à la relève.
+    #[test]
+    fn mika2700_lassesseur_pose_la_releve_du_meme_bassin_quil_a_pose() {
+        let mut a_grommer = base_issue(1802);
+        a_grommer.plan_present = false;
+        a_grommer.priority_rank = Some(1);
+        let mut state = base_state(vec![a_grommer]);
+        state.outside_candidates = vec![pool::PoolCandidate {
+            missing_grooming_signals: None,
+            number: 1700,
+            state: IssueState::Open,
+            priority_rank: Some(1),
+            plan_present: false,
+            plan_reading: None,
+            dormancy: None,
+            labels: vec!["p1-important".into()],
+        }];
+
+        let a = Assessor::new(AssessorConfig {
+            silence_threshold_days: 90,
+        })
+        .assess(&state);
+
+        let verdict = a
+            .pool
+            .as_ref()
+            .expect("un cycle qui a lu le bassin porte un verdict");
+        let releve = a
+            .relief
+            .as_ref()
+            .expect("un cycle qui a nommé la relève la porte");
+
+        assert_eq!(
+            releve.next.iter().map(|t| t.number).collect::<Vec<_>>(),
+            vec![1802, 1700],
+            "les deux lectures nourrissent la relève, le milestone d'abord à \
+             priorité égale"
+        );
+        assert_eq!(
+            releve.next[0].priority_rank,
+            Some(1),
+            "le rang relu depuis les candidats voyage avec le ticket"
+        );
+        assert_eq!(
+            *releve,
+            relief::name_relief(
+                verdict,
+                &state
+                    .sub_issues
+                    .iter()
+                    .map(pool::PoolCandidate::from)
+                    .collect::<Vec<_>>(),
+                &state.outside_candidates,
+            ),
+            "la relève est exactement celle que la fonction pure tire du verdict \
+             posé — l'assesseur ne juge pas le bassin deux fois"
+        );
+    }
+
+    /// Un candidat du palier 2 dont des PR mergées citent le ticket (mika#2924,
+    /// vol 2, AC2).
+    ///
+    /// La forme exacte de #2698 le 2026-10-27 : six PR mergées, triées par
+    /// `merged_at` décroissant. Le contrôle négatif est dans le **même** test,
+    /// parce que c'est la paire qui sépare « le libellé suit la sonde » de « le
+    /// libellé a changé pour tout le monde ».
+    #[test]
+    fn mika2924_next_nomme_les_pr_mergees_au_lieu_de_reclamer_une_implementation() {
+        let mut cite = base_issue(2698);
+        cite.plan_present = true;
+        cite.merged_prs = Some(MergedPrReading::Citing(vec![
+            2931, 2929, 2892, 2706, 2704, 2712,
+        ]));
+        let rec = pick_next_action(&base_state(vec![cite]), &[]);
+
+        assert_eq!(
+            rec.next_sub_issue,
+            Some(2698),
+            "le ticket reste le « Next »"
+        );
+        assert_eq!(
+            rec.rationale,
+            "#2698 has a plan and merged PRs already cite it (PR #2931, #2929, \
+             #2892 (+3 more)) — check what remains before implementing",
+            "les trois plus récentes sont nommées, le reste est compté"
+        );
+        assert!(
+            !rec.rationale.contains("no PR"),
+            "c'est exactement le mensonge que ce vol corrige : le rapport du \
+             sink du 2026-10-26 disait « #2698 has a plan but no PR » alors que \
+             #2704 et #2706 étaient mergées depuis le 2026-10-16"
+        );
+        assert!(
+            !rec.rationale.contains("delivered") && !rec.rationale.contains("livré"),
+            "`cross-referenced` est plus large que « la PR qui délivre ce \
+             ticket » — #2929 et #2931 citent #2698 sans le livrer, donc le \
+             libellé ne déduit aucun numéro de vol"
+        );
+
+        // Contrôle négatif, même test : timeline lue en entier, aucune PR.
+        let mut sans = base_issue(2699);
+        sans.plan_present = true;
+        sans.merged_prs = Some(MergedPrReading::NoneCiting);
+        assert_eq!(
+            pick_next_action(&base_state(vec![sans]), &[]).rationale,
+            "#2699 has a plan but no PR — implementation is the next step",
+            "quand la timeline atteste l'absence, le texte historique est vrai \
+             et reste mot pour mot"
+        );
+    }
+
+    /// Une indétermination ne se lit jamais comme une absence (mika#2924,
+    /// vol 2 — classe mika#2205).
+    #[test]
+    fn mika2924_une_page_pleine_ne_se_lit_jamais_comme_une_absence_de_pr() {
+        let mut pleine = base_issue(2698);
+        pleine.plan_present = true;
+        pleine.merged_prs = Some(MergedPrReading::IndeterminatePageFull);
+        let page_full = pick_next_action(&base_state(vec![pleine]), &[]).rationale;
+
+        let mut echec = base_issue(2698);
+        echec.plan_present = true;
+        echec.merged_prs = Some(MergedPrReading::IndeterminateFetchFailed);
+        let fetch_failed = pick_next_action(&base_state(vec![echec]), &[]).rationale;
+
+        assert_eq!(
+            page_full,
+            "#2698 has a plan; its timeline is truncated (100 events read) — PR \
+             state indeterminate, verify by hand before implementing",
+            "la page pleine nomme le nombre d'événements lus, donc le remède : \
+             paginer"
+        );
+        assert_eq!(
+            fetch_failed,
+            "#2698 has a plan; its timeline could not be read — PR state \
+             indeterminate, verify by hand before implementing",
+            "l'échec de lecture nomme son remède : la forge"
+        );
+        assert_ne!(
+            page_full, fetch_failed,
+            "deux causes d'indétermination aux remèdes opposés ne peuvent pas \
+             rendre les mêmes octets (classe mika#2205)"
+        );
+        for r in [&page_full, &fetch_failed] {
+            assert!(
+                !r.contains("no PR"),
+                "« la lecture n'a pas conclu » n'est pas « aucune PR » : {r}"
+            );
+        }
+        assert!(
+            page_full.contains(&TIMELINE_PAGE_SIZE.to_string()),
+            "le nombre annoncé est celui de la constante qui décide la \
+             troncature, pas un littéral qui en divergerait"
+        );
+    }
+
+    /// Un binaire antérieur au vol garde son libellé (mika#2924, vol 2 — motif
+    /// mika#2340).
+    #[test]
+    fn mika2924_un_blob_sans_sonde_garde_le_libelle_historique() {
+        let mut sans_sonde = base_issue(2698);
+        sans_sonde.plan_present = true;
+        assert_eq!(sans_sonde.merged_prs, None, "la sonde n'a pas parlé");
+        assert_eq!(
+            pick_next_action(&base_state(vec![sans_sonde]), &[]).rationale,
+            "#2698 has a plan but no PR — implementation is the next step",
+            "`None` signifie « la sonde n'a pas été émise » et jamais « aucune \
+             PR » : un binaire antérieur garde son texte, il n'hérite pas d'une \
+             incertitude qu'il n'a pas mesurée"
+        );
+    }
+
+    /// La cible de la sonde est désignée au même endroit que le jugement
+    /// (mika#2924, vol 2).
+    #[test]
+    fn mika2924_la_cible_de_sonde_est_vide_quand_le_palier_1_lemporte() {
+        let mut avec_pr = base_issue(2700);
+        avec_pr.pr_number = Some(2701);
+        let mut avec_plan = base_issue(2698);
+        avec_plan.plan_present = true;
+
+        let palier1 = base_state(vec![avec_pr, avec_plan.clone()]);
+        assert_eq!(
+            timeline_probe_target(&palier1),
+            None,
+            "le palier 1 l'emporte : la sonde n'est pas émise, et son coût `gh` \
+             est nul"
+        );
+
+        let palier2 = base_state(vec![avec_plan]);
+        assert_eq!(
+            timeline_probe_target(&palier2),
+            Some(2698),
+            "sans candidat de palier 1, la cible est celle que le palier 2 \
+             nommerait"
+        );
+        assert_eq!(
+            timeline_probe_target(&palier2),
+            pick_next_action(&palier2, &[]).next_sub_issue,
+            "même site qu'au jugement : lire ailleurs que là où l'on décide, \
+             c'est sonder un ticket et en recommander un autre"
+        );
+    }
+
+    /// AC3 de mika#2956 — le « Next » ne lit pas `missing_grooming_signals`.
+    ///
+    /// Ce test est le garde-fou de la prose du § 4 du plan : AC3 est fermée
+    /// **par non-modification**, et une fermeture par non-modification n'est
+    /// tenue par rien tant qu'aucun test ne rougit le jour où quelqu'un câble
+    /// le nouveau champ ici.
+    ///
+    /// Il vit dans ce module plutôt que dans `pool.rs`, où le plan le rangeait
+    /// (§ 5.4, ligne 5), pour la raison même qui le rend utile : `tier2_pick`
+    /// est privée à ce module, et un garde-fou doit vivre là où le câblage
+    /// qu'il refuse apparaîtrait. Les deux paliers sont donc lus à leur propre
+    /// site de décision, et non par une reconstruction de leur filtre — qui
+    /// resterait verte si le filtre réel changeait.
+    ///
+    /// Les deux candidats portent une mesure **contraire** à leur
+    /// `plan_present` : c'est ce qui sépare « le palier ignore le champ » de
+    /// « le champ se trouvait d'accord avec le booléen ».
+    #[test]
+    fn mika2956_le_next_ne_lit_pas_le_nouveau_champ() {
+        use crate::auto_pull::GroomingSignal;
+
+        let mut non_groome = base_issue(3101);
+        non_groome.plan_present = true;
+        non_groome.missing_grooming_signals = Some(vec![
+            GroomingSignal::BranchCallout,
+            GroomingSignal::GroomedVerdict,
+        ]);
+
+        let palier2 = base_state(vec![non_groome]);
+        assert_eq!(
+            tier2_pick(&palier2).map(|s| s.number),
+            Some(3101),
+            "le palier 2 lit `plan_present` — « il y a de quoi lire » — et le \
+             bassin répond à l'autre question, « il y a de quoi dispatcher »"
+        );
+        assert_eq!(
+            pick_next_action(&palier2, &[]).next_sub_issue,
+            Some(3101),
+            "donc le palier 3 n'est pas atteint et le « Next » de ce cycle ne \
+             bouge pas d'un pouce"
+        );
+
+        // Le miroir : mesuré groomé, mais sans callout pour le lecteur lâche.
+        // Aucun corps réel ne produit cet état ; il est ici pour que le palier 3
+        // soit lu sur sa seule entrée, `!plan_present`.
+        let mut groome_sans_callout = base_issue(3102);
+        groome_sans_callout.plan_present = false;
+        groome_sans_callout.missing_grooming_signals = Some(vec![]);
+
+        let palier3 = base_state(vec![groome_sans_callout]);
+        assert_eq!(
+            tier2_pick(&palier3).map(|s| s.number),
+            None,
+            "le palier 2 ne récupère pas un ticket sur la seule foi de la mesure"
+        );
+        let rec = pick_next_action(&palier3, &[]);
+        assert_eq!(rec.next_sub_issue, Some(3102));
+        assert!(
+            rec.rationale.contains("grooming is the next step"),
+            "c'est bien le palier 3 qui a décidé : {}",
+            rec.rationale
+        );
     }
 }

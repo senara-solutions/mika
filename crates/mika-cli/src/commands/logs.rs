@@ -80,7 +80,7 @@ pub fn run(agent_name: &str, agent_home: &Path, format: &OutputFormat) -> Result
                     "date": today,
                 },
             });
-            print!("{}", serde_yaml::to_string(&obj)?);
+            print!("{}", yaml_serde::to_string(&obj)?);
         }
         OutputFormat::Text => {
             println!();
@@ -537,7 +537,7 @@ fn render_yaml(agent: &str, since: &str, until: &str, events: &[LogEvent]) -> Re
         "total": events.len(),
         "events": events,
     });
-    print!("{}", serde_yaml::to_string(&envelope)?);
+    print!("{}", yaml_serde::to_string(&envelope)?);
     Ok(())
 }
 

@@ -9,6 +9,8 @@ Each tool validates inputs. Control fields capped at `MAX_INPUT_LEN = 10_000` ch
 
 Tool trait uses `#[async_trait]` (Send futures). Per-tool timeout override via `timeout_secs()` default method (returns `None` -> uses 30s default). Shared `validate_and_resolve_path(path, base_dir, create_parents: bool)` helper in `tools/mod.rs` for path security (tilde expansion to base_dir, `~username` rejection, empty check, length limit, absolute rejection, traversal inspection, symlink check, canonicalize containment). Three-layer UUID validation chain in `tools/mod.rs` (#531, #596): (1) `validate_uuid(field_name, value)` — format-only via `Uuid::parse_str()`, returns `Result<Uuid, ToolOutput>` with structured JSON `{"error": "invalid_uuid", ...}`; (2) `validate_task_exists(db, field_name, value)` — format + DB existence + agent-scope, returns `Result<Task, ToolOutput>` with `{"error": "task_not_found", ...}` or `{"error": "db_error", ...}` (fail-closed); (3) `validate_task(db, task_id)` — calls `validate_task_exists` then layers trigger_type=manual + active status checks, returns `Option<String>`. Most task-accepting tools use layer 2 (`get_task`, `cancel_task`, `complete_task`, `update_task_status`, `check_task`); `delegate_task` and long-running dispatch use layer 3. `create_task` (`parent_task_id`) uses layer 1 only + `get_task_depth`.
 
+**Live-pilot guard on `complete_task` (mika#2739):** after the layer-2 validation, after the `trigger_type=callback` refusal and after the status refusal — and **before any write** — `complete_task` asks whether a pilot is alive under the row. The question has a single reader, `live_pilot::live_pilot_for_task` (mika#2653 / mika#2670); the tool composes none of its terms itself. A proven live pilot and an **unreadable** verdict both refuse (fail-closed): the cost of completing a row whose pilot is in fact running is a whole dispatch thrown away — the `implement` slot is freed mid-flight and the pilot's own callback later lands on a terminal row, where its result is dropped (measured 2026-10-16 13:19Z on mika#2700: three pilots under a cap of 2). The refusal body carries the PID, the task label and the row bearing the pgid, names the two correct exits and whose the lift is, and names no command — `MIKA_DEV_IDENTITY` carries `shell-exec`. It also names the premise that produced the incident: a parent task in status `completed` is the normal state after a groom (the engine reuses that task to relaunch the pilot, mika#1614), not evidence of an orphaned callback. **Named cost of the fail-closed:** a callback row carrying a `process_id` with no readable `process_start_time` (the population mika#2335 counts under `unusable_child_count`) can no longer be completed by the LLM tool; bounded by `timeout_at` (6 h panic-fallback) and counted under its own audit value. The guard is **unconditional** — no turn-class term — because no reference site of the tool is an operator path and there is no `mika tasks complete`. (Its `cancel_task` sister carried one until mika#2763, which removed it: a silent `deferred_dispatch` turn posts `is_webhook_pr_event_turn: false`, so the guard did not arm, and on 2026-10-17 at 07:59:38Z such a turn cancelled a 4-minute-old live groom callback. Both guards are now unconditional, for the same reason: a refusal is reversible and a kill is not.) The nominal delivery path, `POST /tasks/{id}/complete` → `update_task_completed`, does not go through the tool and is deliberately left ungated: `dispatch-lib`'s EXIT trap delivers the callback from inside the still-running wrapper, so there the process *is* alive and the completion *is* legitimate. All three outcomes write an audit row under `tool_name = complete_task_pilot_guard`, fire-and-forget (residue `complete_task_pilot_guard_audit_failed`), with four `after_value`s shared by import with the `cancel_task` guard — `blocked_live_pilot`, `blocked_db_unreadable`, `blocked_start_time_unreadable`, `allowed_no_pilot`. The pass writes too: without that positive control, "zero refusals" and "the guard never ran" render identical bytes. `tool_name`, never the value, is what separates the two populations.
+
 **Cross-agent file access:** `read_agent_file`, `write_agent_file`, and `list_agent_files` accept an optional `agent` parameter for orchestrator-only cross-agent file access. `resolve_agent_home(agent_param, ctx)` helper validates permissions.
 
 **Core memory path guard (#645):** `read_agent_file` rejects paths targeting core_memory sections with a domain-specific error before reaching `validate_and_resolve_path`. `is_core_memory_path(path)` matches `core_memory/` and `core-memory/` prefixes, bare section names (with or without `.md`), tilde/dot-prefixed variants, and exact directory names. Uses `core_memory_section_names()` from `db.rs` as single source of truth. The system prompt's core_memory preamble and tool-usage section also warn against reading core_memory via file tools (defense-in-depth).
@@ -414,6 +416,284 @@ General-purpose `gh` CLI handler. Four-tier validation: (1) global subcommand al
 
 **Regression coverage.** Predicate units in `evidence::guards::tests::mika2237` (both directions, the nine inherited body shapes with three negative controls, the hatch open and shut, URL ↔ bare-number matching); production path in `tests/eval/test_pr_review_flag_coherence_2237.rs` (`MockLlmProvider`, no network — plus three negative controls, without which "the guard decides" would be indistinguishable from "the guard blocks", and an audit-row assertion separating "accepted by the hatch" from "accepted by abstention"); U2 in `tests/eval/test_verdict_handler.rs` with its approved-pass negative control; and the two mika-qa calibration scenarios `memory_vs_skill_precedence` / `memory_vs_skill_no_verdict_degradation` (real-provider swap gate, mika#1190 — a text proxy, stated as such). Compound entry: `docs/solutions/best-practices/une-memoire-apprise-dun-echec-survit-au-fix-de-cet-echec-2026-09-19.md`.
 
+### Un `block[pipeline]` cite une garde en échec, ou il ne part pas (mika#2687, vol 1)
+
+**Le défaut, mesuré n=2 sur la même tête.** Sur mika#2685 (bump de lockfile
+`quinn-proto` + exception `deny.toml` + doc dans `docs/solutions/`), mika-qa a
+rendu `VERDICT: block[pipeline]` deux fois sur la tête `0a53b5f0` — 2026-10-13
+11:54Z et 17:03Z — pendant que `scripts/verify-pipeline.sh` (check *Pipeline
+Artifacts*) sortait **vert les deux fois**. Aucune des deux revues ne portait de
+section `PIPELINE:` ni de ligne `NEGATIVE-TEST:`, et les deux raisons énonçaient
+une règle que la garde ne porte pas (« plan manquant dans `docs/plans/` » ;
+« label `pipeline-exempt` avec des fichiers non-docs ») — `verify-pipeline.sh`
+compte `docs/solutions/` comme doc. Le prompt déployé l'interdisait déjà à ses
+Step 2 et Step 2E. Même classe que mika#2172 et mika#2519, toutes deux fermées
+par le prompt : **le correctif par le prompt seul ne tient pas**, le modèle
+paraphrase une règle que le prompt a retirée. Le PR a été débloqué en ajoutant
+un plan — on a satisfait la lecture erronée, pas corrigé la cause.
+
+**La porte est la chaîne pré-subprocess de `run_gh`, pas `verdict_handler`.**
+`validate_pipeline_block_grounding` refuse un `gh pr review` dont le corps porte
+un `block[pipeline]` qui ne cite aucune garde en échec. Le critère d'acceptation
+dit « n'est pas publié comme bloquant » : une rétrogradation dans
+`verdict_handler` agirait **après la publication** — la revue serait sur GitHub,
+lue par l'humain et par le dispatcher, et le handler ne corrigerait qu'une
+conséquence. Même raison que mika#1646 et mika#2237 ci-dessus : le défaut est
+l'appel.
+
+**Position dans la chaîne.** Immédiatement **après** le garde verdict↔flag
+(mika#2237), **avant** le garde CI↔verdict (mika#2455) et le garde
+verdict↔dependabot (mika#2519/#2565). La chaîne va du plus local au plus
+engageant : le nôtre est le dernier lien qui ne lit **ni le réseau ni la DB** —
+il décide sur le corps seul. Conséquence sur une PR dependabot portant un
+`block[pipeline]` sans section : c'est le nôtre qui répond, en amont de
+mika#2519. Comme mika#2237, il est gardé **sur le corps** et non sur
+`required_tool_arg_suffixes` : une revue humaine ou ad-hoc sans ligne
+`VERDICT:` n'est jamais bloquée, et le garde ne disparaît pas en silence le jour
+où qa-review réorganise son manifeste.
+
+**Le prédicat, et sa population.** `classify_pipeline_block_grounding`
+(`evidence::guards`) ne s'applique qu'à `parse_verdict(&body) == Verdict::Block(k)`
+avec `k.eq_ignore_ascii_case("pipeline")` — hérité de `parse_verdict`, donc des
+tolérances mika#1828/#2239 **et de leurs bornes**. Trois issues de ce côté-ci :
+`RefusedSectionAbsent` (aucune ligne `PIPELINE:`), `RefusedNoFailingGuardCited`
+(section présente, aucune citation d'échec), `Allowed`. Depuis mika#2961 la
+fonction porte un second booléen et **deux** issues de plus, toutes deux pour le
+membre `pass` — §§ suivants. La citation est une
+**disjonction de trois motifs**, insensible à la casse et tolérante au préfixe
+d'emphase markdown : (1) `exit` suivi d'un entier **non nul** (`PIPELINE_EXIT_CODE_RE`,
+comparaison chiffre à chiffre, jamais un `parse`) ; (2) `REJECT:` ; (3)
+`Verification FAILED`. Les trois tokens sont déclarés classe A dans
+`scripts/canonical-tokens.tsv` (`PIPELINE`, `REJECT`, `FAILED`), donc un
+renommage côté script casse la lint avant de casser le garde.
+`PIPELINE: not-applicable (…)` — la forme Step 2D — est refusée délibérément :
+un verdict qui bloque sur la pipeline tout en déclarant la pipeline non
+applicable est exactement le défaut mesuré.
+
+**Dans quel sens il échoue : fail-open.** La disjonction est volontairement
+large. Un faux positif du refus rend une revue légitime **impossible à poster**
+— le tour boucle et meurt (coût R8, cf. mika#2237) ; un faux négatif est le coût
+déjà payé aujourd'hui. **Borne nommée :** un corps dont la seule mention
+d'échec est un `exit 1` dans la prose d'une garde par ailleurs verte **passera**.
+Lire la preuve d'exécution en DB — sur le patron B3 de mika#2565 — est le vol 2,
+`Tracked in: senara-solutions/mika#2687`.
+
+**Le gate, et son STOP.** `MIKA_PIPELINE_GROUNDING_GATE`, armé par défaut,
+désarmé seulement par `0`/`false`/`off`/`no` ; toute autre valeur reste **armée**
+avec un WARN citant la valeur d'origine trimée (mika#2220). Résolu une fois par
+process (`OnceLock`), donc non commutable à chaud, et annoncé au démarrage par
+`log_pipeline_grounding_gate_state()` quand il est désarmé (mika#2205).
+**STOP opérateur : `MIKA_PIPELINE_GROUNDING_GATE=0` + redémarrage** — un
+`block[pipeline]` non fondé repart alors, et c'est l'état déclaré. L'application
+est scindée en un wrapper qui lit le gate à un seul site plus un corps
+`…_gated(gate_enabled: bool, …)`, convention du dépôt (cf.
+`classify_dependabot_verdict`) : le cache `OnceLock` rend `std::env::set_var`
+intestable depuis un binaire de test partagé.
+
+**Audit + greps opérateur.** Chaque décision — refus **et** autorisation —
+écrit une ligne `audit_events` avec `tool_name = 'pipeline_grounding_guard'`,
+`target_key = "pr_review:{repo}#{n}"` et `after_value` dans
+`{refused_section_absent, refused_no_failing_guard_cited, allowed}`. La ligne
+`allowed` est le **contrôle positif** de mika#2205 : une table vide dit que le
+lien n'est pas atteint, pas qu'il ne refuse rien. Signal grep :
+`pipeline_block_refused` (WARN, `reason` ∈ {`section_absent`,
+`no_failing_guard_cited`}) — **attendu non vide**, chaque ligne est un
+`block[pipeline]` que le moteur a retenu. Sonde, tables de lecture et les trois
+haltes post-déploiement : `docs/operator/environment-variables.md` § *Un
+`block[pipeline]` cite une garde en échec*.
+
+**Couverture de régression.** Unités du prédicat dans
+`evidence::guards::tests::mika2687` (15 cas : les deux corps mesurés du ticket,
+les trois motifs un par un, le non-zéro contre `exit 0`, l'emphase markdown, le
+`not-applicable`, et les contrôles négatifs `pass`/`hold`/`block[ac]`) ; câblage
+dans `skills::builtin_handlers::mika2687_pipeline_grounding_tests` (6 cas sur le
+chemin `run_gh` : le refus atteint l'appelant en `Err` avant tout subprocess, le
+corps fondé passe, un `pass` passe, gate désarmé ⇒ même corps et il passe, plus
+les lignes d'audit des deux côtés). Sans ce second Layer, **un prédicat qui
+décide bien resterait compatible avec une garde que personne n'appelle**. Noter
+que notre lien est en aval du `debug_assert!` de dedup mika#821 : un test au
+niveau `run_gh` sur un `pr review` doit donc fournir `ctx.pr_reviews_posted` —
+une map **vide**, car la peupler ferait répondre mika#821 avant nous.
+
+### Et un `pass` dit ce que la garde a fait — la population passe à deux membres (mika#2961, vol 1/2)
+
+**Le défaut, mesuré sur toute la population.** Le prompt de qa-review exige une
+section `PIPELINE:` dans **chaque** verdict qui atteint Step 2E, et plafonne à
+`hold[review]` celui qui en manque (l. 45). Sur 261 `pass` de
+`mika-platform-qa` — 60 dernières PR de mika, claude-pilot, mika-platform et
+control-monitor, relevé du 2026-10-29 — **zéro** porte une ligne `PIPELINE:`
+ancrée. Aucun garde moteur ne tenait la règle sur cette population : mika#2687
+ci-dessus a une population étroite et déclarée, `block[pipeline]` seul. Le cas
+fondateur est `control-monitor#217` (14:26:22Z) : une approbation nue, postée une
+seconde après une abstention du garde CI de mika#2455, sur un dépôt sans garde
+exécutable et sans porte de merge.
+
+**`contains` et un prédicat ancré ne comptent pas la même population**, et c'est
+ce qui a corrigé la mesure du ticket. `pipeline_section_present` lit une ligne qui
+**commence** par `PIPELINE:` (blancs de tête, course d'emphase markdown, casse
+repliée) ; les quatre `pass` de mika#2691 que la mesure initiale comptait comme
+conformes portent le mot dans leur **prose** — cette PR implémentait mika#2687 et
+en parle — et zéro ligne ancrée. Régime réel : 426/426, pas 422/426. Un
+`contains` compterait la prose d'une revue comme sa preuve, c'est-à-dire le
+fail-open même que le ticket condamne. Le garde de cette doctrine est un test, pas
+un commentaire : `mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`
+assère les **deux** faits sur le même corps mesuré, donc il rougit le jour où
+quelqu'un réécrit le prédicat en `contains`.
+
+**Un membre de plus, pas un garde de plus.** `classify_pipeline_block_grounding`
+prend `verdict_is_pass: bool` en second argument — même convention que
+`classify_dependabot_verdict` — et rend `RefusedPassSectionAbsent` sur un `pass`
+sans section. Élargir plutôt que dupliquer, parce que la question est la même
+(*ce corps porte-t-il la preuve de la garde ?*), que le prédicat de section est
+le même, et que deux gardes voisins lisant le même corps auraient deux prédicats
+à garder synchrones. Les deux booléens sont mutuellement exclusifs chez
+l'appelant : un corps a une classe de verdict.
+
+**Les deux autres refus de mika#2687 ne s'appliquent pas, et c'est un choix
+argumenté.** `RefusedNoFailingGuardCited` serait un contresens sous un `pass` —
+une approbation ne cite aucun échec par construction. `RefusedNoGuardExecuted`
+lit le ledger d'outils : il reste réservé au membre `block`, donc **un `pass` ne
+paie pas cette requête** et n'écrit jamais de ligne `abstained`.
+
+**Polarité inverse, et c'est la seule de la famille.** `MIKA_QA_PASS_EVIDENCE_GATE`
+est **désarmé par défaut** : `1`/`true`/`on`/`yes` arment, tout le reste laisse
+désarmé (valeur non reconnue ⇒ WARN citant la valeur entre guillemets,
+mika#2220). Ses quatre voisins sont armés par défaut, donc leur ligne de
+démarrage signale une **dérogation** ; ici elle décrit le cas **nominal**, et
+c'est le silence qui veut dire « armé ». Raison du défaut : armer d'emblée
+changerait le régime de 261 verdicts d'un coup, et un refus tue le tour sans
+aucune revue postée. L'ouverture est une décision de Vincent (AC4). Même
+`OnceLock`, même scission wrapper/`…_gated`, pour la même raison qu'au § ci-dessus.
+
+**Le remède ne cite pas la forme qu'il demande.** Un refus portant sa propre
+ligne `PIPELINE:` **ancrée** satisferait ce garde-ci si le modèle le recollait
+dans son corps suivant — le garde lirait alors son propre texte comme la preuve
+du relecteur. Les deux sorties correctes (la section de Step 2E, la forme
+*not-applicable* de Step 2D) sont donc **décrites** et jamais citées verbatim.
+Pinné par `le_remedy_nomme_les_deux_sorties_sans_se_satisfaire_lui_meme`, qui
+vérifie en plus qu'aucune ligne n'ouvre sur un libellé de verdict (`VERDICT_RE`
+est ancré là).
+
+**Audit et greps : noms d'événement distincts.** La ligne `audit_events` partage
+`tool_name = 'pipeline_grounding_guard'` et son contrôle positif `allowed`, mais
+le WARN est `pass_evidence_refused` (`reason = pass_section_absent`) et **non**
+`pipeline_block_refused` : ce dernier est déjà un jeton de fil dans la doc
+opérateur et dans les greps de `server.log`, et y classer un refus de `pass`
+élargirait en silence une population publiée (mika#2131). La charge utile porte
+`"error": "pass_evidence_absent"` et `"doctrine": "mika#2961"`, pour la même
+raison. Sonde d'ouverture (AC5), tables de lecture et haltes :
+`docs/operator/environment-variables.md` § *Un `pass` dit ce que la garde du
+dépôt a fait*.
+
+**Couverture de régression.** Layer A dans `evidence::guards::tests::mika2961`
+(10 cas : les trois corps **mesurés** de cm#217, mika#2960 et mika#2691, le
+contraste `contains`/ancrage, le `not-applicable` de Step 2D admis sous `pass` et
+refusé sous `block` sur le **même** corps, le hors-population, la non-lecture du
+ledger sur les deux valeurs du 4ᵉ argument, et la polarité de l'interrupteur) ;
+Layer B dans `skills::builtin_handlers::mika2961_pass_evidence` (8 cas sur la
+forme gatée). Ce module ne repasse pas par `run_gh` — l'interrupteur étant
+désarmé par défaut derrière un `OnceLock`, un tour complet traverserait et irait
+chercher `gh` ; les deux membres entrent dans le **même** appel, au même point de
+chaîne, et le test `run_gh` de mika#2687 tient la position. Ce qu'aucun cas de
+comportement ne pourrait voir — l'enveloppe non gatée figeant son second argument
+à `false`, garde mort partout avec toutes les assertions vertes (classe
+mika#2158) — est tenu par un scan de source à deux rôles : la décision et la
+ligne de démarrage.
+
+**Ce que le vol ne ferme pas.** La ligne `NEGATIVE-TEST:` (mika#2264) part au vol
+2/2, avec son propre jeton canonique et son lint — § suivant. L'abstention de
+mika#2455 reste **fail-open**, inchangée : sur un dépôt qui ne merge pas par
+`pr_merge_with_gate`, rien de mécanique ne tient le merge fermé — le vol ferme le
+signal, pas la porte. **Aucun jeton canonique ajouté** :
+`scripts/canonical-tokens.tsv` déclare déjà `PIPELINE` avec la tolérance
+`ci+emphasis:line-anchored`.
+
+### Et il nomme l'invariant qu'un test négatif épingle — le membre `pass` passe à deux termes (mika#2961, vol 2/2)
+
+**Un terme de plus dans le même garde, pas un garde de plus.** Le prompt de
+qa-review exige **exactement une** ligne `NEGATIVE-TEST:` dans chaque verdict et
+plafonne à `hold[review]` celui qui en manque (même l. 45 que la section). Le vol
+2 ajoute `RefusedPassNegativeTestAbsent` à `classify_pipeline_block_grounding` —
+cinquième issue, deuxième classe de refus du membre `pass` — sans nouveau garde,
+sans nouvel interrupteur, sans nouveau point de chaîne. Le raisonnement
+d'élargissement du vol 1 s'applique mot pour mot : la question est la même (*ce
+corps porte-t-il la preuve que le prompt exige ?*), le prédicat d'ancrage est le
+même, et deux gardes voisins lisant le même corps auraient deux prédicats à
+garder synchrones.
+
+**Mesure, refaite sur la population du 2026-10-30** (60 dernières PR par dépôt,
+même requête que le vol 1 avec la casse de `NEGATIVE-TEST`) : **260 `pass`, zéro
+ligne `NEGATIVE-TEST:` ancrée, une seule occurrence en `contains`** — et cette
+occurrence est la revue de la PR #2967, le vol 1 lui-même, qui *parle* du jeton
+dans une case de critère d'acceptation. Le contraste `contains`/ancré du vol 1 se
+reproduit donc à l'identique sur le second jeton, sur un corps mesuré différent :
+`mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne` assère les deux
+faits sur ce corps.
+
+**La conjonction est ordonnée, et l'ordre est porteur.** Sous un `pass`, la
+section est évaluée d'abord, la ligne ensuite ; `RefusedPassSectionAbsent` sort
+donc sur un corps qui manque des deux. Deux conséquences qu'un futur éditeur ne
+doit pas avoir à déduire : les trois corps mesurés du vol 1 restent classés
+exactement comme avant, à zéro édition de fixture (c'est ce qui rend le vol 2
+non-régressif par construction) ; et un corps qui porte la ligne **sans** la
+section sort quand même en `RefusedPassSectionAbsent`. Ce dernier cas n'existe
+pas dans la population mesurée — sa seule raison d'être est d'épingler l'ordre, et
+c'est `mika2961_la_table_des_deux_termes_epingle_lordre` qui le fait, en
+asservissant les deux prédicats **et** la sortie sur quatre corps.
+
+**Présence seule, pas de validation de forme.** Le prompt prescrit quatre
+dispositions (`satisfied`, `mechanical`, `missing`, `n/a`) ; le garde ne lit que
+le préfixe ancré. Valider la disposition demanderait de décider ce qu'est un
+invariant « nommé » et un test « qui l'assère », c'est-à-dire de relire la revue —
+hors de ce que peut faire un garde pré-subprocess. Il n'y a pas non plus de bras
+de contradiction : un `pass` portant `NEGATIVE-TEST: missing` passe ce garde-ci,
+et c'est `self-dev-webhook-qa` (mika#2264) qui le rejette en aval. Le remedy le
+**dit**, parce qu'un modèle qui cherche la sortie la moins coûteuse doit lire que
+celle-là coûte le merge un cran plus tard au lieu de l'acheter.
+
+**Le prédicat de ligne est factorisé, pas copié.** `line_prefix_present(body,
+prefix)` porte le parcours char-par-char (blancs de tête, course d'emphase
+markdown, casse repliée, **sans** ancre de fin) ; `pipeline_section_present` et
+`negative_test_line_present` sont chacune une ligne au-dessus. Char-par-char parce
+que `scripts/check-byte-slices.sh` interdit les offsets d'octets calculés
+(mika#764).
+
+**Audit et greps : même événement, `reason` différent.** La ligne `audit_events`
+reste sous `tool_name = 'pipeline_grounding_guard'` et le WARN reste
+`pass_evidence_refused` — un seul nom d'événement par membre, discriminé par
+`reason` ∈ {`pass_section_absent`, `pass_negative_test_absent`} (mika#2131). La
+charge utile porte `"error": "pass_negative_test_absent"` et la même
+`"doctrine": "mika#2961"`. L'issue est **liée** avant le `match` chez l'appelant
+plutôt que comparée en chaîne : la seconde branche remedy reste ainsi typée, et
+ne dérive pas en silence le jour où le jeton est renommé.
+
+**Jeton canonique, celui-là oui.** `scripts/canonical-tokens.tsv` gagne une ligne
+— `NEGATIVE-TEST`, classe A, site
+`crates/mika-agent/src/evidence/guards.rs::NEGATIVE_TEST_LINE_PREFIX`, tolérance
+`ci+emphasis:line-anchored`. Un seul jeton pour la regex ALL-CAPS malgré le tiret.
+
+**Couverture de régression.** Layer A dans `evidence::guards::tests::mika2961`
+passe de 10 à **14 cas** (les deux contrôles positifs du vol 1 amendés et
+renommés — ils portaient la section et pas la ligne, donc leur issue attendue
+change —, le corps mesuré de #2967, la table d'ordre, et les deux `pass`
+conformes, composites assumés puisque **aucun** corps mesuré ne porte les deux
+lignes) ; Layer B dans `skills::builtin_handlers::mika2961_pass_evidence` passe
+de 8 à **11** (le refus sous son propre motif avec l'absence de l'autre motif
+assérée, le contrôle positif qui traverse, et le remedy qui nomme trois formes et
+refuse la quatrième). Le scan de source du vol 1 devient
+`les_deux_jetons_ancres_nont_quun_site_litteral_de_production` et boucle sur les
+**deux** constantes : un second site littéral comparant l'un ou l'autre jeton est
+la forme qu'aucune assertion de comportement ne verrait (classe mika#2158).
+
+**Ce que le vol 2 ne ferme pas.** Le rename
+`validate_pipeline_block_grounding` → `validate_pipeline_evidence` est **encore**
+reporté : son unique site d'appel est dans le corps de `run_gh`, que mika#2966
+modifiait en parallèle, et un rename dont le site d'appel ne peut pas bouger n'est
+pas un rename. Précondition du suivi : le merge de mika#2966. L'interrupteur
+reste **désarmé** — le vol 2 ne change pas la disposition de tir du vol 1, il
+ajoute un terme derrière le même bit, donc l'ouverture (AC4/AC5) reste une
+décision de Vincent, et la sonde d'ouverture compte désormais **deux** manquants.
+
 ### Per-Tool Skill Budget (mika#2276 M1)
 
 **A skill tool runs under the budget of the skill that DEFINES it**, resolved once
@@ -454,13 +734,20 @@ even though 30 is the manifest default (mika#2276 AC5).
 `server::deadline_verdict` — when a turn **owed a verdict on a PR and did not post
 one**, the engine itself posts `VERDICT: hold[review]` on that PR.
 
-**Two reasons since mika#2368, and the question the module answers changed with
-them.** It is no longer *"was the turn cut off?"* but *"did this turn owe a verdict
-and fail to post one?"* — `VerdictReason::CutOffByDeadline` (mika#2276: the turn
-never reached its conclusion) and `VerdictReason::CallbackConcludedWithoutVerdict`
-(mika#2368: a QA build callback **concluded**, cleanly, posting nothing). The
-reason decides the **body**, the **log line** and the **event name**; it decides
-nothing else — target resolution, the anti-double-post registry, the 422
+**Five reasons since mika#2943, and the question the module answers changed at
+the second.** It is no longer *"was the turn cut off?"* but *"did this turn owe a
+verdict and fail to post one?"*:
+
+| `VerdictReason` | ticket | the turn | `event_name()` | `cause()` |
+|---|---|---|---|---|
+| `CutOffByDeadline` | mika#2276 | webhook turn, never reached its conclusion | `qa_deadline_verdict` | *absent* |
+| `CallbackConcludedWithoutVerdict` | mika#2368 | QA build callback, **concluded** cleanly, posting nothing | `qa_callback_verdict` | *absent* |
+| `TurnFailed` | mika#2289 | died on a loop error (transport timeout, …) | `qa_deadline_verdict` | `error` |
+| `CallbackCutOffWithoutVerdict` | mika#2515 | callback cut off by its deadline **or** its step budget | `qa_callback_verdict` | `cut_off_deadline` / `cut_off_max_steps` |
+| `WebhookCutOffByMaxSteps` | mika#2943 | webhook turn cut off by its **step budget** | `qa_deadline_verdict` | `cut_off_max_steps` |
+
+The reason decides the **body**, the **log line** and the **event name**; it
+decides nothing else — target resolution, the anti-double-post registry, the 422
 classification and the never-return-an-error discipline are shared.
 
 The entry guard that used to read `overrun == None → NotApplicable("turn_completed")`
@@ -470,10 +757,16 @@ population, so it could not stay a refusal. It moved down into
 `deadline_verdict_target`, the webhook call-site's entry decision, where it still
 costs nothing on the nominal path (no token resolution, no log, no parse).
 
-**The signal.** `AgentOutput.deadline_exceeded: Option<DeadlineOverrun>` (carrying
-`steps_completed`) is stamped in `persist_deadline_fallback` — the one function all
-three deadline gates (prelude, continuation-skip, `LoopResult::DeadlineExceeded`)
-return through, so the flag cannot be set on two and forgotten on the third.
+**The signal — two fields, one per bound.** `AgentOutput.deadline_exceeded:
+Option<DeadlineOverrun>` (carrying `steps_completed`) is stamped in
+`persist_deadline_fallback` — the one function all three deadline gates (prelude,
+continuation-skip, `LoopResult::DeadlineExceeded`) return through, so the flag
+cannot be set on two and forgotten on the third. Since mika#2943 its sibling
+`max_steps_exceeded: Option<MaxStepsCutOff>` carries the **step** bound, stamped
+only on the "continuation performed" exit of the `LoopResult::MaxStepsExceeded`
+arm. The two are mutually exclusive by construction (each exit of `run_loop`
+poses at most one), and `handlers.rs` reads them through the single **total**
+converter `TurnConclusion::of_output(&AgentOutput)` — never field by field.
 Architect Q3 chose a field over propagating `LoopResult`: `handlers.rs` already
 consumes this struct, and widening the agent-core/orchestrator interface was too
 much surface for a p1.
@@ -597,12 +890,83 @@ of the new reason read as a regression of the old. Same principle as
 `wip_rescue_no_token` (mika#2205). Both carry an `outcome` field in
 `{posted, already_reviewed, already_posted_upstream, post_failed, no_token, no_registry}`,
 plus, for the callback reason, `disarmed` and the four abstention motives above.
-Steady state for `qa_deadline_verdict` after M1 is zero lines. For
-`qa_callback_verdict`, **near zero is the contract**: a net carrying nominal traffic
-has replaced a silence with a systematic `hold[review]`, which means mika#2355's
-B1/B2/guard did not take — and *that* is where to look, not in the net's tuning.
-*This is a net, not a path*; if it carries the nominal traffic it has also erased the
-signal that would show it.
+For `qa_callback_verdict`, **near zero is the contract**: a net carrying nominal
+traffic has replaced a silence with a systematic `hold[review]`, which means
+mika#2355's B1/B2/guard did not take — and *that* is where to look, not in the
+net's tuning. *This is a net, not a path*; if it carries the nominal traffic it
+has also erased the signal that would show it.
+
+**Two names are no longer two populations — `cause` is what subtracts them, and
+reading the name alone now lies.** `qa_deadline_verdict` carried exactly one
+reason when mika#2355 wrote its negative-control probe (*"the mika#2276 net must
+not start firing"*, steady state zero lines); it carries three since mika#2943.
+A `posted` under that name is therefore **not**, by itself, a regression of
+mika#2276. The founding population is isolated by the **absence** of the field:
+
+```sh
+# mika#2276's founding population — the probe mika#2355 wrote, corrected.
+grep qa_deadline_verdict /var/log/mika/server.log \
+  | jq 'select(.cause == null) | select(.outcome == "posted")'   # expected: empty
+
+# mika#2943's population — a webhook turn cut off at its step ceiling.
+grep qa_deadline_verdict /var/log/mika/server.log \
+  | jq 'select(.cause == "cut_off_max_steps")'
+```
+
+`cut_off_max_steps` is **one constant**
+(`qa_build_callback::CAUSE_CUT_OFF_MAX_STEPS`), shared with the callback path
+rather than retyped: one quantity, one name. The two paths stay separable
+because they keep **different event names** while sharing the cause — so
+`cause` alone answers *"which bound?"* and the name alone answers *"which
+path?"*, and neither has to answer both.
+
+#### The fifth reason: a webhook turn cut off by its step budget (mika#2943)
+
+**The half of the net that was missing, and the reason nothing noticed.** The
+mika#2276 net arms on `DeadlineExceeded` or `Failed`. A turn that exhausts its
+**tool-step** budget arrives as `Concluded`, because the loop runs a continuation
+turn and that turn produces text: `text` reads exactly like an answer. Six
+webhook turns of mika-qa between 2026-10-26 and 2026-10-28 ended that way, each
+leaving its PR unreviewed and **nothing on the PR saying so** — including
+`b22e6ea0` on #2920 at the 30-step ceiling mika#2926 had just raised, so the
+raise was not the fix. The callback path already had this net (mika#2515); the
+webhook path did not.
+
+**The partial converter is gone, and that is the fix's shape.**
+`impl From<Option<DeadlineOverrun>> for TurnConclusion` saw one field, so a call
+site could read the deadline alone **and compile** — which is precisely how this
+defect shipped. It is replaced by `TurnConclusion::of_output(&AgentOutput)`,
+total on both flags. Keeping the partial one beside it would have left the trap
+armed for the next field. The constructively-impossible crossing (both `Some`)
+is **decided** in favour of the deadline rather than `unreachable!()`: a future
+mis-wired exit should cost a less precise verdict body, never a server crash.
+Held structurally — `grep -rn 'TurnConclusion::from' crates/` returns nothing.
+
+**One body, no second grammar (AC1).** The posted body is mika#2276's, with one
+sentence changed, because the deadline body is frozen byte-for-byte by
+mika#2368 AC5c: *"Le tour de revue QA a atteint la limite de son budget de steps
+d'outil…"*. It says *budget de steps*, never *enveloppe de temps* — trace
+`b22e6ea0` still had ~295 s of its envelope left, and reusing `CutOffByDeadline`
+would have posted that falsehood. The step count is the **served** ceiling,
+transported by `LoopResult::MaxStepsExceeded`, never re-read from a constant: a
+mika-qa turn that consumed 30 must not be reported as 20.
+
+**A build callback in flight is the one abstention (AC3).** The measured cases
+`11699630` (#2920) and `517380e0` (#2932) were cut off at the ceiling **after**
+dispatching a `long_running:build_mika` — and their review came back through the
+callback, hence through *its* net. So when
+`qa_build_callback::build_callback_dispatched_in_turn` holds, `run_loop` poses no
+cut-off fact at all and says so once
+(`event = "qa_max_steps_verdict_withheld"`, `cause = "build_callback_pending"`).
+Posting here would double the `hold`. The abstention is **journalised** rather
+than silent, because an abstention and a blind net return identical bytes.
+
+**Probe (AC4).** At the next `max_steps_tool_census` of a mika-qa webhook turn on
+a PR, the same `trace_id` carries either a posted `qa_deadline_verdict` with
+`cause=cut_off_max_steps`, or a review the session posted itself, or a
+`qa_max_steps_verdict_withheld`. Those three exhaust the dispositions; a fourth
+outcome — the census line alone — is the defect still live. The instrument is not
+live until `make deploy` (motif mika#2340).
 
 ### Structural Verdict Handler
 
@@ -1078,11 +1442,19 @@ have **opposite** dispositions — the point the words confuse most easily:
 Treating the first as the second makes the arm **inert over a healthy
 population** while reading exactly like a healthy disk (class mika#2205);
 treating the second as the first purges blind. Hence three variants, never a
-bool. `libc` is already a dependency but sits under
-`[target.'cfg(target_os = "linux")'.dependencies]`, so the call follows
-`process_liveness::is_same_process_alive`: a `#[cfg(target_os = "linux")]` block
-with an **explicit non-Linux fallback that keeps**. Rendering "free" there would
-purge on the one platform where a running build cannot be seen.
+bool. The call follows `process_liveness::is_same_process_alive`: a
+`#[cfg(target_os = "linux")]` block with an **explicit non-Linux fallback that
+keeps**. **Nothing in the manifest forces that `#[cfg]`** — since mika#2900
+`libc` is declared under `[target.'cfg(unix)'.dependencies]`, so the crate is
+available for a darwin target. What forces it is semantic: `flock` semantics
+differ across OSes, and the population of `<target>/<profile>/.cargo-lock` is
+only verified under Linux. Rendering "free" there would purge on the one
+platform where a running build cannot be seen.
+
+The earlier wording presented the Cargo key as the cause of the `#[cfg]`, and
+that is precisely the reading that produced mika#2900: the key was taken for a
+platform constraint when it was only a too-narrow declaration, which an unguarded
+call site brought down at the first release tag.
 
 **P4 walks a bounded, declared set** — `target/`, its direct children, and their
 children (depth 2) — and deliberately **not** `measure_tree_size`, whose 400 000
@@ -1548,7 +1920,7 @@ through the gateway's `GET /admin/tenants/{customer_id}/recurring-tasks`
 
 **Additive, and `Passthrough` never `Handled`** — `Handled` would tell the LLM an action was taken, and AC3 forbids automatic adoption: no task is created, no dispatch is triggered, no status is written, no process is signalled. Three surfaces, of which the first two hold whatever the model does: an `audit_events` row, an operator notification, and an `enrichment` the LLM reads (the intent half).
 
-**The ownership list is `DISPATCHABLE_REPOS`, and that is a decision.** Two lists exist and they answer different questions: the gateway's `INTERNAL_REPOS` decides which repositories **route** to mika-dev (it carries `claude-pilot-py` and `wizzard`), `DISPATCHABLE_REPOS` decides where the loop may **dispatch**. AC1's list is the second, because the surface *proposes an action* — "create a task from this event and engage" — and that list is the one answering whether the proposal is executable. Surfacing `claude-pilot-py` would put a proposal in front of the operator that the mika#2046 gate refuses structurally, so that repository belongs to **AC4 (silent-stop)**. No third list: that would be the programmed divergence this repo has paid for twice (dispatch seats mika#2092, `DISPATCHABLE_REPOS` ↔ `labels.yml`).
+**The ownership list is `DISPATCHABLE_REPOS`, and that is a decision.** Two lists exist and they answer different questions: the gateway's `INTERNAL_REPOS` decides which repositories **route** to mika-dev (it carries `claude-pilot` and `wizzard`), `DISPATCHABLE_REPOS` decides where the loop may **dispatch**. AC1's list is the second, because the surface *proposes an action* — "create a task from this event and engage" — and that list is the one answering whether the proposal is executable. Surfacing `claude-pilot` would put a proposal in front of the operator that the mika#2046 gate refuses structurally, so that repository belongs to **AC4 (silent-stop)**. No third list: that would be the programmed divergence this repo has paid for twice (dispatch seats mika#2092, `DISPATCHABLE_REPOS` ↔ `labels.yml`).
 
 **Every term is fail-safe towards today's silence**, and each was seen red by individual mutation — a conjunction of fail-safe terms is not proven by neutralising them all at once (the mika#2277 lesson). A repository that is not dispatchable, an unreadable `head_sha`, an unreadable `audit_events`: each falls back on the pre-mika#1745 behaviour. `is_already_surfaced` takes the `Result` rather than a count so the fail-open half is a property of a pure function instead of a branch no in-memory test can reach.
 

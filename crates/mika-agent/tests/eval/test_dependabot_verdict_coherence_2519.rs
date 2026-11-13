@@ -89,6 +89,18 @@ fn block_pipeline_body() -> String {
         .to_string()
 }
 
+/// The same `block[pipeline]`, grounded the way mika#2687 requires: a
+/// `PIPELINE:` section citing a guard that exited non-zero. The wiring test
+/// below drives the REAL `run_gh` chain, where the mika#2687 refusal runs
+/// before this gate; an ungrounded body would be refused there and never reach
+/// the reader this file observes.
+fn block_pipeline_body_grounded() -> String {
+    format!(
+        "{}\nPIPELINE:\nscripts/verify-pipeline.sh origin/main — exit 1 (Verification FAILED)",
+        block_pipeline_body()
+    )
+}
+
 /// A `pass` with the `DEP-REVIEW:` section Step 1.6 requires, and **no**
 /// `API-SURFACE:` line.
 fn pass_body_without_api_surface() -> String {
@@ -818,7 +830,8 @@ async fn an_absent_title_abstains_on_b2() {
 ///
 /// This is the half the injected-reader tests cannot give: it observes that
 /// `run_gh` calls the gate at all, in its real position, after mika#275,
-/// mika#1196, mika#2237 and mika#2455.
+/// mika#1196, mika#2237, mika#2455 and mika#2687 — whose refusal of an
+/// ungrounded `block[pipeline]` runs first, hence the grounded body.
 #[tokio::test]
 async fn the_gate_is_reached_from_the_real_run_gh_chain() {
     let harness = harness_without_token(
@@ -826,7 +839,7 @@ async fn the_gate_is_reached_from_the_real_run_gh_chain() {
             tool_call_response(
                 "run_gh",
                 json!({
-                    "command": ["pr", "review", "2453", "--comment", "--body", block_pipeline_body()],
+                    "command": ["pr", "review", "2453", "--comment", "--body", block_pipeline_body_grounded()],
                     "repo": "senara-solutions/mika"
                 }),
             ),

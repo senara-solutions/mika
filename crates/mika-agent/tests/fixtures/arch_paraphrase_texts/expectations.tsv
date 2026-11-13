@@ -1,0 +1,137 @@
+# Corpus doré des cinq tiers de disposition (mika#2194, vols 3 et 4).
+#
+# UN corpus, DEUX lecteurs, UN fichier d'attendus. Les deux lecteurs sont :
+#   - bash : skills/bundled/_shared/test-dispatch-lib.sh, bloc « mika#2194 —
+#     parité des cinq tiers de disposition », qui appelle _parse_disposition /
+#     _parse_verdict, les lecteurs de PRODUCTION ;
+#   - Rust : crates/mika-agent/tests/arch_paraphrase_parity.rs, qui appelle
+#     crates/mika-agent/src/arch_disposition.rs::decide, qui n'a AUCUN appelant
+#     de production.
+# Les deux lisent CE fichier. Un attendu modifié d'un seul côté redevient rouge
+# de l'autre : c'est tout le dispositif.
+#
+# CETTE DISSYMÉTRIE EST LE LIVRABLE DU VOL 4, et elle cesse au vol 5. Tant que
+# le bash décide lui-même, la parité compare deux implémentations ; le jour où
+# les deux enveloppes délèguent à la sous-commande, elle comparerait `decide` à
+# lui-même — verte et vide. La preuve exige un commit pre-switch mergé, et c'est
+# celui-ci.
+#
+# Six colonnes séparées par des TABULATIONS :
+#
+#   1. fichier   le corps, relatif à ce répertoire
+#   2. pass      « first » (_parse_disposition) ou « second » (_parse_verdict)
+#   3. token     READY | ITERATE | ESCALATE | GROOMED, ou « - » si aucun match
+#   4. fragment  le texte matché TEL QU'IL EST ÉCRIT dans le corps (casse comprise
+#                — grep -o rend l'entrée, pas le motif), ou « - » si aucun match.
+#                SEUL le tier 2 en produit un : fragment ≠ « - » ⟺ tier = « 2 ».
+#   5. tier      0 | 0b | 1a | 1b | 2 | -   — qui a décidé, dans l'ordre du bash.
+#                « - » veut dire qu'aucun tier n'a rendu de token ; « 0 » veut dire
+#                que le tier 0 a décidé de n'en rendre aucun. Les deux rendent un
+#                token vide et ne se lisent pas pareil (mika#2205), donc la colonne
+#                token vaut « - » pour les deux et c'est CETTE colonne qui les sépare.
+#   6. classe    nominal | substring-fp | french-inert | multiline | tier-nominal
+#                | tier-shadowed
+#
+# LA COLONNE « tier » N'EST ASSERTÉE QUE PAR LE LECTEUR RUST. Avant la bascule,
+# le bash n'a aucun canal de sortie pour le tier : il rend le jeton sur stdout et
+# de la prose sur stderr, et le tier ne se lit que dans cette prose. Le lecteur
+# bash valide donc le token (et le fragment quand tier = 2) ; il ignore la
+# colonne. C'est le vol 5 qui lui donne la ligne 2 de stdout.
+#
+# UNE COLONNE VIDE PORTE « - », JAMAIS RIEN. `IFS=$'\t' read` fusionne deux
+# tabulations consécutives : une colonne vide y disparaît et toutes les suivantes
+# se décalent d'un cran, en silence — alors que le `split('\t')` du Rust ne le
+# fait pas. Les deux lecteurs liraient alors des choses différentes du même octet.
+#
+# Un même fichier peut porter DEUX lignes, une par passe : les deux tables sont
+# distinctes et un corps peut être inerte pour l'une et parlant pour l'autre.
+#
+# Les six classes, et ce que chacune mesure (§ 3 du plan) :
+#
+#   nominal        la paraphrase que le tier 2 existe pour attraper. Inclut deux
+#                  corps de PRIORITÉ, qui matchent plusieurs classes à la fois et
+#                  épinglent ESCALATE > ITERATE > READY et ESCALATE > GROOMED.
+#   substring-fp   le match est en SOUS-CHAÎNE : « fundamentally sound » est lu
+#                  ESCALATE, « the dispatcher » est lu READY. Ce n'est pas un bug
+#                  à corriger ici — B1 interdit de resserrer une tolérance pendant
+#                  la migration. Le fragment de ces lignes est volontairement
+#                  AU MILIEU d'un mot : le lecteur Rust ÉCHOUE si l'un d'eux se
+#                  met à matcher sur une frontière de mot, parce que cela voudrait
+#                  dire que quelqu'un a resserré le lecteur sans toucher au bash.
+#   french-inert   le tier 2 est quasi inerte sur le français : les deux tables
+#                  sont entièrement en anglais et les réponses de mika-arch sont
+#                  en français. C'est le cas MODAL en production. Le lecteur Rust
+#                  ÉCHOUE si l'une de ces lignes se met à rendre un token.
+#   multiline      grep est orienté ligne : « human\nreview » ne matche PAS le motif
+#                  « human review ». Un `contains` sur le texte entier ne matcherait
+#                  pas davantage (aucun motif ne porte de `\n`) : ce que ces lignes
+#                  épinglent est l'ABSENCE DE NORMALISATION DES BLANCS avant le match.
+#                  Un `replace('\n', " ")` glissé par un portage serviable les ferait
+#                  matcher là où le bash les laisse passer. Le lecteur Rust ÉCHOUE si
+#                  l'une de ces lignes se met à matcher.
+#   tier-nominal   le tier NOMMÉ par le corps décide, et c'est le cas positif de
+#                  chacun des quatre tiers de tête : le marqueur en tête de ligne
+#                  (0), la ligne d'escalade du moteur (0b), le littéral de la passe
+#                  (1a), la tolérance de reprise qui lit la forme de l'AUTRE passe
+#                  (1b). Le lecteur Rust ÉCHOUE si la colonne tier de l'une de ces
+#                  lignes change : un tier qui décide à la place d'un autre est
+#                  exactement la régression que l'ORDRE des cinq tiers porte, et
+#                  aucune assertion sur le seul token ne la voit — 0b et 1a rendent
+#                  tous deux ESCALATE, 1a et 1b rendent tous deux GROOMED.
+#   tier-shadowed  le littéral d'un tier est PRÉSENT dans le corps, et c'est un
+#                  autre tier — ou aucun — qui décide. C'est le cas négatif des
+#                  quatre : le marqueur cité au milieu d'une ligne ne supprime rien
+#                  (1a décide), la prose qui cite « [mika-engine] » sans la forme
+#                  complète de l'ancre n'escalade pas (1a décide), un
+#                  « Disposition: » hors vocabulaire ne rend rien, et un ITERATE en
+#                  seconde passe tombe au tier 2 par la lacune DÉLIBÉRÉE de la table
+#                  de reprise. Le lecteur Rust ÉCHOUE si l'une de ces lignes se met
+#                  à rendre le token du tier dont elle porte le littéral.
+#
+# Les cinq « ÉCHOUE si » ci-dessus sont des assertions AUTO-NETTOYANTES : le jour
+# où l'exception cesse, le test devient rouge et force la mise à jour du corpus
+# plutôt que de laisser une classe vide passer pour une classe satisfaite.
+#
+# CETTE COLONNE « classe » EST L'ALLOWLIST (Fire-Disposition, option (a)). Il n'y
+# a pas d'autre fichier d'exceptions : chaque dérogation est une ligne, visible
+# au grep, nommée par sa classe, et chaque classe porte ci-dessus l'assertion qui
+# la fait expirer. Aucune classe n'est introduite vide (mika#2201) : les six
+# portent au moins une ligne ci-dessous.
+
+nominal-first-ready.md	first	READY	Ship it	2	nominal
+nominal-first-iterate.md	first	ITERATE	revise	2	nominal
+nominal-first-escalate.md	first	ESCALATE	human review	2	nominal
+nominal-first-priority.md	first	ESCALATE	human review	2	nominal
+
+nominal-second-groomed.md	second	GROOMED	No remaining concerns	2	nominal
+nominal-second-escalate.md	second	ESCALATE	cannot approve	2	nominal
+nominal-second-priority.md	second	ESCALATE	cannot approve	2	nominal
+
+substring-fp-fundamental.md	first	ESCALATE	fundamental	2	substring-fp
+substring-fp-dispatch.md	first	READY	dispatch	2	substring-fp
+substring-fp-revise.md	first	ITERATE	revise	2	substring-fp
+substring-fp-proceed.md	first	READY	proceed	2	substring-fp
+substring-fp-second-groomed.md	second	GROOMED	groomed	2	substring-fp
+
+french-inert-2641.md	first	-	-	-	french-inert
+french-inert-2641.md	second	-	-	-	french-inert
+french-inert-seconde-passe.md	second	-	-	-	french-inert
+
+multiline-first-human-review.md	first	-	-	-	multiline
+multiline-second-cannot-approve.md	second	-	-	-	multiline
+
+tier-0-marqueur-en-tete-de-ligne.md	first	-	-	0	tier-nominal
+tier-0-marqueur-en-tete-de-ligne.md	second	-	-	0	tier-nominal
+tier-0-marqueur-cite-en-ligne.md	first	ITERATE	-	1a	tier-shadowed
+
+tier-0b-escalade-moteur-apres-ready.md	first	ESCALATE	-	0b	tier-nominal
+tier-0b-escalade-moteur-apres-ready.md	second	ESCALATE	-	0b	tier-nominal
+tier-0b-prose-sans-la-forme.md	first	ITERATE	-	1a	tier-shadowed
+
+tier-1-disposition-ready.md	first	READY	-	1a	tier-nominal
+tier-1-disposition-ready.md	second	GROOMED	-	1b	tier-nominal
+tier-1-verdict-groomed.md	first	READY	-	1b	tier-nominal
+tier-1-verdict-groomed.md	second	GROOMED	-	1a	tier-nominal
+
+tier-1a-hors-vocabulaire.md	first	-	-	-	tier-shadowed
+tier-1b-iterate-seconde-passe.md	second	-	-	-	tier-shadowed

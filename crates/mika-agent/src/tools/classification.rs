@@ -34,6 +34,8 @@ pub fn is_write_tool(name: &str) -> bool {
             | "update_core_memory"
             // Served-content ledger write (mika#1867)
             | "record_served_content"
+            // Reviewed-head ledger write (mika#2917)
+            | "record_reviewed_head"
             // Skill mutations
             | "create_skill"
             | "delete_skill"

@@ -2453,6 +2453,21 @@ Optional (callback delivery bounds — mika#2179):
 - **Error classes** come from the `LlmError` *variant* via `downcast_ref` (which walks the whole `anyhow` cause chain), never from a substring match on the rendered message: `transport_timeout`, `transport`, `http_<status>`, `parse`, `provider`, `unsupported`, `other`. The one string consulted is inside `Transport`, to separate a timeout from a refused connection — `LlmError` does not model that distinction and the timeout is the shape the incident was made of. `http_429` stays distinguishable from `http_500` because "we are being rate-limited" and "the provider is down" need different responses.
 - **Out of scope, deliberately:** the *cause* of the timeouts (openrouter / `z-ai/glm-5.3`, request size, egress proxy). This makes the failure visible and bounded; it does not make it go away.
 
+Optional (retenue de crédit sur une livraison de callback — mika#2944):
+- **Le défaut que ça borne.** Un 402 d'OpenRouter (« This request would exceed your available credits… ») tombe dans la classe `http_402` du vocabulaire ci-dessus et se fait réessayer comme une panne passagère : 60 s, 120 s, puis quarantaine au plafond. Chaque tentative **rejoue la revue depuis le début**, consomme le crédit qui reste, et retombe sur le même 402. Mesuré sur la tâche `26b8d5c7` (build de mika#2920, 2026-10-28) : 4 tentatives, 60 tours de revue rejoués, aucune ne pouvait aboutir, solde à 0,16 $ à 08:07Z ; le verdict n'est parti qu'à 09:05:44Z après une recharge à la main vers 08:51Z, suivi d'un `callback_delivery_slow` (`wait_secs=7743`). Un backoff borne la *fréquence* d'un réessai ; il ne peut rien contre un réessai dont on sait qu'il ne peut pas aboutir.
+- `MIKA_CALLBACK_DELIVERY_CREDIT_HOLD_SECS` — intervalle (secondes) entre deux **sondes** de crédit sur une ligne retenue (défaut `900`). Sur un 402 de crédit, cet intervalle **remplace** le calcul du backoff de mika#2179 ; tout le reste de la ligne d'échec est conservé — compteur `delivery_attempts`, classe de fil `http_402`, événement `callback_delivery_failed`, résultat de build, et la quarantaine le jour où elle la franchit. La retenue ne dépend **pas** du compteur, et c'est une différence de nature : l'intervalle est constant, donc il n'y a rien à escalader depuis un nombre qui peut être non fiable (ligne du compteur non inscriptible ci-dessus). `next_fire_at` reste écrit à un seul site.
+- **`0` est un interrupteur STOP déclaré, pas un plancher** (doctrine mika#1833). `Some(0)` désarme la retenue en bloc : rien n'est marqué sur la ligne, la garde pré-verrou rend `false` sans sonder, et un 402 retrouve l'échelle de mika#2179 — c'est-à-dire le défaut mesuré ci-dessus, délibérément et de façon réversible sans redéploiement. Il n'est **pas** relevé à 1. Toute autre valeur passe par `clamp(1, CALLBACK_DELIVERY_BACKOFF_ABSOLUTE_MAX_SECS)` : même plafond de 30 jours et même raisonnement que le backoff — `chrono::Duration::seconds` **panique** passé `i64::MAX/1000`, à l'intérieur de la fonction qui s'apprêtait à écrire le timer.
+- **Ce que paie une reprise retenue : un message, jamais une revue.** La garde est **pré-verrou**, posée dans `dispatch_resume_agent` juste après celle de mika#2671 et **avant** `agent_lock.try_lock()` — un tour qui n'a pas lieu n'a besoin ni du verrou de l'agent ni d'un compte `AgentBusy`. Elle envoie une sonde d'un seul message, sans outils et portant `llm.max_tokens()` : la vérification de crédit d'OpenRouter est un **pré-vol sur le coût maximal** de la requête, donc une sonde à petit `max_tokens` passerait là où la revue échoue et dirait l'inverse de ce qu'on lui demande. Sonde qui passe ⇒ marque de relâchement, et la revue repart au tour suivant **sans geste à la main**. 402 ⇒ re-retenue. **Autre erreur ⇒ re-retenue sous WARN, fail-closed assumé** : la seule façon de savoir coûterait précisément la revue que ce ticket existe pour ne plus payer. L'ordre des deux gardes est porteur — la supersession est un test de base gratuit, la retenue coûte un appel LLM.
+- **La ligne n'est jamais suspendue.** Elle garde `status='completed'` et son `result` — le retour du pilote que rien d'autre ne re-livrera — et porte un `next_fire_at` à l'intervalle de retenue. Même discipline que la quarantaine : marquer `delivered` jetterait le retour, marquer `failed` mentirait sur un travail qui a réussi.
+- **Surfaces opérateur.** Métadonnées sur la ligne, lisibles via `mika tasks get` : `delivery_credit_held_at`, `delivery_credit_released_at` et `delivery_credit_probes` (nombre de sondes payées). La retenue est **tenue** quand `held_at > released_at` : `async_db` n'a pas d'effacement de champ, donc deux horodatages plutôt qu'un drapeau — et la comparaison lexicographique est chronologique, `crate::timestamp` écrivant un ISO 8601 UTC de largeur fixe. Une métadonnée illisible est **fail-open** (la ligne n'est pas retenue), parce qu'un JSON cassé ne doit pas retenir un verdict pour toujours.
+- **Événements d'audit et signaux de grep** dans `$MIKA_SPIRIT_LOG_FILE` :
+  - `callback_delivery_credit_held` (WARN) — une retenue posée ou reconduite. `SELECT count(*) FROM audit_events WHERE tool_name = 'callback_delivery_credit_held'` compte les revues **non** rejouées.
+  - `callback_delivery_credit_restored` (INFO) — la sonde est passée, la revue repart. Un compte de retenues qui monte sans aucun relâchement en face est l'état à lire : le crédit n'est pas revenu, et c'est une recharge qu'il faut, pas un diagnostic de moteur.
+  - `callback_delivery_credit_probe_inconclusive` (WARN) — la sonde a échoué sur **autre chose** qu'un 402 ; la ligne est retenue quand même. Devrait être rare ; un flot soutenu dit que le provider est en panne et que la retenue masque cette panne.
+- **Cause d'indélivrabilité.** `classify_undelivered_verdict` rend `cause=credit_held` avant toute autre classification, donc une PR dont le verdict manque faute de crédit le dit avec ce mot plutôt que `quarantined` — deux populations sous un même nom ne sont pas soustrayables (mika#2205).
+- **Le contrôle négatif tient par construction.** La classification lit la **variante** `LlmError::HttpError { status: 402, .. }` via `downcast_ref` sur toute la chaîne de causes `anyhow`, jamais le message rendu (doctrine mika#2331) : un 429 ou un 5xx — même portant mot pour mot le texte du 402 — garde le backoff de mika#2179 et ne pose aucune marque de crédit.
+- **Hors périmètre, délibérément :** la recharge du crédit. Ce travail rend l'épuisement visible, borné et réversible sans geste à la main ; il ne met pas d'argent sur le compte.
+
 Optional (deferred-dispatch re-arm honesty — mika#2169):
 - `MIKA_DEFERRED_PROMOTION_STALE_SECS` — Age (seconds) past which a deferred wrapper that was **promoted but never taken** is reported by the L2b starvation indicator (default `900`). Three-tier parse: absent/empty → default; unparseable, `0`, or negative → default with a `deferred-promotion stale` WARN. **This threshold drives a warning and nothing else** — no mutation, no re-armament, no expiry. That restraint is the finding, not timidity: the only latency ever measured on this path is **2 h 47 min** (wrapper `f0cd5967`, promoted `2026-09-04T00:48:11Z`, delivered `03:35:31Z`), so a naive 300 s watchdog applied to that same trace would have expired twenty-two live wrappers around `00:53Z` and permanently failed parents that were served at `03:35Z`. A time window cannot separate queue starvation from a genuine orphan; only a state discriminant can, and there is not one yet. The action is deliberately deferred to a separate ticket, to be decided on the distribution this indicator produces.
   - **Epoch bound, self-installing.** The count is restricted to wrappers born at or after the `schema_meta` key `deferred_promotion_epoch`, stamped `INSERT OR IGNORE` on the first tick of the first binary carrying the fix. Before that fix, a sterile consumption left a wrapper `completed` forever; counting that residue would fire the indicator permanently for a reason unrelated to starvation. The instant is read from the database, never compiled in: a literal date would fix the epoch at the day the plan was written rather than the day the code started running, and an `env!()` would make two builds of the same commit behave differently. Nothing mutates the residual rows.
@@ -3582,7 +3597,7 @@ Portage de contexte entre passes architecte : la question est tranchée (mika#23
   **contrôle négatif** sans le bloc, l'événement rend `agent` / `2` et l'autre ticket
   est présent. Ce second test est porteur : il distingue « le filtre filtre » de
   « le champ est une constante » et de « la requête est cassée ». Structurel :
-  `agent_loop::tests::mika2305_the_scope_has_a_single_decisional_reader` (un seul
+  `mika2305_the_scope_has_a_single_decisional_reader` (un seul
   lecteur décisionnel de `HistoryScope` hors désérialisation) avec son contrôle de
   bonne foi, et `…_the_label_match_has_no_wildcard_arm`. Côté shell, le contrat de
   session de `_arch_ask` / `_iterate_groom_loop` est épinglé dans
@@ -3847,8 +3862,350 @@ grep manager_liveness_recovered "$MIKA_SPIRIT_LOG_FILE"
 - **Il ne rattrape aucun battement perdu.** Pas de file, pas de réessai : un battement raté est perdu, le suivant arrive dans 5 min. C'est le bon arbitrage pour un signal de vivacité — réessayer un « je suis vivant » périmé est au mieux inutile, au pire un mensonge daté.
 - **Il n'ajoute aucun compteur et aucune ligne d'audit** : les seuls instruments neufs sont les deux lignes de transition et le booléen de configuration, et **leur silence ne prouve rien tant que personne n'exécute les sondes**.
 
+### Une URL de battement n'est pas une route de rapport (mika#2697)
+
+**Aucune variable neuve.** Ce travail est une **garde** sur deux variables qui existent déjà, plus la phrase qui dit laquelle vise quoi.
+
+**Le défaut que ça ferme.** `MIKA_MANAGER_DELIVERY_URL` visait `…/api/v1/agents/mika-manager/heartbeat`. Cet endpoint enregistre un tick, répond **201 pour n'importe quel nom d'entité**, et **ne conserve pas le corps**. Les trois conséquences s'enchaînent : le POST réussit, donc le cycle journalise `manager_cycle_delivered route=http` ; le 2xx ferme aussi la porte du repli, donc le sink disque ne se déclenche jamais ; et personne ne peut lire le rapport. `cm health --agent mika-manager` montrait un tick frais et `last_reason: null`, `cm cat mika-manager` ne trouvait aucune entité. Trois semaines de rapports perdus — dernier fichier lisible du sink : **2026-09-27 06:08Z**. Le canal de vivacité a sa propre variable depuis mika#1990 ; c'est **elle** qui doit viser cet endpoint.
+
+**Quelle variable vise quoi — la table entière, parce que c'est leur voisinage qui crée la confusion :**
+
+| variable | cible légitime | le corps est-il conservé ? |
+|---|---|---|
+| `MIKA_MANAGER_DELIVERY_URL` | une route d'**ingestion de rapport** (sévérités normales) | doit l'être — sinon le rapport est perdu |
+| `MIKA_MANAGER_ESCALATION_URL` | une route d'ingestion de rapport (`Severity::Blocked`, route délibérément distincte) | idem |
+| `MIKA_MANAGER_LIVENESS_URL` | **l'endpoint de battement** `…/agents/mika-manager/heartbeat` | **non, et c'est correct** : un battement est un instant, pas un contenu |
+| `MIKA_MANAGER_HEALTH_URL` | la santé d'un **autre** agent, qu'on *lit* | sans objet (sens inverse) |
+
+**Ce que la garde fait, au démarrage du manager.** Les deux variables de rapport passent par `reject_heartbeat_endpoint` : si le **dernier segment non vide du chemin** est `heartbeat` (insensible à la casse), la valeur est **effacée** et une ligne ERROR est émise. Effacée, pas déviée : en aval, « refusée » et « absente » deviennent le même mot, donc `url_is_routable` reste le lecteur unique du prédicat de routage (mika#2267) et `manager_delivery_resolved` annonce `delivery_url_set=false route_normal=offline_sink` sans qu'aucune ligne n'ait à le recalculer. La route obtenue est le puits **nominal**, jamais `offline_sink_fallback` : rien n'est tombé en panne, une variable était mal remplie.
+
+Le jugement porte sur le **chemin**, en **position terminale**, sur le mot **`heartbeat` seul** : un `?from=heartbeat` en query passe, un hôte `heartbeat.example.com/reports` passe, un `/heartbeat/reports` passe, `…/heartbeats` passe. Une URL non parsable passe aussi — refuser ce qu'on ne sait pas lire ferait de cette garde un second mode de panne, et le repli après échec HTTP rattrape ce cas-là.
+
+**Le sink est la route lisible, et pour l'instant la seule.** `control-monitor` **n'expose aucun endpoint d'ingestion de rapports** à ce jour. Tant que c'est vrai, la bonne configuration est `MIKA_MANAGER_DELIVERY_URL` **absente**, et les rapports se lisent dans `~/.mika/manager/sink/` — avec `mika manager reports` (mika#2267), pas avec `cat`. Poser cette variable sur une URL quelconque ne rend rien plus lisible : au mieux elle échoue et tombe en repli, au pire elle réussit et jette le corps, ce qui est exactement l'incident ci-dessus.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Une URL de rapport a-t-elle été refusée ? (régime attendu après remédiation : VIDE)
+grep manager_report_url_rejected_heartbeat_endpoint "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{env_var, use_instead, matched_segment, route}'
+
+# 2. Quelle route est en force ? (une ligne par démarrage)
+grep manager_delivery_resolved "$MIKA_SPIRIT_LOG_FILE" \
+  | jq '{milestone, delivery_url_set, route_normal, liveness_url_set}'
+
+# 3. Le sink reçoit-il ?
+mika manager reports --limit 3
+ls -lt ~/.mika/manager/sink/ | head -3
+```
+
+| événement | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `manager_report_url_rejected_heartbeat_endpoint` | **ERROR** | **vide** après remédiation | `env_var` nomme la variable fautive, `use_instead` celle où déplacer la valeur. Une ligne = un geste à faire dans `~/.mika/.env`, pas un bug du moteur |
+| `manager_delivery_resolved` avec `delivery_url_set: false` + `route_normal: offline_sink` | INFO | **1 / démarrage** | la configuration attendue tant que cm n'a pas d'endpoint d'ingestion |
+| `delivery_url_set: true` + `route_normal: http` | INFO | — | une URL d'ingestion est posée et acceptée. Vérifier qu'elle **conserve** le corps : la garde ne sait refuser qu'un battement, pas tout endpoint amnésique |
+| `manager_cycle_delivered` avec `route: offline_sink` | INFO | 1 / cycle délivrant | le rapport est écrit et lisible |
+
+La ligne de refus **ne porte aucune URL ni aucun chemin** — discipline du module : un journal porte des booléens et des noms. `matched_segment` est le littéral de la garde, jamais une valeur extraite de l'entrée. Les deux noms de variables y sont parce qu'une ligne qui dit « mauvaise URL » sans dire *où la mettre* décrit un problème et aucun geste.
+
+#### Le geste de remédiation (hors code, à faire par l'opérateur)
+
+Dans `~/.mika/.env`, **déplacer** l'URL du battement d'une variable à l'autre :
+
+```diff
+-MIKA_MANAGER_DELIVERY_URL=https://cm.example.com/api/v1/agents/mika-manager/heartbeat
++MIKA_MANAGER_LIVENESS_URL=https://cm.example.com/api/v1/agents/mika-manager/heartbeat
+```
+
+Puis redémarrer le service. Déplacer, pas dupliquer : la garde effacerait de toute façon la copie restée sur `DELIVERY_URL`, mais chaque démarrage crierait une ERROR pour une configuration que personne ne corrige — et une ERROR qu'on apprend à ignorer ne protège plus rien.
+
+#### La fenêtre d'attente, parce que le silence ne prouve rien avant elle
+
+Un fichier neuf dans `~/.mika/manager/sink/` n'apparaît qu'**à l'issue du premier cycle délivrant**, et la delivery est hybride : `state_changed || heartbeat_fired`, le second sur un plancher de **6 h**. Donc après le redémarrage, l'absence de fichier ne signifie rien pendant jusqu'à six heures si aucun état de milestone n'a changé entretemps. Lire d'abord la sonde 2 (la route est-elle `offline_sink` ?), puis `manager_cycle_delivered` ; conclure à un défaut seulement si un cycle a délivré **et** que le sink est resté vide.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas exister l'endpoint d'ingestion de rapports de cm.** `control-monitor` est hors de ce workspace. Tant qu'il n'en expose pas, le puits disque est la route lisible, et c'est une configuration correcte — pas un mode dégradé.
+- **Il ne valide pas une URL d'ingestion.** La garde sait reconnaître **un** endpoint, celui du battement, parce qu'il est nommé et que son défaut est mesuré. Toute autre URL qui répond 2xx en jetant le corps produirait le même silence, et aucune inspection statique ne peut le savoir. Ce qui le dira est la sonde 3 : un sink qui ne reçoit rien alors que `route_normal: http`.
+- **Il ne rattrape aucun des rapports perdus depuis le 27/09.** Le corps n'a jamais été conservé nulle part ; il n'y a rien à rejouer.
+
+### Le manager poste son verdict sur le ticket du vol (mika#2698, vol 2)
+
+- `MIKA_MANAGER_EVALUATE_WRITE` — l'unique interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**. Armé par `1` ou `true` (insensible à
+  la casse, espaces tolérés) ; l'**absence est l'état normal**, pas un cas
+  d'erreur, et toute autre valeur laisse l'interrupteur fermé. Lecteur unique :
+  `verdict_poster::write_is_armed()` (doctrine mika#2201), consulté à un seul
+  site du cycle.
+
+  ```
+  MIKA_MANAGER_EVALUATE_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un geste : `gh issue comment` sur le
+ticket d'un vol terminé, pour y poster le verdict que le rapport du manager
+porte déjà (même phrase, même fonction de rendu — `reporter::render_flight_verdict`
+est appelée par les deux, donc ils ne peuvent pas divergir). Ni `gh issue edit`,
+ni `gh pr comment`, ni une relecture de ce qui est déjà posté : le mandat est
+« un seul geste », et c'est une écriture.
+
+**Pourquoi c'est une exception nommée et pas un trou.** Le module porte un
+invariant LECTURE SEULE tenu structurellement par
+`milestone_manager/no_dispatch_test.rs`, qui refuse tout jeton de dispatch dans
+ses sources. L'allowlist de ce garde porte désormais **exactement une** entrée,
+épinglée au fichier (`verdict_poster.rs`) et au jeton (`gh issue comment`) près.
+Le posteur déclare son geste **à plat** (`const GESTE: &str = "gh issue comment"`)
+et en **dérive** son vecteur d'arguments : ce qui s'exécute est exactement ce que
+le garde voit. La forme éclatée `.args(["issue", "comment"])` échapperait au grep
+plat, et l'exception serait alors décorative.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Le
+verdict ombre doit concorder avec le jugement de l'orchestrateur sur **10 vols
+consécutifs**, ou sur **7 jours** si ce délai arrive avant. Concorder veut dire :
+même verdict merge/non-merge et mêmes vols signalés. *Un désaccord se lit, il ne
+se moyenne pas.* Le rollback est le retrait de la variable — sans redéploiement.
+
+**L'idempotence est portée par le checkpoint, pas par GitHub.** Le champ
+`posted_flight_task_ids` de `MilestoneCheckpoint` retient les vols déjà postés
+(500 au plus, les plus récents), et le checkpoint est désormais sauvegardé quand
+le cycle **a posté** même sans avoir livré de rapport — sans quoi le rejeu du
+cycle reposterait. Dans ce cas les trois champs de cadence (`state_digest`,
+`last_delivered_at`, `last_observed_at`) sont **préservés** tels quels : une
+sauvegarde faite pour une autre raison ne doit pas avaler un `state_changed` en
+attente. Conséquences, nommées plutôt que silencieuses : perdre le fichier de
+checkpoint peut produire un **doublon** — jamais un verdict perdu — et le corps
+du commentaire porte un marqueur `<!-- mika-manager:verdict:<task-id> -->` pour
+qu'un doublon soit reconnaissable à l'œil.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Qu'a-t-on posté, sur quel ticket ?
+grep manager_verdict_posted "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Un verdict non postable — le ticket du vol n'a pas pu être identifié.
+#    (régime attendu avec l'interrupteur armé : rare)
+grep manager_verdict_not_postable "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Un `gh` qui refuse. Le vol n'est PAS marqué comme posté : le cycle
+#    suivant réessaiera. Un flot soutenu ici est un problème de jeton.
+grep manager_verdict_post_failed "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. CONTRÔLE POSITIF — le cycle tourne-t-il seulement ? Les trois greps
+#    ci-dessus sont muets avec l'interrupteur OFF, ce qui est le régime
+#    nominal et se lit exactement comme un manager mort (mika#2205).
+grep manager_cadence_start "$MIKA_SPIRIT_LOG_FILE"
+```
+
+**Ce que ce travail n'achète PAS.** Il n'ouvre pas l'interrupteur. Il ne lit
+aucun commentaire existant sur GitHub, donc il ne détecte pas un doublon né d'un
+checkpoint perdu — il le rend seulement reconnaissable. Et il ne ferme pas
+mika#2698 : la ligne `Turn ceiling: N` côté producteur et le tour du dernier
+commit restent dus (vol 3).
+
+### Le manager fait entrer un ticket au bassin `ready` (mika#2699, vol 4)
+
+- `MIKA_MANAGER_POOL_WRITE` — le **second** interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**, et indépendant de
+  `MIKA_MANAGER_EVALUATE_WRITE` ci-dessus. Armé par `1` ou `true` (insensible à
+  la casse, espaces tolérés) ; l'**absence est l'état normal**, pas un cas
+  d'erreur, et toute autre valeur laisse l'interrupteur fermé. Lecteur unique :
+  `pool_writer::pool_write_is_armed()` (doctrine mika#2201), consulté à un seul
+  site du cycle.
+
+  ```
+  MIKA_MANAGER_POOL_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un geste **groupé** par ticket admis :
+
+```
+gh issue edit <n> --repo <dépôt> --add-label ready --milestone "<titre>"
+```
+
+Les deux mutations du point 3 du ticket dans le **même appel**, pour qu'un échec
+ne laisse jamais la moitié d'une décision. **Jamais un retrait** : aucun
+`--remove*` n'est composé, et c'est asserté sur l'argv réellement émis. Le
+milestone est désigné par son **titre** — `--milestone` ne résout pas un
+numéro — et ce titre vient de l'état lu au cycle, jamais de la configuration.
+
+**Le geste suit la décision, pas l'interrupteur.** `pool_writer` n'écrit que ce
+que `PoolVerdict::admit` nomme, et cette liste est vide hors famine. Les deux
+motifs de refus des vols 2 et 3 — plan groomé absent, estimation au-delà de la
+borne par vol — protègent donc le dépôt une fois l'interrupteur ouvert, sans
+qu'une ligne du poseur les reprenne.
+
+**Pourquoi c'est une exception nommée et pas un trou.** L'allowlist de
+`milestone_manager/no_dispatch_test.rs` porte désormais **exactement deux**
+entrées, une par ticket, épinglées au fichier et au jeton près —
+(`verdict_poster.rs`, `gh issue comment`) et (`pool_writer.rs`,
+`gh issue edit`). Le poseur déclare son geste **à plat**
+(`const GESTE: &str = "gh issue edit"`) et en **dérive** son vecteur
+d'arguments : ce qui s'exécute est exactement ce que le garde voit. Et chaque
+dérogation est **auto-nettoyante** : le test vérifie que le fichier existe
+encore et que sa source *hors commentaires* porte vraiment le jeton, sans quoi
+il rougit en demandant le retrait de l'entrée (motif mika#2309). Une dérogation
+qu'un refactor vide de son geste cesserait sinon d'être une décision pour
+devenir un trou permanent dans le grep.
+
+**L'idempotence est structurelle, et aucun champ de checkpoint ne la porte.**
+Un label `ready` posé est relu au cycle suivant par le filtre de candidats du
+bassin, qui écarte tout ticket déjà `ready` — le ticket n'est donc plus proposé.
+C'est la différence avec le vol 2 de mika#2698, dont l'idempotence devait être
+portée par `posted_flight_task_ids` : un commentaire n'est pas visible du
+prédicat qui l'a décidé, un label l'est.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Il
+faut que `MIKA_MANAGER_EVALUATE_WRITE` soit déjà ouvert, **et** qu'aucun `ready`
+mal formé n'ait été admis en ombre — ce que le refus nommé par ticket du vol 2
+rend précisément lisible. Le rollback est le retrait de la variable, sans
+redéploiement.
+
+**Deux choses à trancher AVANT d'ouvrir, nommées plutôt que tues :**
+
+1. **Le park n'est pas consulté** (mika#2315). `ready_label.rs` est l'applicateur
+   gouverné du label `ready` et son `apply_ready` consulte le park (le STOP
+   opérateur) ; `pool_writer` est un **cinquième applicateur** qui ne le consulte
+   pas. Son garde est *nominal* (`gh_apply_label` / `add_label_to_issue`) et ne
+   rougit donc pas ici. Router par `apply_ready` a été envisagé et écarté : cette
+   fonction ne pose que le label, le rattachement au milestone deviendrait une
+   **seconde** mutation, et l'AC3 demande une seule mutation par décision.
+   L'interrupteur fermé garantit qu'aucune écriture non parkée n'a lieu avant
+   l'ouverture ; l'ouvrir demande de trancher l'interaction des deux.
+2. **Le jeton n'a peut-être pas `issues: write`** (mika#2228). `ProcessGhRunner`
+   écrit avec le `GH_TOKEN` ambiant, et le PAT résolu a été **mesuré** le
+   2026-09-07 comme authentifiant sans porter `issues: write` (34 refus
+   `--add-label`). Le chemin d'échec est déjà tenu par ticket — le ticket n'est
+   pas compté comme posé et un WARN le nomme — donc c'est une exposition du jour
+   de l'ouverture, pas un défaut de correction. À vérifier avant d'armer.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Qu'a-t-on fait entrer, sur quel ticket, dans quel milestone ?
+grep manager_pool_admitted "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Pourquoi rien n'est entré. `reason` prend cinq valeurs :
+#      no_pool_verdict        — un blob antérieur au champ (jamais en nominal)
+#      no_admission           — le bassin n'admet personne : le régime NOMINAL
+#      no_runner              — une décision existait, aucun `gh` câblé
+#      disarmed               — l'interrupteur est fermé : le régime par défaut
+#      empty_milestone_title  — le milestone lu n'a pas de titre
+grep manager_pool_not_admitted "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Un `gh` qui refuse. Le ticket n'est PAS compté comme posé ; le cycle
+#    suivant le reproposera. Un flot soutenu ici est un problème de jeton
+#    (voir le point 2 du seuil d'ouverture ci-dessus).
+grep manager_pool_admit_failed "$MIKA_SPIRIT_LOG_FILE"
+```
+
+La sonde 2 est son **propre contrôle positif** : elle est émise sur *toutes* les
+branches, y compris celle à zéro admission, donc « le geste tourne et n'a rien à
+faire » et « le geste n'est pas câblé » ne rendent pas les mêmes octets (classe
+mika#2205). Son **absence** du journal signifie un binaire antérieur à ce vol
+(classe mika#2340), jamais un bassin calme — et l'instrument n'est vivant
+qu'après `make deploy`.
+
+**Ce que ce travail n'achète PAS.** Il n'ouvre pas l'interrupteur. Il ne consulte
+pas le park (point 1 ci-dessus). Il ne relit aucun label existant sur GitHub : la
+non-répétition vient du filtre de candidats, pas d'une vérification. Et il ne
+ferme pas mika#2699 — la seconde moitié de l'AC3 (idempotence inter-cycle
+épinglée par un test de verdict rejoué) et le rapport nommant ce qui a été posé
+restent dus au vol 5.
+
 Optional (dispatch grooming gate):
 - `MIKA_DISPATCH_BYPASS_GROOMING_CHECK` — Emergency bypass for the grooming-marker dispatch gate (#919). When `1` or `true` (case-insensitive), `validate_dispatch_readiness()` skips the three-signal grooming check on `dev-pilot` dispatches. Logged at WARN on every hit. Default: unset (gate active).
+
+### Le manager groome la relève d'avance (mika#2958, vol 1)
+
+- `MIKA_MANAGER_GROOM_WRITE` — le **troisième** interrupteur d'écriture du
+  `milestone_manager`, **OFF par défaut**, indépendant de
+  `MIKA_MANAGER_EVALUATE_WRITE` et de `MIKA_MANAGER_POOL_WRITE` ci-dessus. Armé
+  par `1` ou `true` (insensible à la casse, espaces tolérés) ; l'**absence est
+  l'état normal**, pas un cas d'erreur, et toute autre valeur laisse
+  l'interrupteur fermé. Lecteur unique :
+  `groom_trigger::groom_write_is_armed()` (doctrine mika#2201). Le prédicat est
+  celui de `pool_writer` — `trim` puis `eq_ignore_ascii_case` — délibérément, pour
+  que deux interrupteurs du même module ne puissent pas avoir deux tables de
+  vérité.
+
+  ```
+  MIKA_MANAGER_GROOM_WRITE=1
+  ```
+
+**Ce qu'il autorise, et rien de plus.** Un `message/send` A2A vers mika-dev
+portant l'instruction `groom mika#<n>` — la **porte moteur**, la même que
+`mika ask --agent mika-dev "groom mika#N"`. Ni spawn, ni dispatch
+d'implémentation, ni appel GitHub : le geste ne touche pas le dépôt, il demande à
+un agent de groomer.
+
+**Pourquoi c'est une exception nommée et pas un trou.** L'allowlist de
+`milestone_manager/no_dispatch_test.rs` porte désormais **exactement trois**
+entrées, une par ticket, épinglées au fichier et au jeton près —
+(`verdict_poster.rs`, `gh issue comment`), (`pool_writer.rs`, `gh issue edit`) et
+(`groom_trigger.rs`, `message/send`). Le scan n'a **pas** été assoupli : il a été
+**resserré** sur un jeton de plus, mesuré à zéro occurrence préexistante dans le
+module avant l'ajout. `groom_trigger.rs` reste interdit sur les vingt-deux autres
+jetons d'écriture, et son geste est déclaré **à plat**
+(`const GESTE: &str = "message/send"`) pour que ce qui s'exécute soit exactement
+ce que le garde voit. Chaque dérogation est **auto-nettoyante** (motif
+mika#2309) : le test rougit si le fichier disparaît ou si sa source hors
+commentaires cesse de porter le jeton.
+
+**Un groom par cycle, et le nombre n'est pas une prudence.** `GROOMS_PER_CYCLE`
+vaut `1` parce que le moteur ne tient qu'un créneau `dispatch_class = 'groom'`
+par agent (schéma v34) : un second envoi dans le même cycle serait refusé par le
+moteur, pas absorbé. Au-delà de la borne, les candidats restants sont **nommés**
+`budget_spent` plutôt que tus. Si mika-dev tient déjà son créneau, le refus A2A
+préexistant (`a2a_wait_queue`, mika#2163) est **transcrit** en `agent_busy` et le
+cycle s'arrête là — pas de retente, le cycle suivant reprendra la relève telle
+qu'elle sera alors. La classe d'échec est dérivée du **statut HTTP**, jamais d'un
+sous-texte de message (mika#2179), et son vocabulaire est gelé par un test de
+format de fil (mika#1990 D8) parce que l'opérateur `GROUP BY` dessus.
+
+**Seuil d'ouverture — un geste opérateur, jamais une bascule automatique.** Il
+faut que `MIKA_MANAGER_EVALUATE_WRITE` **et** `MIKA_MANAGER_POOL_WRITE` soient
+déjà ouverts, et stables sur un cycle complet. Les deux sont OFF aujourd'hui, et
+**mika#2958 n'en ouvre aucun**. Le rollback est le retrait de la variable, sans
+redéploiement.
+
+**Surfaces opérateur** (journal `$MIKA_SPIRIT_LOG_FILE`) :
+
+```
+# 1. Quels grooms ont été déclenchés, et par quel geste ?
+grep manager_groom_triggered "$MIKA_SPIRIT_LOG_FILE"
+
+# 2. Pourquoi aucun groom n'a été déclenché. `reason` prend trois valeurs :
+#      disarmed    — l'interrupteur est fermé : le régime par défaut
+#      no_sender   — aucun émetteur A2A câblé (le régime du vol 1, voir plus bas)
+#      no_relief   — la relève est vide : rien à groomer, le régime NOMINAL
+grep manager_groom_not_triggered "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Les sauts, par ticket, avec leur motif :
+#      already_groomed  — le ticket porte déjà son plan groomé
+#      groom_in_flight  — un groom est déjà en vol sur ce ticket
+#      budget_spent     — la borne d'un groom par cycle est consommée
+grep manager_groom_skipped "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. Un envoi refusé. `class` prend deux valeurs, dérivées du statut HTTP :
+#      agent_busy   — mika-dev tient déjà son créneau ; le cycle s'arrête
+#      send_failed  — credential refusé, injoignable, ou autre
+grep manager_groom_failed "$MIKA_SPIRIT_LOG_FILE"
+```
+
+La sonde 2 est son **propre contrôle positif** : elle est émise sur *toutes* les
+branches de refus, y compris celle à relève vide, donc « le geste tourne et n'a
+rien à faire » et « le geste n'est pas câblé » ne rendent pas les mêmes octets
+(classe mika#2205). Son **absence** du journal signifie un binaire antérieur à ce
+vol (classe mika#2340), jamais une relève calme — et l'instrument n'est vivant
+qu'après `make deploy`.
+
+**Ce que ce vol n'achète PAS.** Il n'ouvre pas l'interrupteur. Et il ne branche
+**aucun rail** : au vol 1 le site d'appel passe un émetteur absent, donc un
+interrupteur armé rend `reason: no_sender` et rien d'autre — c'est le régime
+nominal du vol, pas un défaut. Le rail A2A, le câblage de cycle, la lecture d'un
+« groom en cours » depuis les tâches moteur et le rendu ON du rapport (AC4,
+moitié ON) sont le **vol 2** de mika#2958 et restent dus.
 
 ### Un `ESCALATE` de groom est terminal, et son producteur l'estampille (mika#2545)
 
@@ -4207,6 +4564,12 @@ dans le voisinage de mika#2545.
   empêcher. Le prompt est donc court **par contrat et c'est asserté** (347 octets
   mesurés contre 2000), avec le seuil **lu depuis le manifeste** plutôt que
   recopié : un seuil durci sans que le prompt rétrécisse fait rougir.
+  **Renversé par mika#2996 (2026-10-31).** Sous le seuil, un `Verdict: GROOMED`
+  (ou un `Disposition: READY` en première passe) rendu à la relance était accepté
+  sans aucune preuve. Mesuré sur la première passe, trace `15ea28bd`. Les deux
+  relances portent désormais le plan entre deux lignes-marqueurs, la garde s'arme
+  sur ce tour et ne vérifie les ancres que contre le plan. V4 asserte le sens
+  inverse : le prompt de relance est plus long que le plan qu'il porte.
 
 - **`Outcome: ESCALATE` reste la ligne de disposition, et c'est une décision.**
   Tentant de poser un autre mot pour éviter le gel de mika#2545 ; **refusé**, et
@@ -4608,6 +4971,418 @@ garde que personne n'a exercée se lit exactement comme une garde qui marche*
 - **Aucune ligne de journal nouvelle côté producteur** : le seul instrument est
   le gate existant, enrichi d'un motif. **Son silence ne prouve rien tant que le
   contrôle positif n'est pas établi.**
+
+### Un `block[pipeline]` cite une garde en échec, ou il ne part pas (mika#2687, vols 1 et 2)
+
+- `MIKA_PIPELINE_GROUNDING_GATE` — désarme le refus d'un `block[pipeline]` non
+  fondé. **Défaut : armé.** `0`/`false`/`off`/`no` (insensible à la casse,
+  espaces tolérés) désarment ; absent, vide ou **non reconnu** laissent armé,
+  avec un `pipeline_grounding_gate_unrecognized_value` nommant la valeur **entre
+  guillemets** — sans eux une espace parasite est invisible (mika#2220). Même
+  polarité que `MIKA_QA_CI_COHERENCE_GATE` et `MIKA_DEPENDABOT_VERDICT_GATE`.
+  Lue **une fois par process** et mise en cache : poser ou retirer la variable
+  sur un process déjà démarré n'a aucun effet, par construction.
+
+**Le défaut, mesuré (n=2, même tête).** Sur mika#2685 — bump de lockfile
+`quinn-proto` + exception `deny.toml` + doc dans `docs/solutions/` — mika-qa a
+rendu deux fois `VERDICT: block[pipeline]` sur `0a53b5f0` (2026-10-13 11:54Z et
+17:03Z) alors que le check *Pipeline Artifacts* était **vert les deux fois**.
+Aucune des deux revues ne portait la section `PIPELINE:`. Les deux raisons
+données énonçaient une règle que la garde ne porte pas : `verify-pipeline.sh`
+compte `docs/solutions/` comme doc. La PR a été débloquée en **ajoutant un plan**
+— on a satisfait la lecture erronée, pas corrigé la cause. Même classe que
+mika#2172 et mika#2519, toutes deux fermées par le prompt seul : le prompt
+déployé interdisait déjà ce verdict à son Step 2 et à son Step 2E.
+
+**Ce que ça fait, en une phrase.** Un `pr review` dont le corps porte
+`VERDICT: block[pipeline]` est refusé **avant tout sous-processus** dans trois
+cas : le corps ne porte aucune ligne `PIPELINE:` (`section_absent`), il en porte
+une sans citer de garde en échec (`no_failing_guard_cited`), ou — vol 2 — il
+cite bien un échec mais **aucun `run_shell` de cette session n'a invoqué de
+garde** (`no_guard_executed`). Le refus nomme les deux sorties : exécuter
+Step 2B et poster la section verbatim, ou rendre
+`pass` / `hold[review]` / `block[ac]`.
+
+**La preuve d'exécution (vol 2), et sa frontière.** Les deux premiers motifs
+lisent de la **prose**, et un modèle qui paraphrase une règle sait aussi écrire
+`exit 1` sous une ligne `PIPELINE:`. Le troisième lit le **ledger d'outils** :
+les appels `run_shell` de la session, filtrés sur ceux dont l'`input` nomme
+`scripts/verify-pipeline.sh` ou `scripts/plan-doc-check.sh` (motif
+`find_recent_tool_invocation`, mika#2565 B3 ; fenêtre constante de 2 h, la
+requête étant déjà bornée par `session_id`). Trois états, et le troisième est
+celui qui compte :
+
+| ce que le ledger dit | effet |
+|---|---|
+| un appel shell nomme une garde | la preuve est acquise |
+| des appels shell existent, aucun ne nomme de garde | **refus** `no_guard_executed` |
+| la lecture a échoué | abstention `tool_ledger_unreadable` |
+| aucun appel shell du tout | abstention `no_shell_call_recorded` |
+
+L'abstention est **partielle** (les deux prédicats de corps décident encore) et
+elle est **dite** (`pipeline_grounding_abstained` + ligne d'audit
+`after_value = 'abstained'`). La dernière ligne est le faux positif réel : une
+revue reprise sur un callback de build tourne sous un `session_id` tout neuf et
+ne voit donc pas le `run_shell` de la session d'origine — indiscernable, dans le
+ledger, d'un `MIKA_STORE_TOOL_CALLS` désarmé. Les deux sont du silence, pas une
+accusation. **Compter cette population avant de resserrer** est l'objet de la
+sonde S4.
+
+**Citer une garde en échec** est une disjonction de trois motifs, insensible à la
+casse : `exit` suivi d'un entier **non nul** (séparateur `=`, `:` ou espaces
+toléré, donc la forme `GUARD: … exit=1` de la boucle de Step 2B compte), le jeton
+`REJECT:`, ou `Verification FAILED` — les trois derniers étant les mots que
+`scripts/verify-pipeline.sh` écrit lui-même, déclarés dans
+`scripts/canonical-tokens.tsv`. Une section `PIPELINE: not-applicable (…)`
+(Step 2D) est refusée délibérément : elle n'est pas un `block`.
+
+**Le sens dans lequel ça se trompe, nommé.** La disjonction est **volontairement
+large** : un faux positif du refus rend une revue légitime impostable, un faux
+négatif est le coût d'aujourd'hui, déjà payé. Borne assumée : un corps dont la
+seule mention d'échec est un « exit 1 » dans la prose d'une garde par ailleurs
+verte **passera**. Même arithmétique que mika#2455 et mika#2519.
+
+**Le prompt ne nomme PAS encore ce refus, et c'est un report assumé.** Le vol 2
+devait ajouter à Step 2C/2E une ligne annonçant le refus moteur et prescrivant
+le **geste** — *exécuter Step 2B dans cette session, puis poster ce qu'il a
+imprimé* — plutôt que l'artefact, parce que « écris une section `PIPELINE:` »
+est, sous la preuve d'exécution, un générateur de défaut : il pousse le modèle à
+produire la section sous le verdict déjà choisi. La ligne a été écrite, puis
+retirée : `qa-review/system_prompt.md` est à 77 259 octets pour une porte à
+77 337, soit **78 octets de marge**, et son `skill.toml` déclare depuis mika#2639
+que les deux premières remédiations sont épuisées et que *la prochaine addition
+shard* (extraire Step 1.6 en skill frère). Ce shard est un vol à lui seul, avec
+son propre risque — un handler dont personne ne dépend est injoignable et muet
+(mika#2355). **Conséquence opérationnelle à tenir d'ici là :** le refus moteur
+est en vigueur dès que le binaire tourne, face à un prompt qui ne l'annonce pas.
+Un agent qui tombe dessus le découvre dans la charge de refus, dont le champ
+`remedy` nomme Step 2B explicitement pour cette raison. C'est aussi pourquoi la
+sonde S3 ci-dessous ne peut pas encore conclure sur le prompt.
+
+#### Surfaces opérateur
+
+```bash
+# 1. La garde a-t-elle refusé, et sur quel motif ?
+grep pipeline_block_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, reason, agent_id, session_id}'
+
+# 2. Le gate est-il désarmé ? (une ligne INFO par démarrage, muette si armé)
+grep pipeline_grounding_gate_disabled "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Une valeur de gate illisible ? (régime attendu : VIDE)
+grep pipeline_grounding_gate_unrecognized_value "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. La preuve d'exécution s'abstient-elle, et sur quelle cause ? (vol 2)
+grep pipeline_grounding_abstained "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, reason, session_id}'
+```
+
+```sql
+-- CONTRÔLE POSITIF, et c'est la requête qui compte : la garde écrit une ligne
+-- sur les TROIS issues, `allowed` compris. Une table vide dit « le lien n'est
+-- jamais atteint », jamais « la garde ne refuse rien » (mika#2205).
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pipeline_grounding_guard' GROUP BY 1, 2;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `reason = section_absent` | WARN | **non vide, décroissant** | la forme mesurée sur #2685 ; décroît quand le prompt prend |
+| `reason = no_failing_guard_cited` | WARN | faible | une section postée sans sortie de garde citée |
+| `reason = no_guard_executed` | WARN | faible | une section bien formée, écrite plutôt qu'observée |
+| `pipeline_grounding_abstained` | WARN | **à mesurer** | la population du faux positif de la preuve d'exécution (S4) |
+| `after_value = 'allowed'` | audit | **non vide** | le contrôle positif ; son absence seule ne prouve rien |
+| `pipeline_grounding_gate_disabled` | INFO | **vide** | un `block[pipeline]` non fondé qui sort est alors l'état déclaré |
+
+#### Sondes post-déploiement, et leurs trois haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** (classe mika#2340).
+> Après `make deploy`, établir que le `mika-spirit` qui tourne porte le correctif
+> avant toute conclusion.
+
+**S1 — le rejeu du défaut fondateur** (première revue `block[pipeline]` après
+déploiement). Soit elle porte sa section `PIPELINE:` avec une sortie non nulle,
+soit elle est refusée et la ligne WARN nomme le motif.
+*Halte 1 — un `block[pipeline]` sans section est publié quand même.* **Ne pas
+élargir le prédicat par réflexe** : lire d'abord le contrôle positif SQL. Zéro
+ligne `allowed` signifie que le lien n'est pas atteint du tout, et la question
+n'est alors pas le prédicat.
+
+**S2 — contrôle négatif (7 jours).** Aucun refus sur un `block[pipeline]` qui
+citait bien une garde, et aucun sur un autre verdict.
+*Halte 2 — un refus sur une revue fondée.* Désarmer
+(`MIKA_PIPELINE_GROUNDING_GATE=0` + redémarrage), **puis** diagnostiquer : une
+garde qui rend les revues légitimes impostables coûte plus que le défaut qu'elle
+ferme.
+
+**S3 — le prompt finit par porter la règle (30 jours).** `section_absent`
+décroît. **Lecture conditionnelle tant que le shard n'a pas eu lieu :** Step
+2C/2E n'annonce pas encore le refus (voir le report ci-dessus), donc un plateau
+s'explique d'abord par là et ne met pas le prédicat en cause. Cette sonde ne
+devient discriminante qu'une fois la ligne de prompt déployée.
+*Halte 3 — les deux sondes muettes.* Zéro refus **et** zéro `allowed` ne prouve
+rien : il faut qu'un `block[pipeline]` ait été rendu depuis le déploiement. *Une
+garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+**S4 — le taux d'abstention de la preuve d'exécution (30 jours, vol 2).**
+Rapporter `pipeline_grounding_abstained` au nombre total de décisions de la
+garde (`SELECT after_value, count(*) … GROUP BY 1`). Un taux non nul est
+**attendu** : les revues reprises sur callback y tombent par construction.
+*Halte 4 — l'abstention est majoritaire.* Alors `no_guard_executed` ne ferme
+rien et la classe n'est pas mesurée : le travail à faire est de rendre la
+session d'origine lisible depuis la session reprise (le `parent_session_id`
+existe en base, `create_session_with_parent` l'écrit), **pas** de transformer
+l'abstention en refus.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne rattrape pas les deux revues de #2685.** Elles sont publiées, la PR est
+  mergée. Rien ici ne réécrit un verdict passé. La sonde est la **prochaine**
+  occurrence.
+- **Il n'annonce pas le refus en amont.** Step 2C/2E ne nomme pas encore
+  `pipeline_block_ungrounded` : le prompt est à 78 octets de sa porte de taille
+  et la prochaine addition doit le sharder. L'agent rencontre donc le refus sans
+  l'avoir lu dans ses instructions. Suivi sur mika#2687.
+- **Il n'observe pas qu'une garde est allée au bout**, seulement qu'elle a été
+  **invoquée** : le prédicat lit l'`input` de l'appel outil, pas sa sortie.
+  Exiger aussi un `GUARD: ` dans la sortie a été envisagé et écarté — cela ajoute
+  un faux négatif (sortie tronquée, outil qui a timeouté) du mauvais côté de
+  l'arithmétique fail-open.
+- **Il ne voit pas la session d'origine d'une revue reprise.** La lecture est
+  scopée au `session_id` courant ; la remontée par `parent_session_id` est un
+  travail à part, et la halte 4 ci-dessus en est la condition d'ouverture.
+- **Il ne couvre aucune autre classe de `block[…]`.** `block[ac]` traverse sans
+  être lu : son fondement est l'énumération par AC, une autre famille.
+- **Il ne rétrograde pas en `hold[review]`.** Le ticket proposait « refuse ou
+  rétrograde » ; refuser est le bras retenu, parce qu'une rétrogradation
+  réécrirait le jugement de l'agent au lieu de le lui rendre. Le remède nomme
+  `hold[review]` comme sortie, l'agent le choisit.
+- **Aucune liste d'exemptions, et elle est vide par construction** : aucun label,
+  aucune constante, aucun dépôt ne permet de passer outre. L'échappatoire est la
+  variable ci-dessus, et elle n'est jamais silencieuse.
+
+Raisonnement complet (la position du lien dans la chaîne, et pourquoi pas
+`verdict_handler`) : `docs/agent-internals/tools.md` § *Un `block[pipeline]` cite
+une garde en échec* — c'est là que vit la doctrine de la chaîne `run_gh` depuis
+que `crates/mika-agent/CLAUDE.md` § *Tools* y a été vidé (mika#2684).
+
+### Un `pass` dit ce que la garde du dépôt a fait, ou il ne part pas (mika#2961, vols 1 et 2 sur 2)
+
+- `MIKA_QA_PASS_EVIDENCE_GATE` — **arme** le refus d'un `pass` qui ne porte pas
+  la preuve que le prompt exige : depuis le vol 2, **deux** termes derrière le
+  **même** bit — aucune ligne `PIPELINE:` (vol 1) et aucune ligne
+  `NEGATIVE-TEST:` (vol 2), évalués dans cet ordre.
+  **Défaut : DÉSARMÉ**, et c'est la seule variable de
+  cette famille dont la polarité est inverse : `1`/`true`/`on`/`yes` arment,
+  absente, vide ou **non reconnue** laissent désarmé, avec un
+  `pass_evidence_gate_unrecognized_value` nommant la valeur **entre guillemets**
+  (mika#2220). Lue **une fois par process** et mise en cache, comme ses quatre
+  voisines : poser ou retirer la variable sur un process déjà démarré n'a aucun
+  effet, par construction. **L'ouverture revient à Vincent** (AC4) :
+  `MIKA_QA_PASS_EVIDENCE_GATE=1` + redémarrage.
+
+**Pourquoi désarmé par défaut, chiffré.** Le régime mesuré n'est pas une
+exception, c'est la règle : sur 261 `pass` de `mika-platform-qa` (60 dernières PR
+de mika, claude-pilot, mika-platform et control-monitor, relevé du 2026-10-29),
+**zéro** porte une ligne `PIPELINE:` ancrée. Armer d'emblée changerait donc le
+régime de toute la population d'un coup, et un refus tue le tour **sans aucune
+revue postée** — l'asymétrie que calcule la doc de `validate_qa_ci_coherence`.
+L'interrupteur existe pour que l'ouverture soit une décision datée, pas un effet
+de bord de `make deploy`.
+
+**Le défaut, mesuré (n=1, sur un dépôt sans porte de merge).** Revue directe sur
+`senara-solutions/control-monitor#217`, binaire `8d127552` : à 14:26:21Z
+`gh pr checks` échoue (`Resource not accessible by personal access token`) et le
+garde CI de mika#2455 s'abstient (`qa_ci_coherence_abstained`, `reason
+"gh_failed"`) ; à 14:26:22Z un `pr review 217 --approve` part avec
+`VERDICT: pass` et **aucune** preuve pipeline. control-monitor n'a aucune garde
+exécutable : Step 2D y prescrivait `PIPELINE: not-applicable (…)`. Le merge y est
+manuel, donc l'approbation est restée seule sur la PR, sans contrôle CI ni preuve
+pipeline, jusqu'à ce que samidarko la requalifie en `hold[review]`.
+
+**Ce que ça fait, en une phrase.** Interrupteur ouvert, un `pr review` dont le
+corps porte `VERDICT: pass` sans **aucune** ligne `PIPELINE:` est refusé **avant
+tout sous-processus** (`reason = pass_section_absent`), au même point de chaîne
+que mika#2687. Le refus nomme les **deux** sorties que le prompt prescrit à une
+approbation — la section de Step 2E quand le dépôt a une garde, la forme
+*not-applicable* de Step 2D quand il n'en a pas — et il **décrit** les deux
+formes sans en citer aucune verbatim : un remède portant sa propre ligne
+`PIPELINE:` ancrée satisferait ce garde-ci si le modèle le recollait dans son
+corps suivant.
+
+**Le prédicat est ancré, et c'est le cœur du vol.** `pipeline_section_present`
+lit une ligne qui **commence** par `PIPELINE:` (blancs de tête et course
+d'emphase markdown tolérés, casse repliée) — pas un `contains` sur le corps. Les
+quatre `pass` de mika#2691 que la mesure initiale comptait comme conformes
+portent le mot dans leur **prose** (cette PR implémentait mika#2687 et en parle)
+et **zéro** ligne ancrée : le régime réel est 426/426, pas 422/426. Un `contains`
+compterait la prose d'une revue comme sa preuve, c'est-à-dire exactement le
+fail-open que le ticket condamne. Tenu par
+`mika2961_le_corps_de_2691_contient_le_mot_et_na_pas_la_section`, qui assère les
+**deux** faits sur le même corps mesuré.
+
+**Un `pass` ne paie pas la lecture du ledger d'outils.** Le troisième motif de
+mika#2687 (`no_guard_executed`) reste réservé au membre `block` : une approbation
+ne cite aucun échec, donc la preuve d'exécution n'a rien à corroborer, et la
+requête n'est pas faite. Conséquence lisible en base : le membre `pass` n'écrit
+jamais de ligne `abstained`.
+
+**Le second terme (vol 2), et ce que l'ordre change pour vous.** Interrupteur
+ouvert, un `pass` qui porte bien sa section `PIPELINE:` mais **aucune** ligne
+`NEGATIVE-TEST:` est refusé lui aussi, au même point de chaîne, sous
+`reason = pass_negative_test_absent`. La conjonction est **ordonnée** : la section
+d'abord, la ligne ensuite. Donc un corps qui manque des deux — le régime mesuré,
+et les trois corps du vol 1 — sort toujours en `pass_section_absent`, et
+`pass_negative_test_absent` ne se lit que sur une revue **déjà** à moitié
+conforme. Lire une croissance de ce second motif comme une dégradation serait un
+contresens : c'est la mesure du progrès du premier.
+
+**La mesure du second terme (2026-10-30, 60 dernières PR par dépôt).** **260
+`pass`, zéro ligne `NEGATIVE-TEST:` ancrée, une seule occurrence en `contains`** —
+et cette occurrence est la revue de la PR #2967, le vol 1 lui-même, qui *parle* du
+jeton dans une case de critère d'acceptation. Le contraste `contains`/ancré se
+reproduit donc à l'identique sur le second jeton. Tenu par
+`mika2961_le_corps_de_2967_contient_le_mot_et_na_pas_la_ligne`.
+
+**Le remedy du second terme nomme trois formes sur quatre, et dit pourquoi la
+quatrième n'est pas une sortie.** Le prompt prescrit `satisfied`, `mechanical`,
+`missing` et `n/a` ; le refus décrit les trois premières et nomme la quatrième
+comme **refusée** : `missing` n'est compatible qu'avec un verdict bloquant sur les
+critères d'acceptation, et `self-dev-webhook-qa` (mika#2264) rejette en aval une
+approbation qui la porte. L'écrire coûte donc le merge un cran plus tard au lieu
+de l'acheter — et c'est dit dans le refus, parce qu'un modèle qui cherche la
+sortie la moins coûteuse doit pouvoir la calculer. Comme au vol 1, aucune des
+formes n'est citée verbatim avec son préfixe ancré : un remède que le modèle
+recollerait satisferait le garde. Pinné par
+`le_remedy_de_la_ligne_nomme_les_formes_sans_offrir_la_sortie_contradictoire`.
+
+**Ce que le garde ne vérifie pas, et c'est délibéré.** La **présence** de la ligne,
+rien de plus. Pas la disposition, pas qu'un invariant soit nommé, pas qu'un
+fichier de test l'assère : valider cela, c'est relire la revue, hors de ce que
+peut faire un garde pré-subprocess. Un `pass` portant une ligne
+`NEGATIVE-TEST:` vide de sens passe donc ici.
+
+**Ce que le vol ne ferme pas, et c'est écrit (AC3).** L'abstention de mika#2455
+**reste fail-open**, inchangée — aucune ligne de ce vol ne touche
+`validate_qa_ci_coherence`. Ce qui tient alors le merge fermé sur
+control-monitor, réponse franche : **rien de mécanique**, le merge y est un acte
+humain. Ce que le vol change n'est pas la porte, c'est le **signal** :
+l'enchaînement mesuré du 2026-10-29 — abstention CI puis approbation nue — n'est
+plus postable une fois l'interrupteur ouvert.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Le garde a-t-il refusé un `pass` ? (nom d'événement DISTINCT de celui de
+#    mika#2687 : un refus de `pass` classé sous `pipeline_block_refused`
+#    élargirait en silence une population déjà publiée — mika#2131)
+grep pass_evidence_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, reason, agent_id, session_id}'
+
+# 2. L'interrupteur est-il désarmé ? (une ligne INFO par démarrage — ici c'est le
+#    cas NOMINAL qui parle, et le SILENCE qui veut dire « armé » : polarité
+#    inverse de ses quatre voisines)
+grep pass_evidence_gate_disarmed "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Une valeur d'interrupteur illisible ? (régime attendu : VIDE)
+grep pass_evidence_gate_unrecognized_value "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- CONTRÔLE POSITIF, partagé avec mika#2687 : la garde écrit une ligne sur
+-- TOUTES les issues, `allowed` compris. Une table vide dit « le lien n'est
+-- jamais atteint », jamais « la garde ne refuse rien » (mika#2205).
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'pipeline_grounding_guard' GROUP BY 1, 2;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `pass_evidence_gate_disarmed` | INFO | **non vide avant l'ouverture** | l'état livré ; son absence après `make deploy` veut dire *armé*, ou un binaire antérieur au vol |
+| `reason = pass_section_absent` | WARN | **vide avant l'ouverture, puis décroissant** | la forme mesurée sur cm#217 et mika#2960 |
+| `reason = pass_negative_test_absent` | WARN | **vide avant l'ouverture, puis croissant AVANT de décroître** | le second terme (vol 2) ; l'ordre de la conjonction ne le rend visible qu'une fois la section acquise, donc sa montée mesure le progrès du premier motif, pas une dégradation |
+| `pass_evidence_gate_unrecognized_value` | WARN | **vide** | une faute de frappe laisse désarmé, donc muet autrement |
+| `after_value = 'allowed'` | audit | **non vide après l'ouverture** | le contrôle positif ; son absence seule ne prouve rien |
+
+#### Sonde d'ouverture (AC5), et ses deux haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** (classe mika#2340),
+> et l'interrupteur n'est lu qu'au démarrage. Avant toute conclusion : établir
+> que le `mika-spirit` qui tourne porte le correctif **et** que
+> `pass_evidence_gate_disarmed` a cessé d'apparaître.
+
+**S1 — le compte des `pass` sans ligne `PIPELINE:` et sans ligne
+`NEGATIVE-TEST:` sur 7 jours. Cible : 0 pour les deux.** La requête est celle qui
+a produit les mesures des deux vols, ancrée en début de ligne (`contains` ne
+mesure pas la même population — c'est tout l'objet des deux § ci-dessus, et sur le
+second jeton l'écart est exactement de 1 corps sur 260) :
+
+```sh
+gh pr list --repo senara-solutions/<repo> --state all --limit 60 \
+  --json number,reviews,state \
+  --jq '[.[] | .number as $n | .reviews[]
+         | select(.author.login=="mika-platform-qa")
+         | select(.body|startswith("VERDICT: pass"))
+         | {n:$n,
+            pipe:([.body|split("\n")|.[]
+                   |select(test("^[ \t*_]*[Pp][Ii][Pp][Ee][Ll][Ii][Nn][Ee]:"))]|length),
+            neg:([.body|split("\n")|.[]
+                   |select(test("^[ \t*_]*negative-test:"; "i"))]|length)}]
+        | {pass:length,
+           sans_pipeline:([.[]|select(.pipe==0)]|length),
+           sans_negative_test:([.[]|select(.neg==0)]|length),
+           sans_les_deux:([.[]|select(.pipe==0 and .neg==0)]|length)}'
+```
+
+Les deux termes ne se somment pas : `sans_les_deux` est l'intersection, et c'est
+elle que l'ordre de la conjonction classe sous `pass_section_absent`. Lire
+`sans_negative_test` seul, puis en déduire le compte du second motif, donnerait un
+sur-compte de `sans_les_deux` exactement.
+
+**S2 — le compte des tours QA morts, à côté, sur la même fenêtre.** C'est l'autre
+moitié de la mesure, et elle n'est pas facultative : un `sans_pipeline: 0` obtenu
+en tuant les tours n'est pas un succès. Le numérateur est
+`grep -c pass_evidence_refused`, à rapporter aux PR de la fenêtre dont aucune
+revue `mika-platform-qa` n'est jamais arrivée.
+
+*Halte 1 — un refus sur une approbation qui portait bien sa section.* Désarmer
+(retirer la variable + redémarrage), **puis** diagnostiquer : un garde qui rend
+les revues légitimes impostables coûte plus que le défaut qu'il ferme.
+*Halte 2 — les deux sondes muettes.* Zéro refus **et** zéro ligne `allowed` ne
+prouve rien : il faut qu'un `pass` ait été rendu depuis l'ouverture. *Une garde
+que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne traite pas `NEGATIVE-TEST:`.** La seconde exigence du prompt
+  (mika#2264) part au vol 2/2, avec son propre jeton canonique et son lint :
+  le motif d'une ligne de test négatif n'est pas celui d'une section, et les deux
+  prédicats n'auraient pas la même mesure. Le régime mesuré est le même (0 sur
+  261).
+- **Il ne ferme pas l'abstention de mika#2455** (voir AC3 ci-dessus) : sur un
+  dépôt qui ne merge pas par `pr_merge_with_gate`, rien de mécanique ne tient le
+  merge fermé. Ce vol ferme le signal, pas la porte.
+- **Il ne rétrograde pas en `hold[review]`.** Le ticket proposait « refuse ou
+  plafonne » ; refuser est le bras retenu, comme chez mika#2687 et pour la même
+  raison — les gardes de cette chaîne rendent `Result<(), ToolOutput>` et ne
+  mutent jamais l'argv, donc plafonner voudrait dire réécrire le jugement de
+  l'agent au lieu de le lui rendre. Le remède nomme les sorties, l'agent choisit.
+- **Il ne rattrape aucune des 261 approbations mesurées.** Elles sont publiées.
+  La sonde est la **prochaine** occurrence.
+- **Il n'annonce pas le refus dans le prompt.** `qa-review/system_prompt.md` est
+  à 78 octets de sa porte de taille et la prochaine addition doit le sharder
+  (même report que mika#2687). L'agent rencontre donc le refus sans l'avoir lu
+  dans ses instructions — d'où un `remedy` qui nomme Step 2E et Step 2D
+  explicitement.
+- **Aucune liste d'exemptions, et elle est vide par construction** : aucun label,
+  aucune constante, aucun dépôt ne permet de passer outre. L'échappatoire est la
+  variable ci-dessus, et elle n'est jamais silencieuse.
+
+Raisonnement complet (la position du lien dans la chaîne, la population à deux
+membres et l'inversion de polarité) : `docs/agent-internals/tools.md` § *Un
+`block[pipeline]` cite une garde en échec*.
 
 ### La porte de merge lit TOUS les checks, et cesse de déléguer le vert (mika#2617, phase A)
 
@@ -5025,12 +5800,21 @@ déploiement — et aujourd'hui, ce chemin est presque désert (ci-dessous).
 ### Ce que ce travail n'achète PAS
 
 - **Il ne prouve pas qu'un chemin moteur atteint `claude-pilot` aujourd'hui.**
-  `INTERNAL_REPOS` du gateway (`crates/mika-gateway/src/github.rs:265`) liste
-  encore `senara-solutions/claude-pilot-py` ; si les webhooks portent le nom
-  courant, ils ne routent plus vers `mika-dev`, et la prémisse R8 du plan
-  (« `merge_ready_handler` peut merger une PR claude-pilot ») est à **re-mesurer**.
-  Hors périmètre de la phase C, nommé ici. La garde tient sur les trois sites
-  quel que soit le routage, parce qu'elle est dans le type.
+  Ce constat portait d'abord sur `INTERNAL_REPOS` du gateway, qui listait encore
+  l'ancien nom ; **mika#2666 l'a migré** (`crates/mika-gateway/src/github.rs`,
+  nom courant, sans alias). Et la crainte qui l'accompagnait — « ils ne routent
+  plus vers `mika-dev` » — **était fausse en mono-locataire**, mesuré le
+  2026-10-07 : `is_internal_repo` n'est consulté que pour un dépôt sans ligne
+  `github_repos`, et avec `agent_base_url` posé le fallback rend **la même
+  route**. L'allowlist n'y changeait que le niveau du log (`info!` au lieu de
+  `debug!`) — d'où l'absence de ligne INFO depuis le 2026-07-07, qui ne montrait
+  aucune perte. Les événements claude-pilot atteignaient déjà les agents (review
+  de claude-pilot#281 le 2026-10-02, canal `github`). La prémisse R8 du plan
+  (« `merge_ready_handler` peut merger une PR claude-pilot ») ne dépend donc pas
+  du routage ; ce qui reste à mesurer est qu'une PR claude-pilot atteigne un
+  chemin de merge **moteur**, et ce chemin est presque désert (CC-spawns-only,
+  ci-dessus). La garde tient sur les trois sites quel que soit le routage, parce
+  qu'elle est dans le type.
 - **Il ne ré-enclenche pas le merge quand MPC pose le marqueur.** Aucun webhook
   ne relance la porte sur un commentaire : après le marqueur, le merge est un
   geste (MPC, ou Vincent — c'est déjà la doctrine pour claude-pilot,
@@ -5041,7 +5825,7 @@ déploiement — et aujourd'hui, ce chemin est presque désert (ci-dessous).
   mesurée** sur un fil très long : un marqueur au-delà de ce que `gh` rend
   serait lu `Missing` — fail-closed, jamais ouvert.
 
-### Un tour Webhook Fallthrough ne crée pas de travail par `run_gh` (mika#2573)
+### Le moteur ne crée pas de travail par `run_gh` (mika#2573, élargi par mika#2995)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
 entrée est ici parce que l'opérateur qui voit un `run_gh` refusé sur un tour
@@ -5100,6 +5884,70 @@ ci-dessus.
   chemin de création de travail serait un désarmement par coquille. Le geste de
   désarmement est un **revert**, et le coût d'un faux positif le supporte.
 
+#### Les deux motifs n'ont plus la même population (mika#2995)
+
+**Depuis mika#2995 cette garde ne se lit plus « sur un tour Fallthrough ».** Elle
+se lit par motif, et l'asymétrie EST la décision :
+
+| motif | population refusée | borne |
+|---|---|---|
+| `issue_create` | tours **Webhook Fallthrough** seulement | inchangée depuis mika#2573 |
+| `ready_label_add` | **tout** tour, sans exception de classe | élargie par mika#2995 |
+
+- **Le défaut, mesuré le 2026-10-31 (n=1, trace `0104d923`).** À 16:46:32Z la
+  garde de consentement de mika#2772 refuse un groom forcé sur mika#2958
+  (`forced_dispatch_without_consent`), et **son propre texte de remède prescrit
+  de promouvoir le ticket en posant `ready`**. À 16:51:37Z mika-dev appelle
+  `run_gh ["issue","edit","2958","--add-label","ready"]` avec le `GH_TOKEN` du
+  moteur ; la timeline porte `16:51:38Z labeled mika-platform-dev ready`. À
+  16:52:09Z le groom `d18d6ef1` part — il s'arrête seul sur `auto_skipped` /
+  `already_groomed`, donc aucun dégât, et c'est une chance et non une garde. Le
+  label est retiré à la main à 16:54:19Z.
+
+- **Pourquoi la borne de mika#2573 n'a rien refusé ce jour-là.** Le tour de
+  16:51 était un tour **ordinaire**, pas un Fallthrough. Une garde bornée au
+  domaine Fallthrough est, sur ce défaut, une garde absente.
+
+- **Pourquoi le label et pas l'issue.** `ready` est le consentement positif de
+  l'opérateur au dispatch autonome (mika#841), et la garde de mika#2772 lit
+  seulement sa **présence** — ni qui l'a posé, ni quand. Une identité capable de
+  l'écrire se donne donc elle-même le consentement que cette garde existe pour
+  exiger d'un humain. Le consentement n'existe alors que si l'agent s'abstient :
+  une garde improbable, pas une garde impossible. mika#2995 vol 1 retire la
+  **capacité d'écriture** (voie B) ; la lecture de provenance dans la garde de
+  mika#2772 est le vol 2.
+
+- **L'arbitrage faux positif / faux négatif, refait hors du domaine
+  Fallthrough.** Il tombe du même côté, et c'est ce qui autorise
+  l'élargissement. Un faux positif coûte **un `run_gh` refusé** dont le remède
+  nomme la sortie. Un faux négatif coûte un **groom ou un dispatch que personne
+  n'a autorisé** — 48 tours et 3,40 $ le 2026-10-17, l'incident qui a fait
+  naître mika#2772.
+
+- **Sur la population nominale, le geste retiré était déjà inerte.** Depuis
+  mika#1614 `try_dispatch_pilot_after_groom_success` dispatche dev-pilot
+  **directement**, sans aller-retour par le label ni par le webhook. Et un
+  ticket qui porte déjà `ready` ne produit rien sur un `--add-label` : GitHub
+  n'émet `labeled` que sur une **transition** (mika#2323). Ce qui est retiré est
+  donc une capacité, pas un chemin en service.
+
+- **Le coût, nommé plutôt que découvert.** Un opérateur qui demande en
+  conversation « pose le label `ready` sur #2562 » est **refusé lui aussi**. La
+  promotion se fait depuis sa propre surface — le geste canonique
+  `remove` → `add` du § *Le geste opérateur canonique* reste entier, il quitte
+  seulement le texte que l'agent lit. Une exception « quand c'est un humain qui
+  demande » serait une exception que l'agent se déclare à lui-même, c'est-à-dire
+  pas une exception : la demande arrive dans le message, et le message est ce
+  que l'agent interprète.
+
+- **Le remède de mika#2772 ne prescrit plus le geste (AC3).** Son champ
+  `recovery` **attribue** désormais la promotion à l'opérateur au lieu de la
+  prescrire au lecteur, et conserve mot pour mot sa seconde voie —
+  `mika ask --agent mika-dev "groom <owner/repo>#<n>"`, qui porte une intention
+  de grooming et **traverse** la porte au lieu de la lever (mika#1173). Un refus
+  doit nommer sa levée (mika#2520) : la correction porte sur le mode, pas sur la
+  présence du label dans le texte.
+
 #### SQL
 
 ```sql
@@ -5128,7 +5976,12 @@ un **format de fil** à site de définition unique, épinglé par test.
 ```bash
 # 1. La garde a-t-elle mordu, et sur quel motif ?
 grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
-  | jq -c '{agent_id, session_id, trace_id, motif, verb, label}'
+  | jq -c '{agent_id, session_id, trace_id, motif, verb, label, turn_is_fallthrough}'
+
+# 1b. Les deux sous-populations, séparées sans découper la mesure (mika#2995)
+grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -s 'group_by([.motif, .turn_is_fallthrough]) | map({motif: .[0].motif,
+      turn_is_fallthrough: .[0].turn_is_fallthrough, n: length})'
 
 # 2. La sonde du ticket : quel acteur a posé `ready` ?
 grep ready_label_received "$MIKA_SPIRIT_LOG_FILE" \
@@ -5142,8 +5995,10 @@ grep webhook_fallthrough_turn "$MIKA_SPIRIT_LOG_FILE" \
 | surface | régime attendu | lecture |
 |---|---|---|
 | `fallthrough_work_creation_blocked` | **non vide, faible** | chaque ligne est une création de travail que le moteur a arrêtée |
-| `after_value = 'ready_label_add'` | non vide, faible | le vecteur de dispatch mesuré le 2026-09-28 |
+| `after_value = 'ready_label_add'` | non vide, faible | le vecteur de dispatch mesuré le 2026-09-28, puis le self-consent du 2026-10-31 |
 | `after_value = 'issue_create'` | non vide, faible | le substitut mesuré à `create_task` |
+| `ready_label_add` avec `turn_is_fallthrough: false` | **attendu depuis mika#2995** | la sous-population que la borne de mika#2573 laissait passer — c'est l'incident du 2026-10-31, et une occurrence ici est la garde qui **marche** |
+| `issue_create` avec `turn_is_fallthrough: false` | **vide** | cette combinaison n'est pas atteignable : `issue_create` garde sa borne. Une ligne ici est un élargissement non voulu — lire `work_creation_is_refused` |
 | `webhook_fallthrough_turn` | non vide | **le contrôle positif** : zéro refus avec zéro tour ne prouve rien (mika#2205) |
 | une même session portant plusieurs refus | **anomalie** | le modèle insiste ; lire le prompt servi **avant** de toucher au prédicat |
 | `fallthrough_work_creation_audit_failed` | **vide** | le WARN est passé, la ligne d'audit non — le `GROUP BY` est alors incomplet |
@@ -5154,7 +6009,18 @@ mesuré (classe mika#2304). `webhook_fallthrough_turn` la porte déjà **sous le
 même `trace_id`** — une ligne dit *quel tour*, l'autre *ce qu'il a tenté*, et le
 `trace_id` les joint exactement.
 
-#### Sondes post-déploiement, et leurs quatre haltes
+**Le nom d'événement n'a PAS changé avec mika#2995, et `turn_is_fallthrough` est
+un champ, pas un second nom.** Deux noms ne se soustraient pas (mika#2205), et
+la jointure par `trace_id` avec `webhook_fallthrough_turn` ci-dessus n'en
+joindrait plus que la moitié — les refus hors domaine n'ont pas de tour
+Fallthrough à joindre, et c'est précisément ce que le champ dit. C'est le
+`group_by([.motif, .turn_is_fallthrough])` de la recette 1b qui sépare les
+sous-populations, sans découper la mesure en deux instruments dont aucun ne
+répond « combien de créations de travail le moteur a-t-il arrêtées ? ».
+L'**absence** du champ sur une ligne signifie un binaire antérieur à mika#2995
+(classe mika#2340), jamais un tour non-Fallthrough.
+
+#### Sondes post-déploiement, et leurs cinq haltes
 
 > **Préalable à toutes.** `skills/bundled/` est une projection du **binaire**,
 > pas du checkout (mika#2340). `cat ~/.mika/skills/.manifest-writer` doit porter
@@ -5180,18 +6046,49 @@ est inférieur à celui d'une lecture refusée en boucle.
 
 **S3 — la sonde du ticket (30 jours).** Chaque `ready_label_received` portant
 `actor: mika-platform-dev` est attribuable à `auto_pull` Phase 2 (remove → add),
-jamais à une session conversationnelle dont le tour est un Fallthrough.
-*Halte 3 — un refus apparaît sur un tour qui n'est **pas** Fallthrough :* c'est
-le **prédicat de classe du tour** qui est mal lu, pas la liste de verbes. Lire le
+jamais à une session conversationnelle.
+*Halte 3 — un `issue_create` refusé apparaît avec `turn_is_fallthrough: false` :*
+c'est le **prédicat de classe du tour** qui est mal lu, ou la population de ce
+motif qui a été élargie par inadvertance. Lire d'abord
+`work_creation_is_refused` (le motif décide, le tour est son paramètre), puis le
 message servi (`is_webhook_fallthrough_domain` refuse `[GitHub] PR `,
-`[GitHub] Check suite ` et le marqueur ready-label) **avant** de toucher au
+`[GitHub] Check suite ` et le marqueur ready-label) — **avant** de toucher au
 prédicat argv.
+*Ce qui n'est PAS une halte depuis mika#2995 :* un `ready_label_add` refusé avec
+`turn_is_fallthrough: false`. C'est la sous-population pour laquelle ce vol
+existe, et une occurrence y est la garde qui mord. Jusqu'à mika#2995 cette
+même ligne était la halte 3 ; elle est aujourd'hui le résultat attendu.
 
 **S4 — le résidu `run_shell` (30 jours).** La requête SQL n°3 ci-dessus.
 *Halte 4 — elle rend des lignes :* le vecteur est réel et mesuré ; le ticket de
 suivi s'ouvre **avec ce compte**, jamais avec une intuition. Zéro ligne est un
 **résultat** — il dit que le modèle n'emprunte pas cette route — et non une
 preuve que la route est fermée.
+
+**S5 — la sonde de l'AC5 (30 jours, à reporter sur mika#2995).** Le compte
+d'événements `labeled ready` dont l'acteur est l'identité du moteur. Cible **0**,
+ou **chaque cas refusé par la garde** — les deux sont des succès, et ce ne sont
+pas les mêmes : zéro dit que le geste n'est plus tenté, un refus compté dit que
+la garde l'arrête. Les deux moitiés de la jointure :
+
+```bash
+# a) côté forge — qui a posé `ready`, sur les 30 derniers jours
+gh api 'repos/senara-solutions/mika/issues/events?per_page=100' --paginate \
+  | jq -c '.[] | select(.event == "labeled" and .label.name == "ready")
+             | {created_at, actor: .actor.login, issue: .issue.number}'
+
+# b) côté moteur — ce que la garde a arrêté sur la même fenêtre
+grep fallthrough_work_creation_blocked "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.motif == "ready_label_add") | {trace_id, turn_is_fallthrough}'
+```
+
+*Halte 5 — (a) rend une pose par `mika-platform-dev` sans ligne correspondante
+en (b) :* une route non couverte a servi. **Ne pas élargir le prédicat argv par
+réflexe** — établir d'abord le déploiement (préalable ci-dessus), puis *quelle
+porte* : `run_shell` (le résidu de S4 ci-dessus), `gh pr edit --add-label` (hors
+population, § *Hors périmètre*), ou `auto_pull` Phase 2, qui est **légitime** et
+dont la signature est un `remove` immédiatement suivi d'un `add` sur le même
+ticket. Cette dernière est la raison pour laquelle (a) seul ne conclut rien.
 
 **Halte transverse — les deux sondes muettes.** Zéro refus et zéro tour
 Fallthrough ne prouve **rien** : vérifier le contrôle positif avant toute
@@ -5212,7 +6109,40 @@ garde qui marche* (mika#2205).
 - **Il ne rattrape pas l'incident du 2026-09-28.** L'issue #2571 existe et le
   dispatch `53a10c4a` a eu lieu ; **rien ici ne rétro-estampille** — fabriquer
   une ligne décrivant un fait qu'on n'a pas observé est l'inverse de ce que ce
-  travail défend. La sonde est la **prochaine** occurrence.
+  travail défend. La sonde est la **prochaine** occurrence. Idem pour le
+  2026-10-31 : le groom `d18d6ef1` est parti, et qu'il se soit arrêté seul sur
+  `already_groomed` est une chance, pas une garde.
+- **Il ne fait pas lire la provenance de `ready` à la garde de mika#2772
+  (mika#2995 vol 2).** Un `ready` posé par l'identité du moteur — par une route
+  que ce vol ne couvre pas, ou par un binaire antérieur au déploiement — **vaut
+  toujours consentement** pour cette garde, qui lit la seule présence du label.
+  Ce vol retire la capacité d'écriture ; il ne change pas la lecture. C'est
+  l'AC2 du ticket, et c'est ce qui rend la sonde S5 porteuse plutôt que
+  décorative.
+  - **La précondition du vol 2, nommée ici pour qu'il ne la redécouvre pas.**
+    Lire la provenance, c'est poser un **filtre d'identité**, et la doctrine
+    mika#2323 le déclare hors périmètre par construction au site voisin :
+    l'acteur traverse bien la frontière depuis ce ticket, mais
+    `mika2323_no_gate_predicate_reads_the_actor` (allowlist **vide**, contrôle
+    positif `mika2323_the_actor_guard_bites_on_a_planted_read`) refuse qu'un
+    prédicat de refus le lise, et son doc-comment dit la résolution :
+    *« remove the read »*, une entrée d'allowlist étant une décision de
+    politique qui exige son propre ticket. Ce scan est **borné au fichier**
+    `src/server/ready_label_handler.rs`, donc il ne refuse pas de lui-même la
+    lecture que le vol 2 ferait dans `executor.rs` — mais il dit à quel prix :
+    le vol 2 est le ticket qui décide cette politique, pas un correctif qui la
+    suppose.
+  - **Décision du 2026-11-01 : la politique est décidée, et c'est « non ».**
+    L'AC2 a été **réécrite sous la voie B** par Vincent. Le vol 2 n'a posé
+    aucun filtre d'identité dans la garde, et n'a ajouté aucune entrée à
+    `ACTOR_READING_PREDICATES_ALLOWED`, qui reste `&[]`. La garde de mika#2772
+    lit donc **toujours** la seule présence du label, et c'est le périmètre
+    d'écriture qui porte la sûreté — voir § *Les cinq écrivains de `ready`*
+    ci-dessous. Ce qui précède reste vrai comme **état du vol 1** ; ce n'est
+    plus une précondition en attente.
+- **Il ne retire pas `ready` d'un ticket qui le porte déjà.** Rien ne nettoie
+  rétroactivement, et GitHub n'émet `labeled` que sur une transition
+  (mika#2323) : un ticket promu avant le déploiement reste promu.
 - **Il ne surveille rien.** Les seuls instruments sont les greps et les requêtes
   ci-dessus, et **leur silence ne prouve rien tant que personne ne les
   exécute** — d'où le contrôle positif sur `webhook_fallthrough_turn`, sans
@@ -5230,6 +6160,128 @@ garde qui marche* (mika#2205).
 - **La classification `marker_class` sur la ligne de refus** — refusée : la
   jointure par `trace_id` la donne, et l'inventer serait un champ qui affirme ce
   qu'on n'a pas mesuré.
+
+### Les cinq écrivains de `ready`, et les deux détecteurs qui les tiennent (mika#2995 vol 2)
+
+**Aucune variable d'environnement, aucune migration, aucune surface opérateur
+neuve.** Cette entrée est ici parce que c'est le voisinage où l'on cherche :
+elle dit *qui* peut écrire le consentement que la garde ci-dessus exige, et
+*quels tests* refusent qu'un sixième écrivain apparaisse en silence.
+
+#### Le recensement (AC2c)
+
+Cinq sites écrivent `ready`. Quatre passent par l'applicateur unique
+(`ready_label::apply_ready` / `apply_ready_with_timeline`, mika#2315) ; le
+cinquième ne passe pas par lui, délibérément.
+
+| site | porte d'entrée | le ticket porte-t-il déjà `ready` ? | crée-t-il un consentement que personne n'a donné ? | vol 2 |
+|---|---|---|---|---|
+| `auto_pull.rs` — `phase0_feeder` | tick `auto_pull`, après `promotion_gate_allows` | **non** (le feeder promeut) | **oui** | **nomme** |
+| `auto_pull.rs` — `phase1_idle_pull` | tick `auto_pull` | **non** (filtre inverse de la phase 2) | **oui** | **nomme** |
+| `auto_pull.rs` — `phase2_stuck_rescue` | tick `auto_pull`, filtre 1 = porte `ready` | **oui** | **non** — il **repose**, il ne crée pas | rien à faire |
+| `server/milestone_context_handler.rs` — `milestone_phase_cascade` | handler webhook, après `classify_dispatch_seat` | **non** (cascade M4) | **oui** | **nomme** |
+| `milestone_manager/pool_writer.rs` — `admit_pool_tickets` | tick manager, `MIKA_MANAGER_POOL_WRITE` **OFF** par défaut | **non** (l'admission promeut) | **oui**, et **sans consulter le parc** | **nomme + rend visible** (D2) |
+
+**Pourquoi les quatre premiers sont nommés et non fermés.** Les phases 0 et 1 et
+la cascade M4 créent bien un consentement que personne n'a donné, et *c'est la
+promotion déléguée de la boucle autonome* : mika#841 définit `ready` comme le
+consentement positif de l'opérateur, mika#1824 délègue au moteur le droit de le
+poser au nom d'une politique que l'opérateur a armée en amont. Les fermer
+tuerait le feeder et la cascade.
+
+**Ce n'est pas une échappatoire, parce que l'incident n'est pas là.** Le défaut
+du 2026-10-31 n'est pas « le moteur pose `ready` » : c'est « **l'agent, dans son
+tour LLM, pose le `ready` qui lève la garde qui venait de le retenir** ». Les
+quatre sites gouvernés sont atteignables depuis un corps de tick ou un handler
+webhook, et depuis rien d'autre. C'est cette propriété que le détecteur D1 rend
+structurelle au lieu de la laisser vraie par accident.
+
+**La phase 2 d'`auto_pull` est la seule qui ne demande rien (AC2b).** Son filtre
+nº 1 *est* la porte `ready` : elle ne considère qu'un ticket qui le porte déjà,
+et son `remove` + `add` **repose** un consentement existant. Elle ne peut donc
+pas en créer un, et le vol 2 n'y touche pas — ni code, ni halte.
+
+#### Les deux détecteurs, et comment les lire quand ils rougissent
+
+Tous deux vivent dans `crates/mika-agent/src/ready_label.rs § mod tests`, à côté
+du test 13 (`no_ready_label_write_outside_this_module`), qui reste **intact**.
+Trois détecteurs, trois populations : deux populations sous un même nom ne se
+soustraient pas (mika#2205), donc chacun porte son nom, sa question et sa
+disposition.
+
+| détecteur | question | population | disposition quand il rougit |
+|---|---|---|---|
+| test 13 (mika#2315) | une écriture de `ready` existe-t-elle hors de ce module ? | tout `src/**/*.rs`, label et poseur sur la **même ligne** | router par l'applicateur |
+| **D1** `mika2995_aucune_surface_doutil_natteint_lapplicateur_de_ready` | une **surface d'outil** atteint-elle l'applicateur ? | `tools/**`, `skills/builtin_handlers.rs`, `skills/executor.rs` | **retirer l'appel** — jamais l'allowlister (mika#2201) |
+| **D2** `mika2995_une_ecriture_de_ready_en_forme_argv_est_declaree` | une écriture de **forme argv** est-elle non déclarée ? | toute la production hors `ready_label.rs`, fenêtre de ±2 lignes | router par l'applicateur ; une entrée nouvelle est une décision d'opérateur |
+
+**D1 — l'allowlist est livrée vide et le reste.** `TOOL_SURFACE_APPLICATOR_EXCEPTIONS`
+est `&[]`, et `mika2995_lallowlist_de_surface_est_vide` rougit à la première
+entrée. L'applicateur est gouverné **pour le parc**, jamais pour le tour LLM :
+le parc dit *ce ticket est-il dé-promu*, il ne dit jamais *qui demande*. Un
+handler d'outil qui l'appelle rend la voie B fausse — il redonne à l'agent le
+geste du 2026-10-31 par une autre porte.
+
+**D2 — une seule entrée déclarée, et elle expire d'elle-même.**
+`ARGV_READY_WRITERS_DECLARED` porte `src/milestone_manager/pool_writer.rs` avec
+le fait précis dans le littéral : décision groupée `--add-label ready` +
+`--milestone`, hors applicateur **par conception**, donc aveugle au parc, bornée
+par `MIKA_MANAGER_POOL_WRITE` OFF. L'assertion auto-nettoyante exige que chaque
+entrée **porte encore** la forme argv : router ce site par l'applicateur, le
+supprimer ou le renommer fait rougir le test en demandant le retrait de
+l'entrée. *Le geste qui rend l'exception inutile est celui qui la fait expirer*
+— c'est ce qui l'empêche de devenir l'allowlist que mika#2309 condamne.
+
+**Pourquoi D2 existe, et ce que le test 13 ne pouvait pas voir.** Le test 13
+exige le label et le nom d'un poseur sur la **même ligne**. La forme argv les
+sépare :
+
+```rust
+args.push("--add-label");
+args.push(READY_LABEL);
+```
+
+Aucune ligne ne porte les deux : le test 13 est donc vert sur une écriture
+réelle, `pool_writer.rs:156`. Ce n'est pas un défaut du test 13 — sa question est
+autre — mais c'est la classe mika#2578/mika#2752 : une garde qui ne refuse rien
+pour une **forme entière** passe la revue et passe la CI par construction.
+
+**Le verbe tranche, et c'est ce qui évite un faux positif réel.** Les drapeaux
+d'`issue create` (`--label`, `-l`) sont aussi ceux d'`issue list`.
+`milestone_manager/reader.rs` **compte** le bassin `ready` du dépôt avec
+`gh issue list --label ready` et n'écrit rien. D2 excuse donc un drapeau ambigu
+quand son argv nomme un verbe de lecture (`ARGV_READ_VERBS`), et **seulement**
+alors : la polarité est fail-closed, un `--label=ready` dont aucun verbe n'est
+lisible est refusé plutôt qu'excusé. Si vous retirez ce prédicat, D2 rougit sur
+le compteur de la porte de place — et c'est exactement comme ça qu'un détecteur
+finit désarmé. Le contrôle `mika2995_le_scan_argv_rougit_sur_une_ecriture_plantee`
+le tient : trois syntaxes plantées sur deux lignes, et trois silences exigés (un
+`use READY_LABEL` sans drapeau, un `--add-label` portant un autre label, la forme
+de `reader.rs`).
+
+#### Ce que ce vol n'achète PAS
+
+- **La garde de mika#2772 ne lit toujours pas la provenance.** C'est la décision
+  du 2026-11-01, pas un oubli : voir la puce *Décision du 2026-11-01* du § ci-dessus.
+- **`pool_writer` n'est pas routé par le parc.** Le faire changerait un
+  comportement voulu (la décision groupée) et relève de l'ouverture de
+  `MIKA_MANAGER_POOL_WRITE`, que le doc de module de `pool_writer` pré-déclare
+  sous `Fire-Disposition: cinquième applicateur découvert`. L'interrupteur reste
+  OFF : aucun ticket non parqué ne peut être écrit par ce chemin aujourd'hui.
+- **Deux textes de remède nomment encore le geste.**
+  `skills/executor.rs` — `recovery` de `dispatch_grooming_not_verified`
+  (« re-apply the `ready` label ») et de `DISPATCH_NO_GROOMING_MARKER`
+  (« or re-apply the `ready` label »). Ce ne sont pas des routes d'écriture :
+  zéro capacité, de la prose dans un payload d'erreur, et les deux s'adressent
+  d'abord à l'opérateur qui lit l'erreur d'outil. Depuis le vol 1 le moteur ne
+  *peut* plus exécuter ce geste, donc ces deux phrases décrivent à l'agent une
+  route morte (classe mika#2520). Les corriger serait un amendement d'AC3 —
+  décision de Vincent.
+- **Aucun des deux détecteurs ne voit un comportement.** Un site qui lirait le
+  bon champ et n'écrirait jamais reste invisible à un scan de source ; c'est
+  pourquoi l'AC2 est aussi tenue par un test de comportement,
+  `mika2995_un_ready_humain_laisse_passer_le_groom_force_et_son_absence_le_refuse`
+  (`skills/executor.rs § mod mika2772_consentement_force`).
 
 ### Un dispatch ouvert par un événement PR est borné à la lignée de cet événement (mika#2649)
 
@@ -5339,9 +6391,9 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 | `create_task` | **oui** | oui, mais **transitivement suffisant** | **non fermé, et c'est raisonné** : une tâche créée sans dispatch ne lance aucun processus et ne consomme aucun créneau ; la fermer séparément demanderait la charge utile que R6 refuse, pour un dommage que le terme de lignée intercepte au seul endroit où il devient réel. `4df82c3a` existe encore et n'a rien coûté d'autre qu'une ligne |
 | `update_task_status` | oui | **non** | une transition d'état ne lance rien — et l'en priver **casserait M4**, dont l'étape 1 *est* un `update_task_status` sur le frère suivant |
 | `cancel_task` | oui | **OUI — et c'est le second cas mesuré** | **suivi mika#2653** : c'est lui qui a tué `8a3b2082` et jeté 71 tours (trace `8ec6364c-be71-11f1-908b-e931f18d2c16`). Son remède n'est pas un terme de cible mais un terme de **vivacité** (`live_pilot`, mika#2279) ; ce qui le sort d'ici est le rayon de souffle — un faux refus d'annulation retire à l'opérateur son geste de reprise le plus court — et le cinquième booléen sur `ToolContext` |
-| `promote_deferred_callback` | oui | oui | **suivi mika#2654**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici, avec sa précondition — **zéro occurrence mesurée**, et armer une garde sur une population vide produirait un détecteur dont le silence ne prouve rien (mika#2205) |
+| `promote_deferred_callback` | oui | oui | **fermé par mika#2654**, même famille : il force la promotion d'un wrapper, donc il **choisit** quel dispatch prend le créneau. Absent du recensement du ticket ; ajouté ici avec sa précondition — **zéro occurrence mesurée à la rédaction**, levée depuis : mesure du 2026-10-07 (73 appels / 58 sessions sur 30 j, dont 27 sessions de canal `github` pour 33 appels et 10 promotions réussies). La même mesure a **écarté le terme de lignée** pour cet outil — les 10 réussites sont toutes dans la lignée de l'événement, donc la population de refus d'une garde de lignée serait vide (mika#2205) — et le remède retenu est un terme de **classe de tour** : refus sur un tour PR / check-suite |
 | `pr_merge_with_gate` | oui | non | sa cible **est** la PR, par la forme de son entrée |
-| `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573), bornée au domaine Fallthrough |
+| `git_ops`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | ne touchent pas le plan de dispatch. `run_gh` porte déjà sa propre garde de création de travail (mika#2573) : `issue create` bornée au domaine Fallthrough, la pose de `ready` sur tout tour (mika#2995) |
 
 ### Sondes post-déploiement, et leurs cinq haltes
 
@@ -5452,12 +6504,19 @@ Raisonnement complet, les six rectifications et les deux scans structurels :
 `crates/mika-agent/CLAUDE.md` § *Un dispatch ouvert par un événement PR est borné à
 sa LIGNÉE*.
 
-### `cancel_task` n'annule pas un pilote vif depuis un tour webhook PR (mika#2653, phases A et B)
+### `cancel_task` n'annule pas un pilote vif, dans aucune classe de tour (mika#2653 phases A et B, mika#2763)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette
 entrée est ici parce qu'elle est le second cas mesuré de la famille ci-dessus —
 même jour, même classe, et le plus coûteux des deux — et parce que l'opérateur
 qui lit un `cancel_task` refusé cherche dans ce voisinage.
+
+**Lire cette section dans l'ordre : mika#2653 l'a écrite pour la population des
+tours webhook PR, mika#2763 a supprimé ce terme.** Le prédicat ne lit plus la
+classe du tour ; tout ce qui suit décrit la garde telle qu'elle est, et le
+§ *mika#2763 — la garde devient inconditionnelle* ci-dessous dit ce qui a bougé
+et pourquoi. Les tables de recensement de mika#2653 restent telles quelles : ce
+sont des mesures datées, pas des descriptions de l'état courant.
 
 - **Le défaut, mesuré le 2026-10-02.** Trace
   `8ec6364c-be71-11f1-908b-e931f18d2c16` : un tour mika-dev ouvert par un
@@ -5520,28 +6579,35 @@ qui lit un `cancel_task` refusé cherche dans ce voisinage.
 
   | | faux `Alive` (refus à tort) | faux `None` (passage à tort) |
   |---|---|---|
-  | coût | **un appel d'outil refusé** dans un tour webhook | **71 tours jetés** (mesuré) |
+  | coût | **un appel d'outil refusé** dans un tour, quelle qu'en soit la classe | **71 tours jetés** (mesuré) ; **un groom de 4 min détruit** (mika#2763, 2026-10-17) |
   | visibilité | `tool_calls.output` + un WARN + une ligne d'audit | aucune ligne, le pilote meurt |
-  | boucle ? | **non** — un refus d'outil ne se rejoue pas tout seul, et aucune garde `required_tools` ne réclame `cancel_task` | oui — le défaut se rejoue à chaque webhook |
-  | geste opérateur | **intact sur ses trois chemins** (R5) | — |
+  | boucle ? | **non** — un refus d'outil ne se rejoue pas tout seul, et aucune garde `required_tools` ne réclame `cancel_task` | oui — le défaut se rejoue à chaque occurrence |
+  | geste opérateur | **intact sur ses deux chemins sans `ToolContext`** (R5 : CLI, HTTP) | — |
   | rattrapage | le modèle rend la main, le callback arrive de lui-même | aucun : le travail est détruit |
+
+  **L'asymétrie ne tient pas à la classe du tour** — c'est ce que mika#2763 a
+  constaté : elle tient à ce qu'un refus est réversible et qu'un kill ne l'est
+  pas. Ce qui vaut dans un tour webhook vaut dans un tour silencieux.
 
 - **Le coût de ce choix, nommé plutôt que découvert.** Une ligne portant un
   `process_id` **sans** `process_start_time` lisible ne pourra pas être annulée
-  depuis un tour webhook PR. C'est la population que mika#2335 compte sous
+  par un modèle, **dans aucune classe de tour** depuis mika#2763. C'est la
+  population que mika#2335 compte sous
   `unusable_child_count`, celle que le faucheur mika#2249 **décline** et que le
   watchdog #959 ne peut pas juger — donc le refus peut durer jusqu'à ce que
   `timeout_at` (panic-fallback 6 h) rende la ligne terminale. Borné, mesuré par sa
-  propre valeur d'audit, et l'opérateur garde ses trois chemins.
-  **L'arbitrage est local et ne se transporte pas.**
+  propre valeur d'audit, et l'opérateur garde ses deux chemins sans
+  `ToolContext`. **L'arbitrage est local et ne se transporte pas.**
 
 - **La garde est dans l'outil, jamais dans `cancel_task_and_kill`** — c'est ce qui
-  préserve les trois chemins opérateur **par construction** plutôt que par
-  prédicat. Placement : après la validation d'existence et de portée, **avant**
-  toute écriture de statut et tout signal. Le terme de classe de tour est **dans
-  le prédicat pur**, jamais une branche de l'appelant (forme mika#2649) : « hors
-  tour webhook PR, rien ne change » est ainsi une propriété de la fonction, avec
-  son propre test.
+  préserve les chemins opérateur **par construction** plutôt que par prédicat.
+  Placement : après la validation d'existence et de portée, **avant** toute
+  écriture de statut et tout signal. Le prédicat est **pur**, jamais une branche
+  de l'appelant (forme mika#2649) : ce que la fonction décide est une propriété
+  de la fonction, avec son propre test. Depuis mika#2763 il n'y a plus de terme
+  de classe de tour à y mettre — deux chemins opérateur restent hors garde
+  (CLI, HTTP), et c'est leur **absence de `ToolContext`** qui les en sort, pas un
+  prédicat.
 
 - **Le corps du refus nomme la levée sans donner de gabarit** (doctrine mika#2520
   / mika#2292) : le fait (un pilote travaille sous cette tâche, et quelle ligne
@@ -5552,7 +6618,49 @@ qui lit un `cancel_task` refusé cherche dans ce voisinage.
   gabarit du contournement. Épinglé par
   `mika2653_le_refus_ne_nomme_aucun_contournement`.
 
-#### AC4 — recensement : qui peut encore toucher un pilote vif depuis un tour webhook PR
+#### mika#2763 — la garde devient inconditionnelle
+
+**Le défaut, mesuré le 2026-10-17 à 07:59:38Z.** Un tour **silencieux** de
+mika-dev (`trigger=deferred_dispatch`), ouvert pour lancer le regroom de
+mika#2752, a trouvé la place groom tenue par le callback groom **vivant** de
+mika#2757, lancé à 07:55:25Z — **4 minutes**. Il l'a déclaré « stale (>1h, no
+output, no PR, no Plan callout) », l'a annulé, puis a promu son propre lanceur
+différé. Le « >1h » était l'âge du **parent** (06:41:38Z), seule date qu'il
+pouvait lire : `check_task` refuse les tâches non manuelles, donc l'âge du
+callback lui était structurellement inaccessible. mika#2757 est resté
+`in_progress` sans enfant actif.
+
+**Ce que la garde de mika#2653 ne couvrait pas, et pourquoi.** Son prédicat
+portait deux termes : `ctx.is_webhook_pr_event_turn` **et** la vivacité. Un tour
+silencieux pose ce booléen à `false` — comme les vingt sites de construction qui
+ne le calculent pas, seul `agent_loop/mod.rs` le dérive — donc la garde ne
+s'armait pas. **mika#2763 a retiré le terme de classe de tour** : le prédicat ne
+lit plus que la vivacité, et refuse dans tout tour qui traverse un
+`ToolContext`.
+
+**La borne de mika#2517 / mika#2573 restait exacte, et c'est ce qui l'a rendue
+trompeuse.** La population « webhook servi en silencieux » est bien vide ; le
+tour de l'incident n'en faisait pas partie — il n'était pas un webhook du tout.
+Le coût n'est pas venu du cas limite que la borne décrivait, il est venu du cas
+nominal. Leçon pour toute garde future : ce booléen borne ce qu'un **événement
+PR autorise** et rien d'autre. Une garde dont le faux-passage **détruit du
+travail** n'a pas sa place dessus (mika#2763 en a retiré une) ; une garde sur
+l'**étendue d'une autorisation** y a la sienne (mika#2654 en est une — section
+dédiée ci-dessous, et c'est désormais le **seul** lecteur production du
+booléen).
+
+**Un renommage d'événement, à connaître avant de grepper** (table de migration
+en fin de section) : le contrôle positif ne s'appelle plus
+`cancel_task_webhook_turn_allowed` — ce nom affirmait une population qui n'existe
+plus — mais `cancel_task_pilot_absent`. Les quatre `after_value` d'audit sont
+**inchangés**, `allowed_no_pilot` compris : ce sont le format de fil, et
+`complete_task` les importe (mika#2739).
+
+#### AC4 — recensement daté du 2026-10-03 : qui pouvait toucher un pilote vif depuis un tour webhook PR
+
+**Mesure, pas description de l'état courant.** La ligne `cancel_task` ci-dessous
+est fermée dans **toute** classe de tour depuis mika#2763 ; les autres lignes
+n'ont pas été remesurées.
 
 Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 `FALLTHROUGH_WITHHELD_TOOLS` ne s'y applique pas et `create_task` y est servi.
@@ -5562,7 +6670,7 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 | `cancel_task` | oui | **OUI — le vecteur mesuré** | **fermé par cette PR** |
 | `cancel_reminder` | oui | oui (délègue à `CancelTaskTool`) | **fermé** — même site, R4 |
 | `update_task_status` → `cancelled` | oui | **ne le tue pas, mais l'ORPHELINE** (ligne terminale, classe mika#2279) | **non couvert** — dommage et remède distincts. **Suivi** (R6) |
-| `promote_deferred_callback` | oui | choisit quel dispatch prend le créneau | **suivi mika#2654**, population mesurée vide |
+| `promote_deferred_callback` | oui | choisit quel dispatch prend le créneau | **fermé par mika#2654** — population mesurée depuis (2026-10-07), terme de classe de tour, section dédiée ci-dessous |
 | `run_claude_pilot{,_groom}` | oui | borné à sa lignée | **fermé par mika#2649** |
 | `run_shell` | oui | oui, par la commande d'annulation du CLI | **non couvert**, population mesurée vide. **Suivi** (R6) |
 | `complete_task`, `create_task`, `run_gh`, `send_message`, `list_tasks`, `check_task` | oui | non | hors population |
@@ -5571,7 +6679,8 @@ Rappel porteur : ces tours sont **hors** du domaine Fallthrough, donc
 refusé par le ticket, et pour la raison que mika#2484 a déjà dû écrire sur
 `run_gh` — une retenue casse un geste légitime que le prompt prescrit, ici
 l'annulation d'un dispatch réellement perdu. La retenue est **indisponible**, le
-refus **conditionnel** est la seule forme qui reste.
+refus **sur un fait vérifiable** est la seule forme qui reste — conditionné à la
+classe du tour en mika#2653, conditionné à la seule vivacité depuis mika#2763.
 
 #### Surfaces opérateur
 
@@ -5584,7 +6693,13 @@ grep cancel_task_live_pilot_blocked "$MIKA_SPIRIT_LOG_FILE" \
 grep cancel_task_pilot_unreadable "$MIKA_SPIRIT_LOG_FILE" | jq -c '{task_id, reason}'
 
 # 3. CONTRÔLE POSITIF — la garde tourne-t-elle seulement ?
-grep -c cancel_task_webhook_turn_allowed "$MIKA_SPIRIT_LOG_FILE"
+#    mika#2763 a renommé cet événement :
+#      avant : cancel_task_webhook_turn_allowed  (population « tour webhook PR »)
+#      après : cancel_task_pilot_absent          (le fait : aucun pilote sous la tâche)
+#    Un zéro sur l'ANCIEN nom ne dit plus rien ; un zéro sur le nouveau veut dire
+#    soit « la garde n'a jamais tourné », soit « le binaire servi est antérieur
+#    au correctif » (classe mika#2340) — c'est `mika --version` qui tranche.
+grep -c cancel_task_pilot_absent "$MIKA_SPIRIT_LOG_FILE"
 ```
 
 ```sql
@@ -5608,19 +6723,28 @@ SELECT created_at, session_id, substr(input, 1, 200)
 | `blocked_live_pilot` | WARN | **zéro** | chaque ligne est un pilote vif que le moteur n'a pas tué |
 | `blocked_db_unreadable` | WARN | **zéro** | la base ne répond pas — c'est **elle** qu'il faut lire, pas la disposition qu'il faut inverser |
 | `blocked_start_time_unreadable` | WARN | **zéro** | l'instance n'est pas prouvable (population `unusable_child_count`, mika#2335) |
-| `allowed_no_pilot` | INFO | **non vide, faible** | **le contrôle positif** : la garde tourne et laisse passer |
+| `allowed_no_pilot` | INFO | **non vide** — et **plus fourni depuis mika#2763** | **le contrôle positif** : la garde tourne et laisse passer. Événement journal `cancel_task_pilot_absent` (avant mika#2763 : `cancel_task_webhook_turn_allowed`) |
 | `cancel_task_pilot_guard_audit_failed` | WARN | **vide** | la ligne de journal est passée, l'audit non — le `GROUP BY` sous-compte à partir de là |
 
 **Le contrôle positif n'est pas décoratif.** Sans `allowed_no_pilot`, zéro ligne
-aurait **trois** causes indistinguables : aucun refus (sain), aucune annulation
-depuis un tour webhook (sain), binaire antérieur au correctif (classe mika#2340).
+aurait **trois** causes indistinguables : aucun refus (sain), aucun appel de
+`cancel_task` du tout (sain), binaire antérieur au correctif (classe mika#2340).
 *Une garde que personne n'a exercée se lit exactement comme une garde qui marche*
 (mika#2205).
 
-**Rien n'est audité hors population.** Une annulation sur un tour ordinaire
-n'écrit **aucune** ligne : ce serait l'essentiel du trafic, soit très exactement
-le churn que la doctrine mika#2131 borne. Écriture d'audit **fire-and-forget** :
-un échec d'audit ne doit jamais pouvoir changer un verdict d'annulation.
+**Le volume d'audit a changé avec mika#2763, et il faut le savoir avant de lire
+le `GROUP BY`.** La garde de mika#2653 n'écrivait que dans sa population : une
+annulation sur un tour ordinaire n'écrivait **aucune** ligne. Le terme de classe
+de tour ayant disparu, **tout** appel de `cancel_task` / `cancel_reminder` passé
+par l'outil écrit désormais exactement une ligne — un refus, ou
+`allowed_no_pilot`. Deux conséquences : le compte `allowed_no_pilot` **n'est pas
+comparable** de part et d'autre du déploiement (il change de population, pas de
+régime), et le churn que borne la doctrine mika#2131 est accepté ici parce que
+la ligne est désormais ce qui distingue « la garde a jugé » de « la garde n'a pas
+tourné » sur le chemin même de l'incident. Les deux chemins opérateur (CLI,
+HTTP) n'écrivent toujours rien : ils ne traversent aucun `ToolContext`. Écriture
+d'audit **fire-and-forget** : un échec d'audit ne doit jamais pouvoir changer un
+verdict d'annulation.
 
 #### Sondes post-déploiement, et leurs cinq haltes
 
@@ -5629,9 +6753,11 @@ un échec d'audit ne doit jamais pouvoir changer un verdict d'annulation.
 > conclusion (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte —
 > la base n'est pas montée dans le bac à sable de dispatch.
 
-**S1 — le défaut fondateur ne se rejoue pas** (premier tour webhook PR qui
-tente). Attendu : une ligne `blocked_live_pilot`, la tâche non terminale, le
-pilote toujours vivant, et son callback qui arrive ensuite normalement.
+**S1 — le défaut fondateur ne se rejoue pas** (premier tour qui tente, **quelle
+qu'en soit la classe** depuis mika#2763 — y compris un `deferred_dispatch`
+silencieux, qui est le tour de l'incident du 2026-10-17). Attendu : une ligne
+`blocked_live_pilot`, la tâche non terminale, le pilote toujours vivant, et son
+callback qui arrive ensuite normalement.
 *Halte 1 — aucune ligne alors qu'un pilote a été tué :* **ne pas élargir le
 prédicat par réflexe.** Lire d'abord le contrôle positif (commande 3) : zéro des
 deux ne prouve rien du tout (mika#2205). Établir ensuite **par quelle porte**
@@ -5649,13 +6775,21 @@ coût nommé ci-dessus qui se réalise. Vérifier que `timeout_at` finira par re
 la ligne terminale, et **ne pas** retirer le terme : le geste est opérateur, sur
 l'hôte.
 
-**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un tour **hors**
-population, et en particulier aucun sur une annulation d'opérateur.
-*Halte 4 — une occurrence :* la garde mord hors de sa population, donc le terme
-de classe de tour est mal lu. **Désarmer d'abord** (revert de l'appel dans
-`CancelTaskTool::execute`), diagnostiquer ensuite — retirer à l'opérateur son
-geste d'annulation est pire que le défaut qu'on referme, puisque ce geste n'a pas
-de contournement.
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus alors qu'**aucun
+pilote ne tournait** sous la tâche, et **aucun refus servi à un opérateur**.
+Depuis mika#2763 la population de la garde est tout appel d'outil, donc la
+question n'est plus « mord-elle hors population ? » mais « son verdict de
+vivacité est-il juste ? ».
+*Halte 4 — un refus sur une tâche dont aucun process ne tournait :* le verdict
+de vivacité est faux, pas la disposition. Lire `cancel_task_live_pilot_blocked`
+(il porte `pid` et `owner_task_id`) et vérifier ce PID sur l'hôte. **Désarmer
+d'abord** (revert de l'appel dans `CancelTaskTool::execute`), diagnostiquer
+ensuite.
+*Halte 4bis — un opérateur reçoit un refus :* impossible par construction sur
+ses deux chemins, qui ne traversent aucun `ToolContext` (R5). Une occurrence veut
+dire qu'un troisième chemin a été ajouté depuis — c'est **lui** qu'il faut lire,
+et retirer à l'opérateur son geste d'annulation serait pire que le défaut
+refermé, puisque ce geste n'a pas de contournement.
 
 **S4 — la population hors périmètre (30 jours), et c'est la précondition des deux
 suivis de R6.**
@@ -5676,12 +6810,15 @@ n'emprunte pas cette route), pas une preuve que la route est fermée.
 
 **Halte transverse — les sondes muettes.** Zéro refus **et** zéro
 `allowed_no_pilot` ne prouve rien : il faut qu'un `cancel_task` ait été appelé
-depuis un tour webhook PR depuis le déploiement.
+par l'outil depuis le déploiement — n'importe quelle classe de tour suffit
+désormais, ce qui rend cette halte beaucoup plus facile à lever qu'avant
+mika#2763.
 
 #### Ce que ce travail n'achète PAS
 
 - **Il ne rend pas le modèle incapable de vouloir annuler un pilote.** Il rend
-  l'annulation impossible **par cet outil, dans cette classe de tour**. La
+  l'annulation impossible **par cet outil** — dans la seule classe de tour
+  webhook PR jusqu'à mika#2763, dans **toutes** depuis. La
   doctrine maison est *construis l'incapacité, ne promets pas la retenue*
   (mika#1991) ; elle est **partiellement** applicable ici — la capacité est bien
   retirée à `cancel_task` / `cancel_reminder`, et elle reste entière via
@@ -5698,10 +6835,24 @@ depuis un tour webhook PR depuis le déploiement.
   lui est retiré est celle qu'il a **effectivement** prise, et le corps du refus
   ne lui donne pas l'autre.
 - **Il ne ferme pas `promote_deferred_callback`** (mika#2654) ni le cap implement
-  (mika#2652) : trois tickets, trois termes, trois populations.
-- **Il ne couvre pas un tour webhook servi en mode silencieux** — borne héritée
+  (mika#2652) : trois tickets, trois termes, trois populations. **mika#2654 est
+  fermé depuis**, par un terme de **classe de tour** et non de vivacité — refus
+  sur un tour `[GitHub] PR …` / `[GitHub] Check suite …` — et il lisait le
+  **même** `ToolContext.is_webhook_pr_event_turn` que ce travail a posé, sans le
+  modifier. Depuis mika#2763 il en est le **seul** lecteur production : la
+  divergence est délibérée, les deux gardes ne répondent pas à la même question
+  (« du travail tourne-t-il sous cette tâche ? » contre « cet événement
+  m'autorise-t-il à toucher au plan de dispatch ? »). Le cap implement
+  (mika#2652) reste ouvert.
+- **Il ne couvrait pas un tour webhook servi en mode silencieux** — borne héritée
   de mika#2517 / mika#2573, population mesurée vide (un tour silencieux a
-  `originating_message = None`).
+  `originating_message = None`). **Cette borne a été franchie le 2026-10-17, et
+  pas par un webhook** : le tour de l'incident était un `deferred_dispatch`
+  silencieux, qui ne sert aucun webhook du tout. La borne telle qu'écrite
+  **restait exacte**, et c'est précisément ce qui l'a rendue trompeuse : elle
+  décrivait un cas limite vide pendant que le coût venait du cas nominal — les
+  vingt sites de construction qui posent `false` parce qu'ils ne servent aucun
+  événement. mika#2763 a supprimé le terme plutôt que d'élargir la borne.
 - **AC6 est livré en phase B** : la traversée parent→enfant a un site unique,
   `live_pilot::resolve_task_pilot`, appelé par la garde (via
   `live_pilot_for_task`) et par `cancel_task_and_kill` ; le scan
@@ -5724,7 +6875,9 @@ depuis un tour webhook PR depuis le déploiement.
 #### Hors périmètre, délibérément
 
 - **Le cap implement** (mika#2652) et **`promote_deferred_callback`**
-  (mika#2654) : aucune ligne touchée.
+  (mika#2654) : aucune ligne touchée **par ce travail**. mika#2654 a depuis posé
+  sa propre garde, dans son propre outil, en **lecteur** du champ que ce travail
+  a introduit : aucune ligne de mika#2653 n'a bougé pour l'accueillir.
 - **Le terme de lignée de mika#2649** : inchangé, octet pour octet. Il répond à
   *quelle cible ce dispatch vise-t-il*, celui-ci à *un pilote travaille-t-il
   ici* — axes orthogonaux, et le ticket le dit.
@@ -5768,6 +6921,187 @@ Raisonnement complet, les six rectifications, la frontière de la duplication
 différée et les quatre détecteurs : `crates/mika-agent/CLAUDE.md` § *Une
 annulation depuis un tour webhook PR ne touche pas un pilote vif*.
 
+### `promote_deferred_callback` est refusé sur un tour webhook PR (mika#2654)
+
+Sur un tour dont le message d'origine commence par `[GitHub] PR ` ou
+`[GitHub] Check suite `, `promote_deferred_callback` **refuse** de forcer la
+promotion d'un wrapper différé. Troisième et dernier cas nommé par le
+recensement AC4 de mika#2649, et le seul des trois dont la population a été
+**mesurée avant** d'armer quoi que ce soit.
+
+Ce qui est retiré au modèle est borné et dit : une **avance ≤ 60 s** sur le
+backstop périodique (`promote_pending_deferred_if_idle`,
+`DB_SCAN_INTERVAL_TICKS = 60`), et le **contournement de la priorité
+opérateur** — `force_promote_deferred_for_class` ne consulte pas
+`has_pending_operator_task_for_class` (mika#1948 AC3), le backstop oui. Rien
+n'est retiré à l'opérateur : `mika tasks promote-deferred` est intact, le CLI
+n'a pas de `ToolContext` et ne traverse pas cette garde.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Un tour webhook PR a-t-il tenté de forcer un créneau ?
+grep promote_deferred_refused_webhook_pr_turn "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_id, session_id, dispatch_class, trace_id}'
+
+# 2. CONTRÔLE NÉGATIF — l'audit a-t-il échoué derrière une ligne passée ?
+#    (régime attendu : VIDE)
+grep promote_deferred_guard_audit_failed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{dispatch_class, verdict, error}'
+```
+
+```sql
+-- Le verdict, soustractible en une requête (SOLE WRITER ⇒ compte exact)
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_force_promote_refused_webhook_pr_turn'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+
+-- La population du refus, telle que le modèle l'a reçue
+SELECT agent_id, count(*) FROM tool_calls
+ WHERE tool_name = 'promote_deferred_callback'
+   AND output LIKE 'REFUS (webhook-pr-turn, mika#2654)%' GROUP BY 1;
+
+-- La mesure fondatrice, rejouable : promotions réussies par canal de session
+SELECT s.channel_type, tc.success, count(*) FROM tool_calls tc
+  JOIN sessions s ON s.id = tc.session_id
+ WHERE tc.tool_name = 'promote_deferred_callback'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+| nom | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `refused_webhook_pr_turn` (`after_value`) | INFO | **non vide au début, puis décroissant** | chaque ligne est une promotion forcée qu'un tour d'événement n'a pas obtenue ; `target_key` porte `dispatch_class:implement` ou `dispatch_class:groom` |
+| `promote_deferred_refused_webhook_pr_turn` (journal) | INFO | idem | le pendant journal du même refus. **INFO et non WARN** : le moteur promeut de lui-même au scan suivant, donc le refus ne laisse aucun travail en souffrance — et un WARN qu'on apprend à ignorer ne se lit plus |
+| `promote_deferred_guard_audit_failed` | WARN | **vide** | la ligne de journal est passée, l'audit non — le `GROUP BY` sous-compte à partir de là |
+
+**Il n'y a PAS de contrôle positif côté outil, et c'est une décision.**
+L'énumération `ForcePromoteTurnDecision` ne porte **aucune** variante
+« autorisé » (la sœur mika#2653 en a une, `AllowedNoPilot` /
+`allowed_no_pilot`) : ici
+tout tour hors population est un tour ordinaire, soit l'essentiel du trafic de
+l'outil, et une valeur d'audit « autorisé » y serait une ligne par appel pour
+un verdict qui ne décide de rien — très exactement le churn que la doctrine
+mika#2131 borne. La contrepartie est assumée et doit être lue : **zéro refus a
+deux causes indistinguables** — aucun tour webhook PR n'a tenté (sain), ou le
+binaire servi est antérieur au correctif (classe mika#2340). C'est le
+*préalable* des sondes ci-dessous qui tranche, pas une absence de ligne.
+
+**Rien n'est écrit hors population.** Un appel sur un tour ordinaire, un
+callback de pilote ou un tour Webhook Fallthrough n'écrit **aucune** ligne :
+`audit_value()` rend `None` et le rapporteur rend la main avant tout accès à la
+base. Écriture d'audit **fire-and-forget** (motif
+`report_cancel_pilot_decision`, type de retour `()`) : un échec d'audit ne peut
+pas changer un verdict de promotion.
+
+#### Sondes post-déploiement, et leurs trois haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** : établir après
+> `make deploy` que le `mika-spirit` qui tourne porte le correctif —
+> `cat ~/.mika/skills/.manifest-writer` — avant toute conclusion tirée d'un
+> silence (classe mika#2340). Ce sont des **gestes d'opérateur** sur l'hôte :
+> la base n'est pas montée dans le bac à sable de dispatch.
+
+**S1 — la garde mord, et le compte décroît.**
+```sql
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_force_promote_refused_webhook_pr_turn';
+```
+Régime attendu : **non vide au début** — la mesure du 2026-10-07 a compté 33
+appels depuis des sessions de canal `github` sur 30 jours, dont 10 réussis —
+**puis décroissant**, à mesure que le refus (qui nomme la raison, et aucun
+contournement) se répercute dans le plan de dispatch que le modèle se fait.
+
+**S2 — plus aucune promotion réussie depuis un tour github (après déploiement).**
+```sql
+SELECT count(*) FROM tool_calls tc
+  JOIN sessions s ON s.id = tc.session_id
+ WHERE tc.tool_name = 'promote_deferred_callback'
+   AND s.channel_type = 'github'
+   AND tc.success = 1
+   AND tc.created_at > '<déploiement>';
+```
+Attendu : **zéro**.
+*Halte 1 — S2 rend des lignes :* **ne pas toucher au prédicat d'abord.**
+`channel_type = 'github'` est un **surensemble** de la population de la garde
+— le texte du message d'origine n'est pas persisté dans `messages` pour ce
+canal, alors que la garde teste ce texte. Lire donc d'abord **de quel tour**
+vient la ligne : un tour Webhook Fallthrough ou un Passthrough de label `ready`
+est **hors population par décision** (AC7), et ces deux-là comptent dans
+`channel_type = 'github'`. Croiser avec
+`audit_events.tool_name = 'webhook_fallthrough_turn'` tranche le premier cas.
+Si la ligne vient bien d'un tour `[GitHub] PR …` / `[GitHub] Check suite …`,
+vérifier **ensuite** que le binaire servi porte le correctif (préalable
+ci-dessus) — et seulement alors mettre le prédicat en cause.
+
+**S3 — CONTRÔLE NÉGATIF : le moteur promeut toujours.**
+```sql
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'deferred_dispatch_promoted' AND created_at > '<déploiement>';
+```
+Attendu : **non vide**. C'est le backstop qui fait son travail, et c'est lui qui
+rend le refus sans coût fonctionnel.
+*Halte 2 — S3 tombe à zéro alors que des wrappers attendent :* ce n'est **pas**
+ce correctif. Le chemin de promotion du moteur n'a pas été touché, octet pour
+octet. Lire `deferred_dispatch_promotion_starved` (mika#2169) et la priorité
+opérateur (`has_pending_operator_task_for_class`) : un wrapper qui attend
+derrière du travail opérateur `pending` attend **par conception**.
+
+*Halte 3 — des builds QA attendent visiblement plus d'une minute après un
+refus :* c'est le coût nommé (≤ 60 s) qui se réalise, et **ce n'est pas une
+raison de rouvrir l'outil**. Mesurer l'écart entre la ligne
+`promote_deferred_refused_webhook_pr_turn` et le `deferred_dispatch_promoted`
+du **même parent** ; si l'écart dépasse un intervalle de scan, le défaut est au
+**backstop**, pas dans cette garde.
+
+**Halte transverse — les sondes muettes.** Zéro refus **et** zéro tour
+`[GitHub] PR …` depuis le déploiement ne prouve rien : une garde que personne
+n'a exercée se lit exactement comme une garde qui marche (mika#2205). Le
+préalable du binaire servi est ce qui distingue les deux.
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne retire rien à l'opérateur.** `mika tasks promote-deferred` et
+  `force_promote_deferred_for_class` sont intacts ; la garde vit dans l'outil,
+  jamais dans la fonction de base, ce qui préserve le CLI **par construction**.
+- **Il ne ferme pas le domaine Fallthrough pour cet outil** : 1 tentative
+  mesurée sur 30 jours, 0 réussie. Hors population par décision (AC7), et une
+  garde sur cette population-là serait un détecteur dont le silence ne prouve
+  rien (mika#2205).
+- **Il n'ajoute pas la priorité opérateur à `force_promote_deferred_for_class`.**
+  C'est une décision distincte, qui appartient **aussi** au chemin CLI, donc à
+  son propre ticket.
+- **Il ne couvre pas un tour webhook servi en mode silencieux** — borne héritée
+  de mika#2517 / mika#2573 : un tour silencieux a `originating_message = None`,
+  donc `is_webhook_pr_event_turn` y est `false`.
+- **Il ne rend pas structurelle l'exclusivité des deux axes.** Lignée
+  (mika#2649) et classe de tour (celui-ci) restent deux termes indépendants ;
+  le suivi qui les réconcilierait — un
+  `webhook_turn: WebhookTurnClass (None | Fallthrough | PrEvent)` en place du
+  booléen — gagne ici un **second lecteur**, ce qui en renforce la précondition
+  sans la satisfaire.
+- **Il n'ajoute aucune variable d'environnement, et c'est une décision.** Même
+  raison que mika#2653, mika#2624 et mika#2573 : *un désarmement par variable
+  sur un chemin de sûreté serait un désarmement par coquille*. Le geste de
+  désarmement est un **revert** de l'appel dans
+  `PromoteDeferredCallbackTool::execute`, et le coût d'un faux positif (≤ 60 s)
+  le supporte.
+
+#### Hors périmètre, délibérément
+
+- **Le backstop périodique** (`promote_pending_deferred_if_idle`,
+  `task_engine/engine.rs`) : aucune ligne touchée.
+- **Le terme de lignée de mika#2649** et **le terme de vivacité de mika#2653** :
+  inchangés. Trois tickets, trois axes — *quelle cible ce dispatch vise-t-il*,
+  *un pilote travaille-t-il ici*, *quelle classe de tour demande* — et ce
+  travail ne lit que le troisième.
+- **Le cap implement** (mika#2652) : toujours ouvert, aucune ligne touchée.
+
+Raisonnement complet, la mesure qui a décidé la forme, les six rectifications au
+corps du ticket et ce que les tests ne peuvent pas attester :
+[`docs/agent-internals/exec-handlers.md`](../agent-internals/exec-handlers.md)
+§ *Un tour webhook PR ne force pas la promotion d'un wrapper différé
+(mika#2654)*.
+
 Optional (STOP global à chaud — mika#2329) :
 - **Le geste, et c'est un fichier, pas une variable :**
   ```bash
@@ -5792,7 +7126,7 @@ Optional (STOP global à chaud — mika#2329) :
 - **Portée de la sentinelle `auto-pull` : c'est le FREIN DE DISPATCH NEUF de la boucle, pas l'interrupteur privé d'un scan (mika#2498).** Son nom dit un scan ; lire le nom comme la portée a coûté un incident. Le 2026-09-23, sentinelle posée à **05:38** locales : le tick du feeder se court-circuite comme prévu, et un implement part quand même à **06:11:39Z** (`ff694ec0`, 103 tours, 17,86 USD, parent `resume_agent` `107f8849`). Un groom convergé enchaîne sur son implémentation par l'**auto-fire moteur** (`try_dispatch_pilot_after_groom_success`, mika#1614), qui ne passe par **aucun tick**. L'opérateur n'a pu que l'annuler en réaction. C'est la forme de panne que ce mécanisme nomme lui-même pour une autre raison : *« un STOP silencieusement inopérant se lit exactement comme un STOP qui marche »*.
   - **Élargie dans son sens, jamais dupliquée.** Le critère de mika#2420 est *« une décision distincte mérite un fichier distinct »* — or les deux routes ont la **même sortie** (un dispatch dev-pilot neuf) atteinte par deux chemins : le feeder promeut `ready` puis dispatche in-process (mika#2470), l'auto-fire dispatche directement. Un opérateur qui arrête l'une et pas l'autre n'a rien arrêté : c'est l'incident. Un second fichier (`groom-implement-stop`) est **refusé** pour cette raison — il scinde une décision d'opérateur en deux gestes, et celui de la mémoire musculaire rendrait alors le comportement d'aujourd'hui en ayant l'air d'arrêter. Renommer la sentinelle est refusé aussi : le fichier peut être armé **en ce moment** sur l'hôte, et la mémoire musculaire est ce qu'un frein de P0 ne doit pas casser. Ce qui change est la portée **documentée**, pas le geste.
   - **Le critère pour un futur consommateur**, et ce n'est pas « suis-je un scan ? » : *est-ce que je démarre du travail pilote **neuf** ?* Si oui, lire cette sentinelle, quelle que soit la porte d'entrée. Sinon, il lui faut un nom de scan à soi.
-  - **Ce que ça ne couvre pas, nommé.** `verdict_handler` (`block[ac]` / `block[ci]`) : réparer une PR ouverte est une **continuation**, pas du travail neuf — décision distincte, inchangée. Un `ready` posé **à la main** pendant un STOP : `ready_label_handler` dispatche, délibérément non couvert — savoir si un fichier prime sur le geste que l'opérateur vient de poser est une décision produit, pas substrat, et le discriminant qui permettrait de la scoper étroitement est structurellement interdit (l'acteur est lisible depuis mika#2323 mais **aucun prédicat de refus n'a le droit de le lire**, tenu par `mika2323_no_gate_predicate_reads_the_actor` à allowlist vide). **Tickets de suivi**, dont la précondition est la sonde S2 ci-dessous. Enfin la voie prompt-level de `self-dev-callback` (`run_gh issue edit --add-label ready`) : **inerte sur la population nominale** — le ticket porte déjà `ready`, `dispatch-lib.sh` ne le retire jamais, et GitHub n'émet `labeled` que sur une **transition** (mika#2323), donc un `--add-label` redondant n'émet rien. Elle cesse d'être inerte pour un groom lancé par `mika ask "groom mika issue#N"` (mika#2484) — même suivi, même précondition.
+  - **Ce que ça ne couvre pas, nommé.** `verdict_handler` (`block[ac]` / `block[ci]`) : réparer une PR ouverte est une **continuation**, pas du travail neuf — décision distincte, inchangée. Un `ready` posé **à la main** pendant un STOP : `ready_label_handler` dispatche, délibérément non couvert — savoir si un fichier prime sur le geste que l'opérateur vient de poser est une décision produit, pas substrat, et le discriminant qui permettrait de la scoper étroitement est structurellement interdit (l'acteur est lisible depuis mika#2323 mais **aucun prédicat de refus n'a le droit de le lire**, tenu par `mika2323_no_gate_predicate_reads_the_actor` à allowlist vide). **Tickets de suivi**, dont la précondition est la sonde S2 ci-dessous. Enfin la voie prompt-level de `self-dev-callback` (`run_gh issue edit --add-label ready`) : **inerte sur la population nominale** — le ticket porte déjà `ready`, `dispatch-lib.sh` ne le retire jamais, et GitHub n'émet `labeled` que sur une **transition** (mika#2323), donc un `--add-label` redondant n'émet rien. Elle cesse d'être inerte pour un groom lancé par `mika ask "groom mika issue#N"` (mika#2484) — même suivi, même précondition. **Cette voie-là est fermée depuis mika#2995, et deux fois** : le prompt du callback ne prescrit plus la pose du label, et `run_gh` la refuse sur **tout** tour (motif `ready_label_add`, § *Le moteur ne crée pas de travail par `run_gh`*) — ce qui ne ferme ni les deux cas précédents de cette puce ni le résidu `run_shell`, qui gardent leur ticket de suivi et leur précondition S2.
   - **Le refus est convergent, jamais terminal**, et c'est ce qui rend l'élargissement acceptable plutôt que destructeur : il n'annule pas le groom, ne perd pas le plan (committé et poussé par `_push_branch`), ne retire pas `ready`, ne marque rien `failed`, ne crée aucune row. Le parent reste `in_progress` / `groom` — une raison de refus de plus dans un sillon que les chemins de saut existants de la fonction (pas de jeton, outil absent du registre, handler non long-running, flip impossible, readiness refusée, création du callback échouée, script de handler absent) creusaient déjà, et c'est ce qui garde le changement petit. À la levée, le réconciliateur stuck-ready le re-drive (in-process depuis mika#2470) ; et pendant le STOP aucun tick ne tourne, donc **aucun point du budget de re-drive n'est consommé** (mika#2020). **Effet de bord utile :** sous STOP, les grooms en vol convergent, committent leur plan et **ne chaînent pas** — c'est littéralement la « pause grooms-seuls » demandée, obtenue sans introduire d'état nouveau.
   - **Surfaces.** Journal : `groom_pilot_autofire_stopped` (INFO — champs `parent_task_id`, `callback_task_id`, `repo`, `issue`, `stop_file`, ce dernier rendu par `stop_file_path`, jamais un littéral). Base : une row sous le **même `tool_name` que le chemin nominal**, la porte dans `after_value` — motif `ready_label_outcome` (mika#2323), délibérément **pas** le motif à deux noms de `phantom_aged_out` / `phantom_sweep_spared`, qui s'applique quand chaque nom porte sa propre cause ; ici les deux issues appartiennent au même dispatcheur et à la même population.
     ```bash
@@ -5847,6 +7181,17 @@ Observabilité des exclusions d'auto_pull (mika#2131 + mika#2132) :
   - **La scission est datée du déploiement, et c'est voulu.** Les lignes `audit_events` déjà posées gardent `after_value = 'operator_review_or_blocked'` : les réécrire rendrait faux ce qu'elles ont dit au moment où elles ont été écrites. Un opérateur qui compare de part et d'autre du déploiement **doit sommer les deux noms**. La moitié qui n'a pas changé de nom reste comparable à elle-même — un ticket tenu mais **non** abandonné continue de produire l'ancien nom (`mika2361_an_unabandoned_held_ticket_keeps_its_historic_filter_name`).
 - **Surfaces opérateur.** SQL : `SELECT after_value, count(*) FROM audit_events WHERE tool_name = 'auto_pull_exclusion' GROUP BY 1` (distribution par filtre) et `... WHERE target_key = 'issue:2117'` — la réponse directe à « pourquoi ce ticket n'est-il jamais dispatché ? », en une ligne plutôt qu'en un grep sur 19 Go. Journal : `grep auto_pull_exclusions $MIKA_SPIRIT_LOG_FILE | jq .by_filter` donne la forme du tick courant.
 - **Garde permanente :** `auto_pull::tests::mika2131_exclusion_skips_never_return_to_an_uncollected_debug` est un scan de source qui refuse le retour d'un `debug!` d'exclusion. Un test comportemental ne peut pas attraper cette classe : la régression ne rendrait pas une décision fausse, elle la rendrait invisible — et toutes les assertions sur la décision resteraient vertes pendant que l'opérateur reperdrait la réponse.
+
+La porte de promotion compte séparément une branche sans plan (mika#2170) :
+- **Deux slugs, une seule décision.** `auto_pull_staleness_measured` porte désormais `reason = 'stale_branch_without_plan'` quand la branche refusée ne porte **aucun** fichier sous `docs/plans/`, et garde `reason = 'salvage_work_on_stale_branch'` quand elle porte son plan **et** du code. Le refus est le même dans les deux cas et **aucune décision n'a changé** — seuls le nom et le message changent. L'ancien message cadrait tout refus comme le reliquat d'un pilote mort et prescrivait « décider du sort du travail **partiel** » ; sur une branche faite à la main c'était un diagnostic faux, qui envoyait l'opérateur chercher un pilote inexistant. Le nouveau nomme le fait mesuré (la branche n'a jamais été une branche de grooming) et porte la butée : **groomer le ticket ne lèvera pas le refus**, puisque le plan s'ajouterait au code et que `non_plan_files` resterait non vide.
+- **La scission est datée du déploiement, comme celle de mika#2361.** Les lignes déjà posées gardent `salvage_work_on_stale_branch` : les réécrire rendrait faux ce qu'elles disaient. **Un opérateur qui compare de part et d'autre du déploiement doit sommer les deux noms.** La moitié qui n'a pas changé de nom reste comparable à elle-même.
+- **`plan_files_count`, posé plutôt que dérivé.** Champ additif émis sur **chaque** décision, promotions comprises : `changed_files_count − non_plan_files_count`, et `null` — jamais `0` — quand la liste n'a pas pu être lue. Il répond « cette branche porte-t-elle un fichier de plan ? » sans soustraction. C'est ce qui manquait : mika#2170 a dormi dix-sept jours derrière une condition de réveil qui se testait sur `non_plan_files`, lequel est `docs/plans/` **filtré hors**, donc trivialement vraie de tout refus salvage.
+- **Requête de comptage.** Attention à la colonne : contrairement à `auto_pull_exclusion` ci-dessus, cet événement range son nom dans **`target_key`**, et `tool_name` vaut `'auto_pull'`. Distribution : `SELECT json_extract(after_value, '$.reason') AS reason, count(*) FROM audit_events WHERE target_key = 'auto_pull_staleness_measured' AND json_extract(after_value, '$.outcome') = 'refuse' GROUP BY 1;`. Cas nommés : `SELECT created_at, reasoning AS phase, after_value FROM audit_events WHERE target_key = 'auto_pull_staleness_measured' AND json_extract(after_value, '$.reason') = 'stale_branch_without_plan' ORDER BY created_at DESC;` — `reasoning` porte la phase, donc la sortie dit *par quelle entrée* le refus est passé (la Phase 2 est la seule qui n'est pas précédée d'`is_groomed`). **Régime attendu : zéro** — la population mesurée le 2026-09-04 (18 tickets ouverts portant un callout `> - **Branch:**`) était vide.
+- **Halte 1 — la distribution `promote`/`refuse` bascule.** C'est la seule chose que ce travail ne doit pas produire : il ne touche aucune décision. **Désarmer par revert, pas par réglage.**
+- **Halte 2 — une ligne `stale_branch_without_plan` apparaît.** Ce n'est **pas une panne**, c'est le résultat que le ticket attendait : noter le ticket, la branche et la date.
+- **Halte 3 — le nouveau nom porte le trafic nominal.** S'il domine `salvage_work_on_stale_branch`, le discriminant est inversé ou la troncature mord : lire `changed_files_count` **avant** de toucher au prédicat. L'endpoint `compare` plafonne `files` à 300, et le nouveau slug n'est émis que sous ce plafond — au-delà, l'ancien est produit, précisément pour ne pas affirmer une absence sur une liste coupée. Une branche de grooming porte toujours son plan ; comptée sans, c'est le préfixe qui n'est pas apparié, pas la population qui a changé.
+- **Halte 4 — la décision de politique reste réservée.** Une population non nulle **n'autorise pas** à élargir `docs/plans/` ni à filtrer `is_groomed` en Phase 2 de sa propre autorité : c'est la décision que mika#2140 réserve, et elle se prend dans son propre ticket avec le compte de la halte 2 en pièce jointe. La dissymétrie de la Phase 2 est **correcte** et documentée au site d'appel : les phases 0 et 1 *posent* `ready`, la Phase 2 *rejoue* un `ready` que quelqu'un d'autre a posé.
+- **Le silence ne prouve rien** si aucun ticket `ready` ne porte de callout `Branch:` : vérifier que `outcome = 'promote'` avec `measurement = 'measured'` est non vide avant de conclure d'un zéro (classe mika#2205).
 
 Un `labeled ready` répété sur un pilote vif est un NO-OP (mika#2279) :
 - **La boucle que ça casse, mesurée le 2026-09-10 sur #2276.** `10:46:57` dispatch (parent `23fd8852`, enfant `ddb05913`, pid 577434) ; `10:47:28` — trente secondes plus tard — un **second** événement `labeled ready` sur le ticket déjà en vol : supersession, parent `cancelled` pendant que son pilote travaille jusqu'à 11:59, `dispatch readiness check failed`, puis `deferred_dispatch_registered` — un **second pilote en doublon** en file. Annulé à la main à 11:02, réapparu à 11:10, puis à 11:30. Les événements GitHub sont **tous** de `mika-platform-bot` : c'est le moteur qui fait battre le label, le défaut n'a besoin de personne pour se rejouer. Depuis mika#2335 la supersession ne se contente plus d'orpheliner ce pilote, **elle le tue** — donc la fermeture du défaut (a) du ticket a changé le signe du défaut (b), pas refermé.
@@ -6049,6 +7394,282 @@ Optional (plan-callout predicate — mika#2120):
 
 Optional (auto-feeder ready-pool maintenance):
 - `MIKA_AUTO_FEEDER_MIN_READY` — Target size of the **pullable**-ready pool the auto-feeder (Phase 0 of `auto_pull_groomed_ticket`) keeps topped up (mika#1863, default `3`, clamp `[1, 10]`). The literal value `0` **disables** the feeder (Phase 0 returns early); missing/invalid falls back to `3` (WARN on invalid). Phase 0 runs **before** Phase 1 on each 10-min tick, sharing the same `gh issue list` / `gh pr list` fetches (zero added API load), so a promotion made by the feeder is pickable by the puller in the same tick. **Pullable-count, not raw `ready`-count, is the threshold signal (D2):** a `ready` ticket counts toward the pool only if it is actually dispatchable — no open closing PR, no in-flight self_dev task, not labelled `blocked`/`operator-review`. This is the founding-incident fix — the 2026-07-27→28 11 h idle had raw-count ≥ 1 (#1682 open-PR + #1646 in-flight) while pullable-count was 0. When the pool is under target, the feeder promotes up to `MIN_READY − pullable` groomed-and-dispatchable backlog tickets (`is_groomed` full canonical callout, not the loose `Plan:` substring — required by the #919 dispatch gate) ranked by real-label priority (`p0-critical` > `p1-important` > `agent-core` > `p2-normal` > `p3-nice-to-have`) then oldest-first. Emits `auto_feeder` audit events (`tool_name = "auto_feeder"`): `auto_feeder_promoted` per apply, `auto_feeder_skip` when the pool already meets target, and — when nothing is promotable — **one of the three cause names** below (mika#2161). **N+1 over-promotion bound (benign):** Phase 0 tops the pool to N, then Phase 1's `!ready` filter may promote one *additional* groomed ticket when the queue is idle → at most **N+1** ready tickets per tick. Intentional — the webhook dispatch drains the pool and the two phases have complementary intents (feeder = hold a buffer; Phase 1 = kick a dispatch when idle). **50-issue working-set cap:** the groomed-not-ready backlog the feeder ranks is capped at 50 (`FEEDER_WORKING_SET_CAP`); a dispatchable backlog exceeding 50 is itself a grooming-throughput signal, kept observable rather than silently absorbed — single-line raise if real operation ever warrants it. **That cap is NOT surfaced by `auto_feeder_no_backlog`**, contrary to what this entry and the constant's own doc-comment claimed until mika#2161: that event fires only when the candidate set is **empty**, i.e. exactly when there is no backlog to exceed the cap. A backlog of 80 promotable tickets truncates in silence and emits nothing; the surface AC9 names is pool sampling.
+
+### Un dispatch de groom forcé par une contrainte d'outil ne vise jamais un ticket sans `ready` (mika#2772)
+
+**`MIKA_FORCED_DISPATCH_CONSENT` — armé par défaut ; `0` ou `false` (insensible à
+la casse) désarme ; toute autre valeur, ou l'absence, arme.** Contrairement à ses
+trois voisines de famille ci-dessus, cette garde porte un levier, et la phrase qui
+va avec est celle-ci : **désarmer rend la boucle capable de groomer un ticket que
+personne n'a promu** — c'est le défaut mesuré ci-dessous rendu à l'identique, pas
+une tolérance de confort. Le levier existe pour qu'un faux positif qui gèlerait le
+grooming n'exige pas un redéploiement ; il ne se pose pas « le temps de voir ».
+
+- **Le défaut, mesuré le 2026-10-17 à 08:59:18Z.** Un `groom` dans le slug de
+  branche `fix/2762/rollback-reaper-groom` a matché le mot-clé de dev-groom, armé
+  son `required_tools`, et fait groomer **mika#2766** — un ticket sans label
+  `ready`, absent du bassin de dispatch : `create_task "Groom mika#2766"` puis
+  `run_claude_pilot_groom mika#2766`, **48 tours, 3,40 $**. Le tour de reprise a
+  ensuite tenté de dispatcher l'**implémentation** du même ticket non promu ;
+  seule l'occupation de la place `implement` l'a arrêté. Le consentement positif
+  du label `ready` (mika#841) a donc été contourné par une contrainte d'outil que
+  personne n'avait demandée.
+
+- **Le discriminant est la PROVENANCE du dispatch, jamais le label du ticket** —
+  et c'est la rectification centrale. Un gate « pas de `ready`, pas de groom »
+  casserait `/mika-groom-ticket` (mika#1173), dont la raison d'être est de groomer
+  des tickets non promus sur dispatch opérateur en texte libre. La question posée
+  est « ce dispatch a-t-il été **forcé** par `required_tools` plutôt que
+  demandé ? », une provenance que le moteur ne portait pas. Elle est née d'un
+  drapeau par tour, `LongRunningContext::tool_constraint_forced`, écrit à **un
+  seul site** : l'arm de re-prompt `required_tools` de `run_loop`, le seul endroit
+  du moteur qui dise au modèle « appelle cet outil ». Les deux autres arms du même
+  bloc *relâchent* la contrainte et ne l'écrivent pas — un drapeau posé par les
+  trois dirait « ce tour avait des outils requis », pas « ce tour a forcé un
+  outil », et refuserait des dispatchs que personne n'a exigés.
+
+- **La garde de lignée voisine ne pouvait pas la porter.**
+  `webhook_dispatch_target_mismatch` (mika#2649, même fichier, même frontière
+  d'outil) demande « une lignée relie-t-elle cette tâche à la cible de
+  l'événement ? » et ne sait rien du consentement du ticket visé. C'est elle qui a
+  refusé le dispatch de 09:13:21Z — **par accident de lignée, pas par
+  consentement.**
+
+- **Trois court-circuits à coût nul avant tout réseau, dans cet ordre :** la
+  classe (un `implement` forcé relève de l'axe de mika#2757 et sort de la
+  population **avant toute ligne de journal** — la sonde compte des dispatchs de
+  groom, pas des tours), le forçage, puis la demande, lue sur le texte d'intention
+  **masqué** par `mask_cited_branch` (mika#2755/#2768) : le texte qui a armé le
+  forçage portait justement un slug de branche.
+
+- **Un seul sujet, lu depuis le prompt de dispatch** et de nulle part ailleurs
+  (motif mika#2545). Un `reference_url` qui désignerait un autre ticket est
+  précisément l'accident de lignée par lequel le dispatch de 08:59 n'a *pas* été
+  refusé : le rouvrir ici rouvrirait le trou mesuré.
+
+- **Fail-closed, à l'inverse de la porte de siège qui le précède de quelques
+  lignes.** La porte de place (mika#2084 D2) est fail-**open** sur des labels
+  illisibles, et c'est le bon choix *là* : sa population est **tout** dispatch,
+  donc un faux positif arrête la boucle entière sur une panne d'API GitHub. Ici la
+  population est l'intersection « classe groom ∧ forcé ∧ non demandé », **vide en
+  régime nominal**. Un faux positif fait attendre un ticket que
+  `stuck_ready_reconcile` re-pousse ; un faux négatif est l'incident mesuré, 48
+  tours et 3,40 $ sur un ticket que personne n'avait promu. L'asymétrie est
+  inversée parce que la population l'est, et elle ne se transporte pas d'un gate à
+  l'autre.
+
+- **La population refusée est VIDE à la livraison, et c'est un résultat.**
+  mika#2768 a élargi `mask_cited_branch` à tout texte enveloppé ou enrichi : sans
+  slug cité dans le texte d'intention, `required_tools` ne s'arme plus sur un
+  événement de branche, donc **le dispatch non consenti n'a plus de producteur
+  connu**. Cette garde tient la **classe** ouverte pour le prochain producteur de
+  contrainte d'outil ; elle ne poursuit pas un incident en cours. C'est
+  exactement pourquoi elle écrit une ligne sur la branche saine : sans elle, « la
+  classe est vide » et « la garde n'est pas déployée » rendraient les mêmes
+  octets.
+
+- **Un refus nomme ses deux levées, et depuis mika#2995 il n'en prescrit
+  aucune** (AC3). Un refus qui ne nomme pas sa levée est un refus qu'on
+  contourne au jugé (mika#2520) — mais son champ `recovery` disait *« promote
+  the ticket by posting the `ready` label as remove→add »*, et c'est ce texte
+  que mika-dev a exécuté le 2026-10-31 à 16:51:37Z avec le `GH_TOKEN` du moteur.
+  Le remède d'une garde de consentement décrivait comment se donner le
+  consentement. Il **attribue** désormais : la promotion appartient à
+  l'opérateur, `ready` est son consentement positif (mika#841), et le moteur
+  refuse de l'écrire sur **tout** tour (mika#2995, § *Le moteur ne crée pas de
+  travail par `run_gh`*). La seconde levée est inchangée au mot près —
+  `mika ask --agent mika-dev "groom <owner/repo>#<n>"`, qui fait du dispatch une
+  demande, **traverse** la porte au lieu de la lever (mika#1173) et sort de la
+  population. Le geste `remove` → `add` et le fait de mika#2323 qui le motive
+  n'ont pas disparu : ils vivent au § *Le geste opérateur canonique*, la surface
+  d'où la promotion se fait. Ils ont seulement quitté le texte que l'agent lit.
+  Épinglé par `mika2995_le_remede_attribue_la_promotion_sans_prescrire_le_geste`
+  (aucun des gabarits `--add-label`, `--remove-label`, `remove→add` dans
+  `recovery`, **et** la promotion attribuée — retirer le gabarit sans dire à qui
+  elle appartient laisserait un blanc, et un agent comble un blanc).
+
+### Surfaces opérateur
+
+```bash
+# 1. La garde tourne-t-elle ? (régime attendu : NON VIDE dès le premier groom)
+grep forced_dispatch_consent "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "forced_dispatch_consent")
+           | {verdict, forced, requested, subject, has_ready, trace_id}'
+
+# 2. A-t-elle mordu ? (régime attendu : VIDE — population résiduelle sans producteur)
+grep forced_dispatch_consent "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.event == "forced_dispatch_consent" and .forced == true)'
+
+# 3. CONTRÔLE NÉGATIF — l'audit a-t-il échoué ? (régime attendu : VIDE)
+grep forced_dispatch_consent_audit_failed "$MIKA_SPIRIT_LOG_FILE"
+```
+
+Le `select` sur `.event` de la commande 1 est **porteur** : `grep` est une
+sous-chaîne et rend aussi tout texte qu'un pilote écrirait *au sujet* du signal —
+classe mika#2050, mesurée sur le Signal S, et toute session qui groome ou
+implémente ce ticket recrée ce faux positif. Même raison pour la commande 2 : le
+`.forced == true` doit être lu dans le JSON, jamais par un `grep '"forced":true'`
+sur la prose.
+
+```sql
+-- La population du consentement. SOLE WRITER, donc ce compte est exact.
+SELECT after_value, count(*) FROM audit_events
+ WHERE tool_name = 'forced_dispatch_consent' GROUP BY 1 ORDER BY 2 DESC;
+
+-- Le détail des refus, avec le ticket visé
+SELECT target_key, created_at, reasoning FROM audit_events
+ WHERE tool_name = 'forced_dispatch_consent'
+   AND after_value LIKE 'forced_dispatch_%'
+ ORDER BY created_at DESC;
+```
+
+**Un seul nom de journal et un seul `tool_name` d'audit pour les neuf issues, le
+verdict en colonne** (mika#2323, motif `ready_label_outcome`) : une sonde
+opérateur qui doit connaître neuf noms est une sonde qu'on n'écrit pas.
+`target_key` porte le ticket visé, ou le littéral `<unresolved>` quand aucun
+numéro n'a pu être lu.
+
+| surface (`after_value`) | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `allowed_not_forced` | INFO | **non vide, dominant** | le tour n'a forcé aucun outil : le dispatch a été demandé par construction. **C'est le régime nominal de la boucle**, et le contrôle positif qui dit que la garde est déployée |
+| `allowed_requested` | INFO | **non vide, faible** | forcé, mais le texte d'intention masqué *est* une demande de groom — `/mika-groom-ticket` et mika#1173 intacts. Zéro ici **et** zéro refus ne prouve rien (mika#2205) |
+| `allowed_consented` | INFO | **non vide, faible** | forcé, non demandé, et le ticket porte `ready` : le consentement de mika#841 est là, le dispatch part |
+| `allowed_disarmed` | INFO | **vide** | `MIKA_FORCED_DISPATCH_CONSENT=0` est en vigueur. Le désarmement **émet quand même sa ligne** : un désarmement muet serait indiscernable d'une garde absente. Chaque ligne est une boucle capable de groomer un ticket que personne n'a promu |
+| `forced_dispatch_without_consent` | WARN | **vide** | **le refus nominal** : labels lus, `ready` absent — l'incident du 2026-10-17 rejoué et arrêté |
+| `forced_dispatch_subject_unresolved` | WARN | **vide** | aucun numéro de ticket résoluble depuis le prompt de dispatch. `subject` se rend `null`, jamais `""` : absent n'est pas zéro (mika#2331) |
+| `forced_dispatch_consent_no_token` | WARN | **vide** | pas de token GitHub : le consentement ne peut pas être **lu**, ce qui n'est pas « il n'y en a pas ». Si ce compte porte du trafic, c'est la résolution du token qu'il faut lire, pas le prédicat |
+| `forced_dispatch_consent_unverifiable` | WARN | **vide** | le lecteur de labels a répondu `Err(_)` — API GitHub en panne. Le fail-closed gèle ce chemin : voir la halte 2 ci-dessous **avant** d'inverser la disposition |
+| `forced_dispatch_subject_is_pull_request` | WARN | **vide** | la cible est une PR, pas un ticket : il n'existe aucun `ready` à lire, et un groom de PR n'est pas un flux déclaré |
+| `forced_dispatch_consent_audit_failed` | WARN | **vide** | le WARN est passé, l'audit non : le `GROUP BY` sous-compte à partir de là |
+
+### Sondes post-déploiement
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** : après `make deploy`,
+> établir que le `mika-spirit` qui tourne porte le correctif avant toute
+> conclusion (classe mika#2340). L'**absence** de la ligne
+> `forced_dispatch_consent` signifie un binaire antérieur à ce vol, **jamais** une
+> absence de dispatch forcé. Ce sont des **gestes d'opérateur** sur l'hôte — la
+> base n'est pas montée dans le bac à sable de dispatch.
+
+```bash
+# S1 — l'instrument est vivant (après make deploy, au premier dispatch de groom)
+grep -c 'forced_dispatch_consent' ~/.mika/logs/mika-spirit.log     # attendu : > 0
+
+# S2 — la classe est vide (régime attendu de la population résiduelle)
+grep 'forced_dispatch_consent' ~/.mika/logs/mika-spirit.log \
+  | grep -c '"forced":true'                                        # attendu : 0
+```
+
+**S1 — l'instrument est vivant (premier dispatch de groom après le déploiement).**
+Attendu : au moins une ligne, verdict `allowed_not_forced`.
+*Halte 1 — zéro ligne alors qu'un groom est parti :* **ne pas conclure que la
+classe est vide.** C'est la lecture que la ligne saine existe pour interdire :
+établir d'abord le déploiement (classe mika#2340), et seulement ensuite lire le
+régime.
+
+**S2 — la classe reste vide (30 jours).** Aucune ligne portant `"forced":true`.
+*Halte 2 — une occurrence avec `allowed_consented` :* nominal, un producteur de
+contrainte d'outil existe et le ticket était promu — rien à faire. *Avec un
+verdict de refus :* un producteur est **réapparu**. Lire le `trace_id`, remonter
+au tour, et nommer le producteur **avant** de toucher au prédicat : mika#2768 en a
+fermé un, un second n'a pas la même cause.
+
+**S3 — contrôle négatif de bruit (7 jours).** Aucun refus sur un dispatch de groom
+qu'un opérateur a demandé en texte libre.
+*Halte 3 — une occurrence :* `is_grooming_intent_message` ne lit pas la demande
+comme on croit (il exige `groom` en tête de message, puis un espace ou une
+tabulation **obligatoire**). Réparer la lecture de l'intention, **ne pas** élargir
+vers le label du ticket — ce serait le gate `ready` aveugle que mika#1173 refuse.
+
+**S4 — la lecture des labels est saine (7 jours).**
+`forced_dispatch_consent_unverifiable` et `forced_dispatch_consent_no_token`
+restent vides.
+*Halte 4 — non vide :* le fail-closed gèle les dispatchs de groom forcés. Lire la
+résolution du token et l'API GitHub **avant** d'inverser la disposition —
+l'inverser rouvrirait le constat du 2026-10-17.
+
+**Halte transverse — les sondes muettes.** Zéro refus **et** zéro passage ne prouve
+rien : il faut qu'un dispatch de groom soit parti depuis le déploiement. *Une
+garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+### Ce que ce travail n'achète PAS
+
+- **Il n'élargit pas la garde à la classe `implement`.** Le tour de reprise du
+  constat a bien tenté un `implement` du même ticket non promu, et seule
+  l'occupation de la place l'a arrêté ; le fermer demande le prédicat de place,
+  pas celui-ci. La classe sort de la population **avant toute ligne de journal**,
+  donc la sonde ci-dessus ne dira jamais rien de cet axe — c'est explicite, pas un
+  trou.
+- **Il ne touche ni `validate_dispatch_readiness` ni ses 43 sites d'appel.** La
+  garde est une fonction **sœur**, appelée depuis le seul site où la provenance du
+  forçage est connue (`execute_skill_tool`), parce que le `LongRunningContext`
+  n'est pas dans la signature de cette chaîne — ses deux autres appelants moteur
+  n'en ont pas.
+- **Il ne rattrape pas l'incident du 2026-10-17.** Les 48 tours et les 3,40 $
+  restent dépensés, et **rien ne rétro-estampille** : fabriquer une ligne d'audit
+  datée d'un refus qu'on n'a pas observé est l'inverse de ce que ce travail
+  défend. La sonde est la **prochaine** occurrence.
+- **Il ne rend pas le modèle incapable de vouloir groomer un ticket non promu** :
+  il rend le dispatch impossible. La doctrine maison est *construis l'incapacité,
+  ne promets pas la retenue* (mika#1991), et elle est applicable ici — il y a une
+  capacité à retirer, et c'est elle qui est retirée.
+- **Il rend le champ lisible, pas surveillé.** Les seuls instruments sont les
+  greps et les requêtes ci-dessus, et **leur silence ne prouve rien tant que
+  personne ne les exécute.**
+
+### Un groom retenu trois fois d'affilée par la garde d'ancrage n'est plus relancé automatiquement (mika#2786)
+
+**`MIKA_GROOM_ANCHOR_BRAKE_MAX` — défaut `3` ; `0` désarme ; vide ou illisible
+retombe sur `3` (WARN sur illisible).** Le nombre de retenues consécutives de la
+garde d'ancrage (mika#2037) sur un même ticket à partir duquel tout dispatch de
+groom **automatique** de ce ticket est refusé à la frontière d'outil
+(`validate_dispatch_readiness`).
+
+- **Ce qui compte.** Un callback de groom terminal dont le `result` porte une ligne
+  `Engine reason: … (BLOCKING) [mika-engine] review-anchor: …` est une retenue.
+  Un callback qui porte une ligne `Outcome: …` sans retenue (`PLAN_GROOMED`, un
+  ESCALATE d'architecte, `PIPELINE_INCOMPLETE`) **arrête** la série. Un callback
+  sans ligne `Outcome:` (le lanceur différé, « deferred dispatch slot freed ») est
+  **neutre**.
+- **Pourquoi un frein ici.** Le 2026-10-18, mika#2762 a été retenu trois fois de
+  suite. Deux des trois relances venaient de mika-dev lui-même, qui relisait le
+  callback d'ESCALATE comme un succès. Le budget de re-drive de mika#2020 ne
+  compte que les re-drives de la Phase 2, et le gate mika#2545 laisse passer tout
+  tour qui porte un message. La frontière d'outil est le seul site que tous ces
+  chemins traversent.
+- **La levée.** `mika ask --agent mika-dev "groom <owner/repo>#<n>"` : une
+  intention de grooming explicite traverse le frein. **Reposer `ready` ne le lève
+  pas**, parce que le moteur ne distingue pas le `ready` de l'opérateur de celui
+  que mika-dev repose. Un groom qui converge remet la série à zéro.
+- **La levée est écrite, et elle borne la série.** Une demande explicite qui
+  traverse un frein armé écrit une ligne `groom_anchor_brake_lifted` (INFO + audit,
+  `target_key` = `owner/repo#n`). Le frein ne compte ensuite que les retenues
+  postérieures à la dernière levée. C'est ce qui fait survivre la levée à la file
+  différée : si la place de groom est prise, la demande est garée en lanceur
+  différé, et son rejeu part d'un tour silencieux sans message d'origine. Une
+  nouvelle série de trois retenues après la levée freine de nouveau.
+- **La levée est large au tour.** Elle porte sur le tour qui contient la demande,
+  pas sur le ticket qu'elle nomme : un `groom mika#100` dont le tour dispatche un
+  groom de mika#2762 lève le frein de mika#2762. C'est le même choix que
+  mika#2484, et la ligne de levée nomme le ticket réellement levé.
+- **Ce que le frein ne fait pas.** Il ne pose ni label ni commentaire. Le ticket
+  garde `ready`, la Phase 2 le re-drive, chaque re-drive est refusé sans pilote, et
+  le budget de mika#2020 finit par le garer derrière `operator-review` avec un
+  commentaire.
+- **Base illisible : il ne freine pas**, et le dit sous
+  `groom_anchor_brake_unreadable` (WARN).
+
+| surface | niveau | lecture |
+|---|---|---|
+| `groom_anchor_withheld_brake` (journal) | WARN | un dispatch de groom refusé ; champs `issue`, `withheld_in_a_row`, `max` |
+| `audit_events.tool_name = 'groom_anchor_withheld_brake'` | — | même population ; `target_key` = `owner/repo#n`, `after_value` = la série |
+| `dispatch_groom_anchor_brake` dans `tasks.result` | — | le JSON de refus rendu au modèle |
+| `groom_anchor_brake_lifted` (journal + audit) | INFO | une levée par l'opérateur ; `after_value` = la série levée |
+
+Sonde : `SELECT target_key, count(*) FROM audit_events WHERE tool_name =
+'groom_anchor_withheld_brake' GROUP BY 1;`. Avant `make deploy`, son silence veut
+dire « binaire antérieur », pas « aucune boucle ».
 
 ### L'alimenteur nomme la cause qu'il a mesurée (mika#2161)
 
@@ -6267,6 +7888,7 @@ Optional (purge du `target/` d'un worktree vif — mika#2497):
 - `MIKA_TARGET_PURGE` — kill-switch, **défaut armé**. `0`/`false`/`off`/`no` désarment sans redéploiement ; absent, vide ou **non reconnu** laissent armé, avec un WARN nommant la valeur entre guillemets — un désarmement par coquille sur un frein de disque serait la panne silencieuse que tout ceci ferme. Désarmé, le bras n'écrit **rien** : il ne « refuse » pas, il n'existe pas ce tick.
 - `MIKA_TARGET_PURGE_DISPOSITION` — `armed` (défaut) | `observe`. En observation le bras mesure, journalise et **ne supprime rien** (`target_purge_would_dispose`, jamais `target_purged`). Patron mika#2249 : *la détection est inconditionnelle, seule la disposition est gatée* — et la correction de mika#2469 est prise d'emblée plutôt qu'après coup.
 - `MIKA_TARGET_PURGE_IDLE_SECS` — fenêtre P4, **défaut `14400` (4 h)**, bornée des deux côtés : en dessous, une boucle QA → CI-fix active enchaîne en minutes et se ferait purger son cache entre deux itérations ; au-dessus, la fenêtre nocturne de 8 h qui a produit l'incident cesse d'être mordue.
+- `MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS` — **fenêtre P4 courte, défaut `900` (15 min)**, appliquée **au seul candidat dont le dernier consommateur a fini** (mika#2808, § *La fenêtre de P4 est choisie par candidat* ci-dessous). `MIKA_TARGET_PURGE_IDLE_SECS` reste la fenêtre de tous les autres, **inchangée à 4 h**. Pourquoi pas zéro : P3 et P5 tiennent la correction, mais une boucle QA → CI-fix peut enchaîner en minutes et cette marge protège son cache ; pourquoi pas plus : au-delà on reperd l'écart avec les 4 h qui est tout l'objet. Même parse à trois paliers que les autres clés numériques.
 - `MIKA_TARGET_PURGE_MAX_PER_TICK` — **défaut `2`**, budget **distinct** de celui du faucheur (un budget partagé ferait manger au faucheur le sien, ou l'inverse). Un `remove_dir_all` de 40 Go est une tempête d'E/S : ce cap est ce qui l'étale. Les trois clés numériques suivent le parse maison à trois paliers, et le `0` **ne désarme pas** — c'est le rôle du kill-switch.
 - **Disposition propre, sentinelle STOP PARTAGÉE.** Disposition propre parce que les deux létalités diffèrent d'un ordre de grandeur : coupler forcerait l'opérateur à régler les deux sur la plus prudente, et donc à perdre la purge dès qu'il veut observer le faucheur. Sentinelle **partagée** (`~/.mika/state/worktree-reap-stop`, mika#2329) parce que la décision d'urgence est **la même** — « arrête ce qui supprime dans les worktrees ». Le court-circuit existant est en tête de tick, donc il couvre le nouveau bras sans une ligne.
 - **Livré armé, et l'argument est celui de l'asymétrie.** mika#2420 a shippé armé en s'appuyant sur mika#2272 (*« zéro était l'absence de mesure, pas la présence de prudence »*) ; l'argument est plus fort ici, le pire cas d'un faux positif étant un rebuild et non une perte. Ce qui paie la prudence est nommé et concret : les cinq termes fail-safe, la garde directe P5, le mode observe, la sentinelle partagée, le kill-switch — **et la sonde S0, qui prescrit de commencer en `observe`**.
@@ -6439,6 +8061,11 @@ d'autre du déploiement, cherche dans ce voisinage.
   que le suivi `rename`-avant-suppression s'ouvre, avec ce compte comme
   précondition. Ne pas raccourcir `MIKA_TARGET_PURGE_IDLE_SECS` par réflexe —
   ce serait purger le cache de travail en cours pour un problème de course.
+  **Toujours vrai après mika#2808 :** cette valeur est restée à `14400`. Ce
+  ticket n'a pas raccourci la fenêtre, il en a ajouté une **seconde**
+  (`MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS`) qui ne s'applique qu'au candidat
+  dont le dernier consommateur a fini. Un candidat sans verdict QA — c'est-à-dire
+  exactement celui dont un build pourrait démarrer — garde ses quatre heures.
   **S6 — contrôle négatif du zéro :** un compte **nul** ne prouve **pas** que le
   défaut n'existait pas ; il faut qu'un `cargo` démarre pile dans la fenêtre, et
   celle du premier candidat d'un tick est de l'ordre de 2 s (`measure_tree_size`
@@ -6888,6 +8515,135 @@ P3, P4 ou P5 a lu vrai alors qu'il était faux. La fenêtre résiduelle du verro
   claude-pilot** — suivi déjà nommé par mika#2548, sans rapport avec ce code.
 - **Le vocabulaire du faucheur** (`ALL_REFUSAL_REASONS`) — aucun motif ajouté,
   retiré ni renommé. Seule leur **classification** est nouvelle.
+
+### La fenêtre de P4 est choisie par candidat, sur l'état du dernier consommateur (mika#2808)
+
+**Une variable nouvelle, `MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS`
+(défaut `900`), et aucune valeur existante déplacée.**
+`MIKA_TARGET_PURGE_IDLE_SECS` reste à `14400`.
+
+- **Le défaut que ça ferme, mesuré.** 2026-10-19 à 00:00Z : `/data` monté de
+  27 % à 42 % en trois heures, **aucun pilote en vol**. `.claude/worktrees`
+  pesait 268 Go sur 35 worktrees, dont neuf `target/` de 22 à 47 Go — la quasi
+  totalité. Un `cargo clean` à la main sur ces neuf a ramené `/data` à 14 %.
+  Le mécanisme de mika#2497 n'a **rien** récupéré, et c'est conforme : sa
+  fenêtre de 4 h rattrape l'accumulation lente, pas un rythme de plusieurs vols
+  par jour compilant chacun 20 à 50 Go dans un worktree neuf. Les spawns
+  appliquent déjà « `cargo clean` au push » ; les pilotes de la boucle, non.
+
+- **Le point d'accroche est le VERDICT QA, pas la sortie du pilote.** Le dernier
+  consommateur du `target/` d'un worktree de pilote est le build QA
+  (`long_running:build_mika`) qui suit l'ouverture de la PR. Purger à la sortie
+  du pilote obligerait la QA à tout recompiler — on échangerait du disque contre
+  de la latence de boucle sur le chemin **nominal**, ce que mika#2497 avait déjà
+  refusé.
+
+- **C'est un ÉTAT LU, jamais un signal ÉMIS, et les deux raisons sont des
+  incidents passés.** Un signal émis par `dispatch-lib.sh` ne part pas quand le
+  pgid du pilote est tué (mika#2263), et deux écrivains pour une même garde est
+  la classe de divergence de mika#2158. Le bras **lit** donc, à chaque tick, une
+  liste de revues déjà publiée (`gh pr list --json
+  number,headRefName,latestReviews`), et en dérive un état par candidat.
+
+- **`COMMENTED` compte comme un verdict soumis.** mika-qa poste ses verdicts
+  bloquants en `gh pr review --comment`, ce qui laisse `reviewDecision` à
+  `REVIEW_REQUIRED` : seul `latestReviews` les voit. Exiger `APPROVED` rendrait
+  le bras aveugle à la moitié des verdicts. Seul `PENDING` — un brouillon — et
+  un état absent ne comptent pas.
+
+- **La table, et elle est fail-safe dans les deux sens.**
+
+  | motif de conservation | état du consommateur | fenêtre |
+  |---|---|---|
+  | `pr_open` **avec** ≥ 1 revue soumise | `done` | `900 s` |
+  | `pr_open` **sans** revue soumise | `pending` | `14400 s` |
+  | `pr_unknown` / `detached_head_pr_unknown`, aucune PR dans l'index | `done` | `900 s` |
+  | `pr_unknown` / `detached_head_pr_unknown`, mais l'index montre une PR | `unknown` | `14400 s` |
+  | les six autres motifs éligibles | `unknown` | `14400 s` |
+  | liste de revues illisible, ou `branch` absente | `unknown` | `14400 s` |
+
+  La quatrième ligne est une **contradiction entre deux lectures** du même tick
+  (le faucheur a dit « pas de PR », l'index en montre une) : elle conserve. Un
+  terme illisible conserve — la doctrine des cinq termes de mika#2497 est
+  inchangée, et **P1, P2, P3 et P5 ne sont pas touchés** : seule la valeur
+  comparée en P4 devient fonction du candidat.
+
+#### Surfaces opérateur
+
+- `MIKA_TARGET_PURGE_CONSUMER_DONE_IDLE_SECS` — ci-dessus, § `MIKA_TARGET_PURGE`.
+- Les lignes `target_purged` / `target_purge_would_dispose` portent deux champs
+  **additifs** : `consumer_state` (`done` | `pending` | `unknown`) et
+  `window_secs` (la fenêtre réellement appliquée). Ils sont des **champs**,
+  jamais un second `tool_name` : la population reste soustractible et les
+  requêtes publiées existantes sont inchangées.
+- `target_purge_reviews_unreadable` (WARN, par dépôt et par tick) — l'appel `gh`
+  a échoué ; **toutes** les PR ouvertes de ce dépôt retombent sur la fenêtre
+  pleine ce tick-là.
+
+#### Sonde post-déploiement
+
+> Gestes d'opérateur sur l'hôte : la base n'est pas montée dans le bac à sable
+> de dispatch, donc aucun pilote n'exécute ceci.
+
+**S0 — commencer en `observe`, un tick.** Poser
+`MIKA_TARGET_PURGE_DISPOSITION=observe`, lire `target_purge_would_dispose` et
+vérifier que les `consumer_state = "done"` correspondent bien à des PR dont la
+QA a rendu son verdict. **Puis armer.**
+
+```sql
+-- La population purgée sur 24 h
+SELECT count(*) FROM audit_events
+ WHERE tool_name = 'target_purged'
+   AND created_at >= datetime('now', '-1 day');
+```
+
+```bash
+# Quelle fenêtre a servi, et pourquoi
+grep target_purged "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c 'select(.consumer_state == "done")
+           | {worktree_path, branch, pr_number, consumer_state, window_secs, idle_secs}'
+
+# CONTRÔLE POSITIF — la lecture des revues aboutit-elle seulement ?
+grep -c target_purge_reviews_unreadable "$MIKA_SPIRIT_LOG_FILE"   # attendu : 0
+```
+
+**Halte — `consumer_state = "unknown"` domine alors que des PR sont ouvertes et
+revues.** Ne **pas** élargir la table : lire d'abord le contrôle positif
+ci-dessus. Un `target_purge_reviews_unreadable` non nul dit que l'appel échoue
+(jeton, quota, réseau) et que le bras est fail-safe inerte — ce qui se lit
+exactement comme un disque sain (classe mika#2205).
+
+#### Les coûts acceptés, nommés
+
+1. **Un verdict bloquant peut coûter une recompilation à froid.** mika-qa rend
+   `CHANGES_REQUESTED`, le `target/` est purgé 15 min plus tard, et l'itération
+   CI-fix qui suit repart d'un cache vide. C'est le prix du choix de l'accroche,
+   et il est borné à du temps de rebuild.
+2. **La latence est de ≈ 15 à 25 min, pas « dès que ».** Le bras tourne sur le
+   cron `0 */10 * * * *` de `worktree_reap` : au verdict s'ajoutent la fenêtre
+   de 900 s puis l'attente du tick suivant. **Raccourcir le cron de 10 à 5 min a
+   été refusé** — ce serait doubler la fréquence de tout le tick (faucheur
+   compris) pour gagner cinq minutes sur un problème de disque qui se compte en
+   heures.
+3. **Un appel `gh` de plus par dépôt et par tick.** Mesuré le 2026-10-19 :
+   57 Ko / 0,79 s, hors du chemin critique du faucheur. L'appel du faucheur
+   (73 Ko / 2,1 s) est **laissé tel quel** : y ajouter `latestReviews` le faisait
+   passer à 1,21 Mo / 7,05 s.
+4. **La fenêtre de 4 h est intacte.** Rien de ce travail ne purge plus tôt un
+   candidat dont le consommateur n'a pas fini.
+
+#### Hors périmètre, délibérément
+
+- **Raccourcir le cron de `worktree_reap`** — coût 2 ci-dessus.
+- **Un signal émis par `dispatch-lib.sh`** — mika#2263 et mika#2158.
+- **Les cinq termes de mika#2497** — P1, P2, P3 et P5 inchangés ; P4 garde son
+  prédicat, seule la borne comparée devient fonction du candidat.
+- **Un troisième index dans `PrIndex`** — sa documentation affirme que ses index
+  sont construits de la même liste au même instant par un **site unique** ; un
+  index issu d'un second appel `gh` falsifierait cet invariant. La carte est un
+  paramètre séparé.
+- **`scripts/mika-platform-worktree-cleanup`** (mika#2497, pression disque) —
+  mécanisme complémentaire, conservé tel quel.
 
 ### Le lint porte sur les jetons dont le lecteur est strict (mika#2201)
 
@@ -7573,6 +9329,75 @@ mika#2340) : **établir le déploiement avant toute conclusion sur les valeurs.*
   tenant Telegram (l'unité y est le *chat*, ni la session ni l'agent) —
   **suivi**, précondition : la sonde S2.
 
+### La cérémonie de handsoff au plafond de contexte (mika#1748)
+
+**Une variable, et elle est ici** parce que l'opérateur qui cherche « comment la
+fenêtre de conversation se comporte en approchant sa limite » cherche dans le
+voisinage de la section précédente, qui règle la même fenêtre.
+
+Optional (cérémonie de témoignage avant compaction — mika#1748) :
+- `MIKA_COMPACTION_HANDSOFF_THRESHOLD_PCT` — pourcentage de
+  `compaction::COMPACTION_THRESHOLD` (50 messages) au-delà duquel l'agent se voit
+  demander d'écrire un témoignage avant la condensation. Défaut **85** →
+  franchissement à **43 messages**. Bornes **1..=100** inclusives.
+
+  **Le seuil est en MESSAGES, pas en tokens**, et c'est le fond du réglage :
+  `count_messages()` comparé à `COMPACTION_THRESHOLD` est la grandeur sur
+  laquelle le substrat décide réellement de condenser. Un pourcentage de tokens
+  serait un second instrument mesurant une autre grandeur que celle qui déclenche
+  l'événement qu'il prétend précéder — il pourrait rester sous son seuil au
+  moment où la compaction tire, ou tirer trois fois sans qu'elle approche.
+
+  **Trois paliers.** Absent ou vide → défaut, silencieusement (c'est la forme
+  nominale de toute installation). Hors `1..=100` ou non numérique → **défaut
+  plus un WARN** `compaction_handsoff_threshold_invalid`, nommant la valeur
+  reçue, le défaut appliqué et la variable : *un réglage qu'on ne peut pas
+  observer n'est pas un réglage, c'est un espoir* (mika#2293). **`0` est refusé
+  comme toute autre valeur hors bornes** — il signifierait « cérémonie dès le
+  premier message », ce que personne ne demande, et l'interpréter comme
+  « désarmé » installerait deux lectures pour une même valeur. Il n'y a pas de
+  sentinelle de désarmement sur cet axe dans ce vol.
+
+  **Lue à chaque tour**, directement depuis l'environnement (même geste que
+  `db::dispatch_slot_lease_ttl_secs()`), donc un changement prend effet au tour
+  suivant sans redémarrage — mais il n'y a **pas de réglage par agent** : la
+  population de fait est l'ensemble des agents conversationnels, et un
+  `config.toml` de plus à réconcilier répondrait à un besoin que personne n'a
+  mesuré.
+
+- **Surfaces opérateur** (`$MIKA_SPIRIT_LOG_FILE`, toutes sur
+  `target: "mika::otel"`) :
+
+```bash
+# 1. Quels agents approchent leur plafond, et à quel compte ?
+grep compaction_handsoff_due "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent, messages, threshold_pct, window}'
+
+# 2. Le comptage a-t-il échoué quelque part ? (fail-open : le tour continue)
+grep compaction_handsoff_count_failed "$MIKA_SPIRIT_LOG_FILE"
+
+# 3. Une valeur de seuil a-t-elle été refusée ?
+grep compaction_handsoff_threshold_invalid "$MIKA_SPIRIT_LOG_FILE"
+
+# 4. Le témoignage a-t-il été écrit ?
+ls -1 ~/.mika/agents/<nom>/handsoffs/
+```
+
+- **`compaction_handsoff_due` n'est PAS émis au régime nominal, et c'est voulu.**
+  Au-dessous du seuil cette ligne tomberait à chaque tour de chaque agent, et un
+  instrument qui parle tout le temps ne dit plus rien. Le pendant négatif — « le
+  seuil n'est pas franchi » — se lit à l'**absence** de ligne pour un agent dont
+  on connaît le compte de messages. Son absence peut aussi vouloir dire
+  « binaire antérieur à mika#1748 » (classe mika#2340) : l'instrument n'est pas
+  vivant avant un `make deploy`.
+- **Halte de lecture.** Sonde 1 verte et sonde 4 vide ⇒ le défaut est dans
+  l'obéissance au bloc de prompt, **pas** dans la détection. Ne pas déplacer le
+  seuil : c'est la cérémonie qu'il faut regarder, pas le détecteur.
+- **Ce que ce vol n'achète PAS** : le successeur ne lit pas encore le témoignage
+  à son premier démarrage (AC5), et la boucle silencieuse ne rend pas le bloc —
+  **suivi** à `senara-solutions/mika#2805`. Raisonnement complet, tables de
+  lecture et gardes de résidu : `docs/architecture/compaction-handsoff.md`.
+
 Optional (runtime observability):
 - `MIKA_STORE_LLM_CALLS` — Store LLM call metadata (model, tokens, latency) in SQLite (default: true)
 - `MIKA_STORE_TOOL_CALLS` — Store full tool call input/output in SQLite (default: true, 50KB cap per field)
@@ -7725,7 +9550,7 @@ Optional (signal d'adoption sur un travail non dispatché — mika#1745) :
 
   **Le défaut que ça ferme.** Un CI failure sur une PR ouverte d'un dépôt que la boucle a le droit de dispatcher, sans tâche mika correspondante, était écarté en silence : `ci_failure_handler` rendait `Passthrough { enrichment: None }` — le modèle recevait le texte brut du webhook, sans un mot du moteur, puis son prompt lui disait d'ignorer. Le signal est désormais **additif** : aucune tâche créée, aucun dispatch déclenché, aucun statut modifié, aucun processus signalé. `Passthrough`, jamais `Handled` (AC3).
 
-  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot-py` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
+  **Le dépôt hors `DISPATCHABLE_REPOS` reste silencieux, quelle que soit la valeur** — `claude-pilot` et `wizzard` sont spawn-CC-only par la décision opérateur du 2026-08-29, donc y proposer une adoption proposerait une action que la porte mika#2046 refuse structurellement. C'est AC4, et c'est maintenant **attribuable** : la ligne `surface_for_adoption_skipped` nomme le motif.
 
   **Surfaces opérateur.** `grep surface_for_adoption "$MIKA_SPIRIT_LOG_FILE" | jq -c '{event, repo, pr_number, branch, head_sha, dedup_skipped, notified}'` — le grep est un **préfixe**, donc il rend le signal et ses frères de saut ensemble ; `.event` discrimine. SQL : `SELECT target_key, count(*) FROM audit_events WHERE tool_name = 'surface_for_adoption' GROUP BY 1 ORDER BY 2 DESC;` — exact parce que `surface_for_adoption` est **SOLE WRITER** de son nom (scan de source, allowlist livrée vide), et ce compte **est** la précondition explicite de la décision d'auto-adoption qu'AC3 diffère (« until we have enough n »).
 
@@ -7740,6 +9565,255 @@ Optional (signal d'adoption sur un travail non dispatché — mika#1745) :
   **Dédup : condition de viabilité, pas raffinement.** Un push produit jusqu'à **8** `check_suite.completed` (un par workflow, mesuré par mika#1869 qui a fermé la même classe côté succès), donc sans dédup un seul fait produirait huit notifications Telegram — et une notification en rafale est une notification qu'on finit par museler. Clé `pr:{repo}#{n}@{head_sha}`, fenêtre une heure, **fail-open** : une base illisible laisse passer le signal (un doublon coûte une ligne, un signal perdu rouvre le défaut) — l'inverse du fail-closed de `wip_rescue` sur le même primitif, où un rejeu coûtait la file entière.
 
   **Sondes et haltes, la doctrine complète, et le tableau des trois cas de vérification du ticket avec leur statut rectifié** : `docs/architecture/mika-dev-work-assignment.md`. Deux points à connaître avant d'y aller : **S2 (dimensionnement, 30 j) n'était pas disponible à l'implémenteur** — `~/.mika/data/mika.db` n'est pas lisible depuis le bac à sable de dispatch, donc le volume réel est **inconnu à la livraison** ; et si ce compte porte du trafic nominal, ce n'est pas le prédicat qui est trop large, **c'est le résultat que le ticket cherchait** (noter le compte, désarmer la notification pour garder la mesure sans le bruit).
+
+### Le P0 passe par un second chat, et un chat d'escalade absent le dit (mika#1381)
+
+Optional (routage par sévérité des notifications opérateur — mika#1381, vol 1) :
+- `operator_escalation_chat_id` (`config.toml`) / `MIKA_OPERATOR_ESCALATION_CHAT_ID` — le chat Telegram dédié aux notifications **P0**, « la boucle est morte, un humain doit intervenir ». **Défaut : absent**, c'est-à-dire un déploiement à canal unique. `Option<i64>` et non `u64` : un identifiant de groupe Telegram est **négatif**.
+
+**Un second canal plutôt qu'un drapeau, et c'est tout l'arbitrage.** Le défaut que ce
+travail ferme est un **mute** : le chat qui porte dix-sept accusés de réception de
+routine par jour finit mis en sourdine, et l'alarme de panne part avec. Un bit
+« contourne la sourdine » n'est pas exprimable côté Telegram ; un chat
+structurellement distinct l'est, et l'opérateur **garde** sa sourdine. Deux paliers
+seulement — `P0` et `P2` — parce qu'un `P1` sans destination propre ne serait qu'un
+troisième nom du chat normal.
+
+**La surface P0 reste à bas volume par construction**, et ce n'est pas une
+préférence : une surface « jamais mise en sourdine » qui reçoit dix-sept classes de
+message est une surface qui sera mise en sourdine. Vol 1 y route **7 sites** sur 17 —
+les cinq disjoncteurs et limites de reprise de `verdict_handler.rs`, l'épuisement des
+tentatives de correction CI de `ci_failure_handler.rs`, et le site phare
+`agent_loop/mod.rs` (le label `ready` retiré sans que le dispatch aboutisse : aucun
+webhook ultérieur ne le dira). Les 10 sites P2 sont **textuellement inchangés**.
+
+**Absent n'est pas une erreur, et ne perd rien.** Un `P0` sans chat d'escalade
+**retombe sur le chat normal** et l'écrit sous un nom :
+
+```
+grep operator_escalation_chat_unset "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{agent_name, request_id, severity, fallback_chat_id}'
+```
+
+Retomber plutôt que jeter est la décision D4 : sur ce chemin il n'y a **pas** de
+sink hors-ligne (contrairement à `milestone_manager`), donc un `P0` refusé serait un
+`P0` perdu — exactement l'« alarme dans le vide » du diagnostic #4. Un silence
+retombé sans le dire serait le même défaut sous un autre nom ; d'où le WARN, sur
+**chaque** occurrence.
+
+**`0` est refusé comme route.** `chat_id == 0` est le sentinelle documenté « aucun
+canal de réponse » sur lequel `GatewayMessageSender::send` court-circuite avant tout
+POST (mika#650/#1090). Un chat d'escalade réglé à `0` avalerait donc **chaque** P0 en
+silence : la valeur vaut « pas de chat d'escalade », jamais « route vers 0 », et le
+WARN ci-dessus part. Corollaire utile dans l'autre sens : un `P0` dont le chat normal
+vaut `0` (session webhook GitHub) **part quand même** si un chat d'escalade est armé —
+le routage précède le court-circuit, et c'est précisément le cas que le diagnostic #4
+décrivait.
+
+| surface | régime attendu | lecture |
+|---|---|---|
+| `operator_escalation_chat_unset` | **vide** une fois la variable posée | si non vide, la valeur n'a pas été lue par le processus qui sert l'agent |
+| `operator_escalation_chat_unset`, variable **non** posée | non vide, à chaque P0 | nominal sur un déploiement à canal unique — le signal n'est pas perdu, il est sur le chat normal |
+| `send_message_nochannel`, `severity = "p0"` | **vide** | un P0 arrivé sur `chat_id = 0` : aucun canal, ni normal ni d'escalade. L'alarme est perdue — c'est le seul cas qui l'est |
+
+**Sonde post-déploiement (R7/AC6) — la livraison effective n'est pas prouvée par le
+code.** Le vérifier demande un P0 réel sur l'installation réelle :
+
+1. Poser `MIKA_OPERATOR_ESCALATION_CHAT_ID=<id>` et `make deploy` (la valeur est lue
+   par **mika-spirit** via la cascade `MIKA_`, donc un redémarrage est requis).
+2. `grep operator_escalation_chat_id "$MIKA_SPIRIT_LOG_FILE"` ou le `Debug` de
+   `Settings` — l'identifiant y figure **en clair**, c'est une destination de routage
+   et non un secret : le masquer cacherait la seule valeur qu'un opérateur qui
+   débogue « mon P0 n'est parti nulle part » a besoin de lire.
+3. Mettre le chat normal en sourdine, provoquer un P0 (le plus court : retirer le
+   label `ready` d'un ticket dont le dispatch échoue), et constater la notification
+   sur le chat d'escalade.
+
+**Haltes.** *(a)* L'étape 3 arrive sur le chat normal → la valeur n'est pas en force :
+lire l'étape 2 avant de toucher au code. *(b)* `operator_escalation_chat_unset` part
+alors que la variable est posée → le rail qui a émis n'est pas armé ; les deux seuls
+sites armés sont `server/handlers.rs` (rail conversationnel) et `server/mod.rs`
+(rail du moteur de tâches) — `flush_failed_sends` ne l'est **délibérément pas**, il
+rejoue des envois dont la destination est déjà figée. *(c)* Rien n'arrive nulle part
+et `send_message_nochannel` porte `severity = "p0"` → l'agent n'a aucun canal du
+tout ; la variable n'y changera rien, c'est `chat_id` qu'il faut configurer.
+
+### La récidive d'ancrage se nomme, et sa notification P0 est livrée désarmée (mika#2867)
+
+Optional (classe `fabrication-detected` de mika#1381) :
+- `fabrication_p0_notify` (`config.toml`) / `MIKA_FABRICATION_P0_NOTIFY` — arme la notification **P0** de la récidive du garde `assert_grounded` (#1331). **Défaut : `false`.** Résolue aux trois points d'entrée de `run_loop` (conversation, silencieux, équipe) par `is_some_and` : un appelant sans `Settings` laisse la porte **fermée**. Délibérément absente de `SETTABLE_CONFIG_KEYS` : un agent ne peut pas l'armer depuis une conversation. Lisible par `mika config get fabrication_p0_notify`. Lue au démarrage, comme le reste de `Settings` : l'armer demande un redémarrage, pas un déploiement.
+
+**Ce qui est armé, et ce qui ne l'est pas.** Le garde accorde **un** re-prompt. Si la
+seconde réponse réaffirme un état système qu'aucun appel d'outil n'ancre, elle part
+telle quelle — avant mika#2867, en silence. Désormais :
+
+| moitié | état livré | effet |
+|---|---|---|
+| `warn!` `guard.assert_grounded_uncorrected` (cible `mika::otel`) | **armé**, inconditionnel | une ligne par tour au plus, champs `trace_id`, `agent_id`, `session_id`, `step`, `resource_type`, `resource_ref`, `claim`, `label` |
+| notification à l'opérateur via `send_with_severity(…, P0)` | **désarmé** | avec la porte ouverte, part par le routage P0 de mika#1381 (entrée ci-dessus), texte préfixé `Fabrication detected (uncorrected)` |
+
+La première prise (le garde tire, l'agent se corrige) ne produit **ni** l'une **ni**
+l'autre : c'est le travail nominal du garde, pas un incident.
+
+**Le `warn!` est écrit au constat, la notification à la sortie.** D'autres gardes, en
+aval de celle-ci, peuvent encore refuser la clôture après la récidive. La notification
+n'est donc envoyée qu'au moment où l'`EndTurn` est accepté, et seulement si le texte
+accepté porte encore une revendication non ancrée. Une récidive suivie d'une clôture
+corrigée produit donc une ligne de sonde 1 **sans** notification. Ce n'est pas une
+porte qui fuit.
+
+**Où la notification arrive, et où elle ne peut pas partir.** En P0, le transport vise
+`MIKA_OPERATOR_ESCALATION_CHAT_ID`. **Si cette variable est absente, il retombe sur le
+chat normal de l'agent**, avec le WARN `operator_escalation_chat_unset` : sur un
+tenant, c'est le chat de l'utilisateur final, qui recevrait un message d'opérateur.
+Les tours sans transport sortant n'envoient rien, porte ouverte ou non : le mode
+équipe, l'A2A et `investigate` construisent leur contexte avec `message_sender: None`.
+La porte est résolue sur ces chemins, mais rien ne peut en sortir, et rien ne le dit.
+
+**Pourquoi désarmé.** La fréquence réelle de la récidive n'a pas été mesurée sur le
+trafic : une classe P0 qui tirerait à chaque re-prompt d'ancrage rendrait la surface
+jamais muette muette en pratique (« alarm-into-void », mika#1381). Le `warn!` **est**
+l'instrument de cette mesure.
+
+#### Sondes de comptage
+
+**La porte couvre trois sites, et chacun a sa fenêtre.** mika#2878 y a rattaché
+`false_local_hosting_claim` (site 5d) et mika#2879 la moitié « état accompli » de
+`unactioned_frequency_promise` (site 5e). La porte est **unique** : l'armer arme les
+trois, donc un site trop bruyant interdit d'armer les autres, et le compte se donne
+**par site**.
+
+Les six sondes ci-dessous sont **bornées à leur fenêtre** (mika#2871). Ce n'est pas de
+l'hygiène : `$MIKA_SPIRIT_LOG_FILE` porte le trafic de binaires antérieurs aux sites,
+et un compte non borné mélange donc des jours où le détecteur n'existait pas avec des
+jours où il tirait — il sous-estime le taux, dans la direction qui fait paraître
+l'armement sûr. Les bornes sont les redémarrages du moteur, pas des dates rondes :
+**2026-10-23T13:01:03Z** pour les sites 6d et 5d (binaire 94b21916, qui contient #2870
+et #2878), **2026-10-23T16:00:35Z** pour le site 5e (binaire bc92d236, premier à porter
+`assertion_nature` à la racine). La fenêtre de 7 jours finit donc le 2026-10-30 à
+13:01Z pour les deux premiers et à 16:00:35Z pour le troisième — trois heures plus tard,
+et ce décalage est réel, pas un arrondi.
+
+```sh
+# --- site 6d : assert_grounded (#1331, classe depuis mika#2867) ---
+# 1. La récidive, par jour (la population que l'armement enverrait en P0)
+grep guard.assert_grounded_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.assert_grounded_uncorrected"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# 2. CONTRÔLE POSITIF — la première prise, par jour (instrumentée depuis #953)
+grep guard.assert_grounded "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.assert_grounded"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# --- site 5d : false_local_hosting_claim (mika#2878, suivi de #2872) ---
+# 3. La récidive, par jour
+grep guard.false_local_hosting_claim_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.false_local_hosting_claim_uncorrected"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# 4. CONTRÔLE POSITIF — la première prise, par jour
+grep guard.false_local_hosting_claim "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.false_local_hosting_claim"
+                  and .timestamp >= "2026-10-23T13:01:03Z"
+                  and .timestamp <  "2026-10-30T13:01:00Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# --- site 5e : unactioned_frequency_promise, moitié « état accompli »
+#     (mika#2879, vol 3) — fenêtre décalée de trois heures ---
+# 5. La récidive, par jour
+grep guard.unactioned_frequency_promise_uncorrected "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.unactioned_frequency_promise_uncorrected"
+                  and .assertion_nature == "accomplished_state"
+                  and .timestamp >= "2026-10-23T16:00:35Z"
+                  and .timestamp <  "2026-10-30T16:00:35Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# 6. CONTRÔLE POSITIF — la première prise, par jour
+grep guard.unactioned_frequency_promise "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "guard.unactioned_frequency_promise"
+                  and .assertion_nature == "accomplished_state"
+                  and .timestamp >= "2026-10-23T16:00:35Z"
+                  and .timestamp <  "2026-10-30T16:00:35Z") | .timestamp' \
+  | cut -c1-10 | uniq -c
+
+# --- l'état de la porte elle-même (mika#2978) ---
+# 7. Quels agents SERVENT la porte armée, au dernier démarrage, et vers quel
+#    canal. Polarité inverse des six sondes ci-dessus : elles comptent une
+#    population et se lisent sur une fenêtre, celle-ci lit un état et se lit sur
+#    le DERNIER démarrage. Pas de borne de fenêtre, donc : la borner mélangerait
+#    les boots. Une sortie VIDE est le résultat attendu avant l'armement — la
+#    ligne ne parle que sur la dérogation (doctrine mika#2131).
+grep fabrication_p0_gate_armed "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -r 'select(.event == "fabrication_p0_gate_armed")
+           | [.timestamp, .agent_id, .escalation_chat_id] | @tsv' \
+  | tail -20
+```
+
+Le `select` sur `.event` est porteur : chaque `grep` de contrôle positif est une
+sous-chaîne du `grep` de récidive et rend aussi ses lignes. Pour chaque site, la
+colonne de la récidive est un sous-ensemble de celle du contrôle positif.
+
+Le terme `.assertion_nature == "accomplished_state"` du site 5e est **porteur de la
+même manière** : la moitié « engagement sur l'avenir » du même détecteur reste **hors**
+de la classe `fabrication-detected`, donc une sonde sans ce terme compte une population
+que l'armement n'enverrait pas en P0 — elle surestime, dans la direction qui fait
+paraître l'armement dangereux. Les deux erreurs de borne vont en sens contraire ; c'est
+pourquoi aucune des six ne se lit sans les siennes.
+
+**Lecture des absences.** Un contrôle positif vide sur plusieurs jours de trafic veut
+dire que le garde ne tire pas, **ou** que le binaire servi est antérieur au site : dans
+ce cas la récidive vide ne prouve rien. Une récidive sans aucune ligne alors que son
+contrôle positif en a beaucoup, sur un binaire qui contient le site, est le résultat
+attendu, pas une panne.
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `fabrication_p0_gate_armed` | INFO | **vide avant l'armement** | une ligne par agent qui SERT la porte armée, avec son canal d'escalade ; son absence après `make deploy` veut dire *désarmée* — l'état livré — **ou** un binaire antérieur au vol (classe mika#2340) |
+
+Le champ `escalation_chat_id` est rendu par le **même formateur** que le refus de
+`assert_fabrication_p0_arming_valid` (`escalation_chat_display`) : il porte `absent`,
+ou la valeur lue, et **jamais** un défaut qui vaudrait `0`. Un `0` et une absence
+perdent tous deux le P0, mais ne se réparent pas au même endroit (mika#2871), et un
+`unwrap_or_default()` ferait mentir les deux lignes le jour où le couple
+armé-et-non-routé redevient atteignable.
+
+#### Condition d'armement
+
+Armer, c'est `MIKA_FABRICATION_P0_NOTIFY=true` puis redémarrer — un changement de
+configuration, pas un déploiement.
+
+**Le code refuse désormais de s'armer sans route (mika#2871 AC3).** Avec la porte armée
+et aucun chat d'escalade utilisable, `mika-spirit` **refuse de démarrer** en nommant
+l'agent fautif, la valeur lue et les deux sorties
+(`server::fabrication_p0_guard::assert_fabrication_p0_arming_valid`). Un
+`MIKA_OPERATOR_ESCALATION_CHAT_ID=0` compte comme une absence : c'est le sentinelle
+« aucun canal de réponse » (mika#650/#1090), qui perd la notification tout aussi
+silencieusement. La doc exigeait le couple ; le code l'exige maintenant aussi. Ce refus
+ne touche pas le CLI : `mika config get fabrication_p0_notify` reste lisible sur une
+installation mal configurée — c'est la commande qui diagnostique le refus.
+
+**Ce qui atteste l'armement, c'est la ligne de démarrage, pas le CLI (mika#2978).**
+`mika config get fabrication_p0_notify` lit la configuration **déclarée** : elle est
+verte sur un `config.toml` édité dont le redémarrage n'a jamais eu lieu, et verte aussi
+quand un `.env` par agent écrase la valeur plus haut dans la cascade. La sonde 7
+ci-dessus est écrite par le processus qui **sert** la valeur, au démarrage, après que
+la garde a établi que la porte armée a une route. C'est donc elle — et non le CLI — qui
+fait la preuve que la décision d'armement d'AC2 est en force : une ligne par agent
+armé, avec son canal, ou le silence qui dit « désarmée ».
+
+Armer après au moins 7 jours de relevé des six sondes, et seulement si les trois
+colonnes de récidive tiennent sous un seuil que ce relevé rend défendable pour une
+surface jamais muette. **Si les comptes divergent, écrire lequel bloque et ouvrir le vol
+qui sépare les portes, plutôt que d'armer en bloc.** Ce relevé et la décision sont
+portés par mika#2871. Les sites `_uncorrected` de la famille autres que ces trois ne
+sont **pas** rattachés à cette classe : c'est un second suivi, une décision par site.
 
 ### Lire un hang LLM « 420 s sans octet » (mika#2331)
 
@@ -7783,6 +9857,196 @@ grep turn_usage $MIKA_SPIRIT_LOG_FILE | jq 'select(.status == "error") | {sessio
 
 **Ce que ce travail ne fait PAS.** Il ne borne aucun prompt (conditionné à la branche 2 ci-dessus). Il ne corrige pas le plafond `120 s` en dur du rail Anthropic ni son ignorance de `max_attempts` (mika#2189 hors périmètre) — il les rend seulement lisibles sur la ligne `llm_call_attempt`. Et il ne traduit pas fidèlement `ClaudeApiError` en `LlmError` : `llm/anthropic.rs` aplatit toute erreur de ce rail en `ProviderError`, ce que l'événement contourne (émis **sous** la frontière) sans le corriger — corriger l'aplatissement changerait la classe d'erreur vue par tout le moteur sur ce rail, donc un format de fil, et mérite son propre ticket.
 
+### La sandbox de pilote présente un justificatif d'egress, et l'addon l'exige — et ce qu'elle pousse est borné au périmètre que le spawn a déclaré (mika#2716, mika#2724, mika#2736, mika#2751)
+
+- `MIKA_PILOT_EGRESS_SENTINEL` — Interrupteur de la **sentinelle d'egress par spawn**. **Défaut : activé** (variable absente ⇒ armée). `0`, `false`, `no`, `off`, `disabled` (insensible à la casse) reviennent au comportement d'**avant ce ticket** : `GH_TOKEN` reprend le placeholder statique nu `proxy-managed-no-secret` et rien n'est enregistré. Toute autre valeur — y compris le **vide** — laisse la sentinelle armée : la lecture est `${MIKA_PILOT_EGRESS_SENTINEL:-1}`, donc absent et vide rendent le même `1`. Lue par `_stage_pilot_egress_sentinel` (`skills/bundled/_shared/dispatch-lib.sh`) **dans le child de dispatch**, qu'elle n'atteint que par le relais `EGRESS_SENTINEL_ENV` de `crates/mika-agent/src/skills/executor.rs` : `sandboxed_pilot_env` reconstruit l'environnement par une allowlist **positive**, donc poser la variable sur le service sans ce relais en ferait un interrupteur décoratif (mika#2165). Elle n'est **pas** dans `SANDBOX_ENV_CORE_ALLOWLIST` et ne doit jamais y entrer (mika#2354 AC9(b) ; un `MIKA_*` y heurte de toute façon le `debug_assert` du confinement).
+
+  **Ce qu'elle arme.** À chaque spawn, le lanceur tire un nonce de 16 octets (`openssl rand -hex 16`, repli `/dev/urandom`), l'enregistre côté **hôte** dans le registre `~/.mika/pilot-egress-sentinels/` — un **répertoire** en `0700`, un fichier vide par nonce, `umask 077` — et passe `proxy-managed-no-secret-<32 hex>` à la sandbox en `--setenv GH_TOKEN`. Un répertoire et non un fichier unique : `mitmdump` est long-vivant et partagé entre dispatches, donc deux pilotes concurrents doivent être valides **au même instant** ; un fichier écrasé refuserait le plus ancien. Chemin surchargeable par `_PILOT_EGRESS_SENTINEL_DIR` (résolu à l'appel, pas au source : les suites de confinement réexportent `HOME` après le `source`, et un défaut figé déposerait des entrées d'allure vivante dans le registre réel de l'opérateur).
+
+  **La sentinelle n'est pas un secret, et c'est délibéré.** Elle voyage dans `GH_TOKEN` — le canal que l'incident mika#2713 écrase — parce qu'une sentinelle qui ne voyage pas dans ce canal n'atteste rien. Elle ne porte aucun jeton, n'en est pas dérivable, et quiconque lit l'argv de bwrap par `/proc/<pid>/cmdline` détient déjà `$_PILOT_GH_TOKEN_FILE`, donc le vrai jeton : la sentinelle ne lui apprend rien.
+
+  **Ce que l'addon exige depuis mika#2724 (vol 2).** `scripts/mika-pilot-github-auth-addon.py` lit maintenant le justificatif présenté par le client **avant** de le retirer, et sur `api.github.com` il **refuse** quand ce n'est pas un justificatif que l'hôte atteste. Trois schémas sont lus, casse du schéma indifférente : `Bearer <v>`, `token <v>` — ce que `gh` émet réellement, capturé sur le fil contre gh v2.92.0 sur REST, GraphQL et une vraie sous-commande : `Authorization: token <tok>`, **jamais** `Bearer` — et `Basic <b64>` décodé (la part après le premier deux-points). La comparaison passe par `hmac.compare_digest` et le registre est lu par `scandir`, jamais par un nom de fichier dérivé de la valeur présentée.
+
+  **Trois motifs de refus, et la différence décide du remède.**
+
+  | motif (corps du 403 et ligne `DENY`) | ce qui s'est passé | remède |
+  |---|---|---|
+  | `sentinel-absent` | la requête ne présente **aucun** justificatif | chercher ce qui a vidé ou écrasé `GH_TOKEN` dans l'arbre de processus — un harnais de test qui le met à la chaîne vide est le cas connu (mika#2713) |
+  | `sentinel-unknown` | un justificatif est présenté, ce n'est pas le placeholder nu, et il ne correspond à **aucune** entrée du registre | soit l'entrée a été purgée avant la fin du pilote (TTL 72 h : un vol plus vieux doit être relancé), soit le registre lu n'est pas celui que le lanceur écrit — vérifier `_PILOT_EGRESS_SENTINEL_DIR` et le `HOME` du processus `mitmdump` |
+  | `registry-unreadable` | `~/.mika/pilot-egress-sentinels/` n'a pas pu être lu : absent, pas un répertoire, droits refusés | la panne est **côté hôte**, pas dans la sandbox — vérifier que le répertoire existe, est un répertoire, et est lisible par l'utilisateur de `mitmdump` (`0700`, lui appartenant) |
+
+  Un motif unique rendrait ces trois causes indiscernables à l'instant exact où la différence décide du remède (classe mika#2205) : la première est un accident **dans** la sandbox, la deuxième une question de registre, la troisième la comptabilité de l'hôte. Chaque refus écrit **une** ligne greppable sur `stderr` de `mitmdump` — `[github-proxy] DENY <motif> <method> <path>`, en miroir du tap `ALLOW` — qui ne porte **jamais** la valeur présentée, ni le jeton de l'hôte, ni une empreinte de l'un ou l'autre : une empreinte est une divulgation différée (mika#1949).
+
+  **Le périmètre du refus est `api.github.com`, et `github.com` reste inchangé.** Sur `github.com`, l'injection `Basic` reste inconditionnelle, parce que `git` ne présente **aucun** justificatif dans la sandbox de pilote (pas de credential helper, `GIT_CONFIG_NOSYSTEM=1`, un `GIT_CONFIG_GLOBAL` écrit de zéro) et que le seul lecteur de `GH_TOKEN` dans la sandbox est `gh`, qui ne parle qu'à `api.github.com`. Exiger un justificatif sur un canal où aucun ne peut voyager refuserait chaque `git push` sans rien acheter. **Conséquence opérateur à connaître :** la moitié `git push` n'est pas fermée **par un justificatif** — elle l'est par une **borne**, décrite ci-dessous (mika#2736), qui ne demande rien au client.
+
+  **Purge du registre : TTL 72 h.** Une entrée survit à son pilote de trois jours au plus. La purge tourne depuis l'addon — le seul processus qui lit le registre — au plus **une fois toutes les dix minutes** (horloge monotone), **avant** le calcul de la liste des nonces attestés et jamais après un verdict, donc l'entrée validée par l'appel courant ne peut pas disparaître sous ses propres pieds. Toute erreur de suppression est ignorée entrée par entrée : une purge qui échouerait en se propageant se lirait comme un registre illisible et refuserait un pilote légitime. **Pas de variable d'environnement** pour ce TTL : un délai qu'un opérateur peut mettre à zéro est un registre qu'un opérateur peut vider par accident.
+
+  **Posture de défaillance : fail-open côté lanceur, fail-closed côté addon. L'asymétrie est voulue.** Côté lanceur, un tirage raté ou un enregistrement raté dégradent vers le placeholder nu avec un message sur `stderr` du dispatch (`dispatch-lib: could not draw an egress sentinel …` / `… could not register the egress sentinel under <dir> …`) : **un dispatch ne meurt jamais sur ce registre**, parce que tuer un dispatch sur un échec de comptabilité coûte un vol et ne protège rien. Côté addon, le **même** registre illisible **refuse** (`registry-unreadable`), parce que l'alternative est d'autoriser tout le monde à l'instant exact où l'on ne peut plus dire qui est qui — c'est-à-dire de perdre la propriété pour laquelle ce garde existe. Les deux côtés lisent le même répertoire et choisissent des défauts opposés **délibérément** ; c'est écrit dans le code des deux côtés, pas seulement ici.
+
+  **Le rollback a deux moitiés, et `MIKA_PILOT_EGRESS_SENTINEL=0` les désarme ensemble.** Côté lanceur, la sandbox reçoit le placeholder **nu** ; côté addon, ce placeholder nu est accepté en **première** branche du verdict, *sans toucher au registre* — donc le rollback survit même à un registre cassé, qui est précisément la panne qu'on peut vouloir contourner. L'addon relit l'interrupteur **dans son propre environnement**, même vocabulaire que la moitié shell (`0`/`false`/`no`/`off`/`disabled`, insensible à la casse ; absent ou vide ⇒ armé) : un interrupteur que son deuxième lecteur n'honore pas est décoratif (mika#2165). Poser la variable sur le lanceur **sans** la poser sur le service qui lance `mitmdump` laisse donc l'addon armé — mais sans conséquence, puisque le placeholder nu est accepté. L'inverse (addon désarmé, lanceur armé) rend le comportement d'`origin/main` : injection inconditionnelle.
+
+  **Sonde post-déploiement : `scripts/canary-pilot-containment`, ligne `gh_token_*`, quatre états.**
+
+  | ligne | lecture |
+  |---|---|
+  | `ok:   gh_token_egress_sentinel` | `GH_TOKEN` = `proxy-managed-no-secret-<32 hex>` — régime nominal, la sentinelle est posée et enregistrée |
+  | `WARN: GH_TOKEN carries the bare static placeholder …` | préfixe **nu** : soit un opérateur a posé `MIKA_PILOT_EGRESS_SENTINEL=0`, soit le staging a fail-open côté hôte. **Invisible depuis la sandbox** — d'où un WARN propre plutôt qu'un partage de la ligne `ok` |
+  | `WARN: GH_TOKEN unset in the sandbox …` | le nom a disparu : `gh` s'arrête sur `gh auth login` (mika#2572 a régressé) |
+  | `LEAK: GH_TOKEN carries a value other than an egress sentinel …` | une valeur qui n'est ni le préfixe nu ni une sentinelle — mika#2056 a régressé |
+
+  **Sonde du refus (mika#2724) : trois lignes `egress_sentinel_*` dans le même canari.** La ligne unique `curl_github=200` ne pouvait pas survivre au vol 2 : un `curl` nu ne présente rien, donc son 403 est désormais **légitime**, et la ligne aurait échoué sur un correctif parfaitement intact exactement comme elle aurait échoué sur un addon qui refuse tout. Chaque sonde dit donc ce qu'elle présente et ce qu'elle attend.
+
+  | ligne | ce qui est présenté | lecture d'un écart |
+  |---|---|---|
+  | `ok:   egress_sentinel_accepted (200)` | le `GH_TOKEN` de la sandbox, c'est-à-dire la sentinelle de ce spawn | un **403 ici est le mode de défaillance critique** : l'injection est cassée et la boucle autonome s'arrête. C'est la ligne à lire en premier après un `make deploy` |
+  | `ok:   egress_sentinel_denied_absent (403 sentinel-absent)` | rien | un 200 signifie que le garde est désarmé — interrupteur d'opérateur, ou l'addon ne lit plus la sentinelle |
+  | `ok:   egress_sentinel_denied_unknown (403 sentinel-unknown)` | une valeur d'allure bien formée qu'aucun registre n'atteste | un 200 : même lecture. Un `403 sentinel-absent` au lieu de `403 sentinel-unknown` : le lecteur de justificatif ne lit plus le schéma présenté |
+
+  **Sous le rollback assumé (`MIKA_PILOT_EGRESS_SENTINEL=0`), les deux lignes `denied_*` rendent 200 et `FAIL` — et c'est la bonne lecture :** le garde est désarmé par décision d'opérateur, pas par défaut. La signature d'un rollback qui n'aurait qu'une moitié est différente et sans ambiguïté : `egress_sentinel_accepted` à 403.
+
+  **La halte, désormais à deux branches.**
+
+  - **`WARN: … bare static placeholder` persistant après un `make deploy`**, alors qu'aucun opérateur n'a désarmé l'interrupteur : **le staging échoue** côté hôte. Lire le **stderr du dispatch** (les deux messages de repli ci-dessus), **pas** le log de l'addon : un tirage ou un `mkdir` ratés se passent avant que l'addon ait quoi que ce soit à voir. Et `~/.mika/skills/` est une projection du binaire (mika#2340) : un `dispatch-lib.sh` édité dans l'arbre de travail n'atteint aucun agent avant ce `make deploy`, donc un WARN avant rebuild n'est pas un défaut.
+  - **`FAIL: egress_sentinel_accepted expected 200, got 403 …`** : le refus mord sur l'appel légitime. Lire cette fois le **stderr de `mitmdump`** — les lignes `[github-proxy] DENY <motif>` nomment lequel des trois motifs mord, et le tableau des motifs ci-dessus donne le remède. Mesure d'urgence si la boucle est arrêtée : `MIKA_PILOT_EGRESS_SENTINEL=0` sur le service **et** sur le lanceur rend le comportement d'`origin/main` en une variable, sans redéploiement de binaire.
+
+- `MIKA_PILOT_EGRESS_PUSH_BOUND` — Interrupteur de la **borne du `git-receive-pack`** sur `github.com` (mika#2736). **Défaut : armée** (variable absente ou vide ⇒ armée). Même vocabulaire que la sentinelle (`0`, `false`, `no`, `off`, `disabled`, insensible à la casse) et même position de lecture : l'**environnement du processus `mitmdump`**, par `_push_bound_enforced()` dans `scripts/mika-pilot-github-auth-addon.py`. **Un interrupteur distinct de `MIKA_PILOT_EGRESS_SENTINEL`, délibérément :** les deux gardes ont des modes de défaillance différents — l'un dépend d'un registre hôte, l'autre d'un corps trop gros pour être lu — et un opérateur qui désarme l'un ne doit pas désarmer l'autre à son insu. Désarmer la borne ne touche **ni** la coupure `api.github.com` du vol 2, **ni** l'injection du credential hôte de mika#2056 ; c'est précisément ce que la sonde `push_bound_*` ci-dessous rend observable.
+
+  **Une borne, pas un justificatif — et c'est strictement plus fort sur cette moitié.** Aucun canal ne peut porter sur `github.com` un justificatif qui atteste le **chemin** légitime plutôt que la **sandbox** : `http.extraHeader` via `GIT_CONFIG_KEY_n` atteint bien le proxy, mais un second processus du même environnement présente le même en-tête valide en poussant où il veut (et la règle 2 de `scripts/verify-no-secret-in-setenv.sh` le refuse par ailleurs). Mesure décisive, faite au grooming : **le proxy n'a besoin qu'on lui dise rien.** Un `git-receive-pack` porte son dépôt dans l'URL et ses commandes de ref **en clair** en tête du corps. Une borne sur ce qu'il voit déjà ne demande **aucune coopération du client**, donc aucun processus de la sandbox ne la contourne en se présentant bien.
+
+  **Cinq motifs de refus, et ce que chacun ferme.** Deux autres, `push-scope-repo` (mika#2751) et `push-scope-ref` (mika#2776), sont arrivés avec le resserrement et vivent à l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` ci-dessous : ils sont documentés là parce que c'est l'autre interrupteur qui les désarme, et un motif rangé sous l'interrupteur qui ne le gouverne pas est un remède qu'on applique au mauvais endroit.
+
+  | motif (corps du 403 et ligne `DENY`) | règle | ce qui est fermé |
+  |---|---|---|
+  | `push-repo-foreign` | le chemin du dépôt est sous l'organisation `senara-solutions` | **exfiltration vers un dépôt tiers** — la seule issue de cette classe qui ne se reprend pas une fois aboutie, d'où sa place en première règle |
+  | `push-ref-delete` | aucune commande ne porte un `new-sha` tout à zéro | **destruction d'une ref**. Lue du protocole lui-même, jamais d'une heuristique, et insensible à la largeur (sha1 comme sha256) |
+  | `push-ref-exotic` | chaque `refname` est sous `refs/heads/` | tags, `refs/notes/*`, `refs/*` arbitraires — des surfaces d'écriture qu'aucun pilote n'emprunte, et chacune un moyen de laisser du contenu sur la forge que la vue des branches ne montre pas |
+  | `push-ref-protected` | aucun `refname` n'est `refs/heads/main` ni `refs/heads/master` | **écriture directe sur la branche d'intégration**. Correspondance sur le **nom entier** : `refs/heads/feat/2736/main-bound` et `refs/heads/mainline` sont du travail de pilote ordinaire et passent |
+  | `push-body-unreadable` | la section de commandes n'a pas pu être décodée | l'état où le garde **ne peut pas juger** (voir l'arbitrage ci-dessous) |
+
+  **Toutes les commandes sont examinées**, et la première qui viole nomme à la fois le motif et sa cible. Une borne qui ne jugerait que la première commande serait contournée par une commande anodine placée en tête. Le corps du 403 nomme la **ref** ou le **dépôt** en cause : c'est une donnée du client, pas un secret de l'hôte, donc la nommer ne divulgue rien — mika#1949 interdit de nommer le **justificatif présenté**, jamais la cible visée. Le log réemploie la ligne exacte du vol 2, `[github-proxy] DENY <motif> <method> <path>`, sans l'élargir : un motif de plus dans un vocabulaire existant vaut mieux qu'une seconde forme de ligne à grepper.
+
+  **Deux états que le décodeur ne confond pas, et c'est le seul défaut capable d'arrêter la boucle.** Avant de streamer un gros push, `git` envoie une **sonde d'authentification de 4 octets** : un flush-pkt nu, **aucune** commande. Un garde exigeant « au moins une commande » la refuserait, donc refuserait **tout** push assez gros pour être streamé — et rien ne le dirait avant le premier dispatch. Une liste de commandes **vide** passe donc ; `None` — un corps qui existe et ne se décode pas, ou pas de corps du tout — refuse. Les deux cas sont épinglés par des assertions **positives** dans `skills/bundled/_shared/tests/test_egress_push_bound.sh` (cas 2 et 3), lançable par `make test-egress-push-bound`.
+
+  **Cette suite est lancée par `ci.yml` depuis mika#2751** (bloc *Pilot sandbox secret-channel guards*), avec `test-egress-push-scope-staging`. Elle ne l'était pas pendant tout mika#2736 : la cible `make` existait, l'entrée du workflow non, donc douze cas gataient zéro PR — classe mika#2578, et la **troisième** occurrence sur cette surface. L'empêchement enregistré au moment de mika#2736 était un scope `workflow` manquant sur le credential que l'addon injecte vers `github.com` (suivi mika#2752) ; **il ne se reproduit pas** — le même hunk `.github/workflows/ci.yml` est parti avec le reste de la branche de mika#2751, mesuré sur le chemin d'egress du pilote. Ce qui refusait alors n'était donc pas une propriété constante du credential. À retenir pour la prochaine fois : un hunk `.github/` refusé se mesure sur la branche du vol, pas une fois pour toutes.
+
+  **Arbitrage du corps illisible : il REFUSE, et il penche dans l'autre sens que celui du registre illisible du vol 2.** `stream_large_bodies=10m` crée un état où le garde ne peut pas juger. Trois raisons, dont la troisième décide : un pack de pilote est de l'ordre du kilo-octet, donc un push de plus de 10 Mo depuis une sandbox est **déjà** l'anomalie ; autoriser sur illisibilité donnerait un contournement trivial — grossir le corps, et un garde qui s'ouvre quand on le dépasse en taille n'est pas un garde ; **et le refus est survivable sans redéploiement**, par `MIKA_PILOT_EGRESS_PUSH_BOUND=0`, ce qui est la condition sous laquelle un fail-closed est acceptable sur le chemin de la boucle. Le corps du 403 nomme la taille comme cause probable **et** nomme l'interrupteur.
+
+  **Le périmètre de la borne est le seul verbe qui écrit.** `git-upload-pack` (le fetch), `info/refs?service=git-receive-pack` (l'annonce, un GET) et tout le reste de `github.com` sont **strictement inchangés** : un fetch lit de la donnée publique, ne détruit rien et n'exfiltre rien. La chaîne de requête est coupée avant la comparaison, donc l'annonce ne peut pas être prise pour le push au motif qu'elle nomme le service. Sur `api.github.com` la borne ne s'applique pas du tout — cet hôte n'a pas d'endpoint `receive-pack`, et le vol 2 le possède entièrement.
+
+  **L'allowlist n'est plus statique depuis mika#2751, sur aucune de ses deux dimensions depuis mika#2776.** Elle l'était pendant tout mika#2736 : *tout* `refs/heads/<quoi que ce soit>` sous `senara-solutions/<n'importe quel dépôt>`. mika#2751 l'a resserrée au **dépôt que le spawn a déclaré** et mika#2776 à la **branche** qu'il a déclarée, par le registre décrit à l'entrée `MIKA_PILOT_EGRESS_PUSH_SCOPE` ci-dessous. Le resserrement s'applique **au-dessus** des cinq règles de cette section, jamais à leur place : périmètre absent ou illisible ⇒ la borne statique s'applique seule. Les quatre vols de cette surface, dans l'ordre où ils ont dû tomber : la borne statique (mika#2736), la dimension dépôt (mika#2751), le **cycle de vie** des entrées (mika#2766), puis la dimension branche (mika#2776) — le cycle de vie **avant** la branche, pour la raison de cardinalité donnée ci-dessous.
+
+  **Une limite connue, écrite ici plutôt que laissée à redécouvrir : le force-push reste hors d'atteinte côté proxy.** C'est pourtant la classe de l'incident fondateur (mika#1318). La raison n'est pas un oubli, c'est une propriété du protocole : `receive-pack` **ne porte aucun drapeau de force**. Le client envoie `<old-sha> <new-sha> <ref>` et rien d'autre ; c'est le **serveur** qui résout l'ancestralité et décide si la mise à jour est un fast-forward. La commande d'un push ordinaire et celle d'un force-push ont donc la **même forme**, et `--force-with-lease` renseigne `old-sha` aussi honnêtement qu'un push normal. Pour les distinguer, le proxy devrait **décoder le packfile en vol** et marcher le graphe, sur le chemin de la boucle, pour une décision à rendre avant de relayer : hors de proportion avec la propriété achetée, et du code fragile placé exactement là où une panne arrête la boucle. Cette sous-classe est gardée ailleurs, et **plus faiblement** : `skills/bundled/dev-groom/system_prompt.md` interdit au pilote de groom tout `git push`, force-push compris, en nommant mika#1318 — c'est une **consigne de prompt**, pas un mécanisme ; et `_push_branch` (`dispatch-lib.sh`) est le site unique de push des dispatches de groom et tourne **côté hôte**, donc hors de la sandbox et hors de portée de tout garde d'egress.
+
+  **Sonde post-déploiement : cinq lignes dans `scripts/canary-pilot-containment` depuis mika#2776.** La première est l'anti-vacuité des quatre autres — une borne qui refuserait tout ferait lire les quatre refus parfaitement verts.
+
+  | ligne | ce qui est poussé | lecture d'un écart |
+  |---|---|---|
+  | `ok:   push_bound_nominal (<code>)` | le dépôt que **ce run du canari a déclaré** comme son périmètre, ref de branche ordinaire, `new-sha` non nul | **un motif de refus ici est le mode de défaillance critique** : la borne mord sur le chemin légitime et la boucle autonome s'arrête. C'est la ligne à lire en premier après un `make deploy`. Un `push-body-unreadable` ici désigne en particulier l'arithmétique pkt-line de la sonde elle-même ; un `push-scope-repo` ou un `push-scope-ref` désigne la déclaration hôte du canari, pas la borne |
+  | `ok:   push_bound_foreign (403 push-repo-foreign)` | dépôt **hors** organisation | aucun motif : la borne est désarmée — interrupteur d'opérateur, ou l'addon ne juge plus le corps |
+  | `ok:   push_bound_delete (403 push-ref-delete)` | `new-sha` tout à zéro | aucun motif : même lecture. Un autre motif que `push-ref-delete` : l'ordre des règles a bougé, et le remède nommé à l'opérateur n'est plus le bon |
+  | `ok:   push_scope_foreign (403 push-scope-repo)` | un dépôt **frère** de l'organisation qu'aucun périmètre vif ne déclare — les quatre règles statiques satisfaites, donc le resserrement est la **seule** chose qui peut le refuser | aucun motif : la **dimension dépôt** du resserrement ne mord plus, et la borne est retombée à son état statique sans le dire. `push-repo-foreign` au lieu de `push-scope-repo` : l'ordre des règles a bougé |
+  | `ok:   push_scope_ref (403 push-scope-ref)` | le dépôt que ce run a **déclaré**, sur une branche qu'il n'a **pas** déclarée — les quatre règles statiques satisfaites **et** la dimension dépôt satisfaite, donc la dimension branche est la seule chose qui peut le refuser (mika#2776) | aucun motif : la **dimension branche** ne mord plus, et un pilote peut repousser sur la branche d'un dispatch voisin. `push-scope-repo` au lieu de `push-scope-ref` : les deux causes arrivent dans les mêmes octets, et le remède nommé à l'opérateur n'est plus le bon (classe mika#2205) |
+
+  **`push_bound_nominal` est vert par décision depuis mika#2751, pas par chance.** Le canari déclare lui-même, côté hôte et par le vrai producteur, le périmètre dont sa sonde a besoin. Avant ce vol il visait un dépôt qu'aucune entrée ne nommait et ne passait que sur un registre **vide** : sur un hôte portant un dispatch concurrent — l'état normal d'un hôte de boucle — il aurait rendu `push-scope-repo` et rougi par **intermittence**, sur un substrat parfaitement intact. mika#2776 a dû faire la même réparation sur l'autre dimension : le canari déclare aussi la **branche** que ses sondes poussent, parce qu'une entrée ne portant que `repo=` fait dégrader le lecteur sur `scope-ref-absent` dès que le dépôt visé correspond — `push_bound_nominal` serait alors vert à travers un resserrement qui n'a jamais examiné sa ref, et `push_scope_ref` n'aurait rien à refuser.
+
+  **Toutes les cibles de ces sondes sont des dépôts qui n'existent pas, délibérément** : un code de statut ne peut alors jamais être confondu avec une écriture qui aurait réellement abouti. Pour la même raison l'assertion porte sur le **motif lu dans le corps** et jamais sur le statut — GitHub répond 403 ou 404 sur un dépôt inexistant tout seul, et cette réponse serait indiscernable de la nôtre.
+
+  **Sous le rollback assumé (`MIKA_PILOT_EGRESS_PUSH_BOUND=0`), les quatre lignes `push_bound_foreign`, `push_bound_delete`, `push_scope_foreign` et `push_scope_ref` ne rendent aucun motif et `FAIL` — et c'est la bonne lecture :** la borne est désarmée par décision d'opérateur, et le resserrement vit **au-dessus** d'elle, donc il tombe avec, ses **deux** dimensions ensemble. **Les trois lignes `egress_sentinel_*` doivent rester vertes à travers ce rollback** ; si elles ne le sont pas, les deux interrupteurs ont été câblés ensemble, et c'est un défaut, pas une décision (mika#2165).
+
+  **La halte propre à cette moitié.** `FAIL: push_bound_nominal expected no refusal, got <motif>` : lire le **stderr de `mitmdump`**, où les lignes `[github-proxy] DENY <motif>` nomment lequel des sept mord, puis le tableau des motifs ci-dessus — ou celui de `MIKA_PILOT_EGRESS_PUSH_SCOPE` pour les deux derniers — pour le remède. Mesure d'urgence si la boucle est arrêtée : `MIKA_PILOT_EGRESS_PUSH_BOUND=0` sur le service qui lance `mitmdump` rend le comportement d'avant ce ticket en une variable, sans redéploiement de binaire, et **sans** désarmer la coupure `api.github.com` du vol 2.
+
+  **Hors périmètre, délibérément.** Le force-push, pour la raison de protocole détaillée ci-dessus : une limite nommée, pas un oubli. Et aucune sentinelle ni aucune borne ne peut fermer le `cargo test` qui **n'écrase pas** `GH_TOKEN` : il hérite de la sentinelle, présente un justificatif valide et passe — un secret présent dans la sandbox est lisible par tout processus de la sandbox, donc ces gardes ferment la classe **accident**, jamais la classe **adversaire**. Cette moitié est fermée côté code par mika#2713 (`run_gh` injectable, scan structurel, plancher de numéro de fixture).
+
+- `MIKA_PILOT_EGRESS_PUSH_SCOPE` — Interrupteur du **resserrement de la borne au périmètre déclaré par le spawn** (mika#2751 pour la dimension dépôt, mika#2776 pour la dimension branche — **un seul interrupteur pour les deux**, et c'est une décision : un opérateur qui veut « rendre mika#2736 » cherche un interrupteur, pas une matrice). **Défaut : armé** (variable absente ou vide ⇒ armé). Même vocabulaire que ses deux voisines (`0`, `false`, `no`, `off`, `disabled`, insensible à la casse), même position de lecture — l'**environnement du processus `mitmdump`** — et **un seul lecteur dans tout le dépôt** : `_push_scope_enforced()` dans `scripts/mika-pilot-github-auth-addon.py`, c'est-à-dire là où le refus vit. Le lanceur ne le lit **pas**, et c'est asserté structurellement (`test_egress_push_scope_staging.sh` CASE 6 compte à zéro les lignes non-commentaires de `dispatch-lib.sh` qui nomment la variable) : un interrupteur à deux lecteurs est un interrupteur dont les deux lecteurs divergeront le jour où ça compte (mika#2165). Conséquence directe : `MIKA_PILOT_EGRESS_PUSH_SCOPE=0` n'empêche pas le lanceur de **déclarer** le périmètre — il empêche l'addon de s'en servir, ce qui est le seul endroit où le désarmement a un sens.
+
+  **Ce qu'il resserre.** mika#2736 autorisait *tout* `refs/heads/<quoi que ce soit>` sous `senara-solutions/<n'importe quel dépôt>`. Le resserrement ajoute la question **relationnelle** que la borne statique ne pose pas : non pas « est-ce une branche ? » mais « est-ce **le dépôt** de **ce** dispatch, et **sa** branche ? ». Un pilote a exactement **un** `origin` possible — un seul `.git` parent est bind-monté dans la sandbox — donc un push vers un dépôt frère de l'organisation n'est jamais du travail ordinaire. Et il a exactement **une** branche de travail, celle que `_set_up_worktree` a dérivée du ticket : un push vers `refs/heads/fix/9999/un-autre-ticket` du **même** dépôt est la branche d'un autre dispatch, éventuellement en vol, et n'est jamais du travail ordinaire non plus. C'est ce second cas que mika#2751 laissait passer et que mika#2776 ferme.
+
+  **Le périmètre voyage par un fichier hôte relu à chaque requête, et ce choix est mesuré.** Pas par l'environnement de l'addon : `mitmdump` est **long-vivant et partagé** entre dispatches (`_ensure_pilot_helper` rend 0 dès que le port est vif), donc son environnement est celui du **premier** dispatch, pour toujours. Un périmètre passé par là serait celui d'un vol terminé depuis des heures. Pas par la sandbox non plus : l'autorité du périmètre vient de ce que l'**hôte** l'écrit et que `~/.mika` n'est pas dans les binds de bwrap — la même asymétrie dont mika#2724 tire sa sentinelle, et ce qui rend ce périmètre **infalsifiable depuis la sandbox**.
+
+  **Le registre.** `~/.mika/pilot-push-scopes/` — un **répertoire** en `0700`, un fichier `0600` par spawn nommé d'un nonce de 16 octets (`openssl rand -hex 16`, repli `/dev/urandom`), `umask 077`. Écrit par `_stage_pilot_egress_push_scope` (`skills/bundled/_shared/dispatch-lib.sh`), appelé dans `_run_pilot_sandboxed`. Chemin surchargeable par `_PILOT_EGRESS_PUSH_SCOPE_DIR`, **résolu à l'appel** des deux côtés (les suites de confinement réexportent `HOME` après le `source`, et un défaut figé déposerait des périmètres d'allure vive dans le registre réel de l'opérateur — défaut mesuré sur mika#2716, hérité délibérément plutôt que redécouvert). Un **répertoire propre**, et non un champ ajouté à l'entrée de sentinelle du vol 1 : les deux données ont des postures de défaillance **opposées** (celle-là refuse, celle-ci dégrade), des interrupteurs différents, et — depuis mika#2766 — des **durées de vie différentes** : 12 h ici, 72 h là (§ *Cycle de vie d'une entrée* ci-dessous).
+
+  Le contenu est fait de lignes `clé=valeur`, une par dimension — `repo=senara-solutions/<dépôt>` et, depuis mika#2776, `ref=refs/heads/<branche du dispatch>` — et le lecteur **ignore toute clé qu'il ne connaît pas**.
+
+  **Les deux lignes voyagent dans la MÊME entrée, et ce n'est pas un détail de forme.** Le lecteur unionne les **entrées**, en lisant chacune comme le couple *(dépôt, branche)*. Un producteur qui éclaterait les deux dimensions d'un spawn sur deux entrées autoriserait le **produit cartésien** — le dépôt de l'entrée A avec la branche de l'entrée B — et rouvrirait le scénario exact que mika#2776 ferme dès qu'un second dispatch est en vol. `_stage_pilot_egress_push_scope` les écrit donc par une **seule** redirection, et `test_egress_push_scope_staging.sh` CASE 13 est le seul endroit qui l'asserte.
+
+  **Une entrée sans `ref=` reste valide**, et c'est l'état **nominal** pendant une fenêtre de déploiement : le registre survit au `make deploy`, donc une entrée écrite par le binaire précédent est là en toute légitimité. Le lecteur ne la refuse pas et ne la jette pas — il **dégrade** sur `scope-ref-absent` (tableau ci-dessous), c'est-à-dire qu'il juge le dépôt et laisse la branche à la borne statique. Le cas est asserté (`test_egress_push_bound.sh` CASE 25) plutôt que supposé.
+
+  La valeur de `repo=` est normalisée comme l'URL l'est (minuscules, suffixe `.git` retiré) : GitHub est insensible à la casse sur `owner/repo`, et une comparaison sensible refuserait un push légitime sur une majuscule. Celle de `ref=` **ne l'est pas, et la comparaison est sensible à la casse** : git l'est sur les refs, donc `refs/heads/feat/2776/Dimension` et `refs/heads/feat/2776/dimension` sont deux branches, et minusculiser ici refuserait tout push d'un dispatch dont la branche porte une majuscule.
+
+  **Le verdict porte sur l'UNION des périmètres en vol, et il faut le savoir pour lire un refus.** Un démon partagé ne peut pas attribuer une requête à un spawn — rien sur le fil ne dit quel pilote parle. La question que l'addon pose est donc « existe-t-il une entrée **vive** qui déclare ce dépôt ? », pas « l'entrée de *ce* spawn le déclare-t-elle ? ». Le coût de cette approximation **diffère par dimension**, et c'est ce qui a découpé les vols : sur la dimension **dépôt**, l'union est bornée par les trois dépôts dispatchables de la boucle (`_is_dispatchable_repo`), donc le resserrement est **insensible au TTL** — une entrée résiduelle n'élargit l'union vers rien que le vol suivant n'aurait pu déclarer lui-même. Sur la dimension **branche**, l'union n'est pas bornée : chaque vol y ajoute un nom, et une entrée qui survit à son pilote laisse sa branche poussable. C'est ce qui a **ordonné** les deux vols suivants : mika#2766 a livré le **cycle de vie** d'abord (ci-dessous), parce qu'un `ref=` posé sur un registre qui ne se vide pas serait un garde qui se desserre tout seul au fil de la journée, et dont la force dépendrait de l'heure ; senara-solutions/mika#2776 porte `ref=` sur le registre désormais borné dans le temps.
+
+  **Corollaire utile à l'opérateur : une entrée de plus ne peut qu'ÉLARGIR l'union, jamais la resserrer.** Donc une entrée résiduelle ne peut pas provoquer un refus ; elle ne peut qu'en manquer un. C'est aussi ce qui rend inoffensive l'entrée que `scripts/canary-pilot-containment` dépose à chaque passage (vers un dépôt qui n'existe nulle part — même fuitée, elle n'accorde rien), et son trap `EXIT` la retire quand même.
+
+  **Deux motifs de refus — un par dimension — et trois états de DÉGRADATION qui ne sont pas des refus.** La différence décide du remède (classe mika#2205), et c'est pourquoi la dimension branche n'a pas élargi le motif de la dimension dépôt : les deux envoient l'opérateur à deux endroits disjoints.
+
+  | jeton (ligne sur `stderr` de `mitmdump`) | ce qui s'est passé | remède |
+  |---|---|---|
+  | `DENY push-scope-repo` | le push vise un dépôt de l'organisation qu'**aucune** entrée vive ne déclare. 403, et le corps nomme le dépôt visé | lister `~/.mika/pilot-push-scopes/` : si la valeur **déclarée** est fausse, le défaut est dans le lanceur qui l'a écrite ; si la valeur **poussée** est fausse, regarder l'URL `origin` du worktree ; si le dépôt n'y est **plus du tout** alors que le pilote est vif, l'entrée a été retirée sous lui — purge, ou `rm` d'opérateur — tandis qu'un voisin maintenait le registre non vide (§ *Cycle de vie d'une entrée* ci-dessous) |
+  | `DENY push-scope-ref` (mika#2776) | le dépôt visé est bien déclaré par une entrée vive, mais **aucune** des entrées qui le déclarent ne déclare la ref poussée. 403, et le corps nomme la **ref visée** — donnée du client, jamais le justificatif de l'hôte (mika#1949) | c'est une faute de **refspec**, pas de remote — regarder ce qui a résolu le nom de branche **au site du push**, jamais l'URL `origin` : c'est le remède qui sépare ce motif du précédent. Si la ref poussée est la branche d'un **autre** dispatch du même dépôt, le garde a fait exactement son travail. Si c'est bien la branche de ce dispatch, le défaut est dans la déclaration — lire le `stderr` du dispatch, où `_stage_pilot_egress_push_scope` nomme laquelle de ses trois dégradations de branche a coûté la ligne `ref=` (ci-dessous). La comparaison est **sensible à la casse** : `refs/heads/Feat/…` et `refs/heads/feat/…` sont deux branches |
+  | `DEGRADE scope-absent` | le registre est **lisible** et ne déclare aucun `repo=` : répertoire absent (l'état d'un hôte où rien n'a jamais déclaré), ou vide, ou purgé. **Le push passe** sous la borne statique seule | chercher pourquoi le dispatch n'a rien déclaré — lire le **stderr du dispatch**, où `_stage_pilot_egress_push_scope` nomme sa dégradation (ci-dessous). Ce n'est **pas** une question de droits |
+  | `DEGRADE scope-unreadable` | le chemin existe mais ne se parcourt pas : un fichier ordinaire là où un répertoire va, `EACCES`, toute autre `OSError`. **Le push passe** sous la borne statique seule | la panne est dans la comptabilité de l'**hôte** : vérifier que le chemin est un répertoire, en `0700`, appartenant à l'utilisateur de `mitmdump`, et que `_PILOT_EGRESS_PUSH_SCOPE_DIR` désigne bien le même des deux côtés |
+  | `DEGRADE scope-ref-absent` (mika#2776) | le dépôt visé est déclaré, mais au moins une des entrées qui le déclarent ne porte **pas** de `ref=`. **Le push passe**, la dimension dépôt ayant mordu et la branche étant laissée à la borne statique. N'est émis que s'il y a **au moins une ref à juger** — une sonde d'authentification de 4 octets n'en porte aucune et ne dégrade donc pas | **le remède nominal est d'attendre**, et c'est ce qu'il faut savoir avant de chercher. Le registre survit au `make deploy`, donc une entrée écrite par le binaire précédent est l'état normal pendant une fenêtre de déploiement : elle disparaît à la fin de son spawn, ou au plus tard par le TTL de 12 h. Ce jeton persistant **après** la fenêtre désigne un lanceur qui ne déclare plus la branche — lire le `stderr` du dispatch |
+
+  **Un répertoire absent dégrade, il ne refuse pas — et c'est le seul point où ce registre se sépare de celui des sentinelles**, où un répertoire absent *est* illisible. La raison : le lanceur crée celui-ci avec le premier périmètre qu'il stage, donc son absence veut dire que rien n'a jamais déclaré, pas que l'hôte est cassé. L'appeler illisible enverrait un opérateur regarder des droits de répertoire pour un lanceur qui n'a jamais tourné. Une entrée **individuellement** illisible est par ailleurs **ignorée**, jamais promue en panne du registre entier : la comptabilité d'un spawn qui tourne mal ne doit ni élargir ni resserrer le verdict de ses voisins.
+
+  **Le resserrement est SUBORDONNÉ par construction, pas par vigilance.** `_push_scope_verdict` n'est atteinte que sur un push que la borne statique a **déjà** autorisé, donc son unique issue neuve est un refus de plus : aucun chemin n'y transforme un refus en autorisation, et aucun `return` de cette fonction n'ouvre quoi que ce soit. C'est le point 2 du ticket — périmètre absent ou illisible ⇒ la borne de mika#2736 continue de s'appliquer — rendu vrai par la **place** du code et non par une relecture.
+
+  **Les deux interrupteurs sont orthogonaux, et la ligne `(0,1)` est une DÉCISION, pas un défaut d'orthogonalité.**
+
+  | `PUSH_BOUND` | `PUSH_SCOPE` | ce qui s'applique |
+  |---|---|---|
+  | armé (défaut) | armé (défaut) | les cinq règles statiques **et** le périmètre déclaré — le régime nominal |
+  | armé | `0` | les cinq règles statiques seules : le comportement exact de mika#2736. **C'est le rollback de ce ticket**, et il n'ouvre rien que mika#2736 fermait |
+  | `0` | armé | **rien ne mord.** Le resserrement vit *au-dessus* de la borne, et l'addon sort avant de l'atteindre : désarmer la borne désarme les deux. Décidé ainsi parce qu'un resserrement sans la borne qu'il resserre n'a pas de sens — et asserté dans la suite, pour que personne ne le lise comme un câblage accidentel |
+  | `0` | `0` | idem — le comportement d'avant mika#2736 |
+
+  Les deux sont par ailleurs prouvés orthogonaux **vers le bas** : ni l'un ni l'autre ne touche la coupure `api.github.com` du vol 2 ni l'injection du credential hôte de mika#2056, et `MIKA_PILOT_EGRESS_SENTINEL=0` ne désarme **aucun** des deux (classe mika#2165, asserté dans `test_egress_push_bound.sh` et `test_egress_push_scope_staging.sh`).
+
+  **Posture de défaillance côté lanceur : fail-open, six dégradations nommées — trois qui coûtent l'entrée entière, trois qui ne coûtent que la dimension branche.** Un fichier de comptabilité ne tue pas un dispatch — même posture que `_stage_pilot_gh_token` et `_stage_pilot_egress_sentinel`. Chaque cas écrit une ligne sur `stderr` **du dispatch** et dégrade vers la borne statique. Six messages distincts et non un partagé : ils décident six remèdes, et un message partagé rendrait indiscernables les causes à l'instant où elles les décident (classe mika#2205).
+
+  Aucun périmètre du tout — le lecteur dégrade sur `scope-absent` :
+
+  - `dispatch-lib: no dispatch repository in scope — …` : dispatch **free-text** ou de **milestone**, qui atteint la sandbox sans dépôt résolu. Rien n'est écrit, délibérément : déclarer `senara-solutions/` seul serait un périmètre qui ne nomme rien, et un `repo=` à valeur **vide** serait pire — le lecteur verrait un périmètre déclaré et refuserait **tout** push.
+  - `dispatch-lib: could not draw a push-perimeter entry name …` : ni `openssl` ni `/dev/urandom`.
+  - `dispatch-lib: could not declare the push perimeter under <dir> …` : `mkdir`, `chmod` ou l'écriture ont échoué.
+
+  Périmètre déclaré, **une dimension sur deux** (mika#2776) — l'entrée reste valide avec son `repo=`, la dimension dépôt mord, et le lecteur dégrade sur `scope-ref-absent`. Les trois lignes se terminent toutes par « *push perimeter declared for the repository only, the branch dimension does not apply to this spawn* », et c'est leur début qui nomme la cause :
+
+  - `dispatch-lib: no dispatch branch in scope — …` : `BRANCH` est vide, aux **mêmes** dispatches que ceux où `REPO` l'est (free-text, milestone). Nominal, aucun remède.
+  - `dispatch-lib: dispatch branch name already carries a refs/ prefix — …` : écrire `ref=refs/heads/refs/heads/…` nommerait une ref qui n'existe nulle part, donc refuserait **tout** push de ce dispatch. Même conséquence que la valeur vide, même remède : ne pas écrire la ligne.
+  - `dispatch-lib: dispatch branch name is not a plain branch name — …` : le nom sort de `[A-Za-z0-9._/-]`. Ce garde-là n'est pas de la politesse : le format est `clé=valeur` **par ligne**, donc un `BRANCH` portant un saut de ligne injecterait un second `repo=` dans l'entrée, c'est-à-dire **élargirait** le périmètre par le canal censé le resserrer. `scripts/derive-branch-name` est l'unique producteur et rend un slug, donc c'est la classe **accident** — et elle se ferme pour une ligne de `case`.
+
+  **Sonde d'opérateur : la dégradation est GREPPABLE, parce que son mode d'échec est le silence.** Un resserrement qui ne mord jamais rend exactement les mêmes octets qu'un resserrement qui mord : des pushes qui passent. D'où une ligne par requête dégradée, de la forme exacte du tap de refus avec un verbe différent — `grep 'DEGRADE scope-' <log de mitmdump>`. **Une ligne par dispatch signifie que le resserrement n'a jamais mordu**, et c'est l'anomalie à chercher après un `make deploy` — en lisant **lequel** des trois jetons sort, puisqu'ils nomment trois causes opposées et que `scope-ref-absent` est, lui, nominal le temps que la fenêtre de déploiement se ferme. Les sondes du canari, elles, sont `push_scope_foreign` pour la dimension dépôt et `push_scope_ref` pour la dimension branche (table ci-dessus) ; il n'existe **pas** de sonde `push_scope_degraded`, et pour une raison mesurée : la dégradation est une propriété du **registre entier**, pas d'une cible, donc inobservable dans un run qui déclare un périmètre — et n'importe quel dispatch concurrent la fait disparaître. Elle est donc mesurée là où elle est déterministe (`test_egress_push_bound.sh` CASE 17) et lue en production sur le log, jamais par une sonde qui serait verte selon l'heure.
+
+  **Cycle de vie d'une entrée : deux mécanismes, et le second existe parce que le premier ne peut pas tout couvrir (mika#2766).**
+
+  - **La désinscription**, à la fin du **spawn** : `_unstage_pilot_egress_push_scope` retire l'entrée dont le lanceur tient déjà le nonce (`_PILOT_EGRESS_PUSH_SCOPE_ENTRY`). Appelée explicitement à la fin de `_run_pilot_sandboxed`, **après** la capture de `_sandbox_rc` (invariant mika#2039 : le statut du pilote reste celui de la fonction), avec un **filet** dans le trap de sortie. À la fin du spawn et non du dispatch, parce que `_run_pilot_sandboxed` tourne **plus d'une fois** par dispatch et que le staging remet le nonce à vide à chaque entrée : le nonce du spawn N est inconnaissable dès que le spawn N+1 stage, donc un `trap EXIT` au niveau du dispatch ne pourrait nettoyer que le dernier. Elle retire **sa propre entrée** et jamais le répertoire, jamais un balayage : un voisin en vol n'est pas à elle.
+  - **Le TTL de 12 h**, côté addon, parce qu'un dispatch tué par `SIGKILL` n'exécute **aucun trap**. Une entrée que rien n'a retirée doit cesser de répondre d'elle-même.
+
+  **D'où vient le 12 h, et pourquoi c'est un PLANCHER et non un confort.** La dégradation de l'addon n'est **pas** par entrée : `_push_scope_verdict` ne se rabat sur la borne statique que si le registre **entier** est vide ou illisible. Les deux directions d'un TTL faux coûtent donc des choses entièrement différentes.
+
+  | direction | ce qu'elle coûte |
+  |---|---|
+  | **trop long** | une entrée survit à un pilote tué. L'union reste bornée par les dépôts dispatchables, donc **rien de neuf ne devient atteignable** — un relâchement borné, et c'est tout |
+  | **trop court** | un pilote **encore vif** voit son entrée purgée tandis qu'un voisin maintient le registre non vide. Son propre push légitime tombe alors sur `DENY push-scope-repo` : un **403 sur du travail innocent**, et la boucle autonome s'arrête |
+
+  L'asymétrie est totale, donc la valeur se choisit comme un **plancher sur le plus long spawn**. Mesuré sur les **718 transcripts de pilote** de l'hôte de développement : médiane **11,9 min**, p90 **55,2 min**, p99 **1,89 h**, **max 4,40 h**. 12 h vaut **2,7×** ce maximum ; 4 h serait déjà **sous** lui. Et 72 h — le TTL des sentinelles de mika#2724 — est calibré sur « un vol peut être relu trois jours après », pas sur « ce périmètre est-il encore en vol ? » : un périmètre de trois jours ne l'est jamais. Les deux registres passent par le **même** `_purge_registry`, qui reçoit désormais le TTL **en paramètre** — un seul nombre pour deux registres serait exactement le défaut que le throttle partagé avait déjà.
+
+  La purge tourne depuis l'addon — le seul processus qui lit ces registres — au plus une fois toutes les dix minutes, **par répertoire** et non globalement (un throttle global laisserait le second registre figé pendant dix minutes à chaque purge du premier ; défaut corrigé par mika#2751). **Sans variable d'environnement**, pour la même raison qu'au vol 1 : un délai qu'un opérateur peut mettre à zéro est un registre qu'il peut vider par accident — et vider ce registre-ci sous un voisin en vol, c'est précisément la colonne « trop court » du tableau.
+
+  **Sonde d'opérateur : `ls -l ~/.mika/pilot-push-scopes/`.** Ce que la liste dit, dans l'ordre où on la lit :
+
+  - **répertoire absent** ⇒ rien n'a jamais déclaré sur cet hôte. C'est l'état nominal d'une machine qui n'a pas dispatché, pas une panne — le lanceur crée le répertoire avec le premier périmètre qu'il stage.
+  - **zéro entrée** ⇒ le cycle de vie a fait son travail : aucun spawn en vol ne laisse de périmètre derrière lui. C'est l'état attendu entre deux dispatches.
+  - **une entrée par dispatch en vol**, et rien de plus. Un `ls` qui en montre davantage que de pilotes vifs est l'anomalie à instruire : soit une désinscription a échoué (elle le dit sur `stderr` du dispatch, en nommant l'entrée, la conséquence et les 12 h), soit un dispatch a été tué et son entrée attend la purge.
+  - **une entrée de plus de 12 h** ⇒ la purge n'a pas tourné, ce qui veut dire que l'addon n'a reçu aucune requête `github.com` depuis — pas qu'elle est cassée.
+
+  **Ne videz pas ce répertoire à la main sous un dispatch en vol.** C'est le seul geste d'opérateur qui transforme une hygiène en 403 : retirer l'entrée d'un pilote vif pendant qu'un voisin maintient le registre non vide refuse le push du premier. S'il faut désarmer en urgence, `MIKA_PILOT_EGRESS_PUSH_SCOPE=0` sur le service qui lance `mitmdump` est le remède — il ne touche à aucune entrée.
+
+  **La halte propre à cette moitié.** `FAIL: push_bound_nominal … got push-scope-repo` **ou** un `DENY push-scope-repo` sur un `git push` de pilote légitime : le périmètre déclaré n'est pas celui que le pilote pousse. Lire d'abord le **stderr du dispatch** (les trois messages ci-dessus — si l'un y est, le lanceur n'a rien déclaré et le refus devrait être une dégradation, pas un refus), puis lister le registre côté hôte. Mesure d'urgence si la boucle est arrêtée : `MIKA_PILOT_EGRESS_PUSH_SCOPE=0` sur le service qui lance `mitmdump` rend le comportement de mika#2736 en une variable, sans redéploiement de binaire, **sans** désarmer la borne statique et **sans** toucher au vol 2.
+
+  **Hors périmètre, délibérément.** La **dimension branche** du périmètre (senara-solutions/mika#2776) — un pilote peut encore pousser sur la branche d'un autre dispatch du **même** dépôt. Le **force-push**, pour la raison de protocole détaillée à l'entrée précédente : resserrer le périmètre ne change rien à P4, la ref visée devient la bonne et la nature de la mise à jour reste invisible. Et la classe **adversaire**, pour la même raison qu'au vol 1 : tout processus de la sandbox lit ce que la sandbox contient — ces gardes ferment la classe **accident**.
+
 Optional (telemetry — requires `--features telemetry` build):
 - `MIKA_TELEMETRY_ENABLED` — Enable OpenTelemetry trace export (default: false)
 - `MIKA_OTLP_ENDPOINT` — OTLP HTTP endpoint URL with `/v1/traces` path
@@ -7808,5 +10072,104 @@ Optional (Telegram outbound rendering — mika#2291):
   **The field is `Option<String>` and never `bool`.** `GatewaySettings::load` deserializes through config-rs, so a `bool` receiving `"plif"` is a hard `load()` error and the gateway **refuses to start** — on a p2 cosmetic flag. Refusing to boot on an invalid LLM budget protects against a mute agent; refusing to boot on a rendering flag protects against nothing. The gateway crate has no `bool` field at all, and `mika2291_c5_*` pins the deserialization itself, which the parse-function tests structurally cannot see.
 
   **Operator surfaces** (gateway log): `telegram_html_render_fallback` (WARN) and `telegram_html_fallback_failed` (WARN) — **expected regime for both: zero lines**; the second is the population where the user receives nothing. Plus `telegram_html_render_disabled` (INFO at startup, only when disarmed), because the silence of a disarmed renderer looks exactly like the silence of a healthy one (mika#2205). No message body is ever logged. Full contract, post-deploy probe and its two halts: `crates/mika-gateway/CLAUDE.md` § *Outbound Text Rendering*.
+
+### Le budget de pas d'un tour de revue (mika#2926)
+
+**Aucune variable d'environnement.** Le plafond de mika-qa est nommé **dans le
+code**, à un site unique — `planning::policy::max_tool_steps_for_agent(agent_id,
+default)`, appelée en tête de `run_loop` — et le prompt de `qa-review` annonce la
+valeur que cette fonction résout, égalité tenue par
+`tests/qa_review_executes_repo_guards.rs § mika2926_le_plafond_annonce_par_le_prompt_est_celui_du_moteur`.
+Il n'est **pas** réglable à chaud, et c'est délibéré : un plafond que l'opérateur
+peut bouger sans toucher le prompt rouvre exactement la dérive que ce ticket
+ferme — le moteur servait 20, le prompt annonçait 14, et le modèle planifiait
+contre un nombre faux. Le geste de changement est un commit, jamais un `export`.
+
+**Ce que le vol a changé.** mika-qa passe de 20 à 30 pas d'outil par tour (les
+autres agents gardent 20 — `mika2926_le_plafond_par_agent_ne_touche_que_mika_qa`
+l'affirme agent par agent), et les deux prompts de revue bornent l'exploration
+par `run_shell` : au plus 2 appels au-delà des étapes prescrites dans
+`qa-review`, au plus 2 tentatives de relecture du plan dans
+`qa-review-build-callback`, chacune nommant sa sortie (`hold[review]`,
+`block[pipeline]`). Le relèvement seul aurait déplacé l'épuisement ; la borne
+seule aurait laissé des tours couper sous 20 pendant que le prompt en annonçait
+14.
+
+**Sonde post-déploiement (AC4) — DEUX compteurs, et le second est ce qui rend le
+premier lisible.** Sur les 7 jours suivant le `make deploy` qui embarque ce vol :
+
+```sh
+# (A) les tours de mika-qa coupés au plafond — doit BAISSER depuis 13 en 3,5 jours
+grep '"event":"max_steps_tool_census"' /var/log/mika/server.log \
+  | grep '"agent_id":"mika-qa"' | wc -l
+
+# (B) le dénominateur : les tours webhook de mika-qa sur la même fenêtre
+grep '"event":"webhook_turn_charged"' /var/log/mika/server.log \
+  | grep '"agent_id":"mika-qa"' | wc -l
+```
+
+**Pourquoi (B) n'est pas décoratif.** (A) seul couvre deux populations non
+soustractibles (classe mika#2205) : *« les tours de revue aboutissent »* et
+*« mika-qa a été moins sollicitée »* — une semaine creuse de la boucle fait
+tomber (A) à zéro sans qu'une seule ligne de ce vol ait servi. La grandeur à lire
+est le **taux** `A / B`, et la baisse n'est attestée que si (B) tient. Référence
+d'avant le vol : 13 coupures du 2026-10-23T13:45Z au 2026-10-26T18:10Z, dont 4
+sur des tours de callback.
+
+**(B) est un dénominateur PARTIEL, et il faut le savoir pour ne pas sur-lire le
+taux.** `webhook_turn_charged` n'est émis que là où `original_github_text` est
+`Some`, c'est-à-dire sur le canal `github` : les tours de **callback** de build —
+4 des 13 coupures de référence — n'en portent aucun. Donc `A / B` surestime le
+taux de coupure, d'un facteur borné par la part de callbacks. Le remède n'est pas
+une seconde approximation mais la comparaison des deux séries de `label` : la
+ligne du census porte `label`, qui vaut `callback` sur cette population et permet
+de scinder (A) en ses deux moitiés (`grep -o '"label":"[^"]*"'`). Un dénominateur
+exact pour la moitié callback demanderait un compteur de tours silencieux que
+rien n'émet aujourd'hui — nommé ici, pas livré.
+
+**Trois haltes, à lire avant de conclure.**
+
+1. **(A) et (B) tous deux à zéro ⇒ la sonde n'a rien mesuré**, pas « c'est
+   réparé ». Vérifier que la fenêtre couvre des dispatches réels.
+2. **L'absence de la ligne `max_steps_tool_census` n'est pas une absence de
+   coupure** mais un binaire antérieur à mika#2877 (motif mika#2340). La sonde
+   de conformité qui le dit —  et **sa forme en différence**, parce que
+   `"agent exceeded max tool steps"` est une sous-chaîne de la variante silencieuse
+   — est dans
+   [`docs/agent-internals/observability.md`](../agent-internals/observability.md)
+   § *Exhausting the step budget names the tools that consumed it*.
+3. **Un `max_steps` à `30` sur une ligne dont l'`agent_id` n'est pas `mika-qa`
+   est un défaut**, pas une mesure : grouper une série par `max_steps` seul mêle
+   désormais deux populations. Filtrer sur `agent_id` d'abord.
+
+**Et si (A) ne baisse pas.** La borne est dans le prompt, donc elle n'atteint un
+agent que par la chaîne *rebuild → seed → read* (§ *Deploying a bundled-skill
+change*, `CLAUDE.md`) : vérifier d'abord
+`cat ~/.mika/skills/.manifest-writer` et que le sha qui y est attesté est celui
+du déploiement. Un prompt d'une semaine servi derrière un moteur à jour donne
+exactement « le plafond est monté, l'exploration n'est pas bornée » — c'est-à-dire
+le déplacement de l'épuisement que la mesure d'AC1 annonçait.
+
+Optional (webhook pre-filter, class (h) — mika#2854):
+- `MIKA_WEBHOOK_COMMENT_TRIAGE` — Dedicated switch for the light triage turn of pre-filter class (h): an `issue_comment` on an issue that carries **no loop task**. Armed, a short LLM call — the agent's own provider, `max_tokens = 160`, 20 s bound, **no tools** — answers one question, *does this text carry an actionable decision?* `DECISION` opens today's full turn; `NOTE: <line>` skips the turn and writes one memory `event` (indexed, deduplicated per issue and per day). **Default `off`** — a deliberate choice of vol 1: the class ships disarmed until the real-comment corpus under the real model (vol 2, tracked in senara-solutions/mika#2854) proves no operator order is downgraded to a note.
+
+  **Truth table.** Same as every switch in the repo (`parse_switch`) except one line: `1`/`true`/`on`/`yes` arm; `0`/`false`/`off`/`no` disarm; **absent ⇒ disarmed**; an unrecognized value arms, with the shared WARN naming it. Read on every event, so it is hot-swappable.
+
+  **What arming changes.** Disarmed, the turn runs exactly as before, and `webhook_turn_charged` carries `candidate = human_text_no_task`, `release = triage_disarmed`. Armed, the release names the branch taken: `triage_escalated` (decision seen), `triage_unreadable` (fail-open — transport error, timeout, off-grammar verdict, no provider), `issue_task_active` (the issue has a live loop task: no triage call at all). A noted turn writes one `webhook_prefilter_skipped` audit row with `after_value = comment_triaged_note` and `target_key = issue_comment:<issue url>`, and no `webhook_turn_charged` line. Escalation rate = `triage_escalated / (triage_escalated + comment_triaged_note)`.
+
+  **`MIKA_WEBHOOK_PREFILTER` disarms it upstream**: class (h) lives inside the pre-filter, so the global switch at `off` wins without this one being read. Outside class (h), always keeping their turn: comments on PRs (`/pull/` URL — the key is read from the template's second line only, never from the comment body), and `issues` `closed`, whose half lands in vol 2 (`upstream_close_handler` cleans the issue's tracking rows before the gate, so the live-task check needs the pre-handler state first).
+
+Optional (webhook pre-filter, class (g′) — mika#2917):
+- `MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD` — Dedicated switch for pre-filter class (g′): a `check_suite` **success** on a PR branch whose head has **already been reviewed**. Armed, the pre-filter reads the head the gateway now puts in the text (vol 1), looks it up in the registry the `qa-review-webhook-success` skill writes (vol 2, sole writer `record_reviewed_head`), and skips the turn under class `green_check_suite_head_already_reviewed` when the registry already carries one of the three recordable issues (`verdict_posted`, `stop_already_reviewed_sha`, `stop_verdict_recorded`). **No `gh` call anywhere on that path** — the head comes from the text, the registry from the agent's own database, scoped by `agent_id` (mika#2260). The population it targets was measured over 4.9 days: 51 turns, 7.06 M input tokens, every one of them paying a full turn to conclude there was nothing to do.
+
+  **Truth table — and the one line where it diverges from its (h) sibling: `absent ⇒ armed`.** `1`/`true`/`on`/`yes`/`""` arm; `0`/`false`/`off`/`no` disarm; **absent arms**; an unrecognized value arms with the shared `qa_switch_invalid` WARN naming it. Read on every event, so it is hot-swappable. It takes `MIKA_WEBHOOK_PREFILTER`'s truth table rather than `MIKA_WEBHOOK_COMMENT_TRIAGE`'s, and that divergence is argued rather than inherited: (h) ships disarmed because arming it changes a verdict on evidence a model produces, which is why it waits on a real-comment corpus. (g′) compares two attested facts — a SHA in the payload and a row the sole writer wrote — and skips **only** on an exact match of both. There is no judgment to calibrate, so shipping it disarmed would mean shipping code that does nothing and measuring nothing (the mika#2340 shape).
+
+  **What disarming it restores — exactly, and not a third regime.** Class (b) (`green_check_suite_head_decided`, mika#2672/#2674) is consulted **whole** on every branch where (g′) does not skip, so a disarmed (g′) gives back the regime `main` carried before this flight. That is what makes the switch a safe retreat gesture rather than a leap: `MIKA_WEBHOOK_PREFILTER_REVIEWED_HEAD=off` plus a restart, no migration, no data to undo. Attested by `mika2917_vol3_linterrupteur_desarme_rend_le_regime_anterieur` and by the non-regression test covering the four branches where (g′) declines.
+
+  **What arming changes in `measure-webhook-turn-cost`, and the quantity that is conserved.** (g′) is consulted **before** (b), so an event both gates would skip is now recorded under (g′). `skipped_by_class.green_check_suite_head_decided` therefore **falls** at deploy, in favour of `green_check_suite_head_already_reviewed` — a transfer, not a loss, and the conserved quantity is the **sum** of the two classes (mika#2205). Likewise `no_decision_attested` and `head_not_previously_decided` give way to `reviewed_head_absent` on this population while staying fully in service on the other three. The four releases (g′) can name: `reviewed_head_absent` (nominal, and decreasing as the registry fills), `reviewed_head_out_of_contract` and `reviewed_head_switch_disarmed` (**expected regime: zero** — the first means the sole writer wrote outside its contract, the second means someone disarmed the class), and `state_unreadable`, which is reused rather than duplicated and carries a `webhook_prefilter_state_unreadable` WARN with `what = "reviewed_head"`.
+
+  **`MIKA_WEBHOOK_PREFILTER` disarms it upstream**: class (g′) lives inside the pre-filter, so the global switch at `off` wins without this one being read. Three populations keep their turn whatever this switch says, because none of them names a single head to compare: no `Check-Suite-PRs:` line at all (a gateway binary older than vol 1), the line present naming **no** PR (measured on mika#2681), and the line naming **several**. They are never summed in the measurement — same decider arm, three distinct facts. The read window is bounded at 30 days (`REVIEWED_HEAD_WINDOW_DAYS`), itself under the 90-day `AUDIT_RETENTION_DAYS`.
+
+  **Post-deploy, before reading AC4** (mika#2340, and the MPC audit of #2919): `make deploy`, then `cat ~/.mika/skills/.manifest-writer` and `diff` the resolved production prompt of `qa-review-webhook-success` against the checkout's. A skill update can do nothing; if the deployed prompt is not the right one, the sole writer stays mute and (g′) filters nothing — it would read as a correct but inert pre-filter.
 
 Gateway mode: See `crates/mika-gateway/CLAUDE.md` for gateway-specific env vars.

@@ -10,7 +10,10 @@ timeout_secs = 120
 # bytes, 99 % of the 16 KiB default, past the 95 % warn gate (mika#852). Raised
 # to 24 KiB: headroom for one more rule, well under the 80 KiB ceiling. The
 # declared size costs nothing — the real size is injected.
-max_prompt_size = 24576
+# mika#2693 — the per-flight bound rule brought the prompt to 24 099 bytes,
+# 98 % of 24 KiB, past the warn gate again. Raised to 32 KiB on the same
+# reasoning.
+max_prompt_size = 32768
 
 [triggers]
 keywords = [
@@ -40,7 +43,10 @@ review_anchor_min_count = 3
 review_anchor_min_quote_chars = 40
 # Seuil d'armement : en dessous, la garde ne fire pas. Les trois skills arch sont
 # always_on, donc le seul match de skill armerait la garde sur TOUS les tours de
-# mika-arch — questions ad-hoc via /mika-ask-arch, et le re-prompt correctif de la
-# récupération UNPARSED (mika#1823), dont le message utilisateur fait ~480 caractères.
-# Aucun des deux ne peut porter la preuve exigée. Le brief de mika#2037 faisait 10 492.
+# mika-arch, y compris les questions ad-hoc via /mika-ask-arch, qui ne peuvent pas
+# porter la preuve exigée. Le brief de mika#2037 faisait 10 492.
+# Depuis mika#2996, les relances UNPARSED (mika#1823, mika#2641) ne sont PLUS sous ce
+# seuil : elles portent le plan entre deux lignes-marqueurs, et la garde vérifie les
+# ancres contre ce plan seul (`review_anchor::anchor_reference`). Une relance courte
+# laissait passer sans preuve la disposition qui fait avancer la chaîne.
 review_anchor_min_brief_chars = 2000

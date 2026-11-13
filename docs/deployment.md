@@ -101,7 +101,8 @@ The gateway image is leaner than the agent image — no GitHub CLI, no file/jq u
 
 ## 3c. CI/CD Pipeline
 
-Three GitHub Actions workflows automate testing, versioning, and binary distribution.
+Two GitHub Actions workflows test the code and distribute binaries. Versioning is manual: the version
+and the changelog move in the release PR, and the operator pushes the tag.
 
 ### CI (`ci.yml`)
 
@@ -110,44 +111,30 @@ Runs on every PR and push to `main`:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 
-### Release PR (`release-pr.yml`) — **DISABLED since 2026-08-29**
+### Release Binaries (`release.yml`)
 
-**This workflow no longer runs.** The `push: main` trigger was removed (mika#2047); only
-`workflow_dispatch` remains, as a manual verification path for whoever picks up the resume ticket.
-There is currently **no automated release, no automated tag, and no automated changelog** in this repo.
+The release path. Operator steps — dry run, launch, verification checklist, rollback — live in
+[`docs/releasing.md`](releasing.md).
 
-Why: release-please failed on every merge and kept `main` permanently red. Its `rust` strategy cannot
-handle our virtual workspace — it does not expand the `members = ["crates/*"]` glob, then hands the
-root `Cargo.toml` (which has no `[package]` section) to a package updater and throws. 300 runs between
-2026-06-05 and 2026-08-29, 300 failures, zero successes.
+- **Tag push `vX.Y.Z` or `vX.Y.Z-rc.N`** (on a commit of `main`, base equal to the workspace version,
+  `docs/releases/vX.Y.Z.md` present): builds, signs, then publishes a release. A `-rc.N` tag is
+  published as a **prerelease** and never becomes `latest`, which is what `install.sh` installs.
+- **Manual run** (`workflow_dispatch`, from `main` only): the same files as a workflow artifact,
+  nothing published.
+- Builds `mika` (CLI) and `mika-spirit` (HTTP server) with `--features telemetry` for x86_64-linux,
+  aarch64-linux, x86_64-macos (cross-compiled on an arm64 runner) and aarch64-macos.
+- Each archive comes with a `.tar.gz.sha256` checksum, a cosign `.bundle` and a build provenance
+  attestation; each binary has a CycloneDX SBOM. See [`docs/release-verification.md`](release-verification.md).
+- `mika-gateway` excluded — deployed via Docker to Kubernetes, not as a standalone binary.
+- Dashboard assets are not embedded in release builds (empty placeholder); the `/dashboard/` endpoint shows a branded "disabled" page.
 
-There is no known consumer of this release channel — last tag `v0.12.2` (2026-05-09) — and deployment
-happens from `main` via `make deploy`. Release assets do still see residual downloads (38 on `v0.12.2`,
-132 across all releases), and `install.sh` below pulls from GitHub Releases; but this workflow has
-produced nothing since 2026-05-09, so turning it off takes away nothing those users were still getting.
-They are pinned to `v0.12.2` regardless. The full reasoning lives in the workflow file's header comment.
-
-- Diagnosis: mika#2047
-- Resume ticket (what it would take to turn it back on): mika#2048
-- History of this failure class: `docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md`
-
-When it was live, it used `googleapis/release-please-action` to maintain a persistent Release PR with
-version bumps and changelog; merging that PR created the `v{version}` tag and GitHub Release. It never
-published to crates.io — all crates are `publish = false`. It required `RELEASE_PLZ_TOKEN` (a PAT with
-`contents: write` and `pull-requests: write`) rather than `GITHUB_TOKEN`, so that the tag push would
-trigger the release binary workflow.
-
-### Release Binaries (`release.yml`) — dormant
-
-Still enabled, but **dormant in practice**: nothing produces `v*` tags automatically since
-`release-pr.yml` was disabled (see above). It is deliberately left in place so that a manually pushed
-tag still produces binaries.
-
-Triggered by `v*` tag push:
-- Builds cross-platform binaries with `--features telemetry`: x86_64-linux, aarch64-linux (cross-compiled), x86_64-macos, aarch64-macos
-- Uploads `mika` (CLI) and `mika-spirit` (HTTP server) to GitHub Releases with SHA256 checksums
-- `mika-gateway` excluded — deployed via Docker to Kubernetes, not as a standalone binary
-- Dashboard assets are not embedded in release builds (empty placeholder); the `/dashboard/` endpoint shows a branded "disabled" page
+**release-please is gone (mika#2890).** `release-pr.yml` failed on every merge between 2026-06-05 and
+2026-08-29 (300 runs, 300 failures): its `rust` strategy cannot handle our virtual workspace — it does
+not expand `members = ["crates/*"]`, then hands the root `Cargo.toml`, which has no `[package]`, to a
+package updater and throws (diagnosis mika#2047). It was disabled, the resume ticket mika#2048 was
+closed not planned, and its only remaining trigger would have opened a real release PR on `main`. The
+workflow and its two config files were removed. History of this failure class:
+`docs/solutions/ci-cd/release-automation-chronic-drift-2026-04-23.md`.
 
 ### Installer Script
 
@@ -223,6 +210,95 @@ Run containers as non-root (the Docker images use UID 1000). Recommended securit
 - Mount `/tmp` as a small tmpfs or writable volume (read-only root filesystem)
 - Only one container should access each volume at a time (SQLite is single-writer)
 - No CPU limit recommended — the agent is I/O-bound (Claude API calls), CPU limits cause throttling
+
+---
+
+## 4b. Schema Migrations and File Rewrites (mika#2735)
+
+### May agent processes hold the database during a migration?
+
+**Today, yes — because no migration rewrites the file any more.** Since
+mika#2735 there is no `VACUUM` anywhere on the startup path, and the
+`migrate_vN_to_vM` ladder only does DDL and row updates inside a transaction.
+Those are safe under concurrency: SQLite serialises writers, and other
+connections see the new schema on their next statement. You do not need to
+sequence process startup for a migration of that shape.
+
+**For a migration that rewrites the file, no — and this is the order.** A
+rewriting operation is one that relocates pages or changes the file header:
+`VACUUM`, a full table rebuild (the v28→v29 idiom), or anything that converts
+`auto_vacuum`. For those:
+
+1. Stop every process that opens `~/.mika/data/mika.db` — `mika-spirit` first,
+   then any `mika` CLI invocation still running.
+2. Confirm nothing holds it: `pgrep -fa 'mika '` must return nothing, and
+   `ls ~/.mika/data/mika.db-wal` should be absent or zero-length after a clean
+   shutdown.
+3. Run the rewriting step from a **single** connection.
+4. Verify: `sqlite3 ~/.mika/data/mika.db 'PRAGMA quick_check'` must print `ok`.
+5. Start `mika-spirit`. Agent processes may start in any order after that —
+   they are ordinary readers and writers once the rewrite is done.
+
+The reason the order matters is the 2026-10-16 incident: the v55→v56 migration
+ran a `VACUUM` at `mika-spirit` startup while the engine tick and one connection
+per agent were live. `quick_check` was `ok` at 09:05Z and reported 25 damaged
+trees by 11:00Z, with `Bad ptr map entry` and `2nd reference to page`.
+
+### Why that `VACUUM` was not just a compaction
+
+`mika.db` was created with `auto_vacuum=NONE`. `Database::open` issues
+`PRAGMA auto_vacuum = INCREMENTAL`, which on a non-empty database is
+**inoperative** — it stays pending until the next `VACUUM`. So that `VACUUM` did
+not only move pages; it applied the pending setting and **converted the file
+format**, adding *pointer-map* pages. Both error signatures above name that
+structure. Replaying v56 *without* the `VACUUM` on the v55 backup takes 6 s and
+leaves `quick_check` at `ok`.
+
+The pending `PRAGMA` is deliberately left in place — removing it is out of
+mika#2735's scope. It is harmless as long as nothing runs a `VACUUM` under
+concurrency, which is exactly what the guard enforces.
+
+### Compacting the database — an operator gesture, engine stopped
+
+Nothing compacts `mika.db` automatically any more. When the file has grown past
+what its live data justifies (after a migration that dropped a column, or after
+`audit_events` compaction), do it by hand:
+
+```bash
+# 1. Stop the engine and confirm nothing holds the file.
+#    (systemd: systemctl stop mika-spirit — OpenRC: rc-service mika-spirit stop)
+pgrep -fa 'mika '          # must return nothing
+
+# 2. Back up first — a VACUUM rewrites the whole file.
+cp ~/.mika/data/mika.db ~/.mika/data/mika.db.bak-$(date -u +%Y%m%dT%H%M%SZ)
+
+# 3. Compact, then verify. Both lines must print `ok`.
+sqlite3 ~/.mika/data/mika.db 'VACUUM;'
+sqlite3 ~/.mika/data/mika.db 'PRAGMA quick_check'
+sqlite3 ~/.mika/data/mika.db 'PRAGMA integrity_check'
+
+# 4. Restart the engine.
+```
+
+If step 3 does not print `ok`, restore the backup from step 2 and escalate — do
+not start the engine on a file that failed the check. `sqlite3 .recover` on a
+copy is the recovery path (it produced a clean file on 2026-10-16).
+
+A `mika db vacuum` command that takes `PRAGMA locking_mode=EXCLUSIVE` plus
+`BEGIN EXCLUSIVE` and **refuses**, naming the reason, when another connection
+holds the file, is tracked as flight 2 of mika#2735. Until it ships, the manual
+gesture above is the only supported one.
+
+### The size warning now insists, and that is expected
+
+`startup_cleanup` logs `database size exceeds threshold` (field
+`threshold_bytes`, constant `DB_SIZE_WARN_BYTES` in `server/mod.rs`) when the
+file is larger than its threshold. Before mika#2735 a `VACUUM` could clear that
+condition on its own; now nothing does. **So the warning fires on every startup
+until an operator performs the gesture above.** It is a standing signal about
+file size, not a transient one — reading it as "something is failing right now"
+is the misreading to avoid. Its accepted cost is the operator's attention; the
+alternative cost was a damaged database.
 
 ---
 

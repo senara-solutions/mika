@@ -38,6 +38,7 @@ mod query_knowledge_graph;
 mod query_timeline;
 mod read_agent_file;
 mod read_workspace;
+mod record_reviewed_head;
 mod record_served_content;
 mod remove_team_member;
 mod resolve_issue_order;
@@ -124,6 +125,21 @@ pub struct ToolContext<'a> {
     pub embedding_client: Option<&'a EmbeddingClient>,
     pub brave_api_key: Option<&'a str>,
     pub github_token: Option<&'a str>,
+    /// Le jeton des **lectures CI** (mika#2963) — App d'abord, PAT en repli.
+    ///
+    /// Jumeau non identitaire de `github_token`, qui reste le jeton
+    /// d'**exécution** (`pr review`, `pr merge`, `pr comment`). Les deux
+    /// coexistent parce que la priorité dépend de la classe d'opération, pas de
+    /// l'appelant : la forge lit l'auteur d'un approve, jamais celui d'une
+    /// lecture de checks. Voie (i) de mika#2963 — lire avec l'App, poster avec
+    /// le PAT `mika-platform-qa`, pour ne déplacer aucune identité observable.
+    ///
+    /// Peuplé aux trois sites de production de `agent_loop::mod` par
+    /// `Settings::resolve_ci_read_token`. `None` ailleurs : ces sites dégradent
+    /// par `pr_merge_with_gate::ci_read_token_or_pat`, qui bâtit alors un jeton
+    /// de source `Pat` — exactement le comportement d'avant ce ticket, et le
+    /// log le dit.
+    pub ci_read_token: Option<&'a mika_common::ci_read::CiReadToken>,
     /// Gateway base URL for builtins that call substrate endpoints on
     /// the gateway (mika#1969 — `fetch_url` calls
     /// `POST /internal/fetch`). Populated from `settings.routing_url`
@@ -153,8 +169,16 @@ pub struct ToolContext<'a> {
     /// Quatrième booléen de classe de tour, à côté de `is_reflection`,
     /// `is_task_context` et `is_callback_turn` — la forme de la maison, pas une
     /// exception. Lu par la garde `validate_fallthrough_work_creation` de
-    /// `run_gh`, qui refuse les verbes créant du travail (`issue create`,
-    /// `issue edit --add-label ready`) sur un tel tour.
+    /// `run_gh`, qui refuse `issue create` sur un tel tour.
+    ///
+    /// **Ce champ ne borne plus toute cette garde (mika#2995).** La pose de
+    /// `ready` y est refusée sur **tout** tour, et donc sans consulter ce
+    /// booléen : l'incident du 2026-10-31 — mika-dev se posant à lui-même le
+    /// consentement que la garde de mika#2772 exige d'un opérateur — a eu lieu
+    /// sur un tour **ordinaire**. La population de chaque motif se lit à son
+    /// seul site, `evidence::guards::work_creation_is_refused`, où ce terme entre
+    /// en paramètre ; ce champ est donc l'une des entrées du prédicat, plus sa
+    /// borne (mika#2201).
     ///
     /// # Un booléen, jamais `originating_message`
     ///
@@ -198,9 +222,16 @@ pub struct ToolContext<'a> {
     /// site — mais ça touche les vingt-et-un sites de construction et les deux
     /// lecteurs, donc c'est un **suivi nommé**, pas ce ticket.
     ///
-    /// Lu par la garde de `CancelTaskTool::execute` (et donc, gratuitement, par
-    /// `cancel_reminder`, qui y délègue), qui refuse d'annuler une tâche dont un
-    /// pilote **vif** porte le travail.
+    /// Lu par la garde de `PromoteDeferredCallbackTool::execute` (mika#2654),
+    /// qui refuse à un tour webhook PR de forcer la promotion d'un lanceur
+    /// différé.
+    ///
+    /// **Et plus par `CancelTaskTool::execute`, depuis mika#2763.** Cette garde
+    /// l'a lu de mika#2653 à mika#2763 ; elle ne le lit plus, et le bord
+    /// documenté ci-dessous est la raison — un tour silencieux pose `false`, et
+    /// la garde ne tournait donc pas du tour par lequel un pilote groom vivant a
+    /// été tué le 2026-10-17. Un pilote vif est un pilote vif dans toute classe
+    /// de tour ; la question que ce booléen tranche est une autre question.
     ///
     /// # Un verdict, jamais une charge utile
     ///
@@ -220,6 +251,24 @@ pub struct ToolContext<'a> {
     /// d'équipe lit `TeamAgentParams`. **Un futur chemin servant un webhook en
     /// mode silencieux échapperait à cette garde** — borne héritée de
     /// mika#2517 / mika#2573, ni élargie ni modifiée, population mesurée vide.
+    ///
+    /// **Cette borne a été franchie, et pas par un webhook (mika#2763).** Le
+    /// 2026-10-17 un tour **silencieux** `deferred_dispatch` — qui n'est pas
+    /// « un webhook servi en mode silencieux », mais un tour ouvert par le
+    /// moteur de tâches — a appelé `cancel_task` sur un callback groom vivant de
+    /// 4 min et l'a tué, parce que ce booléen y vaut `false` et que la garde
+    /// mika#2653 était posée dessus. **La borne telle qu'elle est énoncée
+    /// ci-dessus reste exacte** (la population webhook-en-silencieux est bien
+    /// vide), et c'est précisément ce qui la rendait trompeuse : elle décrivait
+    /// le risque d'un chemin hypothétique, alors que le coût venait du cas
+    /// nominal — les vingt sites qui posent `false` parce qu'ils ne servent
+    /// aucun webhook du tout.
+    ///
+    /// La leçon, pour qui voudrait poser une garde **nouvelle** sur ce booléen :
+    /// il borne ce qu'un événement de PR **autorise**, et il ne borne rien
+    /// d'autre. Une garde dont le coût du faux passage est une destruction de
+    /// travail ne se pose pas dessus (mika#2763 en a retiré une) ; une garde
+    /// dont l'objet est l'étendue d'une autorisation, si (mika#2654 en est une).
     pub is_webhook_pr_event_turn: bool,
     /// Current LLM provider name (e.g., "anthropic", "openrouter").
     /// Used by builtin handlers that need to know the agent's active provider.
@@ -1345,6 +1394,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     // Content-serve ledger tools (mika#1867)
     "record_served_content",
     "check_already_served",
+    // Registre des têtes revues (mika#2917) — écrivain unique
+    "record_reviewed_head",
     // management_tools_if_needed() — always-added management tools
     "create_agent",
     "create_team",
@@ -1423,6 +1474,11 @@ pub fn default_tools() -> ToolRegistry {
     // a fidelity gate is engine, not skill.
     registry.register(Box::new(record_served_content::RecordServedContentTool));
     registry.register(Box::new(check_already_served::CheckAlreadyServedTool));
+    // Registre des têtes revues (mika#2917). Niveau moteur comme ses voisins :
+    // l'outil n'écrit que ce que son appelant lui passe, et c'est le prompt du
+    // skill `qa-review-webhook-success` — non une allowlist — qui décide quel
+    // tour l'appelle.
+    registry.register(Box::new(record_reviewed_head::RecordReviewedHeadTool));
     registry
 }
 
@@ -1634,6 +1690,27 @@ mod tests {
              thing, then update this count. Found: {callers:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // mika#2593 → mika#2748 — the roster moved, and so did its guard
+    // -----------------------------------------------------------------------
+    //
+    // `MIKA_ARCH_SERVED_BUILTINS_FROM_DEFAULT_TOOLS` and
+    // `mika2593_le_tableau_servi_a_mika_arch_est_un_roster_atteste` lived here.
+    // They asserted that the builtins surviving mika-arch's denylist matched a
+    // hand-kept roster, i.e. they detected "a tool is served to the architect
+    // without anyone having decided it".
+    //
+    // mika#2748 made that fact **impossible** rather than merely detected: under
+    // `MIKA_ARCH_ALLOWED_TOOLS` a new `register(...)` below does not reach
+    // mika-arch until its name is written in that constant. The constant *is*
+    // the decision register now, and `mika2748_lallowlist_de_mika_arch_est_le_roster`
+    // (`well_known_agents.rs`, next to the lists it reads) guards it — without
+    // reintroducing the `allowlist == registry − denylist` equality, which would
+    // put the denylist back as the source of truth.
+    //
+    // So: adding a tool to `default_tools()` no longer needs a line here. If the
+    // architect should see it, write its name in `MIKA_ARCH_ALLOWED_TOOLS`.
 
     // -----------------------------------------------------------------------
     // mika#2627 V11 — the gated-tool list mirrors the testimony guard's callers

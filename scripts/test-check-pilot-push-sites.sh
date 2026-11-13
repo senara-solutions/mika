@@ -160,10 +160,12 @@ if [[ "$real_out" == *"1 allowlisted"* ]]; then
 else
     ko "the repository carries exactly one allowlisted residue" "output: $real_out"
 fi
-if [[ "$real_out" == *"7 scanned"* ]]; then
-    ok "the population is the seven handler scripts"
+# Count moved 7 → 8 deliberately: mika#2934 added
+# skills/bundled/qa-review-webhook-success/handlers/qa_head_reviews.sh.
+if [[ "$real_out" == *"8 scanned"* ]]; then
+    ok "the population is the eight handler scripts"
 else
-    ko "the population is the seven handler scripts" \
+    ko "the population is the eight handler scripts" \
        "output: $real_out" \
        "If a handler was added or removed, update this count deliberately —" \
        "a population that shrinks unnoticed is how the scan goes quiet."

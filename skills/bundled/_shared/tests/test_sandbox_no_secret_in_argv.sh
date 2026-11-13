@@ -22,9 +22,11 @@
 # SYNTHETIC secret (`MIKA_TEST_SECRET`), and dedicated tests assert the
 # mika#2056 invariant directly: no GitHub token VALUE reaches the argv, the
 # --setenv list, or the real sandbox env/filesystem. Since mika#2572 the NAME
-# GH_TOKEN does travel, carrying only the non-secret placeholder
-# `proxy-managed-no-secret` (gh refuses to start without some local value) —
-# so these tests assert on the value, never on the name's absence. The
+# GH_TOKEN does travel, carrying only a non-secret value (gh refuses to start
+# without some local value) — so these tests assert on the value, never on the
+# name's absence. Since mika#2716 that value is the per-spawn EGRESS SENTINEL
+# `proxy-managed-no-secret-<32 hex>`, drawn and registered host-side, so the
+# assertions match a FORM ($SENTINEL_FORM below) rather than a literal. The
 # sandbox-absent-but-host-present
 # anti-vacuity proof lives in the sibling
 # test-pilot-github-token-not-in-sandbox.sh.
@@ -40,6 +42,15 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCH_LIB="$SCRIPT_DIR/../dispatch-lib.sh"
+
+# mika#2716: the one accepted shape for the GH_TOKEN value. The anchor is
+# WIDENED, never relaxed — the prefix is pinned, the suffix is pinned to exactly
+# 32 lowercase hex digits, and both ends are anchored. A bare prefix also
+# passes, because that is the fail-open and MIKA_PILOT_EGRESS_SENTINEL=0 shape
+# and refusing it would make this suite red on an operator's deliberate
+# rollback. What still fails is every value that matters: a real token, an empty
+# value, a prefix-shaped decoy with the wrong suffix length.
+SENTINEL_FORM='^proxy-managed-no-secret(-[0-9a-f]{32})?$'
 
 # shellcheck source=skills/bundled/_shared/dispatch-lib.sh
 source "$DISPATCH_LIB"
@@ -94,6 +105,25 @@ CAPTURE="$TMPROOT/bwrap-argv"
 export HOME="$TMPROOT/home"
 WORKTREE_DIR="$TMPROOT/worktree"
 mkdir -p "$HOME" "$WORKTREE_DIR"
+
+# mika#2108 — the SECOND user of the `--ro-bind-data` mechanism, present on
+# purpose.
+#
+# `_pilot_sandbox_readme_args` materialises a README-SANDBOX at the two sandbox
+# locations that answer falsely, and it reads these two globals. Without them it
+# takes its silence path and emits nothing — which would leave this suite
+# measuring a mechanism with a single user, exactly the world the destination
+# filter below was written to leave behind. Set here so the nominal argv carries
+# FOUR `--ro-bind-data` of which TWO are secret channels: that divergence is the
+# measure that tells a repaired predicate from an extinguished one, and Test 8's
+# positive control reads both numbers.
+#
+# The paths are FICTITIOUS and under this suite's own temp root — never the real
+# host workspace. A test that names the real `/data/workspace/...` would bind a
+# marker into a real directory's namespace shadow and read as though the suite
+# needed the host layout to exist.
+PLATFORM_DIR="$TMPROOT/zz-host"
+SUB_REPO_DIR="$TMPROOT/zz-host/mika"
 
 # mika#2049 — the default FLIPPED, and the meaning of `1` changed with it.
 #
@@ -185,11 +215,17 @@ setenv_names() {
 #                        fast, traceable error.
 #
 # mika#2572 added GH_TOKEN, audited on the same terms as ANTHROPIC_API_KEY:
-#   GH_TOKEN             the literal "proxy-managed-no-secret". The GitHub
-#                        addon strips and replaces Authorization host-side; the
-#                        value exists only so gh does not stop on
-#                        `gh auth login`. Test 10b pins that EVERY occurrence
-#                        carries exactly this placeholder.
+#   GH_TOKEN             since mika#2716, the per-spawn EGRESS SENTINEL
+#                        "proxy-managed-no-secret-<32 hex>" — drawn host-side
+#                        and registered under ~/.mika/pilot-egress-sentinels/,
+#                        never a credential and never derived from one
+#                        (scripts/verify-no-secret-in-setenv.sh rule 3 pins the
+#                        provenance). The GitHub addon strips and replaces
+#                        Authorization host-side; the value exists so gh does
+#                        not stop on `gh auth login`, and so a later flight can
+#                        tell a pilot's own gh from a test that overwrote this
+#                        name. Test 10b pins that EVERY occurrence matches
+#                        $SENTINEL_FORM.
 AUDITED_SETENV_NAMES="ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_LOG_FILE \
 CLAUDE_CODE_API_BASE_URL GH_TOKEN GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
 GIT_TERMINAL_PROMPT HOME HOSTNAME HTTPS_PROXY HTTP_PROXY LANG LC_ALL \
@@ -208,26 +244,87 @@ assert_setenv_channel_closed() {
     assert_eq "$label" "" "$unexpected"
 }
 
-# Index (0-based) of the first occurrence of an exact argument, or -1.
-arg_index() {
-    local needle="$1" i=0 a
-    while IFS= read -r a; do
-        if [ "$a" = "$needle" ]; then echo "$i"; return 0; fi
-        i=$((i + 1))
-    done < <(captured_args)
-    echo "-1"
+# mika#2108 (vol 2): THE SECRET CHANNEL IS IDENTIFIED BY ITS DESTINATION, NEVER
+# BY THE `--ro-bind-data` LITERAL.
+#
+# `--ro-bind-data` was a sufficient discriminant for exactly as long as the
+# secret channel was its only user. mika#2108 gives the mechanism a second use —
+# a `README-SANDBOX` materialised at the two mount-skeleton locations that answer
+# falsely — and from that moment the literal names a MECHANISM, not a CHANNEL.
+# Six predicates of this suite read it; left as they were, three would be false
+# (an exact count of 2 against four occurrences) and three would be FORTUITOUS:
+# `--perms 0600 immediately precedes` and `comes after --tmpfs /run` would be
+# measured on whichever triple happens to come first in the argv, and the two
+# `== -1` absence checks would assert the absence of the mechanism instead of
+# the absence of the channel — a green that no longer means what it says.
+#
+# The discriminant already exists and is already named: `$_PILOT_SECRET_DIR_SANDBOX`.
+# It is read from dispatch-lib, not retyped here, so a move of that directory
+# moves the reader with it. This is the mika#2309 doctrine: the predicate belongs
+# on the site that carries the invariant, never on the value or the literal.
+#
+# Nothing below is relaxed by this. Each predicate keeps its ticket of origin
+# (mika#2039, mika#2572, mika#2716) and the property that ticket pinned; only the
+# READER changes. And because a filter is exactly the kind of gesture that turns
+# a test green by emptying it, Test 8 carries its POSITIVE CONTROL: the filter
+# must FIND the two secret channels in the nominal case, and distinguish them
+# from the raw count. Without it, both `== -1` assertions would be green at
+# vacuum the day the accessor stopped recognising anything.
+secret_channel_indices() {
+    local -a a=()
+    local x i
+    while IFS= read -r x; do a+=("$x"); done < <(captured_args)
+    for ((i = 0; i < ${#a[@]}; i++)); do
+        if [ "${a[$i]}" = "--ro-bind-data" ] && [ $((i + 2)) -lt ${#a[@]} ]; then
+            case "${a[$((i + 2))]}" in
+                "$_PILOT_SECRET_DIR_SANDBOX"/*) printf '%s\n' "$i" ;;
+            esac
+        fi
+    done
 }
 
-# Destinations of each `--ro-bind-data <fd> <dest>` triple. Counting raw
+# Index (0-based) of the FIRST secret channel's `--ro-bind-data`, or -1.
+#
+# It replaces a generic `arg_index <exact argument>` helper, which is DELETED
+# rather than left standing: it was used only on this literal, and a generic
+# first-exact-match reader sitting next to `--ro-bind-data` is an invitation to
+# re-measure the mechanism and call it the channel — the defect this accessor
+# exists to end. Reads the whole list rather than piping to `head -1`: an early-closed
+# pipe takes SIGPIPE and, under this suite's `pipefail`, 141 would become the
+# value of the substitution (scripts/verify-no-sigpipe-grep.sh, mika#2055).
+secret_channel_index() {
+    local -a idx=()
+    local i
+    while IFS= read -r i; do idx+=("$i"); done < <(secret_channel_indices)
+    if [ "${#idx[@]}" -eq 0 ]; then
+        printf '%s\n' "-1"
+    else
+        printf '%s\n' "${idx[0]}"
+    fi
+}
+
+# How many secret channels the argv carries. Replaces `grep -c -- '--ro-bind-data'`,
+# which since mika#2108 counts the mechanism's every user.
+secret_channel_count() {
+    local -a idx=()
+    local i
+    while IFS= read -r i; do idx+=("$i"); done < <(secret_channel_indices)
+    printf '%s\n' "${#idx[@]}"
+}
+
+# Destinations of each SECRET `--ro-bind-data <fd> <dest>` triple. Counting raw
 # occurrences of the secret directory would over-count: the entrypoint
-# prologue string legitimately names that directory too.
+# prologue string legitimately names that directory too. Same filter as
+# `secret_channel_indices` above, and for the same reason.
 secret_destinations() {
     local -a a=()
     local x i
     while IFS= read -r x; do a+=("$x"); done < <(captured_args)
     for ((i = 0; i < ${#a[@]}; i++)); do
         if [ "${a[$i]}" = "--ro-bind-data" ] && [ $((i + 2)) -lt ${#a[@]} ]; then
-            printf '%s\n' "${a[$((i + 2))]}"
+            case "${a[$((i + 2))]}" in
+                "$_PILOT_SECRET_DIR_SANDBOX"/*) printf '%s\n' "${a[$((i + 2))]}" ;;
+            esac
         fi
     done
 }
@@ -287,8 +384,8 @@ run_sandboxed /bin/true >/dev/null
 rc=1; captured_has_credential && rc=0
 assert_eq "2b: argv contains no credential-shaped value" "1" "$rc"
 
-rc=1; [ "$(arg_index '--ro-bind-data')" != "-1" ] && rc=0
-assert_true "2b: argv carries --ro-bind-data (secret channel present)" "$rc"
+rc=1; [ "$(secret_channel_index)" != "-1" ] && rc=0
+assert_true "2b: argv carries a secret file channel under \$_PILOT_SECRET_DIR_SANDBOX" "$rc"
 assert_setenv_channel_closed "2b: no unaudited name travels by --setenv"
 
 # The Phase 2b entrypoint is a multi-line `sh -c` script that also launches the
@@ -320,7 +417,7 @@ echo "Test: secret file is created 0600"
 echo "----------------------------------"
 
 run_sandboxed /bin/true >/dev/null
-bd_idx=$(arg_index '--ro-bind-data')
+bd_idx=$(secret_channel_index)
 perms_ok=1
 if [ "$bd_idx" != "-1" ] && [ "$bd_idx" -ge 2 ]; then
     mapfile -t ARGS < <(captured_args)
@@ -328,7 +425,7 @@ if [ "$bd_idx" != "-1" ] && [ "$bd_idx" -ge 2 ]; then
         perms_ok=0
     fi
 fi
-assert_true "--perms 0600 immediately precedes --ro-bind-data" "$perms_ok"
+assert_true "--perms 0600 immediately precedes the secret channel" "$perms_ok"
 
 # ============================================================================
 # Test 4: secret destination is bound AFTER --tmpfs /run
@@ -350,7 +447,7 @@ order_ok=1
 if [ "$run_tmpfs_idx" != "-1" ] && [ "$bd_idx" != "-1" ] && [ "$bd_idx" -gt "$run_tmpfs_idx" ]; then
     order_ok=0
 fi
-assert_true "--ro-bind-data comes after --tmpfs /run" "$order_ok"
+assert_true "the secret channel comes after --tmpfs /run" "$order_ok"
 
 # ============================================================================
 # Test 5: the xtrace channel carries no credential, and survives the call
@@ -382,17 +479,17 @@ assert_eq "trace file contains no credential-shaped value" "1" "$rc"
 # callback — but `++ printf %s <value>` from an untraced-suppressed process
 # substitution would not be, and that is what reaches the caller.
 #
-# mika#2049 — with Phase 2b now the default, the traced call also re-quotes the
-# PAYLOAD argv (`quoted_argv=$(printf ' %q' "$@")`), which traces as
-# `++ printf ' %q' /bin/true`. That line carries the payload, never a secret
-# (the argv channel is audited above), so it alone is excluded — exactly, so
-# any other expanded printf still fails the assertion.
-# Here-string, not a pipe (mika#2055/#2432: `producer | grep -q` SIGPIPEs).
-# The `-n` guard matters: an empty here-string is one empty line, which
-# `grep -v` would count as an offending printf.
+# mika#2049 excluded exactly one line here — `++ printf ' %q' /bin/true` — because
+# Phase 2b re-quoted the PAYLOAD argv with `quoted_argv=$(printf ' %q' "$@")`.
+# mika#2077 removed that re-quoting: the argv travels in positional parameters,
+# so the excluded line has no producer left and the exclusion is gone with it.
+# NOTHING is excluded here any more — ANY `++ printf` fails. Which makes this
+# assertion a second guard on the mika#2057 defect: putting a `$(printf ...)`
+# back on the entrypoint path reddens it here as well as in
+# tests/test_pilot_phase2b_argv.sh.
 _printf_lines=$(grep -E -- '\+\+ printf' "$TRACE" || true)
 rc=1
-[ -n "$_printf_lines" ] && grep -vqxF -- "++ printf ' %q' /bin/true" <<<"$_printf_lines" && rc=0
+[ -n "$_printf_lines" ] && rc=0
 assert_eq "trace carries no expanded process-substitution printf" "1" "$rc"
 
 rc=1; grep -q 'sentinel-after-sandbox-call' "$TRACE" && rc=0
@@ -437,8 +534,23 @@ export MIKA_TEST_SECOND_SECRET="$SECOND_TOKEN"
 
 run_sandboxed /bin/true >/dev/null
 
-bd_count=$(captured_args | grep -c -- '--ro-bind-data' || true)
-assert_eq "two --ro-bind-data arguments emitted" "2" "$bd_count"
+bd_count=$(secret_channel_count)
+assert_eq "two secret file channels emitted" "2" "$bd_count"
+
+# POSITIVE CONTROL of the mika#2108 destination filter, and it is not optional.
+# An accessor that stopped recognising anything would make the assertion above
+# fail loudly (`0` against `2`), but it would make the two `== -1` absence
+# assertions below — Test 9 and Test 10b — green FOR THE WRONG REASON: they
+# would be asserting that a broken reader finds nothing, not that no secret
+# channel exists. So the filter must be shown FINDING what it is meant to find,
+# and shown to be a sub-selection of the mechanism rather than a rename of it.
+# The second number is the whole point of the re-specification: before mika#2108
+# the two counts are equal (2 of 2), after it they diverge (2 of 4), and the
+# divergence is what distinguishes a repaired predicate from an extinguished one.
+bd_raw=$(captured_args | grep -c -- '--ro-bind-data' || true)
+positive_ok=1
+if [ "$bd_count" -eq 2 ] && [ "$bd_raw" -ge "$bd_count" ]; then positive_ok=0; fi
+assert_true "positive control: the filter finds both secret channels, and never more than the argv carries ($bd_count of $bd_raw --ro-bind-data) (mika#2108)" "$positive_ok"
 
 dest_count=$(secret_destinations | sort -u | wc -l | tr -d ' ')
 assert_eq "two distinct secret destinations emitted" "2" "$dest_count"
@@ -465,8 +577,8 @@ rc=0
 ( unset MIKA_TEST_SECRET; _run_pilot_sandboxed /bin/true ) >/dev/null 2>&1 || rc=$?
 assert_eq "unset token: invocation succeeds" "0" "$rc"
 
-bd_idx_unset=$(arg_index '--ro-bind-data')
-assert_eq "unset token: no --ro-bind-data emitted" "-1" "$bd_idx_unset"
+bd_idx_unset=$(secret_channel_index)
+assert_eq "unset token: no secret file channel emitted" "-1" "$bd_idx_unset"
 
 # ============================================================================
 # Test 10: non-secret passthrough is untouched
@@ -513,7 +625,7 @@ _PILOT_SANDBOX_SECRET_ALLOWLIST=()   # production shape: no sandbox-held secret
 rc=1; grep -qzF -- "$GH_LEAK_TOKEN" "$CAPTURE" && rc=0
 assert_eq "GH_TOKEN value is absent from the bwrap argv" "1" "$rc"
 
-# Every `--setenv GH_TOKEN <value>` triple carries the placeholder, and there
+# Every `--setenv GH_TOKEN <value>` triple carries an egress sentinel, and there
 # is at least one (the mika#2572 fix is present on this path). A count of zero
 # would mean this block no longer runs Phase 2b and proves nothing.
 gh_tok_occ=0; gh_tok_bad=""
@@ -522,18 +634,18 @@ while IFS= read -r a; do _args+=("$a"); done < <(captured_args)
 for ((i = 0; i + 2 < ${#_args[@]}; i++)); do
     if [ "${_args[$i]}" = "--setenv" ] && [ "${_args[$((i + 1))]}" = "GH_TOKEN" ]; then
         gh_tok_occ=$((gh_tok_occ + 1))
-        [ "${_args[$((i + 2))]}" = "proxy-managed-no-secret" ] || gh_tok_bad="$gh_tok_bad ${_args[$((i + 2))]}"
+        [[ "${_args[$((i + 2))]}" =~ $SENTINEL_FORM ]] || gh_tok_bad="$gh_tok_bad ${_args[$((i + 2))]}"
     fi
 done
 unset _args
 assert_eq "GH_TOKEN travels via --setenv on the contained path (mika#2572)" "1" "$([ "$gh_tok_occ" -ge 1 ] && echo 1 || echo 0)"
-assert_eq "every --setenv GH_TOKEN carries the placeholder, never the parent token" "" "$gh_tok_bad"
+assert_eq "every --setenv GH_TOKEN carries an egress sentinel, never the parent token" "" "$gh_tok_bad"
 
 rc=1; grep -qzx -- "/run/mika-pilot-secrets/GH_TOKEN" "$CAPTURE" && rc=0
 assert_eq "no /run/mika-pilot-secrets/GH_TOKEN file channel is created" "1" "$rc"
 
-bd_idx_prod=$(arg_index '--ro-bind-data')
-assert_eq "empty allowlist emits no --ro-bind-data secret channel" "-1" "$bd_idx_prod"
+bd_idx_prod=$(secret_channel_index)
+assert_eq "empty allowlist emits no secret file channel" "-1" "$bd_idx_prod"
 
 _PILOT_SANDBOX_SECRET_ALLOWLIST=("${_SAVED_ALLOWLIST[@]}")
 
@@ -579,14 +691,16 @@ else
 
     # (b) mika#2056: with the PRODUCTION (empty) allowlist, the GH_TOKEN VALUE
     #     present in the parent env is absent from the real sandbox — the
-    #     environment carries only the mika#2572 placeholder — and no file
-    #     materialises under /run/mika-pilot-secrets. This is the real
-    #     end-to-end proof the token cannot be read from inside the sandbox.
+    #     environment carries only the mika#2572 placeholder, since mika#2716 an
+    #     egress sentinel built on it — and no file materialises under
+    #     /run/mika-pilot-secrets. This is the real end-to-end proof the token
+    #     cannot be read from inside the sandbox.
     _SAVED_ALLOWLIST=("${_PILOT_SANDBOX_SECRET_ALLOWLIST[@]}")
     _PILOT_SANDBOX_SECRET_ALLOWLIST=()
     got_gh=$(GH_TOKEN="$FAKE_TOKEN" _run_pilot_sandboxed \
         /bin/sh -c 'printf %s "${GH_TOKEN:-<absent>}"' 2>/dev/null)
-    assert_eq "GH_TOKEN in the real sandbox is the placeholder (mika#2572)" "proxy-managed-no-secret" "$got_gh"
+    rc=0; [[ "$got_gh" =~ $SENTINEL_FORM ]] || rc=1
+    assert_eq "GH_TOKEN in the real sandbox is an egress sentinel (mika#2572, mika#2716)" "0" "$rc"
     rc=1; [ "$got_gh" = "$FAKE_TOKEN" ] && rc=0
     assert_eq "the parent GH_TOKEN value never reaches the real sandbox" "1" "$rc"
 
@@ -596,10 +710,12 @@ else
     _PILOT_SANDBOX_SECRET_ALLOWLIST=("${_SAVED_ALLOWLIST[@]}")
 
     # Phase 2b is the branch every real dispatch takes when the egress proxy is
-    # up, and its entrypoint is a materially different string — the prologue is
-    # concatenated with the shim launch and a printf '%q'-quoted argv. Running
-    # it for real is the only way a quoting fault in that composition surfaces
-    # before production.
+    # up, and its entrypoint is a materially different script — the prologue is
+    # concatenated with the shim launch, its bounded wait and the EXIT trap that
+    # reaps it. Since mika#2077 the argv is NOT part of that composition: it
+    # enters in positional parameters, and tests/test_pilot_phase2b_argv.sh
+    # measures its traversal octet for octet. What stays worth running for real
+    # here is the composition itself, under bwrap.
     if [ -x "$_PILOT_EGRESS_PROXY_BIN" ] && [ -S "$_PILOT_EGRESS_SOCK" ]; then
         MOCK_EGRESS_RC=0
         got_2b=$(MIKA_TEST_SECRET="$FAKE_TOKEN" _run_pilot_sandboxed \

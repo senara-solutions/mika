@@ -16,13 +16,30 @@
 //! dont la garde tourne à sa position de production dans `CancelTaskTool`,
 //! ferme ça.
 //!
-//! **Le contrôle négatif est porteur, pas décoratif.** V6a seul serait satisfait
-//! par une garde qui refuse `cancel_task` sur **tout** tour — c'est-à-dire par
-//! un correctif qui retire à l'opérateur son geste d'annulation, lequel n'a pas
-//! de contournement. V6b (le même appel depuis un tour de conversation) est
-//! l'axe qui sépare « la garde décide » de « la garde bloque l'annulation », et
-//! V6c (tour webhook PR, aucun pilote) est le **contrôle positif** : sans lui,
-//! zéro refus serait indistinguable d'une garde qui ne tourne pas.
+//! **Ce que mika#2763 a déplacé, et pourquoi V6b est inversé.** À l'origine,
+//! V6b — le même appel depuis un tour de conversation — était l'axe qui séparait
+//! « la garde décide » de « la garde bloque l'annulation ». mika#2763 a retiré
+//! le terme de classe de tour du prédicat : le 2026-10-17 à 07:59:38Z, un tour
+//! **silencieux** `deferred_dispatch` a annulé le callback groom **vif de 4 min**
+//! de mika#2757 en le croyant « stale (>1h) » — le « >1h » étant l'âge du
+//! *parent*, seule date que l'agent pouvait lire. Ce site pose
+//! `is_webhook_pr_event_turn = false`, comme les vingt autres qui ne le
+//! calculent pas, donc la garde de mika#2653 ne tournait pas du tout. V6b
+//! **refuse** désormais aussi, et c'est ce qu'il atteste sous son nouveau nom
+//! (`mika2763_un_tour_de_conversation_refuse_aussi`).
+//!
+//! L'axe « la garde ne bloque pas tout » repose donc sur V6c seul — tour webhook
+//! PR, aucun pilote, l'annulation passe et le dit — qui est aussi le **contrôle
+//! positif** : sans lui, zéro refus serait indistinguable d'une garde qui ne
+//! tourne pas.
+//!
+//! **Et le geste de reprise de l'opérateur n'a jamais été sur ce chemin** :
+//! c'est la rectification qui autorise l'élargissement.
+//! `cancel_task_and_kill` a quatre appelants et **un seul traverse un
+//! `ToolContext`** ; `mika tasks cancel <id>` (CLI) et `POST /tasks/{id}/cancel`
+//! (HTTP) n'y arrivent pas, donc aucun prédicat posé ici ne peut les lui
+//! retirer. Ce qu'un faux refus coûte est un appel d'outil à un modèle, rendu
+//! visible dans `tool_calls.output` et dans `audit_events`.
 //!
 //! **Linux seulement** pour les deux cas qui demandent un pilote réellement
 //! vif : la vivacité est établie par `is_same_process_alive`, qui lit
@@ -30,7 +47,12 @@
 //! le processus de test est son propre pilote, donc vivant par construction et
 //! avec un `process_start_time` qui correspond.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use mika_agent::agent::{SilentAgentParams, SilentTrigger, run_silent_agent};
 use mika_agent::db::NewTask;
+use mika_agent::messaging::NoopSender;
 use mika_common::llm::mock::*;
 use serde_json::json;
 
@@ -283,32 +305,34 @@ async fn mika2653_un_tour_webhook_pr_nannule_pas_un_pilote_vif() {
 }
 
 // -------------------------------------------------------------------------
-// V6b (AC3) — LE contrôle négatif : hors tour webhook PR, rien ne change.
+// V6b, INVERSÉ par mika#2763 — un tour de conversation refuse aussi.
 //
-// Sans lui, « la garde décide » est indistinguable de « la garde bloque toute
-// annulation », et les trois chemins opérateur pourraient être cassés avec tous
-// les autres tests au vert.
+// **Cette assertion était retournée, et elle est REMPLACÉE, pas ignorée.** Elle
+// attestait « hors tour webhook PR, rien ne change » : c'est précisément la
+// borne que l'incident du 2026-10-17 a franchie, par un tour silencieux qui
+// n'était ni un webhook PR ni une conversation. L'ancien nom
+// (`mika2653_un_tour_de_conversation_annule_comme_avant`) nommerait maintenant
+// l'inverse de ce que le code garantit, et un test juste sous un nom faux est
+// pire qu'un test absent — d'où le renommage, qui porte la raison.
+//
+// Ce qui tient toujours l'axe « la garde ne bloque pas tout » : V6c, le contrôle
+// positif. Et ce qui tient les trois chemins opérateur : leur **construction**
+// (ni le CLI ni le HTTP ne traversent un `ToolContext`), pas ce prédicat.
 // -------------------------------------------------------------------------
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn mika2653_un_tour_de_conversation_annule_comme_avant() {
-    // Ce contrôle traverse `cancel_task_and_kill` par conception — c'est très
-    // exactement ce qu'il atteste — donc le pilote est un enfant dans son
-    // propre groupe, et son kill est l'issue nominale du scénario.
+async fn mika2763_un_tour_de_conversation_refuse_aussi() {
     let pilot = LivePilotChild::spawn();
     let (pid, st) = pilot.pgid_and_start();
     let (harness, task_id, output) = run_on_seeded(OPERATOR_MSG, Some((pid, Some(st)))).await;
 
     assert!(
-        !output.contains(REFUSAL),
-        "INVARIANT VIOLÉ (AC3) : la garde a mordu hors de sa population — retirer à \
-         l'opérateur son geste d'annulation est pire que le défaut qu'on referme, \
-         puisque ce geste n'a pas de contournement ; obtenu : {output}"
-    );
-    assert!(
-        output.contains("cancelled"),
-        "l'annulation doit aboutir exactement comme avant ; obtenu : {output}"
+        output.contains(REFUSAL),
+        "un pilote vif est un pilote vif dans toute classe de tour : depuis \
+         mika#2763 la garde ne consulte plus la classe du tour, et c'est ce qui \
+         ferme le tour silencieux par lequel l'incident est passé ; obtenu : \
+         {output}"
     );
 
     let task = harness
@@ -317,12 +341,20 @@ async fn mika2653_un_tour_de_conversation_annule_comme_avant() {
         .await
         .expect("task readable")
         .expect("task exists");
-    assert_eq!(task.status, "cancelled");
-
+    assert_eq!(
+        task.status, "pending",
+        "la garde tourne AVANT `cancel_task_and_kill` : aucun statut écrit"
+    );
     assert!(
-        guard_rows(&harness).await.is_empty(),
-        "hors population : aucune ligne d'audit — ce serait l'essentiel du trafic, \
-         soit très exactement le churn que la doctrine mika#2131 borne"
+        pilot.is_alive(),
+        "le pilote a été signalé : la garde a laissé passer le kill"
+    );
+
+    assert_eq!(
+        guard_rows(&harness).await,
+        vec![Some("blocked_live_pilot".to_string())],
+        "la décision est comptable dans cette classe de tour comme dans les \
+         autres — c'est ce qui rend le `GROUP BY` de l'opérateur complet"
     );
 }
 
@@ -398,5 +430,230 @@ async fn mika2653_un_signal_illisible_refuse_sur_un_tour_webhook_pr() {
         "la cause est comptée SÉPARÉMENT de la cause base : les deux remèdes sont \
          opposés — « l'instance n'est pas prouvable » contre « la base ne répond \
          pas »"
+    );
+}
+
+// -------------------------------------------------------------------------
+// V7 (mika#2763, AC minimal du ticket) — LE tour de l'incident : silencieux.
+//
+// Rejeu du 2026-10-17 07:59Z. Aucun des quatre cas ci-dessus n'atteint ce
+// chemin : ils passent par `harness.run()`, c'est-à-dire par un tour de
+// conversation, où `is_webhook_pr_event_turn` est calculé. Le tour
+// `deferred_dispatch` est construit ailleurs, et ce site pose le booléen à
+// `false` en dur — donc la garde de mika#2653 n'y tournait pas du tout, et
+// aucun test de cette famille ne pouvait le voir.
+// -------------------------------------------------------------------------
+
+/// Un callback **groom** vif, et vieux de quatre minutes : l'âge exact du
+/// callback que l'incident a déclaré « stale (>1h) ».
+///
+/// L'âge n'est lu par **aucun** terme de la garde — elle lit la vivacité du
+/// process, pas une durée. Il est reculé quand même, parce que c'est le fait sur
+/// lequel l'agent s'est trompé : citer l'âge du *parent* pour juger l'*enfant*.
+/// Un rejeu qui sèmerait un callback flambant neuf laisserait croire que le
+/// correctif tient à une fraîcheur, alors qu'il tient à une vivacité.
+async fn seed_live_groom_callback(
+    harness: &EvalHarness,
+    pid: i64,
+    start_time: Option<u64>,
+) -> String {
+    let id = harness
+        .db
+        .create_task(NewTask {
+            agent_id: harness.db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot_groom".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: "{}".to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        })
+        .await
+        .expect("create groom callback row");
+
+    harness
+        .db
+        .set_task_process_id(&id, Some(pid))
+        .await
+        .expect("record pgid");
+    if let Some(st) = start_time {
+        harness
+            .db
+            .set_task_metadata_field(&id, "process_start_time", &st.to_string())
+            .await
+            .expect("record start time");
+    }
+
+    let row = id.clone();
+    harness
+        .db
+        .with_db(move |db| {
+            db.execute_sql(
+                "UPDATE tasks SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', \
+                 '-240 seconds') WHERE id = ?1",
+                &[&row],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("backdate the groom callback to four minutes");
+
+    id
+}
+
+/// Le lanceur différé que le tour vient promouvoir — la tâche du déclencheur.
+async fn seed_deferred_launcher(harness: &EvalHarness) -> String {
+    harness
+        .db
+        .create_task(NewTask {
+            agent_id: harness.db.agent_id().to_string(),
+            team_run_id: None,
+            parent_task_id: None,
+            depth: 0,
+            label: "long_running:run_claude_pilot:deferred".to_string(),
+            trigger_type: "callback".to_string(),
+            cron_expr: None,
+            event_source: None,
+            event_offset_secs: None,
+            condition_expr: None,
+            next_fire_at: None,
+            timeout_at: None,
+            action_type: "resume_agent".to_string(),
+            action_config: r#"{"skill":"dev-groom","issue":2752}"#.to_string(),
+            input_context: None,
+            created_by_session: None,
+            created_trace_id: None,
+            reference_url: None,
+            source: Some("self_dev".to_string()),
+            metadata: None,
+            r#type: None,
+            dispatch_class: Some("groom".to_string()),
+        })
+        .await
+        .expect("create deferred launcher row")
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn mika2763_un_tour_deferred_dispatch_nannule_pas_un_pilote_vif() {
+    let pilot = LivePilotChild::spawn();
+    let (pid, st) = pilot.pgid_and_start();
+
+    let harness = EvalHarness::builder()
+        .responses(Vec::new())
+        .build()
+        .await
+        .unwrap();
+    let groom_id = seed_live_groom_callback(&harness, pid, Some(st)).await;
+    let deferred_id = seed_deferred_launcher(&harness).await;
+
+    harness.mock().clear_and_set(vec![
+        // Le geste de l'incident, à la lettre : libérer la place en annulant le
+        // callback qui la tient.
+        tool_call_response("cancel_task", json!({"id": groom_id})),
+        // Puis rendre la main. Plusieurs réponses texte, parce qu'un tour sans
+        // appel d'outil *réussi* se fait re-prompter une fois par le garde
+        // d'intention — comportement nominal du chemin, pas un défaut de la
+        // fixture.
+        text_response("Acknowledged."),
+        text_response("Acknowledged."),
+        text_response("Acknowledged."),
+        text_response("Acknowledged."),
+        text_response("Acknowledged."),
+    ]);
+
+    let skills_dirty = AtomicBool::new(false);
+    let params = SilentAgentParams {
+        tier: harness.tier,
+        deployment: harness.deployment,
+        db: &harness.db,
+        llm: harness.llm.as_ref(),
+        tools: &harness.tools,
+        skills: &harness.skills,
+        trigger: SilentTrigger::DeferredDispatch {
+            task_id: deferred_id,
+            parent_task_id: "2752-parent-task".to_string(),
+            action_config: r#"{"skill":"dev-groom","issue":2752}"#.to_string(),
+        },
+        home_dir: harness.home_dir.path(),
+        session_id: &harness.session_id,
+        message_sender: Some(Arc::new(NoopSender)),
+        embedding_client: None,
+        brave_api_key: None,
+        github_token: None,
+        gateway_url: None,
+        internal_token: None,
+        github_app: None,
+        skills_dirty: &skills_dirty,
+        settings: Some(&harness.settings),
+        trace_id: Some(harness.trace_id.clone()),
+        pr_reviews_posted: None,
+    };
+    run_silent_agent(&params).await.expect("silent turn runs");
+
+    // L'appel a bien eu lieu, et ce qu'il a rendu.
+    let (calls, _) = harness
+        .db
+        .query_tool_calls_by_session(&harness.session_id, 1, 100)
+        .await
+        .expect("tool calls readable");
+    let cancel_calls: Vec<_> = calls
+        .iter()
+        .filter(|c| c.tool_name == "cancel_task")
+        .collect();
+    assert!(
+        !cancel_calls.is_empty(),
+        "la fixture doit avoir atteint `cancel_task` depuis le tour silencieux — \
+         sans appel il n'y a rien à affirmer"
+    );
+    let output = cancel_calls[0].output.clone().unwrap_or_default();
+    assert!(
+        output.contains(REFUSAL),
+        "INCIDENT REJOUÉ (mika#2763) : un tour `deferred_dispatch` a annulé le \
+         callback groom vif de 4 min qui tenait la place, et le groom de mika#2757 \
+         a été perdu ; obtenu : {output}"
+    );
+
+    // Le pilote survit — c'est le travail que le défaut détruisait.
+    assert!(
+        pilot.is_alive(),
+        "le pilote groom a été signalé : la garde n'a pas tourné sur ce tour"
+    );
+
+    // La ligne n'est pas touchée : la garde est AVANT toute écriture.
+    let task = harness
+        .db
+        .get_task(&groom_id)
+        .await
+        .expect("task readable")
+        .expect("task exists");
+    assert_eq!(
+        task.status, "pending",
+        "INVARIANT VIOLÉ : un statut a été écrit — c'est l'état dans lequel \
+         mika#2757 est resté, `in_progress` sans enfant actif"
+    );
+
+    // Et la décision est comptable sous le nom de la garde.
+    assert_eq!(
+        guard_rows(&harness).await,
+        vec![Some("blocked_live_pilot".to_string())],
+        "exactement une ligne d'audit sous `cancel_task_pilot_guard` : sans elle, \
+         « la garde a refusé » et « personne n'a appelé » rendent les mêmes octets \
+          (classe mika#2205)"
     );
 }

@@ -1297,6 +1297,126 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // mika#2456 — la clé racine `enabled` reste opérateur-owned.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Il n'y a rien à excuser à la livraison : `CODE_OWNED_IDENTITY_SECTIONS`
+    /// ne nomme pas `enabled`, et son propre doc-comment déclare la clé
+    /// opérateur-owned. **Quand ce scan tire, on retire l'entrée** ; on ne
+    /// l'excepte pas (doctrine mika#2201) — un site qu'on ne veut pas armer est
+    /// un site à supprimer.
+    const IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS: &[&str] = &[];
+
+    /// **`enabled` n'entre pas dans les sections code-owned (mika#2456 R-7).**
+    ///
+    /// `enabled = false` à la racine d'un `identity.toml` est une **décision
+    /// d'opérateur** : c'est ce qui éteint les récurrentes d'un agent, et la
+    /// porte comme le filet de mika#2456 n'ont de sens que si personne ne la
+    /// réécrit sous l'opérateur. Faire entrer `enabled` dans
+    /// `CODE_OWNED_IDENTITY_SECTIONS` ferait exactement cela : le réconciliateur
+    /// remplacerait la valeur du disque par celle du spec au démarrage suivant,
+    /// et un agent délibérément éteint se rallumerait tout seul — sans ligne de
+    /// journal attribuable à qui que ce soit.
+    ///
+    /// *Aucun test comportemental ne peut voir cette classe :* l'entrée ajoutée
+    /// ne rend aucune assertion fausse le jour où elle est écrite. Elle ne mord
+    /// qu'au démarrage d'un agent dont le disque contredit le spec — c'est-à-dire
+    /// chez un opérateur, après le merge. C'est aussi la classe
+    /// d'inertie-renversée de mika#1833 (`[kg]`) et mika#2330
+    /// (`[context.history]`), prise du bon côté : là il s'agissait d'une
+    /// déclaration qui ne mordait pas, ici d'une qui mordrait trop.
+    ///
+    /// L'aiguille est composée à l'exécution pour que CE fichier ne se dénonce
+    /// pas lui-même (motif mika#2496).
+    #[test]
+    fn mika2456_la_cle_enabled_reste_operateur_owned() {
+        let owner = "crates/mika-agent/src/well_known_agents.rs";
+        let const_needle = format!("CODE_OWNED_IDENTITY{}", "_SECTIONS: &[&str] = &[");
+        let gate_key = format!("enab{}", "led");
+        let dotted_prefix = format!("{gate_key}.");
+
+        let mut declaring = Vec::new();
+        let mut owner_entries: Vec<String> = Vec::new();
+        let mut offenders: Vec<String> = Vec::new();
+
+        for (rel, content) in production_sources() {
+            if IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            let Some(start) = content.find(&const_needle) else {
+                continue;
+            };
+            declaring.push(rel.clone());
+
+            let rest = &content[start + const_needle.len()..];
+            let block = &rest[..rest.find("];").unwrap_or(rest.len())];
+
+            for line in block.lines() {
+                // Les commentaires du bloc citent les sections par leur nom :
+                // les lire comme des entrées ferait rougir ce scan sur de la
+                // prose, et on l'aurait désarmé le lendemain.
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                    continue;
+                }
+                for lit in string_literals(line) {
+                    if rel == owner {
+                        owner_entries.push(lit.clone());
+                    }
+                    if lit == gate_key || lit.starts_with(&dotted_prefix) {
+                        offenders.push(format!("{rel} → \"{lit}\""));
+                    }
+                }
+            }
+        }
+
+        // ── Anti-vacuité : un scan qui ne trouve pas sa cible se lit exactement
+        // comme un scan propre (mika#2103 / mika#2205). Deux conditions, parce
+        // que trouver le fichier ne prouve pas qu'on a su lire son bloc.
+        assert!(
+            declaring.iter().any(|d| d == owner),
+            "mika#2456 — la constante des sections code-owned est introuvable \
+             dans {owner} : ce scan vise un nom mort, il ne vérifie rien.\n\
+             Cause la plus probable : la constante a été renommée ou déplacée, \
+             ou un marqueur de module de test est apparu plus haut dans le \
+             fichier et `production_sources` l'a tronqué avant la cible."
+        );
+        assert!(
+            owner_entries.iter().any(|e| e.contains('.')),
+            "mika#2456 — le bloc de la constante a été trouvé mais n'a produit \
+             aucune entrée pointée (`skills.allowlist`, `context.summary`, …) : \
+             le parse du bloc a échoué, et un scan qui ne lit rien n'interdit \
+             rien.\nEntrées lues : {owner_entries:?}"
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2456 R-7 — la clé racine `{gate_key}` est déclarée code-owned : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : retirer l'entrée. `{gate_key}` est la décision par \
+             laquelle un opérateur éteint les récurrentes d'un agent ; \
+             code-owned, le réconciliateur la réécrit depuis le spec au \
+             démarrage suivant et rallume l'agent sans que personne l'ait \
+             demandé. Ne PAS l'ajouter à \
+             IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS — un site qu'on ne veut \
+             pas armer est un site à supprimer (doctrine mika#2201)."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2456_lallowlist_du_scan_enabled_est_livree_vide() {
+        assert!(
+            IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS.is_empty(),
+            "IDENTITY_ENABLED_CODE_OWNED_SCAN_EXCEPTIONS est livrée vide et doit \
+             le rester : une allowlist née vide est un tiroir où déposer la \
+             prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // mika#2496 — le nom d'audit du dépassement de coût a un écrivain.
     // ─────────────────────────────────────────────────────────────────────
 
@@ -1537,6 +1657,650 @@ mod tests {
         );
     }
 
+    // ───────── mika#2843 — l'écrivain unique de la surface d'audit du filet ─────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est **mesuré** et non espéré : le seul
+    /// site de production portant le littéral exact `agent_recurring_gate` est
+    /// la déclaration de la constante dans `dispatcher.rs`. Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
+    /// Quand le scan tire, **on route l'écriture par le propriétaire**, on ne
+    /// l'allowliste pas (doctrine mika#2201).
+    const RECURRING_GATE_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// La propriété qui rend le `GROUP BY target_key, after_value` de la requête
+    /// opérateur de mika#2843 exact.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, le filet continuerait de refuser, et V4-bis comme V4c
+    /// resteraient vertes. Ce qui deviendrait faux est le **compte** — et c'est
+    /// lui que la requête du § *Audit Log* lit pour répondre à « combien de
+    /// lignes échappent à la porte à l'enregistrement ». Un compte qui mélange
+    /// deux mécanismes ne compte plus une population.
+    ///
+    /// Le second écrivain réaliste est nommé : le refus à l'**enregistrement**
+    /// (vol 1), à qui l'on voudrait « la même ligne ». Il n'en écrit
+    /// délibérément aucune — il est borné par la cadence des redémarrages là où
+    /// le tir ne l'est pas.
+    ///
+    /// # La comparaison est EXACTE, et c'est ce qui rend l'allowlist livrable vide
+    ///
+    /// [`audit_name_literal_present`] teste `lit.trim() == needle`. Deux
+    /// littéraux existants **contiennent** la sous-chaîne `agent_recurring_gate`
+    /// sans être des écritures de cette ligne : `AGENT_RECURRING_GATE_RESOLVED_EVENT`
+    /// (`task_engine/mod.rs`, un nom d'événement de journal **suffixé**) et le
+    /// sentinel de session `agent-recurring-gate` (mika#2843 C1, en tirets là où
+    /// le `tool_name` est en tirets bas). Avec un prédicat en `contains`, ce scan
+    /// serait **rouge au premier jour** et son allowlist naîtrait à deux entrées
+    /// — c'est-à-dire exactement ce que mika#2323 refuse, et un lint rouge à la
+    /// naissance se fait désarmer. Avec l'égalité exacte, le seul site trouvé est
+    /// la déclaration de la constante.
+    ///
+    /// # Pas de nouveau contrôle de bonne foi
+    ///
+    /// [`audit_name_literal_present`] en a déjà un,
+    /// `mika2634_the_sole_writer_scan_still_catches_a_second_site`, qui couvre
+    /// ses trois formes bénignes dont un nom d'événement de journal préfixé par
+    /// le nom d'audit. Le prédicat est **partagé**, donc son attestation l'est
+    /// aussi ; en recopier une troisième serait la duplication que mika#2653
+    /// condamne.
+    #[test]
+    fn mika2456_the_gate_audit_name_has_exactly_one_writer() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même
+        // (mika#2496, même geste que le scan mika#2634 voisin).
+        let needle = format!("agent_recurring{}gate", "_");
+        let owner = "crates/mika-agent/src/task_engine/dispatcher.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            if RECURRING_GATE_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2843 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2843 — le nom d'audit du filet récurrent a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : router cette écriture par le propriétaire \
+             (`refuse_recurring_fire_if_agent_disabled`), ou lui donner son \
+             propre `tool_name`. Ne PAS l'ajouter à \
+             RECURRING_GATE_SOLE_WRITER_EXCEPTIONS — le `GROUP BY` de la requête \
+             opérateur ne compte une seule population que tant qu'un seul site \
+             l'écrit."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2456_lallowlist_du_scan_dagent_recurring_gate_est_livree_vide() {
+        assert!(
+            RECURRING_GATE_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "RECURRING_GATE_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on route l'écriture par le \
+             propriétaire. Une allowlist née vide est un emplacement où déposer \
+             la prochaine infraction (mika#2323)."
+        );
+    }
+
+    // ───── mika#2847 — la porte de section heartbeat est registration-only ─────
+
+    /// Les sites de production qui lisent la porte de section `heartbeat`, et
+    /// ce que chacun y fait.
+    ///
+    /// **C'est un périmètre, pas une liste d'exemptions**, et la distinction
+    /// n'est pas rhétorique : le scan plus bas exige que chaque entrée soit
+    /// **trouvée** (anti-vacuité), donc en retirer une ne relâche rien — ça
+    /// rend le scan rouge. L'allowlist, elle, est [`HEARTBEAT_GATE_READER_ALLOWED`],
+    /// et elle est vide.
+    const HEARTBEAT_GATE_REGISTRATION_SITES: &[&str] = &[
+        // Démarrage du démon, par agent : la boucle qui enregistre les
+        // récurrentes intégrées de chaque agent chargé.
+        "crates/mika-agent/src/server/mod.rs",
+        // `crates/mika-cli/src/commands/chat.rs` était le second site — le
+        // démarrage du TUI, pour le seul agent de la session. Retiré par
+        // mika#1727 vol V2a avec le `TaskEngine` de la TUI : le daemon est
+        // désormais le seul enregistreur des récurrentes d'un agent. **Ce
+        // retrait durcit ce scan au lieu de le relâcher** : toute réapparition
+        // d'une lecture de la porte sous `crates/mika-cli/` est maintenant un
+        // `strangers` et rougit. Ne pas réintroduire l'entrée pour accueillir
+        // une telle lecture — c'est le site qu'il faut supprimer.
+    ];
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est mesuré : le seul lecteur de
+    /// production est le site recensé ci-dessus. Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
+    /// Quand le scan tire, **on route la lecture par un site d'enregistrement
+    /// existant**, on n'ajoute pas d'entrée (doctrine mika#2201) : un lecteur
+    /// au **tir** retournerait précisément la propriété que ce scan atteste, et
+    /// l'allowlister serait documenter sa propre perte.
+    const HEARTBEAT_GATE_READER_ALLOWED: &[&str] = &[];
+
+    /// Cette ligne **lit**-elle la porte, par opposition à celle qui la définit ?
+    ///
+    /// La définition vit dans la partie production de `task_engine/mod.rs`
+    /// (définition à `:898`, premier `#[cfg(test)]` à `:944`), donc la
+    /// troncature de [`production_sources`] ne l'enlève pas : ce filtre est
+    /// nécessaire, pas décoratif. Paramétré par l'aiguille plutôt qu'écrit en
+    /// dur, pour que le suivi `reflection` le reprenne tel quel (mika#2653).
+    fn reads_section_gate(line: &str, needle: &str) -> bool {
+        line.contains(needle) && !line.contains(&format!("fn {needle}("))
+    }
+
+    /// Les fichiers de production qui lisent la porte de section désignée par
+    /// l'aiguille.
+    ///
+    /// **Paramétrée par l'aiguille, et appelée par les deux labels** —
+    /// `heartbeat` (mika#2847) et `reflection` (mika#2850). Un second
+    /// exemplaire de cette aide serait exactement ce que mika#2653 interdit ;
+    /// le nom ne porte donc plus `heartbeat`, parce qu'un nom qui désigne une
+    /// seule porte sur une aide appelée par deux mentirait au premier
+    /// relecteur.
+    ///
+    /// L'aiguille est composée **chez l'appelant**, à l'exécution, pour que CE
+    /// fichier ne se dénonce pas lui-même (mika#2496).
+    fn section_gate_reader_sites(needle: &str) -> Vec<String> {
+        let mut readers = Vec::new();
+        for (rel, content) in production_sources() {
+            let reads = crate::source_scan::strip_comment_lines(&content)
+                .lines()
+                .any(|line| reads_section_gate(line, needle));
+            if reads {
+                readers.push(rel);
+            }
+        }
+        readers
+    }
+
+    /// Chaque lecture de la porte est-elle **adjacente au geste
+    /// d'enregistrement** ?
+    ///
+    /// Pour chaque hit de l'aiguille dans le texte décommenté, une fenêtre de
+    /// 25 lignes doit porter les deux termes de la paire d'enregistrement :
+    /// `ensure_recurring_task` (la branche qui enregistre) et une ligne portant
+    /// `cancel_recurring_task_by_label(<label>` (la branche `else` qui annule).
+    ///
+    /// # Le label est un paramètre, et le terme d'annulation lui est corrélé
+    ///
+    /// **Appelé par les deux labels** — `heartbeat` (mika#2847) et `reflection`
+    /// (mika#2850) — d'où le nom génériques de section plutôt qu'un nom qui
+    /// désigne une porte. Le `label` arrive **guillemets compris**, et il est
+    /// cherché **sur la même ligne** que l'appel d'annulation, pas
+    /// indépendamment dans la fenêtre. Ce resserrage n'est pas cosmétique : au
+    /// site recensé, les blocs `heartbeat` et `reflection` sont
+    /// **collés** (`cancel_recurring_task_by_label("heartbeat")` est trois
+    /// lignes avant la lecture de `reflection` dans `server/mod.rs`). Avec les
+    /// trois termes cherchés indépendamment, supprimer la branche `else` de
+    /// `reflection` laissait le prédicat **vert** : l'annulation du voisin
+    /// `heartbeat` satisfaisait le terme, et le littéral `"reflection"` était
+    /// trouvé comme argument de label d'`ensure_recurring_task`. Le prédicat
+    /// aurait été inerte sur sa régression la plus probable, et un paramètre de
+    /// label qu'aucun test ne peut faire rougir n'est pas un paramètre
+    /// (`mika2850_le_predicat_honore_son_parametre_de_label`).
+    ///
+    /// Les guillemets du label restent porteurs pour la même raison qu'avant :
+    /// l'aiguille contient elle-même le nom de la section.
+    ///
+    /// **`ensure_recurring_task` reste un terme de fenêtre non corrélé, et
+    /// c'est mesuré.** Au site recensé, l'appel et son argument de label sont
+    /// sur des lignes **différentes** (`server/mod.rs` : appel `:1920`, label
+    /// `:1923`) : corréler ce terme-là sur une ligne rendrait le prédicat rouge
+    /// sur un arbre conforme. Le résidu que ça laisse — supprimer l'appel
+    /// d'enregistrement en gardant l'annulation garderait la fenêtre verte via
+    /// l'appel voisin — est **nommé** plutôt que corrigé : le fermer exigerait
+    /// une corrélation multi-ligne, et un prédicat qui devine la portée d'un
+    /// appel est la forme qui rougit sur un `cargo fmt`.
+    ///
+    /// # Pourquoi ce prédicat existe en plus du recensement
+    ///
+    /// Un recensement de **fichiers** ne dit rien du **geste**. Un lecteur
+    /// déplacé dans la boucle de tick de `server/mod.rs` resterait vert au
+    /// recensement — même fichier, même entrée. Ce que « registration-only »
+    /// affirme est une **conjonction locale**, et c'est elle que ce prédicat
+    /// mesure.
+    ///
+    /// La fenêtre vaut 25 et a **un seul site de vérité**, partagé par les deux
+    /// labels. Les distances réelles sont de 9 lignes (`server/mod.rs`
+    /// 1906→1915) pour `heartbeat` et de 10 lignes (`server/mod.rs` 1918→1928)
+    /// pour `reflection` : large sans être molle, et plus serrée encore sur le
+    /// texte décommenté puisque [`crate::source_scan::strip_comment_lines`]
+    /// **supprime** les lignes de commentaire au lieu de les vider. Les deux
+    /// autres mesures citées ici étaient celles de `commands/chat.rs` (11
+    /// lignes chacune), retiré du recensement par mika#1727 vol V2a.
+    fn section_gate_reads_at_registration(content: &str, needle: &str, label: &str) -> bool {
+        const WINDOW: usize = 25;
+        let cancels = format!("cancel_recurring_task_by_label({label}");
+        let stripped = crate::source_scan::strip_comment_lines(content);
+        let lines: Vec<&str> = stripped.lines().collect();
+
+        // « Personne ne lit » ne s'atteste pas comme « tout le monde lit au bon
+        // endroit » : sans lecture du tout, le prédicat rend `false` (mika#2103).
+        let mut saw_read = false;
+        for (i, line) in lines.iter().enumerate() {
+            if !reads_section_gate(line, needle) {
+                continue;
+            }
+            saw_read = true;
+            let lo = i.saturating_sub(WINDOW);
+            let hi = (i + WINDOW + 1).min(lines.len());
+            let window = &lines[lo..hi];
+            let registers = window.iter().any(|l| l.contains("ensure_recurring_task"))
+                && window.iter().any(|l| l.contains(cancels.as_str()));
+            if !registers {
+                return false;
+            }
+        }
+        saw_read
+    }
+
+    /// **D2.** Aucun lecteur de la porte de section hors du recensement.
+    ///
+    /// C'est la propriété que la sonde V6 du vol 2
+    /// (`mika2456_le_filet_laisse_la_porte_de_section_decider`) ne tient pas :
+    /// elle atteste le comportement du **filet**, pas l'unicité du lecteur, et
+    /// un lecteur ajouté au tir la laisserait verte. `dispatcher.rs` n'est pas
+    /// au recensement, donc ce volet-ci rougit.
+    ///
+    /// Aucune assertion séparée sur `dispatcher.rs` n'est livrée : elle serait
+    /// exactement redondante avec le volet « étrangers », et une garde
+    /// redondante se fait supprimer par le premier qui la relit.
+    #[test]
+    fn mika2847_la_porte_de_section_na_que_des_lecteurs_denregistrement() {
+        // Composée à l'exécution pour que CE fichier ne se dénonce pas lui-même
+        // (mika#2496, même geste que les scans voisins).
+        let needle = format!("heartbeat_enabled_for{}agent", "_");
+        let readers: Vec<String> = section_gate_reader_sites(&needle)
+            .into_iter()
+            .filter(|r| !HEARTBEAT_GATE_READER_ALLOWED.contains(&r.as_str()))
+            .collect();
+
+        // Anti-vacuité D'ABORD : un scan qui ne trouve personne se lit
+        // exactement comme un scan propre (mika#2103 / mika#2205).
+        for expected in HEARTBEAT_GATE_REGISTRATION_SITES {
+            assert!(
+                readers.iter().any(|r| r == expected),
+                "mika#2847 — la porte de section `heartbeat` n'est lue nulle part dans \
+                 {expected} : ce scan vise un nom mort, il ne vérifie rien. Lecteurs \
+                 trouvés : {readers:?}"
+            );
+        }
+
+        let strangers: Vec<&String> = readers
+            .iter()
+            .filter(|r| !HEARTBEAT_GATE_REGISTRATION_SITES.contains(&r.as_str()))
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2847 — la porte de section `heartbeat` a un lecteur hors des sites \
+             d'enregistrement : {strangers:?}\n\n\
+             RÉSOLUTION : router cette lecture par un site d'enregistrement existant. \
+             Ne PAS l'ajouter à HEARTBEAT_GATE_READER_ALLOWED (mika#2201) — un lecteur \
+             au tir retourne la propriété que ce scan atteste, et l'allowlister la \
+             documenterait au lieu de la tenir. Si la décision doit vraiment vivre au \
+             tir, c'est la propriété de mika#2456 vol 4 qui tombe : ça se remonte."
+        );
+    }
+
+    /// **D3.** Chaque lecteur recensé lit *auprès* de la paire
+    /// enregistrement/annulation — c'est ce qui fait du recensement une
+    /// attestation du geste et pas d'un répertoire.
+    #[test]
+    fn mika2847_chaque_lecteur_recense_annule_a_lenregistrement() {
+        let needle = format!("heartbeat_enabled_for{}agent", "_");
+        // Guillemets compris : le prédicat corrèle ce littéral à la ligne de
+        // l'appel d'annulation. Composé à l'exécution, même raison que l'aiguille.
+        let label = format!("\"heart{}\"", "beat");
+
+        let mut seen = 0usize;
+        for (rel, content) in production_sources() {
+            if !HEARTBEAT_GATE_REGISTRATION_SITES.contains(&rel.as_str()) {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                section_gate_reads_at_registration(&content, &needle, &label),
+                "mika#2847 — {rel} lit la porte de section `heartbeat` hors du geste \
+                 d'enregistrement : aucune fenêtre de 25 lignes décommentées autour de \
+                 la lecture ne porte à la fois `ensure_recurring_task` et une ligne \
+                 `cancel_recurring_task_by_label(\"heartbeat\"`. La porte n'est plus \
+                 registration-only.\n\n\
+                 RÉSOLUTION : ramener la lecture auprès de la paire \
+                 enregistrement/annulation."
+            );
+        }
+
+        // Anti-vacuité du parcours lui-même : un recensement dont aucune entrée
+        // ne correspond à un fichier scanné rendrait cette boucle vide.
+        assert_eq!(
+            seen,
+            HEARTBEAT_GATE_REGISTRATION_SITES.len(),
+            "mika#2847 — {seen} site(s) recensé(s) retrouvé(s) sur {} : une entrée du \
+             recensement ne désigne plus un fichier de production scanné, et la boucle \
+             ci-dessus n'a mesuré qu'une partie du périmètre",
+            HEARTBEAT_GATE_REGISTRATION_SITES.len()
+        );
+    }
+
+    /// **D4 — contrôle de bonne foi du prédicat d'adjacence, et il est dû.**
+    ///
+    /// [`section_gate_reads_at_registration`] **est** désormais un prédicat
+    /// partagé, comme [`audit_name_literal_present`] chez les scans SOLE-WRITER
+    /// voisins : mika#2850 l'appelle avec le label `reflection`. Ce test-ci est
+    /// donc l'attestation qu'il **prête** à `reflection` sur l'axe de
+    /// l'**adjacence** — c'est pour ça que mika#2850 ne le recopie pas
+    /// (mika#2653) et n'ajoute qu'un contrôle sur l'axe **neuf**, celui du
+    /// paramètre de label (`mika2850_le_predicat_honore_son_parametre_de_label`).
+    ///
+    /// (Le doc-comment disait l'inverse quand ce prédicat n'avait qu'un seul
+    /// appelant. Un doc-comment faux sur le périmètre de sa propre garde est la
+    /// façon dont la garde suivante se fait recopier.)
+    ///
+    /// Un prédicat d'adjacence non attesté est la forme qui devient inerte en
+    /// silence, et l'anti-vacuité de D3 ne le dit pas : elle vérifie que les
+    /// **propriétaires** passent, pas qu'un **étranger** serait vu.
+    #[test]
+    fn mika2847_le_predicat_dadjacence_voit_une_lecture_hors_enregistrement() {
+        let needle = format!("heartbeat_enabled_for{}agent", "_");
+        let label = format!("\"heart{}\"", "beat");
+
+        // Négative — la lecture a migré au tir : la fenêtre ne porte aucune des
+        // deux branches d'enregistrement. C'est la régression que D3 doit voir.
+        let at_fire = [
+            "for due in due_tasks {".to_string(),
+            format!("    if !task_engine::{needle}(&home_dir).await {{"),
+            "        continue;".to_string(),
+            "    }".to_string(),
+            "    dispatch_heartbeat(&db, &due).await;".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !section_gate_reads_at_registration(&at_fire, &needle, &label),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus une lecture au tir — il est \
+             devenu inerte et D3 se lirait exactement comme une porte registration-only"
+        );
+
+        // Positive — la forme réelle du site recensé.
+        let at_registration = [
+            format!("if task_engine::{needle}(&home_dir).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            "        &db, &home_dir, \"heartbeat\", HEARTBEAT_CRON, CONFIG,".to_string(),
+            "    ).await;".to_string(),
+            "} else if let Err(e) = db.cancel_recurring_task_by_label(\"heartbeat\").await {"
+                .to_string(),
+            "    warn!(error = %e, \"failed to cancel stale heartbeat task\");".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            section_gate_reads_at_registration(&at_registration, &needle, &label),
+            "le prédicat refuse la forme réelle du site recensé : il est trop \
+             serré, et D3 rougirait sur un arbre conforme"
+        );
+    }
+
+    /// **D5** — le pendant auto-nettoyant de l'allowlist des lecteurs.
+    #[test]
+    fn mika2847_lallowlist_des_lecteurs_est_livree_vide() {
+        assert!(
+            HEARTBEAT_GATE_READER_ALLOWED.is_empty(),
+            "HEARTBEAT_GATE_READER_ALLOWED est livrée vide et doit le rester : quand \
+             le scan tire, on route la lecture par un site d'enregistrement. Une \
+             allowlist née vide est un emplacement où déposer la prochaine infraction \
+             (mika#2323)."
+        );
+    }
+
+    // ───── mika#2850 — la porte de section reflection est registration-only ─────
+
+    /// Les sites de production qui lisent la porte de section `reflection`, et
+    /// ce que chacun y fait.
+    ///
+    /// **C'est un périmètre, pas une liste d'exemptions**, et la distinction
+    /// n'est pas rhétorique : le scan plus bas exige que chaque entrée soit
+    /// **trouvée** (anti-vacuité), donc en retirer une ne relâche rien — ça
+    /// rend le scan rouge. L'allowlist, elle, est
+    /// [`REFLECTION_GATE_READER_ALLOWED`], et elle est vide.
+    ///
+    /// Le recensement est né à **deux** entrées parce que la proposition
+    /// attestée est *« tous les lecteurs sont à l'enregistrement »*, pas
+    /// *« il y a un lecteur »* — et il en porte une depuis que mika#1727 vol
+    /// V2a a retiré le `TaskEngine` de la TUI. Précédents de la même forme :
+    /// [`HEARTBEAT_GATE_REGISTRATION_SITES`] (mika#2847) et
+    /// `TESTIMONY_PREDICATE_READERS` (mika#2627).
+    const REFLECTION_GATE_REGISTRATION_SITES: &[&str] = &[
+        // Démarrage du démon, par agent : la boucle qui enregistre les
+        // récurrentes intégrées de chaque agent chargé.
+        "crates/mika-agent/src/server/mod.rs",
+        // `crates/mika-cli/src/commands/chat.rs` était le second site — le
+        // démarrage du TUI, pour le seul agent de la session. Retiré par
+        // mika#1727 vol V2a avec le `TaskEngine` de la TUI, exactement comme
+        // chez [`HEARTBEAT_GATE_REGISTRATION_SITES`] : le daemon est désormais
+        // le seul enregistreur. Le retrait **durcit** ce scan — une lecture de
+        // la porte qui reviendrait sous `crates/mika-cli/` est un `strangers`
+        // et rougit. Ne pas réintroduire l'entrée pour l'accueillir.
+    ];
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Zéro violation existante, et c'est mesuré : les hits de l'aiguille dans
+    /// l'arbre sont la **définition**
+    /// (`task_engine/mod.rs:909`, écartée par le filtre `fn …(` de
+    /// [`reads_section_gate`]) et exactement le lecteur recensé ci-dessus.
+    /// Aucun hit dans `dispatcher.rs`, donc aucun lecteur au tir. Il n'y a donc
+    /// rien à excepter, ni de case où déposer la prochaine infraction
+    /// (mika#2323).
+    ///
+    /// Quand le scan tire, **on route la lecture par un site d'enregistrement
+    /// existant**, on n'ajoute pas d'entrée (doctrine mika#2201) : un lecteur
+    /// au **tir** retournerait précisément la propriété que ce scan atteste, et
+    /// l'allowlister serait documenter sa propre perte.
+    const REFLECTION_GATE_READER_ALLOWED: &[&str] = &[];
+
+    /// **D2.** Aucun lecteur de la porte de section `reflection` hors du
+    /// recensement.
+    ///
+    /// Même proposition que `mika2847_la_porte_de_section_na_que_des_lecteurs_denregistrement`,
+    /// un label plus loin : rien ne rougissait si cette porte-ci cessait d'être
+    /// registration-only. Un lecteur au tir laisserait la ligne récurrente
+    /// **posée** en base — elle tire, le dispatch démarre, et la décision
+    /// d'abandon arrive après que les tours LLM ont été brûlés.
+    #[test]
+    fn mika2850_la_porte_de_section_reflection_na_que_des_lecteurs_denregistrement() {
+        // Composée à l'exécution pour que CE fichier ne se dénonce pas lui-même
+        // (mika#2496, même geste que les scans voisins).
+        let needle = format!("reflection_cron_for{}agent", "_");
+        let readers: Vec<String> = section_gate_reader_sites(&needle)
+            .into_iter()
+            .filter(|r| !REFLECTION_GATE_READER_ALLOWED.contains(&r.as_str()))
+            .collect();
+
+        // Anti-vacuité D'ABORD : un scan qui ne trouve personne se lit
+        // exactement comme un scan propre (mika#2103 / mika#2205).
+        for expected in REFLECTION_GATE_REGISTRATION_SITES {
+            assert!(
+                readers.iter().any(|r| r == expected),
+                "mika#2850 — la porte de section `reflection` n'est lue nulle part dans \
+                 {expected} : ce scan vise un nom mort, il ne vérifie rien. Lecteurs \
+                 trouvés : {readers:?}"
+            );
+        }
+
+        let strangers: Vec<&String> = readers
+            .iter()
+            .filter(|r| !REFLECTION_GATE_REGISTRATION_SITES.contains(&r.as_str()))
+            .collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2850 — la porte de section `reflection` a un lecteur hors des sites \
+             d'enregistrement : {strangers:?}\n\n\
+             RÉSOLUTION : router cette lecture par un site d'enregistrement existant. \
+             Ne PAS l'ajouter à REFLECTION_GATE_READER_ALLOWED (mika#2201) — un lecteur \
+             au tir retourne la propriété que ce scan atteste, et l'allowlister la \
+             documenterait au lieu de la tenir. Un lecteur d'enregistrement NOUVEAU et \
+             légitime (une troisième porte d'entrée du substrat) se déclare dans \
+             REFLECTION_GATE_REGISTRATION_SITES, avec sa raison, et doit satisfaire \
+             mika2850_chaque_lecteur_recense_annule_a_lenregistrement. Si la décision \
+             doit vraiment vivre au tir, c'est la propriété de mika#2456 vol 5 qui \
+             tombe : ça se remonte."
+        );
+    }
+
+    /// **D3.** Chaque lecteur recensé lit *auprès* de la paire
+    /// enregistrement/annulation — c'est ce qui fait du recensement une
+    /// attestation du geste et pas d'un répertoire.
+    #[test]
+    fn mika2850_chaque_lecteur_recense_annule_a_lenregistrement() {
+        let needle = format!("reflection_cron_for{}agent", "_");
+        // Guillemets compris : le prédicat corrèle ce littéral à la ligne de
+        // l'appel d'annulation. Composé à l'exécution, même raison que l'aiguille.
+        let label = format!("\"re{}\"", "flection");
+
+        let mut seen = 0usize;
+        for (rel, content) in production_sources() {
+            if !REFLECTION_GATE_REGISTRATION_SITES.contains(&rel.as_str()) {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                section_gate_reads_at_registration(&content, &needle, &label),
+                "mika#2850 — {rel} lit la porte de section `reflection` hors du geste \
+                 d'enregistrement : aucune fenêtre de 25 lignes décommentées autour de \
+                 la lecture ne porte à la fois `ensure_recurring_task` et une ligne \
+                 `cancel_recurring_task_by_label(\"reflection\"`. La porte n'est plus \
+                 registration-only.\n\n\
+                 RÉSOLUTION : ramener la lecture auprès de la paire \
+                 enregistrement/annulation — PAS élargir la fenêtre."
+            );
+        }
+
+        // Anti-vacuité du parcours lui-même : un recensement dont aucune entrée
+        // ne correspond à un fichier scanné rendrait cette boucle vide.
+        assert_eq!(
+            seen,
+            REFLECTION_GATE_REGISTRATION_SITES.len(),
+            "mika#2850 — {seen} site(s) recensé(s) retrouvé(s) sur {} : une entrée du \
+             recensement ne désigne plus un fichier de production scanné, et la boucle \
+             ci-dessus n'a mesuré qu'une partie du périmètre",
+            REFLECTION_GATE_REGISTRATION_SITES.len()
+        );
+    }
+
+    /// **D4 — le contrôle de bonne foi du *paramètre de label*, et il est dû.**
+    ///
+    /// L'axe de l'**adjacence** est déjà attesté par
+    /// `mika2847_le_predicat_dadjacence_voit_une_lecture_hors_enregistrement`,
+    /// et ce vol ne le recopie pas (mika#2653). L'axe du **label** est neuf :
+    /// il naît avec la paramétrisation, et c'est précisément celui qu'une
+    /// fenêtre contaminée par la porte voisine rend non portant. Deux axes
+    /// distincts, deux contrôles — pas un doublon.
+    ///
+    /// La négative n°1 est la **régression réelle de l'arbre** : supprimer la
+    /// branche `else` d'annulation de `reflection` alors que celle de
+    /// `heartbeat` est trois lignes plus haut. Un prédicat qui ignorerait son
+    /// argument — ou qui chercherait ses termes indépendamment — la rendrait
+    /// verte. Un paramètre qu'aucun test ne peut faire rougir n'est pas un
+    /// paramètre.
+    #[test]
+    fn mika2850_le_predicat_honore_son_parametre_de_label() {
+        let needle = format!("reflection_cron_for{}agent", "_");
+        let label = format!("\"re{}\"", "flection");
+        // La porte VOISINE, celle qui contamine la fenêtre. Composée elle aussi,
+        // pour que ce fichier ne se dénonce pas côté `heartbeat` non plus.
+        let neighbour = format!("\"heart{}\"", "beat");
+
+        // Négative n°1 — mauvais label. La branche `else` de `reflection` a
+        // disparu ; celle de `heartbeat` est juste au-dessus, et le littéral
+        // "reflection" est présent comme argument de label d'ensure_recurring_task.
+        // C'est la forme sur laquelle un prédicat non corrélé rendait `true`.
+        let wrong_label = [
+            format!(
+                "}} else if let Err(e) = db.cancel_recurring_task_by_label({neighbour}).await {{"
+            ),
+            "    warn!(error = %e, \"failed to cancel stale heartbeat task\");".to_string(),
+            "}".to_string(),
+            format!("if let Some(cron) = task_engine::{needle}(&home_dir, &db).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            format!("        &db, &home_dir, {label}, &cron, CONFIG,"),
+            "    ).await;".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !section_gate_reads_at_registration(&wrong_label, &needle, &label),
+            "INVARIANT VIOLÉ : le prédicat se satisfait de l'annulation de la porte \
+             VOISINE. Son paramètre de label ne porte rien, et \
+             mika2850_chaque_lecteur_recense_annule_a_lenregistrement resterait vert \
+             sur un arbre où `reflection` n'annule plus rien — la régression la plus \
+             probable du site recensé, puisque les deux blocs y sont collés."
+        );
+
+        // Négative n°2 — aucune annulation du tout.
+        let no_cancel = [
+            format!("if let Some(cron) = task_engine::{needle}(&home_dir, &db).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            format!("        &db, &home_dir, {label}, &cron, CONFIG,"),
+            "    ).await;".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            !section_gate_reads_at_registration(&no_cancel, &needle, &label),
+            "INVARIANT VIOLÉ : le prédicat accepte une lecture dont la branche `else` \
+             n'annule rien — la ligne récurrente resterait armée après que la porte \
+             s'est fermée"
+        );
+
+        // Positive — la forme réelle du site recensé. Sans ce volet, un
+        // prédicat trop serré rendrait D3 rouge sur un arbre conforme et le
+        // test ne le dirait pas.
+        let real_form = [
+            format!("if let Some(cron) = task_engine::{needle}(&home_dir, &db).await {{"),
+            "    task_engine::ensure_recurring_task(".to_string(),
+            format!("        &db, &home_dir, {label}, &cron, CONFIG,"),
+            "    ).await;".to_string(),
+            format!("}} else if let Err(e) = db.cancel_recurring_task_by_label({label}).await {{"),
+            "    warn!(error = %e, \"failed to cancel stale reflection task\");".to_string(),
+            "}".to_string(),
+        ]
+        .join("\n");
+        assert!(
+            section_gate_reads_at_registration(&real_form, &needle, &label),
+            "le prédicat refuse la forme réelle du site recensé : il est trop \
+             serré, et mika2850_chaque_lecteur_recense_annule_a_lenregistrement \
+             rougirait sur un arbre conforme"
+        );
+    }
+
+    /// **D5** — le pendant auto-nettoyant de l'allowlist des lecteurs.
+    #[test]
+    fn mika2850_lallowlist_des_lecteurs_reflection_est_livree_vide() {
+        assert!(
+            REFLECTION_GATE_READER_ALLOWED.is_empty(),
+            "REFLECTION_GATE_READER_ALLOWED est livrée vide et doit le rester : quand \
+             le scan tire, on route la lecture par un site d'enregistrement. Une \
+             allowlist née vide est un emplacement où déposer la prochaine infraction \
+             (mika#2323)."
+        );
+    }
+
     // ─────────────── mika#2653 — la garde d'annulation sur pilote vif ───────────────
 
     /// **Livrée vide, et le test plus bas l'assert.**
@@ -1678,6 +2442,284 @@ mod tests {
         );
     }
 
+    // ───── mika#2654 — la garde de promotion forcée sur tour webhook PR ─────
+
+    /// **Livrée vide, et `mika2654_lallowlist_du_nom_daudit_est_vide` l'assert.**
+    ///
+    /// Zéro violation existante, et c'est **mesuré** et non supposé : avant le
+    /// commit du scan, `grep -rn
+    /// 'deferred_dispatch_force_promote_refused_webhook_pr_turn' crates/` rendait
+    /// trois lignes, et aucune n'est un second écrivain de production — la
+    /// constante propriétaire, son épinglage sous `mod tests` (que
+    /// `production_sources_to_test_module` tronque) et une occurrence dans
+    /// `tests/eval/test_promote_deferred_webhook_pr_2654.rs` (que
+    /// `source_scan::is_test_source_path` écarte). Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction
+    /// (mika#2323). Quand le scan tire, **on fait passer le site par la
+    /// constante partagée**, on ne l'allowliste pas (doctrine mika#2201).
+    const FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
+    ///
+    /// Le prédicat est **exact** plutôt qu'en sous-chaîne, et un prédicat
+    /// resserré doit montrer qu'il mord encore — sans quoi il devient inerte en
+    /// silence (mika#2103 / mika#2205). L'anti-vacuité du scan ne le dit pas :
+    /// elle vérifie que le **propriétaire** porte le nom, pas qu'un **étranger**
+    /// serait vu.
+    ///
+    /// Les contrôles négatifs sont les formes réellement présentes dans l'arbre :
+    /// les **trois noms frères** de mika#1453, qui partagent le préfixe
+    /// `deferred_dispatch_force_promote` et vivent dans ce même fichier de
+    /// production, plus une mention en commentaire.
+    #[test]
+    fn mika2654_le_scan_du_nom_daudit_voit_un_second_site() {
+        let needle = format!(
+            "deferred_dispatch_force_promote{}",
+            "_refused_webhook_pr_turn"
+        );
+
+        assert!(
+            audit_name_literal_present(
+                &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
+                &needle
+            ),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus un second écrivain de la \
+             ligne d'audit — le scan est devenu inerte et il se lirait exactement \
+             comme un arbre propre"
+        );
+
+        for benign in [
+            // Les trois frères de mika#1453, écrits par le MÊME fichier : ce
+            // sont eux qui rendraient un scan sur le préfixe partagé rouge à la
+            // naissance, et un lint rouge à la naissance se fait désarmer.
+            "        \"deferred_dispatch_force_promote_succeeded\",".to_string(),
+            "        \"deferred_dispatch_force_promote_rejected_slot_busy\",".to_string(),
+            "        \"deferred_dispatch_force_promote_override\",".to_string(),
+            // Une mention en commentaire.
+            format!("    // le nom `{needle}` vit dans tools/promote_deferred_callback.rs"),
+            // Le résidu de journal de cette garde — autre surface, autre nom.
+            "        warn!(event = \"promote_deferred_guard_audit_failed\");".to_string(),
+        ] {
+            assert!(
+                !audit_name_literal_present(&benign, &needle),
+                "faux positif du scan sur une ligne qui n'écrit pas la ligne \
+                 d'audit : {benign}"
+            );
+        }
+    }
+
+    /// **S1 (mika#2654)** — la propriété qui rend le compte de refus de
+    /// l'opérateur exact.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, la garde continuerait de refuser, et chaque assertion
+    /// de `tools::promote_deferred_callback::tests::mika2654` resterait verte —
+    /// y compris V4, qui compte les lignes d'une **session** et ne voit pas un
+    /// site qui écrit ailleurs. Ce qui deviendrait faux est le **compte**, et
+    /// c'est lui que la sonde S1 du § 11 lit pour décider si la garde mord.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne
+    ///
+    /// Reprise mot pour mot de la correction mesurée par mika#2649, puis
+    /// mika#2634, puis mika#2653 sur leurs propres scans jumeaux. Ici elle porte
+    /// dans les deux sens : le needle est le nom **entier** parce que les trois
+    /// frères de mika#1453 partagent son préfixe (un scan sur le préfixe serait
+    /// rouge à la naissance), et la comparaison est exacte parce qu'un nom
+    /// **étendant** celui-ci — la forme qu'a prise le résidu de la sœur — ne doit
+    /// pas compter comme un second écrivain.
+    #[test]
+    fn mika2654_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!(
+            "deferred_dispatch_force_promote{}",
+            "_refused_webhook_pr_turn"
+        );
+        let owner = "crates/mika-agent/src/tools/promote_deferred_callback.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2654 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2654 — le nom d'audit de la garde de promotion forcée a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `tools::promote_deferred_callback::FORCE_PROMOTE_TURN_GUARD_AUDIT_TOOL`. \
+             Ne PAS l'ajouter à FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS — le \
+             compte de la sonde n'est exact que tant qu'un seul site écrit ce nom."
+        );
+    }
+
+    /// **S2** — le pendant auto-nettoyant de
+    /// `FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS`.
+    #[test]
+    fn mika2654_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "FORCE_PROMOTE_TURN_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit \
+             le rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
+    // ───── mika#2739 — la garde de complétion sur pilote vif ─────
+
+    /// **Livrée vide, et `mika2739_lallowlist_du_nom_daudit_est_vide` l'assert.**
+    ///
+    /// Zéro violation existante, et c'est **mesuré** plutôt que supposé : avant
+    /// le commit de la garde, `grep -rn 'complete_task_pilot_guard' crates/`
+    /// rendait **aucune** ligne. Le nom naît donc avec exactement un écrivain, et
+    /// il n'y a rien à excepter — ni de case où déposer la prochaine infraction
+    /// (mika#2323). Quand le scan tire, **on fait passer le site par la constante
+    /// partagée**, on ne l'allowliste pas (doctrine mika#2201).
+    const COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS: &[&str] = &[];
+
+    /// **Contrôle de bonne foi du scan ci-dessous, et il est dû.**
+    ///
+    /// Le prédicat est **exact** plutôt qu'en sous-chaîne, et un prédicat
+    /// resserré doit montrer qu'il mord encore — sans quoi il devient inerte en
+    /// silence (mika#2103 / mika#2205). L'anti-vacuité du scan ne le dit pas :
+    /// elle vérifie que le **propriétaire** porte le nom, pas qu'un **étranger**
+    /// serait vu.
+    ///
+    /// Les contrôles négatifs sont les formes réellement présentes dans l'arbre :
+    /// le nom du **résidu**, qui a le nom d'audit pour **préfixe**, le nom d'audit
+    /// de la **garde sœur** (mika#2653), dont les quatre valeurs sont partagées et
+    /// qui ne doit surtout pas compter ici, et une mention en commentaire.
+    #[test]
+    fn mika2739_le_scan_du_nom_daudit_voit_un_second_site() {
+        let needle = format!("complete_task{}", "_pilot_guard");
+
+        assert!(
+            audit_name_literal_present(
+                &format!("    db.log_audit_event(s, \"{needle}\", k, None, v, None, None).await?;"),
+                &needle
+            ),
+            "INVARIANT VIOLÉ : le prédicat ne voit plus un second écrivain de la \
+             ligne d'audit — le scan est devenu inerte et il se lirait exactement \
+             comme un arbre propre"
+        );
+
+        for benign in [
+            // Le nom du résidu, PRÉFIXÉ par le nom d'audit : c'est la forme qui
+            // ferait rougir une comparaison par sous-chaîne, et c'est une autre
+            // surface (le journal, pas `audit_events`).
+            format!("        warn!(event = \"{needle}_audit_failed\", error = %e);"),
+            // Le nom d'audit de la garde SŒUR : vocabulaire de verdicts partagé,
+            // `tool_name` distinct. C'est très exactement ce que ce scan compte.
+            "        \"cancel_task_pilot_guard\",".to_string(),
+            // Une mention en commentaire.
+            format!("    // le nom `{needle}` vit dans tools/complete_task.rs"),
+            // Un voisin de la même famille, autre nom.
+            "        warn!(event = \"complete_task_live_pilot_blocked\");".to_string(),
+        ] {
+            assert!(
+                !audit_name_literal_present(&benign, &needle),
+                "faux positif du scan sur une ligne qui n'écrit pas la ligne \
+                 d'audit : {benign}"
+            );
+        }
+    }
+
+    /// **mika#2739** — la propriété qui rend la sonde de déploiement exacte.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second écrivain ne rendrait **aucune décision fausse** : les deux
+    /// lignes partiraient, la garde continuerait de refuser, et chaque assertion
+    /// de `tools::complete_task::tests::mika2739` resterait verte. Ce qui
+    /// deviendrait faux est le **compte** — et c'est lui que la sonde
+    /// post-déploiement lit (`SELECT after_value, count(*) … WHERE tool_name =
+    /// 'complete_task_pilot_guard' GROUP BY 1`) pour décider si la garde mord, si
+    /// l'illisible refuse à tort, et si le **contrôle positif** tourne. Ce
+    /// dernier est ce qui sépare « zéro refus » de « la garde ne tourne pas »
+    /// (classe mika#2205) ; un second site le rendrait insoustractible.
+    ///
+    /// # La comparaison est EXACTE, et pas en sous-chaîne
+    ///
+    /// Reprise mot pour mot de la correction mesurée par mika#2649, puis
+    /// mika#2634, puis mika#2653 et mika#2654 sur leurs propres scans jumeaux :
+    /// le nom du **résidu** de cette famille
+    /// (`complete_task_pilot_guard_audit_failed`) a le nom d'audit pour
+    /// **préfixe**, donc une comparaison par sous-chaîne le compterait comme un
+    /// second écrivain. Ce sont deux surfaces distinctes — l'une répond à
+    /// « combien de complétions la garde a-t-elle tranchées » (`audit_events`),
+    /// l'autre à « la ligne d'audit est-elle passée » (le journal) — et aucune
+    /// n'a à se taire pour que l'autre soit exacte.
+    #[test]
+    fn mika2739_le_nom_daudit_a_un_seul_ecrivain() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("complete_task{}", "_pilot_guard");
+        let owner = "crates/mika-agent/src/tools/complete_task.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            if audit_name_literal_present(&content, &needle) {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme
+        // un scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2739 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2739 — le nom d'audit de la garde de complétion a un second \
+             écrivain : {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `tools::complete_task::COMPLETE_TASK_PILOT_GUARD_AUDIT_TOOL`. Ne PAS \
+             l'ajouter à COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS — le \
+             `GROUP BY` de la sonde n'est exact que tant qu'un seul site écrit ce \
+             nom."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de
+    /// `COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS`.
+    ///
+    /// **Nommée** plutôt que désignée par position : ce fichier a déjà vu la
+    /// phrase « l'allowlist ci-dessus » désigner une autre allowlist que celle
+    /// qu'elle assertait, le jour où un bloc s'est inséré entre les deux
+    /// (leçon mika#2496).
+    #[test]
+    fn mika2739_lallowlist_du_nom_daudit_est_vide() {
+        assert!(
+            COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS.is_empty(),
+            "COMPLETE_PILOT_GUARD_SOLE_WRITER_EXCEPTIONS est livrée vide et doit le \
+             rester : quand le scan tire, on retire le second écrivain. Une \
+             allowlist née vide est un emplacement où déposer la prochaine \
+             infraction (mika#2323)."
+        );
+    }
+
     // ───── mika#2653 phase B — la vivacité d'un pilote a un lecteur unique ─────
 
     /// **Livrée vide, et le test plus bas l'assert.**
@@ -1731,12 +2773,19 @@ mod tests {
     /// mesurés sont `delivered`, et rien ne prouve que `delivered` implique un
     /// processus mort). Ce n'est pas un second lecteur de la question de
     /// `live_pilot.rs` ; c'est une divergence **écrite au site**, et ce scan
-    /// vise la divergence silencieuse. Le résidu, nommé plutôt que découvert :
-    /// un lecteur qui omet le filtre terminal échappe au scan. Il en existe un
-    /// second **aujourd'hui** : `probe_pilot_liveness` (`mika-cli`, rendu de
-    /// `mika tasks show`), même forme que `dispatch_liveness`. Il affiche et ne
-    /// décide rien ; le router par `live_pilot` demande d'exposer
-    /// `resolve_task_pilot` hors du crate — suivi, pas une ligne d'allowlist.
+    /// vise la divergence silencieuse. La borne, dite plutôt que supposée
+    /// (mika#2670) : un lecteur qui **omet** le filtre terminal n'a pas le
+    /// troisième terme, et le scan ne le nomme donc pas. Ce n'est pas un
+    /// périmètre manquant — le corpus de `production_sources_to_test_module()`
+    /// couvre `crates` en entier, `crates/mika-cli/src/` compris, et
+    /// `mika2670_le_corpus_du_scan_contient_la_cli` l'épingle. C'est le
+    /// prédicat qui est *exact* : `probe_pilot_liveness` (`mika-cli`, rendu de
+    /// `mika tasks list` / `get`) refaisait la traversée sans le filtre, et
+    /// l'absence du filtre **était** le défaut. Depuis mika#2670 ce site est
+    /// routé par `live_pilot::resolve_task_pilot`, et un lecteur hors crate est
+    /// fermé par **visibilité** plutôt que par scan : les deux poignées de
+    /// `find_dispatch_children_with_pid` sont `pub(crate)`, donc la traversée ne
+    /// se recompose plus hors de `mika-agent` — ça ne compile pas.
     ///
     /// Le scan est **par fichier** : un appel à `is_terminal_task_status` ajouté
     /// ailleurs dans `engine.rs` ou `tasks.rs` le ferait rougir sur ces deux
@@ -1874,6 +2923,47 @@ mod tests {
         );
     }
 
+    /// **Assertion de périmètre (mika#2670, AC2)** — le corpus du scan du
+    /// lecteur unique contient la CLI.
+    ///
+    /// mika#2670 supposait que
+    /// `mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique` « ne voit que
+    /// `crates/mika-agent` ». C'est faux :
+    /// `production_sources_to_test_module()` marche sur `crates` en entier, et
+    /// `crates/mika-cli/src/commands/tasks.rs` y était déjà. Ce qui laissait
+    /// `probe_pilot_liveness` passer est la conjonction à trois termes — la CLI
+    /// n'appelait jamais `is_terminal_task_status`, précisément parce qu'elle
+    /// avait oublié le filtre.
+    ///
+    /// Cette assertion existe parce que cette borne est désormais **écrite** à
+    /// deux endroits : la doc de `live_pilot::resolve_task_pilot` et le
+    /// paragraphe de résidu de
+    /// `mika2653_le_scan_du_lecteur_voit_un_second_site`. Le jour où le walk se
+    /// restreindrait à `mika-agent`, les deux deviendraient fausses en silence
+    /// et la borne documentée serait un mensonge. Pas d'allowlist : une seule
+    /// proposition, dont la seule issue légitime est vraie.
+    #[test]
+    fn mika2670_le_corpus_du_scan_contient_la_cli() {
+        let cli: Vec<String> = production_sources_to_test_module()
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .filter(|rel| rel.starts_with("crates/mika-cli/src/"))
+            .collect();
+        assert!(
+            !cli.is_empty(),
+            "mika#2670 — le corpus de production_sources_to_test_module() ne \
+             contient plus aucun chemin sous crates/mika-cli/src/. La borne \
+             documentée du scan du lecteur unique — « le corpus couvre déjà la \
+             CLI, c'est le prédicat à trois termes qui laissait passer \
+             probe_pilot_liveness » — est devenue fausse.\n\n\
+             RÉSOLUTION : rétablir le périmètre du walk, ou corriger les deux \
+             sites qui énoncent la borne (doc de \
+             `live_pilot::resolve_task_pilot`, résidu de \
+             `mika2653_le_scan_du_lecteur_voit_un_second_site`). Jamais laisser \
+             une phrase affirmer un périmètre que le walk n'a plus."
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // mika#2532 — la clé sous laquelle vit la cause d'un crash pré-résultat
     // a un seul écrivain.
@@ -1990,10 +3080,11 @@ mod tests {
 
     /// **Livrée vide, et le test plus bas l'assert.**
     ///
-    /// Population mesurée : **un** site (`webhook_dispatch.rs`). Il n'y a donc
-    /// rien à excepter, ni de case où déposer la prochaine infraction
-    /// (mika#2323). Quand le scan tire, **on retire le second corps**, on ne
-    /// l'allowliste pas (doctrine mika#2201).
+    /// Population mesurée : **un** site. Il n'y a donc rien à excepter, ni de
+    /// case où déposer la prochaine infraction (mika#2323). Quand le scan tire,
+    /// **on retire le second corps**, on ne l'allowliste pas (doctrine
+    /// mika#2201) — c'est exactement ce que mika#2680 a fait en route (voir
+    /// [`FALLTHROUGH_DOMAIN_OWNER`]).
     const FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED: &[&str] = &[];
 
     /// Les deux littéraux dont la **conjonction** définit le domaine.
@@ -2019,6 +3110,24 @@ mod tests {
         ]
     }
 
+    /// Le seul fichier autorisé à écrire la conjonction.
+    ///
+    /// **Il a déménagé en mika#2680, et ce déménagement EST la résolution que
+    /// le message d'échec ci-dessous prescrit.** Il valait
+    /// `crates/mika-agent/src/webhook_dispatch.rs` tant que ce module déclarait
+    /// les deux préfixes en propre ; la taxonomie [`crate::server::webhook_prefilter`]
+    /// est arrivée comme cinquième consommateur du même domaine, dans un crate
+    /// qui ne pouvait les lire qu'en les recopiant, et ce scan l'a dit. Les deux
+    /// constantes vivent désormais dans `mika_common::github_event_format`, où
+    /// le test cross-crate de `mika-gateway::github::tests` refuse en plus la
+    /// dérive avec le producteur ; `webhook_dispatch` les `use`, donc n'écrit
+    /// plus aucun littéral et tombe lui-même sous la garde.
+    ///
+    /// La propriété gardée est inchangée : **un seul corps écrit ces deux
+    /// littéraux**, et un second lecteur qui recopierait les `starts_with` est
+    /// toujours attrapé. Seul l'endroit légitime a bougé.
+    const FALLTHROUGH_DOMAIN_OWNER: &str = "crates/mika-common/src/github_event_format.rs";
+
     /// **Un seul corps définit le domaine Webhook Fallthrough (mika#2517 U5).**
     ///
     /// Aucun test comportemental ne peut voir cette classe : un second corps ne
@@ -2026,12 +3135,14 @@ mod tests {
     /// tard, en silence, avec toutes les assertions vertes — exactement la
     /// leçon mika#2158 (une regex copiée dont le commentaire disait
     /// « Mirrors … » et qui a ensuite raté deux élargissements). Le domaine a
-    /// désormais **quatre** consommateurs (les deux refus de mika#910/#933/#1102,
-    /// plus U2 et U3), donc quatre occasions de diverger.
+    /// désormais **cinq** consommateurs (les deux refus de mika#910/#933/#1102,
+    /// plus U2 et U3, plus la taxonomie de mika#2680), donc cinq occasions de
+    /// diverger — et c'est le cinquième qui a fait tirer ce scan, puis déménager
+    /// l'`owner` (voir [`FALLTHROUGH_DOMAIN_OWNER`]).
     #[test]
     fn mika2517_the_fallthrough_domain_has_a_single_definition() {
         let needles = fallthrough_domain_needles();
-        let owner = "crates/mika-agent/src/webhook_dispatch.rs";
+        let owner = FALLTHROUGH_DOMAIN_OWNER;
 
         let mut definers = Vec::new();
         for (rel, content) in production_sources() {
@@ -2068,9 +3179,13 @@ mod tests {
             strangers.is_empty(),
             "mika#2517 — le domaine Webhook Fallthrough a une seconde définition : \
              {strangers:?}\n\n\
-             RÉSOLUTION : retirer le second corps et appeler \
-             `webhook_dispatch::is_webhook_fallthrough_domain`. Ne PAS l'ajouter à \
-             FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED — quatre consommateurs lisent ce \
+             RÉSOLUTION : retirer le second corps. Pour un site qui DÉCIDE, appeler \
+             `webhook_dispatch::is_webhook_fallthrough_domain` ; pour un site qui \
+             CLASSE ou qui a seulement besoin des préfixes, lire \
+             `mika_common::github_event_format::{{PR_EVENT_PREFIX, \
+             CHECK_SUITE_EVENT_PREFIX}}` — un `use` n'écrit aucun littéral (c'est le \
+             geste de mika#2680). Ne PAS l'ajouter à \
+             FALLTHROUGH_DOMAIN_DEFINITION_ALLOWED — cinq consommateurs lisent ce \
              domaine, et deux corps ne rendent aucune décision fausse le jour où le \
              second est écrit."
         );
@@ -2085,6 +3200,148 @@ mod tests {
              rester : quand le scan tire, on retire le second corps. Une allowlist \
              née vide est un emplacement où déposer la prochaine infraction \
              (mika#2323)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2757 — un seul corps énumère la paire d'outils de dispatch.
+    //
+    // Voisin du garde mika#2517 ci-dessus, et sur son modèle exact : même
+    // corpus de scan, même anti-vacuité, même allowlist née vide. Les deux
+    // gardent le même domaine par deux bouts — celui-là la définition du
+    // domaine, celui-ci l'ensemble d'outils que le domaine retire.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Population mesurée après D2 : **zéro** site. Il n'y a donc rien à
+    /// excepter, ni de case où déposer la prochaine infraction (mika#2323).
+    /// Quand le scan tire, on fait passer le site par
+    /// `webhook_dispatch::is_dispatch_tool` — on ne l'allowliste pas (doctrine
+    /// mika#2201).
+    const DISPATCH_PAIR_PREDICATE_ALLOWED: &[&str] = &[];
+
+    /// La forme du prédicat, **pas le littéral** — et c'est tout l'arbitrage.
+    ///
+    /// Le littéral nu `run_claude_pilot` apparaît dans dix-sept fichiers de
+    /// production pour des raisons parfaitement légitimes (libellés de tâches,
+    /// allowlists de skills, fixtures de calibration) : un scan sur le littéral
+    /// serait faux la plupart du temps, et son allowlist serait un alibi plutôt
+    /// qu'une exception. La forme `name == "run_claude_pilot"` n'est, elle,
+    /// écrite que par un site qui *décide* — et elle apparaissait sept fois avant
+    /// D2, toutes dans `agent_loop/mod.rs`, zéro après.
+    ///
+    /// Le guillemet fermant fait partie de l'aiguille : sans lui,
+    /// `name == "run_claude_pilot_groom"` serait accusé par lecture de préfixe,
+    /// et un garde qui rougit sur du code sain est un garde qu'on désarme.
+    ///
+    /// Composée à l'exécution par prudence. `production_sources_to_test_module`
+    /// coupe déjà ce module de test, donc ce fichier ne peut pas s'auto-accuser
+    /// aujourd'hui ; la composition fait que cela reste vrai si le corpus
+    /// s'élargit un jour.
+    fn dispatch_pair_predicate_needle() -> String {
+        format!("name == {q}run_claude_pilot{q}", q = '"')
+    }
+
+    /// Les lignes (1-indexées) de `src` qui posent la paire de dispatch à la main.
+    ///
+    /// **Extraite pour pouvoir être exercée sur une chaîne fabriquée.** Le scan
+    /// réel attend `∅`, et un détecteur dont le résultat attendu est le vide ne
+    /// se distingue pas d'un détecteur mort (mika#2103 / mika#2205) : le test
+    /// d'anti-vacuité plus bas est ce qui atteste que l'aiguille vise encore
+    /// quelque chose.
+    ///
+    /// Les lignes de commentaire sont écartées : de la prose *à propos* du
+    /// prédicat n'est pas un prédicat, et les doc-comments de ce ticket en
+    /// portent plusieurs paragraphes (la forme du Signal S, mika#2050).
+    fn dispatch_pair_predicate_sites(src: &str) -> Vec<usize> {
+        let needle = dispatch_pair_predicate_needle();
+        src.lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+            })
+            .filter(|(_, l)| l.contains(&needle))
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// **La paire d'outils de dispatch n'est énumérée qu'à un endroit
+    /// (mika#2757 D7).**
+    ///
+    /// Aucun test comportemental ne peut voir cette classe. Un huitième site qui
+    /// recopie la disjonction ne rend **aucune décision fausse le jour où il est
+    /// écrit** ; il diverge plus tard, en silence, avec toutes les assertions
+    /// vertes — et pour cette paire-là, diverger veut dire *une porte de dispatch
+    /// restée ouverte*. mika#1173 est le précédent exact : donner son propre
+    /// outil à dev-groom a obligé à visiter sept prédicats à la main, et un oubli
+    /// y aurait été invisible. La classe est celle de `grooming_marker`
+    /// (mika#2158).
+    #[test]
+    fn mika2757_the_dispatch_pair_has_a_single_enumeration() {
+        let mut offenders: Vec<(String, Vec<usize>)> = Vec::new();
+        for (rel, content) in production_sources_to_test_module() {
+            if DISPATCH_PAIR_PREDICATE_ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let sites = dispatch_pair_predicate_sites(&content);
+            if !sites.is_empty() {
+                offenders.push((rel, sites));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "mika#2757 — la paire d'outils de dispatch est ré-énumérée à la main : \
+             {offenders:?}\n\n\
+             RÉSOLUTION : appeler `webhook_dispatch::is_dispatch_tool(name)` — le \
+             site de définition unique de la paire. Pour un `retain` qui a besoin \
+             de la liste elle-même, lire `webhook_dispatch::DISPATCH_TOOLS`. Ne PAS \
+             ajouter d'entrée à DISPATCH_PAIR_PREDICATE_ALLOWED : un second \
+             énumérateur ne rend aucune décision fausse le jour où il est écrit, il \
+             la rend fausse le jour où un troisième outil de dispatch apparaît."
+        );
+    }
+
+    /// L'anti-vacuité, et c'est un **livrable** plutôt qu'une précaution.
+    ///
+    /// Le scan ci-dessus attend le vide. Sans ce test, une aiguille qui ne vise
+    /// plus rien — parce que la forme du prédicat a changé, parce qu'un `rustfmt`
+    /// a cassé la ligne en deux — se lirait exactement comme un dépôt propre.
+    ///
+    /// L'extrait fabriqué porte aussi les deux formes que le détecteur doit
+    /// **refuser** : la citation en commentaire et la variante `_groom`.
+    #[test]
+    fn mika2757_the_dispatch_pair_scan_reddens_on_a_fabricated_site() {
+        let needle = dispatch_pair_predicate_needle();
+        let snippet = format!(
+            "// un commentaire qui cite s.{needle} et n'est pas un prédicat\n\
+             fn fabrique(s: &ToolCallSummary) -> bool {{\n\
+             \x20   s.{needle}\n\
+             \x20       || s.name == {q}run_claude_pilot_groom{q}\n\
+             }}\n",
+            q = '"'
+        );
+
+        assert_eq!(
+            dispatch_pair_predicate_sites(&snippet),
+            vec![3],
+            "le détecteur doit accuser la ligne 3 et elle seule : la ligne 1 est \
+             un commentaire, la ligne 4 porte la variante `_groom` que le \
+             guillemet fermant de l'aiguille exclut"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2757_the_dispatch_pair_allowlist_is_empty() {
+        assert!(
+            DISPATCH_PAIR_PREDICATE_ALLOWED.is_empty(),
+            "DISPATCH_PAIR_PREDICATE_ALLOWED est livrée vide et doit le rester : \
+             quand le scan tire, on fait passer le site par \
+             `webhook_dispatch::is_dispatch_tool`. Une allowlist née vide est un \
+             emplacement où déposer la prochaine infraction (mika#2323)."
         );
     }
 
@@ -3457,7 +4714,7 @@ mod tests {
     }
 
     /// Le `match` sur [`crate::skills::executor::GroomVerdictState`] n'a **aucun
-    /// bras joker** — motif `GroomedState` (mika#2484 D1). Un quatrième état
+    /// bras joker** — motif `GroomedState` (mika#2484 D1). Un cinquième état
     /// devra être décidé par le compilateur, jamais absorbé par un `_ =>` qui le
     /// ferait tomber du côté « laisser passer » en silence.
     ///
@@ -3474,6 +4731,14 @@ mod tests {
 
         // La plage du `match`, bornée sur la ligne qui le porte — composée à
         // l'exécution pour la même raison que le needle ci-dessus.
+        //
+        // 45 lignes, soit la hauteur du `match` depuis que mika#3027 y a ajouté
+        // le bras `AnchorWithheld` et les deux paragraphes qui le justifient. La
+        // fenêtre ne doit **pas** être élargie à l'aveugle : plus large que le
+        // `match`, elle lirait le code d'après et un `_ =>` étranger passerait
+        // pour un joker. C'est l'assertion de bonne foi juste en dessous qui dit
+        // quand la rehausser — elle rougit, en nommant le bras qui est tombé
+        // hors plage, dès que le `match` grandit.
         let opener = format!("let refusal = match {}", "verdict {");
         let start = content.find(opener.as_str()).unwrap_or_else(|| {
             panic!(
@@ -3483,15 +4748,16 @@ mod tests {
         });
         let body: String = content[start..]
             .lines()
-            .take(30)
+            .take(45)
             .collect::<Vec<_>>()
             .join("\n");
 
         assert!(
             body.contains("GroomVerdictState::NotEscalated")
+                && body.contains("GroomVerdictState::AnchorWithheld")
                 && body.contains("GroomVerdictState::Escalated")
                 && body.contains("GroomVerdictState::Unreadable"),
-            "bonne foi : la plage extraite doit bien porter les trois bras — {body}"
+            "bonne foi : la plage extraite doit bien porter les quatre bras — {body}"
         );
         for wildcard in ["_ =>", "_=>"] {
             assert!(
@@ -3501,6 +4767,157 @@ mod tests {
                  énumérer l'état, ne pas l'absorber."
             );
         }
+    }
+
+    // ---- mika#3027 : la retenue d'ancrage a un seul lecteur ----------------
+
+    /// **Livrée vide, et elle le reste.**
+    ///
+    /// Quand le scan tire, on **route le site** vers
+    /// `carries_engine_anchor_withholding` ; on ne l'allowliste pas. Une
+    /// allowlist née vide est un emplacement où déposer la prochaine infraction
+    /// (doctrine mika#2201), et mika#2309 condamne celle qui n'expire pas.
+    const ENGINE_REASON_READER_ALLOWLIST: &[&str] = &[];
+
+    /// Le fichier qui déclare le préfixe et le lit, une fois chacun.
+    const ENGINE_REASON_OWNER: &str = "crates/mika-agent/src/skills/executor.rs";
+
+    /// Le nom du jeton, assemblé par `concat!`.
+    ///
+    /// Le littéral est produit à la compilation, donc le nom cherché n'apparaît
+    /// nulle part dans le code **non commenté** de cette garde. Écrit d'un bloc,
+    /// il ferait de la garde son propre troisième site le jour où la troncature
+    /// au premier `#[cfg(test)]` cesserait de couvrir ce module — et cette
+    /// prémisse a déjà été fausse dans ce dépôt (mika#2335 F2a).
+    fn engine_reason_token() -> String {
+        format!("GROOM_ENGINE_REASON{}", "_PREFIX")
+    }
+
+    /// Les sites de production qui nomment le jeton, et combien de fois.
+    ///
+    /// **Les commentaires sont retirés, et ce n'est pas prudentiel.** Le
+    /// doc-comment de `carries_engine_anchor_withholding` dit « Site unique de
+    /// lecture de [`GROOM_ENGINE_REASON_PREFIX`] » : une prose qui *nomme* le
+    /// jeton n'est pas un lecteur, et sans ce retrait la garde serait rouge au
+    /// jour de sa naissance, donc désarmée le lendemain (forme du signal S,
+    /// mika#2050).
+    fn engine_reason_sites(sources: &[(String, String)]) -> Vec<(String, usize)> {
+        let token = engine_reason_token();
+        sources
+            .iter()
+            .filter_map(|(rel, src)| {
+                if !src.contains(token.as_str()) {
+                    return None;
+                }
+                let n = crate::source_scan::strip_comment_lines(src)
+                    .matches(token.as_str())
+                    .count();
+                (n > 0).then(|| (rel.clone(), n))
+            })
+            .collect()
+    }
+
+    /// La reconnaissance de la retenue d'ancrage passe par **un seul lecteur**
+    /// du préfixe `Engine reason: ` (mika#3027 AC2).
+    ///
+    /// La forme du moteur était déjà reconnue en trois endroits avant ce vol —
+    /// `arch_disposition.rs` (tier 0b), `dispatch-lib.sh::_engine_escalation_line`,
+    /// et le compteur du frein mika#2786. Le vol en a retiré un : le frein
+    /// délègue désormais à `arch_disposition::is_engine_escalation_line` au lieu
+    /// de recomposer la forme depuis un fragment. Ce scan tient la propriété
+    /// qu'aucun test comportemental ne peut voir — un second lecteur ajouté ne
+    /// rend fausse **aucune** décision le jour où il est écrit ; il divergera le
+    /// jour où la forme bougera, et ce jour-là une retenue traversera la porte
+    /// chez l'un et pas chez l'autre (classe `grooming_marker`, mika#2158).
+    #[test]
+    fn mika3027_la_retenue_dancrage_a_un_seul_lecteur() {
+        let sources = production_sources();
+        assert!(
+            sources.len() > 200,
+            "le scan n'a énuméré que {} fichiers — un scan qui ne scanne rien est \
+             un laissez-passer vide, pas un arbre propre",
+            sources.len()
+        );
+
+        let sites = engine_reason_sites(&sources);
+
+        // ANTI-VACUITÉ, et elle porte sur la CARDINALITÉ. Un scan qui vise un
+        // nom mort (jeton renommé, site déplacé) rend zéro infraction et se lit
+        // comme un arbre sain.
+        let owner = sites
+            .iter()
+            .find(|(rel, _)| rel == ENGINE_REASON_OWNER)
+            .map(|(_, n)| *n);
+        assert_eq!(
+            owner,
+            Some(2),
+            "attendu EXACTEMENT deux mentions dans {ENGINE_REASON_OWNER} : la \
+             déclaration et l'unique lecture de \
+             `carries_engine_anchor_withholding`. Vu {owner:?}. Zéro ou un = le \
+             scan vise un nom mort ; plus de deux = un second lecteur du \
+             préfixe. Sites vus : {sites:?}"
+        );
+
+        let offenders: Vec<&String> = sites
+            .iter()
+            .filter(|(rel, _)| rel.as_str() != ENGINE_REASON_OWNER)
+            .filter(|(rel, _)| !ENGINE_REASON_READER_ALLOWLIST.contains(&rel.as_str()))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "lecture du préfixe `Engine reason: ` hors de son site unique, \
+             dans : {offenders:?}\n\
+             \n\
+             RÉSOLUTION : router le site vers \
+             `skills::executor::carries_engine_anchor_withholding`, qui ancre sur \
+             la LIGNE puis délègue la forme fixe à \
+             `arch_disposition::is_engine_escalation_line`. Ne PAS ajouter \
+             d'entrée à `ENGINE_REASON_READER_ALLOWLIST` : on route le site, on \
+             n'allowliste pas (mika#2201)."
+        );
+
+        assert!(
+            ENGINE_REASON_READER_ALLOWLIST.is_empty(),
+            "il n'y a rien à excepter : le préfixe a un site et il est nommé. Une \
+             entrée ici est un consentement rouvert (mika#2309)."
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur un lecteur ajouté ailleurs, et rester muet sur la prose qui nomme le
+    /// jeton sans le lire.
+    #[test]
+    fn mika3027_le_scan_du_lecteur_rougit_sur_un_second_site() {
+        let token = engine_reason_token();
+        let synthetic = vec![
+            (
+                "crates/mika-agent/src/second_lecteur.rs".to_string(),
+                format!(
+                    "fn retenue(text: &str) -> bool {{\n    \
+                     text.lines().any(|l| l.starts_with({token}))\n}}\n"
+                ),
+            ),
+            (
+                "crates/mika-agent/src/prose.rs".to_string(),
+                format!(
+                    "    /// On ne lit plus [`{token}`] ici, et le paragraphe\n    \
+                     /// suivant explique pourquoi `{token}` a un seul lecteur.\n"
+                ),
+            ),
+        ];
+
+        let sites = engine_reason_sites(&synthetic);
+        assert_eq!(
+            sites,
+            vec![("crates/mika-agent/src/second_lecteur.rs".to_string(), 1)],
+            "le scan doit voir le lecteur ajouté et IGNORER les deux lignes de \
+             prose — sans ce contrôle, « la garde décide » est indistinguable de \
+             « la garde ne regarde rien »"
+        );
     }
 
     /// Le vocabulaire de refus est un **format de fil** à site unique, et cette
@@ -3642,6 +5059,74 @@ mod tests {
              l'ajouter à BRIEF_SIZE_OVERRUN_SOLE_WRITER_EXCEPTIONS — le compte \
              par agent qui conditionne le suivi n'est exact que tant qu'un seul \
              site l'écrit."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2783 — un seul scribe du nom du recensement par outil.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le nom du recensement par outil a un seul écrivain.
+    ///
+    /// # Pourquoi un scan de source et pas un test comportemental
+    ///
+    /// Un second site écrivant `tool_defs_census` publierait une **seconde** carte
+    /// `{nom: octets}` pour le même tour, et les deux lignes seraient
+    /// indiscernables dans le journal : un nom, deux populations — exactement la
+    /// classe mika#2205 que cet instrument existe pour fermer sur
+    /// `tool_defs_bytes`. Le jour où il est écrit, il ne rend **aucune décision
+    /// fausse** et toutes les assertions restent vertes ; ce qu'il casse est le
+    /// `jq` de l'arbitrage, plus tard, en silence.
+    ///
+    /// # Disposition : halt-and-surface, et **aucune liste d'exception**
+    ///
+    /// Il n'y a pas de constante où déposer la prochaine infraction, et c'est
+    /// délibéré (doctrine mika#2201 / mika#2323 : une allowlist née vide est un
+    /// endroit où déposer la suite). Population pré-existante : **zéro, mesurée**
+    /// — le nom est neuf. Quand le scan tire, on fait passer le site par
+    /// `agent_loop::TOOL_DEFS_CENSUS_EVENT` ou on le retire.
+    #[test]
+    fn mika2783_le_nom_de_levenement_a_un_seul_scribe() {
+        // Composé à l'exécution pour que CE fichier ne se dénonce pas lui-même.
+        let needle = format!("tool_defs{}", "_census");
+        let owner = "crates/mika-agent/src/agent_loop/mod.rs";
+
+        let mut writers = Vec::new();
+        for (rel, content) in production_sources() {
+            let carries = content
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .any(|line| {
+                    string_literals(line)
+                        .iter()
+                        .any(|lit| lit.contains(needle.as_str()))
+                });
+            if carries {
+                writers.push(rel);
+            }
+        }
+
+        // Anti-vacuité : un scan qui ne trouve PERSONNE se lit exactement comme un
+        // scan propre (mika#2103 / mika#2205).
+        assert!(
+            writers.iter().any(|w| w == owner),
+            "mika#2783 — `{needle}` n'est écrit nulle part dans {owner} : ce scan \
+             vise un nom mort, il ne vérifie rien"
+        );
+
+        let strangers: Vec<&String> = writers.iter().filter(|w| *w != owner).collect();
+        assert!(
+            strangers.is_empty(),
+            "mika#2783 — le nom du recensement par outil a un second écrivain : \
+             {strangers:?}\n\n\
+             RÉSOLUTION : faire passer ce site par \
+             `agent_loop::TOOL_DEFS_CENSUS_EVENT`, ou le retirer. Il n'y a PAS de \
+             liste d'exception à élargir : deux cartes `{{nom: octets}}` pour un \
+             même tour sont un nom pour deux populations (mika#2205), ce que cet \
+             instrument existe précisément pour fermer."
         );
     }
 
@@ -4033,6 +5518,237 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             "BRIEF_SIZE_THRESHOLD_READERS_ALLOWED est livrée vide et doit le \
              rester : quand le scan tire, on retire le second lecteur (doctrine \
              mika#2201)."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2876 — un échec d'initialisation d'agent journalise sa chaîne.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Le message du site de démarrage (`run_server`, boucle d'init).
+    ///
+    /// Ce littéral est aussi ce sur quoi portent les greps opérateur — c'est
+    /// pourquoi le correctif de mika#2876 ne l'a pas touché d'un octet.
+    const INIT_FAILURE_STARTUP_MESSAGE: &str = "failed to initialize agent, skipping";
+
+    /// Le message du site paresseux (`AppState::resolve_agent`, mika#1399).
+    const INIT_FAILURE_LAZY_MESSAGE: &str = "lazy agent construction failed";
+
+    /// Combien de lignes le scan remonte depuis le littéral pour retrouver le
+    /// `warn!(` qui l'ouvre.
+    ///
+    /// Huit suffit aux deux sites d'aujourd'hui (le site de démarrage tient sur
+    /// une seule ligne, le site paresseux sur quatre). Une refonte `rustfmt` qui
+    /// pousserait un littéral hors de cette fenêtre doit **élargir la fenêtre**,
+    /// jamais allowlister le site.
+    const INIT_FAILURE_MACRO_WINDOW: usize = 8;
+
+    /// **Livrée vide, et le test plus bas l'assert.**
+    ///
+    /// Quand ce scan tire, on route le site par `let chain = format!("{e:#}")`
+    /// (doctrine mika#2201) — une allowlist née vide est un emplacement où
+    /// déposer la prochaine infraction (mika#2323).
+    const INIT_FAILURE_CHAIN_EXCEPTIONS: &[&str] = &[];
+
+    /// Vrai si `block` journalise son erreur par un `%e` nu — c'est-à-dire par
+    /// le `Display` d'`anyhow`, qui ne rend que le contexte le plus externe.
+    ///
+    /// La borne de mot est load-bearing : sans elle, `error = %err` — un nom de
+    /// variable parfaitement légitime, qui peut très bien porter une chaîne déjà
+    /// aplatie — serait lu comme l'infraction.
+    fn logs_the_bare_display(block: &str) -> bool {
+        let needle = "error = %e";
+        let mut from = 0;
+        while let Some(offset) = block[from..].find(needle) {
+            let end = from + offset + needle.len();
+            let next = block[end..].chars().next();
+            if !next.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// Les sites d'émission d'un échec d'initialisation qui **masquent** la
+    /// cause : fonction pure de `(chemin, contenu)`, pour qu'un contrôle de
+    /// bonne foi puisse lui donner un bloc fabriqué.
+    ///
+    /// Le jugement porte sur la **fenêtre de macro** — depuis la ligne du
+    /// littéral, on remonte au plus [`INIT_FAILURE_MACRO_WINDOW`] lignes jusqu'au
+    /// `warn!(` qui l'ouvre, et c'est ce bloc-là qui doit porter un `error = %`
+    /// et ne pas porter de `error = %e` nu. Une ligne de prose qui cite le
+    /// message n'ouvre aucune macro et sort donc d'elle-même.
+    ///
+    /// **Angle mort nommé.** Un TROISIÈME site qui inventerait un message
+    /// NOUVEAU et le journaliserait avec `%e` n'est pas vu : le scan est ancré
+    /// sur les deux littéraux d'aujourd'hui. Un prédicat plus large — « tout
+    /// `warn!` portant `error = %e` » — attraperait des voisins légitimes, au
+    /// premier rang desquels la garde de dérive de palier de mika#1962
+    /// (`server/state.rs`, `refusing to lazy-resolve agent`), dont l'erreur est
+    /// un `thiserror` sans contexte empilé : `%e` y rend la chaîne entière et
+    /// l'aplatir ne changerait rien. Sous-approximer rend des faux rouges
+    /// impossibles, jamais des faux verts (mika#2761).
+    fn init_failure_masked_sites(rel: &str, content: &str) -> Vec<String> {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut out = Vec::new();
+
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(INIT_FAILURE_STARTUP_MESSAGE)
+                && !line.contains(INIT_FAILURE_LAZY_MESSAGE)
+            {
+                continue;
+            }
+            let Some(start) = (i.saturating_sub(INIT_FAILURE_MACRO_WINDOW)..=i)
+                .rev()
+                .find(|&j| lines[j].contains("warn!("))
+            else {
+                continue;
+            };
+            let block = lines[start..=i].join("\n");
+            if logs_the_bare_display(&block) || !block.contains("error = %") {
+                out.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+            }
+        }
+        out
+    }
+
+    /// Les deux sites d'échec d'initialisation journalisent la chaîne entière.
+    ///
+    /// Aucun test comportemental ne peut tenir les DEUX : le `warn!` de
+    /// démarrage vit dans la boucle de `run_server`, hors d'`init_agent`, donc
+    /// hors de portée d'un test qui ne démarre pas un serveur complet. C'est
+    /// cette garde-ci qui le couvre, et c'est pour cela qu'elle existe à côté de
+    /// `mika2876_un_docs_root_absent_dit_sa_cause_dans_le_log`.
+    #[test]
+    fn mika2876_aucun_site_dinit_ne_masque_la_chaine() {
+        let mut masked: Vec<String> = Vec::new();
+        let mut startup_seen = false;
+        let mut lazy_seen = false;
+
+        for (rel, content) in production_sources() {
+            if INIT_FAILURE_CHAIN_EXCEPTIONS.contains(&rel.as_str()) {
+                continue;
+            }
+            // Termes de vivacité : les DEUX littéraux existent-ils encore ? Sans
+            // eux, un renommage de message rendrait ce scan silencieux et donc
+            // décoratif — vert parce qu'il ne vise plus rien.
+            startup_seen |= content.contains(INIT_FAILURE_STARTUP_MESSAGE);
+            lazy_seen |= content.contains(INIT_FAILURE_LAZY_MESSAGE);
+            masked.extend(init_failure_masked_sites(&rel, &content));
+        }
+
+        assert!(
+            startup_seen,
+            "mika#2876 — le message « {INIT_FAILURE_STARTUP_MESSAGE} » n'existe \
+             plus dans la production : ce scan vise un littéral mort"
+        );
+        assert!(
+            lazy_seen,
+            "mika#2876 — le message « {INIT_FAILURE_LAZY_MESSAGE} » n'existe plus \
+             dans la production : ce scan vise un littéral mort"
+        );
+        assert!(
+            masked.is_empty(),
+            "mika#2876 — {} site(s) d'échec d'initialisation journalisent l'erreur \
+             sans sa chaîne :\n{}\n\n\
+             RÉSOLUTION : router le site par `let chain = format!(\"{{e:#}}\");` puis \
+             `error = %chain`, et NE PAS l'allowlister. Le sigil `%` de `tracing` \
+             est un `Display`, et sur une erreur `anyhow` `Display` ne rend que le \
+             contexte le plus externe : la cause posée sous un `.with_context(...)` \
+             disparaît du log. C'est ce qui a coûté 37 lignes sans cause pour \
+             mika-litha, diagnostiquées en lisant `identity.toml` à la main.",
+            masked.len(),
+            masked.join("\n")
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur les deux formes d'infraction, et rester muet sur les formes voisines
+    /// qui citent le message sans le masquer.
+    #[test]
+    fn mika2876_le_scan_rougit_sur_un_site_qui_masque_la_cause() {
+        // 1. La régression exacte : le `%e` nu, sur une seule ligne.
+        let une_ligne = format!(
+            "                    warn!(agent = name, error = %e, \"{INIT_FAILURE_STARTUP_MESSAGE}\");\n"
+        );
+        assert_eq!(
+            init_failure_masked_sites("fixture.rs", &une_ligne).len(),
+            1,
+            "le `%e` nu sur la ligne du littéral doit être vu"
+        );
+
+        // 2. La même, étalée sur la fenêtre de macro.
+        let multi_ligne = format!(
+            "                tracing::warn!(\n                    agent = normalized.as_str(),\n\
+             \x20                   error = %e,\n                    \"{INIT_FAILURE_LAZY_MESSAGE}\"\n                );\n"
+        );
+        assert_eq!(
+            init_failure_masked_sites("fixture.rs", &multi_ligne).len(),
+            1,
+            "le `%e` nu quelques lignes au-dessus du littéral doit être vu"
+        );
+
+        // 3. Un site qui ne porte AUCUN champ d'erreur masque la cause tout
+        //    autant — par omission plutôt que par aplatissement manquant.
+        let sans_erreur = format!(
+            "                    warn!(agent = name, \"{INIT_FAILURE_STARTUP_MESSAGE}\");\n"
+        );
+        assert_eq!(
+            init_failure_masked_sites("fixture.rs", &sans_erreur).len(),
+            1,
+            "un site sans champ `error` ne porte pas davantage la cause"
+        );
+
+        // 4. La forme corrigée, sur une ligne et sur quatre.
+        let corrige = format!(
+            "                    let chain = format!(\"{{e:#}}\");\n\
+             \x20                   warn!(agent = name, error = %chain, \"{INIT_FAILURE_STARTUP_MESSAGE}\");\n"
+        );
+        assert!(
+            init_failure_masked_sites("fixture.rs", &corrige).is_empty(),
+            "la forme corrigée ne doit pas être dénoncée"
+        );
+
+        // 5. `error = %err` n'est pas `error = %e` — la borne de mot tient.
+        let err_nomme = format!(
+            "                    warn!(agent = name, error = %err, \"{INIT_FAILURE_LAZY_MESSAGE}\");\n"
+        );
+        assert!(
+            init_failure_masked_sites("fixture.rs", &err_nomme).is_empty(),
+            "un nom de variable commençant par `e` n'est pas le `Display` nu"
+        );
+
+        // 6. La prose qui cite le message n'ouvre aucune macro.
+        let prose =
+            format!("/// Les greps opérateur portent sur « {INIT_FAILURE_STARTUP_MESSAGE} ».\n");
+        assert!(
+            init_failure_masked_sites("fixture.rs", &prose).is_empty(),
+            "citer le message dans un commentaire n'est pas l'émettre"
+        );
+
+        // 7. La garde de dérive de palier de mika#1962, le voisin légitime que
+        //    le prédicat ne doit pas attraper : son erreur est un `thiserror`
+        //    sans contexte empilé, et `%e` y rend bien la chaîne entière.
+        let voisin = "                tracing::error!(\n                    agent = %normalized,\n\
+                      \x20                   error = %e,\n                    \"refusing to lazy-resolve agent: family-tier provisioning drift\"\n                );\n";
+        assert!(
+            init_failure_masked_sites("fixture.rs", voisin).is_empty(),
+            "le scan est ancré sur les deux littéraux d'init, pas sur tout `%e`"
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2876_the_chain_allowlist_is_empty() {
+        assert!(
+            INIT_FAILURE_CHAIN_EXCEPTIONS.is_empty(),
+            "INIT_FAILURE_CHAIN_EXCEPTIONS est livrée vide et doit le rester : \
+             quand le scan tire, on route le site par `format!(\"{{e:#}}\")`, on ne \
+             l'exempte pas (doctrine mika#2201)."
         );
     }
 
@@ -5027,6 +6743,83 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         );
     }
 
+    // ──────── mika#2811 — le nom du champ de cause de groom, en phase ────────
+
+    /// **Livrée vide, et `mika2811_lallowlist_de_parite_est_livree_vide`
+    /// l'assert.** Même contrat que `ARCHITECT_UNREADABLE_WIRE_EXCEPTIONS`.
+    const GROOM_CAUSE_WIRE_EXCEPTIONS: &[&str] = &[];
+
+    /// **Le nom du champ de provenance ne diverge pas entre le Rust et le shell
+    /// (mika#2811 D5).**
+    ///
+    /// Le motif a DEUX moitiés : `ready_label_handler` pose le champ dans
+    /// l'entrée de dispatch sous le nom de
+    /// `executor::INTERNAL_GROOM_CAUSE_FIELD`, et `_parse_input_json` de
+    /// `dispatch-lib.sh` le lit sous le nom de sa propre déclaration
+    /// `GROOM_FORCE_CAUSE_FIELD`. Un seul littéral doit rester en phase, et
+    /// c'est celui-là — les **valeurs** (`markers_without_proof`,
+    /// `proof_unreadable`) ne servent qu'à la ligne de journal du shell, qui ne
+    /// décide que sur la présence.
+    ///
+    /// Ici la divergence est pire que « population vide en silence » (le risque
+    /// que le modèle mika#2641 nomme) : le shell ne lirait **jamais** de cause,
+    /// donc la porte de mika#2012 resterait armée, donc `already_groomed`
+    /// reviendrait — et la boucle du § 1.1 de mika#2811 avec elle, avec tous les
+    /// tests comportementaux des deux côtés verts, chacun correct dans son
+    /// propre monde.
+    #[test]
+    fn mika2811_le_nom_du_champ_de_cause_est_synchronise_shell_a_rust() {
+        use crate::skills::executor::INTERNAL_GROOM_CAUSE_FIELD;
+
+        let rel = "skills/bundled/_shared/dispatch-lib.sh";
+        if GROOM_CAUSE_WIRE_EXCEPTIONS.contains(&rel) {
+            return;
+        }
+        let shell = repo_root()
+            .join("skills")
+            .join("bundled")
+            .join("_shared")
+            .join("dispatch-lib.sh");
+        // Un shell illisible ÉCHOUE plutôt que de rendre une comparaison vide :
+        // un scan qui ne lit rien se lit comme un scan d'accord.
+        let src = std::fs::read_to_string(&shell).unwrap_or_else(|e| {
+            panic!(
+                "mika#2811 — {rel} doit être lisible pour que ce scan vérifie quelque chose : {e}"
+            )
+        });
+
+        // Le lecteur shell déclare le nom par une affectation en colonne 0.
+        // C'est la forme que `test-dispatch-lib.sh` épingle aussi comme site de
+        // définition unique.
+        let expect = format!("GROOM_FORCE_CAUSE_FIELD=\"{INTERNAL_GROOM_CAUSE_FIELD}\"");
+        assert!(
+            src.lines().any(|l| l == expect),
+            "mika#2811 — le nom du champ de provenance a divergé : le Rust pose \
+             `{INTERNAL_GROOM_CAUSE_FIELD}` et {rel} ne porte pas la ligne \
+             `{expect}`.\n\n\
+             RÉSOLUTION : réaligner les deux littéraux. Ne JAMAIS élargir le \
+             lecteur shell à une seconde orthographe, et ne JAMAIS ajouter le \
+             fichier shell à GROOM_CAUSE_WIRE_EXCEPTIONS — ce serait rendre le \
+             scan vert en cessant de regarder la moitié qu'il existe pour \
+             confronter (mika#2201). Un champ que le shell ne lit pas laisse la \
+             porte de mika#2012 armée et ramène `already_groomed` suivi d'un \
+             re-drive."
+        );
+    }
+
+    /// Le pendant auto-nettoyant de l'allowlist ci-dessus.
+    #[test]
+    fn mika2811_lallowlist_de_parite_est_livree_vide() {
+        assert!(
+            GROOM_CAUSE_WIRE_EXCEPTIONS.is_empty(),
+            "GROOM_CAUSE_WIRE_EXCEPTIONS est livrée vide et doit le rester : le \
+             littéral est créé par mika#2811 avec exactement un site de \
+             déclaration de chaque côté, donc aucune violation préexistante \
+             n'est possible. Excepter le fichier shell rendrait le scan vert en \
+             cessant de regarder la moitié qu'il confronte (mika#2201)."
+        );
+    }
+
     // ───────────────── mika#2638 — `reference_url` délimitée ─────────────────
 
     /// Les lignes `reference_url` + `LIKE` que le scan D4 tolère, avec leur
@@ -5200,7 +6993,7 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             "mika#2638 — seulement {population_in} comparaison(s) `{colonne} IN (…)` \
              vue(s), attendu au moins 5 : les deux sondes de vol, le nettoyage de \
              mika#1934, et les deux lecteurs de verdict de groom \
-             (`has_completed_groom_for_issue`, `latest_groom_verdict_for_issue`).\n\n\
+             (`has_completed_groom_for_issue`, `groom_callback_results_newest_first`).\n\n\
              DEUX LECTURES, et la seconde est la plus probable : soit une requête \
              protégée a disparu, soit ce seuil est à zéro marge et vous venez de \
              REFORMATER un littéral SQL. Ce compte se fait LIGNE PAR LIGNE : une \
@@ -5276,8 +7069,9 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// n'enlève aucun appelant et n'en ajoute aucun, donc le compte ne bouge
     /// pas. Mesuré sur ce ticket même — la première version de ce scan était
     /// **verte** avec deux bypasses dans l'arbre
-    /// (`has_completed_groom_for_issue` et `latest_groom_verdict_for_issue`
-    /// faisaient `format!("{}{}", issue_url, GROOM_PHASE_SUFFIX)` puis
+    /// (`has_completed_groom_for_issue` et le lecteur du dernier verdict —
+    /// depuis mika#2795 `groom_callback_results_newest_first` — faisaient
+    /// `format!("{}{}", issue_url, GROOM_PHASE_SUFFIX)` puis
     /// `IN (?2, ?3)`), c'est-à-dire exactement l'état que son propre message de
     /// RÉSOLUTION demandait au lecteur d'aller chercher. Une garde dont le
     /// prédicat ne peut pas atteindre la faute qu'elle nomme est une
@@ -5652,6 +7446,492 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
             "mika#2649 — `classify_event` a disparu ou changé de nom : \
              `webhook_event_target` l'appelle pour lire la grammaire check-suite \
              plutôt que d'en écrire une TROISIÈME copie."
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // mika#2854 AC4 — l'état du ticket a DEUX lecteurs sous `src/server/`,
+    // et pas un troisième.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Les deux lecteurs légitimes de l'état du ticket sous `src/server/`
+    /// (mika#2854 AC4), nommés par chemin ET par symbole.
+    ///
+    /// Ils ne sont pas des **exceptions** — ils sont la *définition* du
+    /// recensement, et c'est pourquoi l'assertion est une **égalité** et non un
+    /// `<=`. Les deux moitiés de la classe (h) lisent le même état par deux
+    /// chemins qui ne sont pas interchangeables :
+    ///
+    /// - `issue_has_active_task` lit **live**, depuis la porte. C'est correct
+    ///   pour un `issue_comment` : rien n'a nettoyé les lignes de suivi.
+    /// - `snapshot_closure_task_state` lit **tôt**, juste après
+    ///   `original_github_text` dans `handlers.rs`, parce que
+    ///   `upstream_close_handler::try_handle_upstream_close` tourne AVANT la
+    ///   porte et marque terminales les lignes du ticket qu'on ferme.
+    ///
+    /// Le défaut que cette garde attrape est donc précis : **une lecture live
+    /// rajoutée sur le chemin de la fermeture**. Elle rendrait `false` pour un
+    /// ticket qui a une tâche vivante, trierait un tour qu'AC7 protège, et
+    /// toutes les assertions comportementales du vol resteraient vertes — la
+    /// classe `grooming_marker` de mika#2158, qu'aucun test de comportement ne
+    /// voit.
+    ///
+    /// **Il n'y a aucune allowlist d'exceptions, pas même vide.** La population
+    /// pré-existante est de zéro (mesurée : `grep -rn
+    /// has_active_self_dev_task_for_issue crates/` ne rend sous `src/server/`
+    /// que les deux sites ci-dessus et trois doc-comments), donc il n'y a rien
+    /// à excepter — et une allowlist née vide est un emplacement où déposer la
+    /// prochaine infraction (mika#2323). C'est l'égalité qui fige cet état.
+    const CLOSURE_TASK_READER_CENSUS: &[(&str, &str)] = &[
+        (
+            "crates/mika-agent/src/server/webhook_prefilter.rs",
+            "issue_has_active_task",
+        ),
+        (
+            "crates/mika-agent/src/server/webhook_prefilter.rs",
+            "snapshot_closure_task_state",
+        ),
+    ];
+
+    /// Les fonctions de production qui **appellent** le lecteur d'état du
+    /// ticket, par leur nom.
+    ///
+    /// Le prédicat est lexical et en trois termes, chacun porteur :
+    /// (1) hors commentaire, via [`crate::source_scan::strip_comment_lines`] —
+    /// la prose *sur* ce lecteur n'est pas une lecture, et elle est abondante :
+    /// `upstream_close_handler.rs` le nomme deux fois en doc-comment pour
+    /// expliquer précisément la divergence de clé que ce vol évite (la classe du
+    /// faux positif du Signal S, mika#2050) ; (2) portant le nom de la méthode ;
+    /// (3) **sans `fn `** — ce qui écarte la ligne de **définition** sans avoir
+    /// à exempter son fichier, une exemption de fichier aveuglant aussi tout
+    /// appel qu'il viendrait à contenir.
+    ///
+    /// Le nom est composé à l'exécution pour que ce fichier ne se dénonce pas
+    /// lui-même s'il venait un jour sous le périmètre du scan (forme mika#2484).
+    ///
+    /// Pas de retour en portée de module, délibérément : la méthode est `async`,
+    /// donc tout site d'appel vit dans une `fn`. Un `const` ne peut pas la
+    /// nommer.
+    fn closure_task_reader_sites(content: &str) -> Vec<String> {
+        let needle = format!("has_active_self_dev{}", "_task_for_issue");
+        let mut current = String::from("<module scope>");
+        let mut out: Vec<String> = Vec::new();
+
+        let stripped = crate::source_scan::strip_comment_lines(content);
+        for line in stripped.lines() {
+            let trimmed = line.trim_start();
+            // `fn ` à n'importe quelle position, borné à gauche par une
+            // frontière de mot pour que `some_fn (` et `impl Fn(` ne comptent
+            // pas — même terme que `enclosing_fns_writing`.
+            if let Some(i) = trimmed.find("fn ")
+                && (i == 0 || trimmed.as_bytes()[i - 1] == b' ')
+            {
+                current = trimmed[i + 3..]
+                    .split(['(', '<', ' '])
+                    .next()
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+            }
+            if trimmed.contains(needle.as_str()) && !trimmed.contains("fn ") {
+                out.push(current.clone());
+            }
+        }
+
+        out
+    }
+
+    /// **V9 — l'état du ticket a exactement les deux lecteurs recensés sous
+    /// `src/server/`.**
+    ///
+    /// L'égalité rougit dans les deux sens, et les deux comptent : sur un
+    /// **troisième** lecteur (le défaut à attraper) comme sur la **disparition**
+    /// ou le renommage d'un des deux (le recensement devenu stale). Un seuil
+    /// `<=` laisserait passer le second cas en silence, et c'est exactement ce
+    /// qui rend une allowlist éternelle.
+    #[test]
+    fn mika2854_letat_du_ticket_a_deux_lecteurs_sous_le_serveur() {
+        let mut trouves: Vec<(String, String)> = Vec::new();
+        for (rel, content) in production_sources() {
+            if !rel.contains("/src/server/") {
+                continue;
+            }
+            for f in closure_task_reader_sites(&content) {
+                trouves.push((rel.clone(), f));
+            }
+        }
+        trouves.sort();
+
+        let mut attendus: Vec<(String, String)> = CLOSURE_TASK_READER_CENSUS
+            .iter()
+            .map(|(rel, f)| ((*rel).to_string(), (*f).to_string()))
+            .collect();
+        attendus.sort();
+
+        assert_eq!(
+            trouves, attendus,
+            "mika#2854 AC4 — le recensement des lecteurs de l'état du ticket \
+             sous `src/server/` doit être EXACT.\n\n\
+             Un lecteur de TROP : c'est très probablement une lecture live \
+             rajoutée sur le chemin de la fermeture. Elle lit l'état d'APRÈS \
+             `upstream_close_handler`, donc `false` sur un ticket qui a une \
+             tâche vivante, donc elle trie un tour qu'AC7 protège — et aucune \
+             assertion de comportement ne le voit. RÉSOLUTION : router le site \
+             par `closure_task_snapshot`, ne pas l'ajouter au recensement \
+             (doctrine mika#2201).\n\n\
+             Un lecteur qui MANQUE : un des deux a été renommé ou supprimé, et \
+             ce scan viserait désormais un nom mort."
+        );
+
+        // Anti-vacuité : le nom cherché doit encore exister là où il est
+        // DÉFINI. Sans ce terme, un renommage amont rendrait le scan vert pour
+        // la pire des raisons — il ne regarderait plus rien.
+        let proprietaire =
+            std::fs::read_to_string(repo_root().join("crates/mika-agent/src/async_db.rs"))
+                .expect("async_db.rs lisible");
+        assert!(
+            proprietaire.contains("pub async fn has_active_self_dev_task_for_issue("),
+            "mika#2854 — `AsyncDatabase::has_active_self_dev_task_for_issue` a \
+             disparu ou changé de nom : ce scan vise un nom mort"
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne regarde rien — très exactement le
+    /// mode de panne qu'il existe pour rendre visible. On le montre donc rougir
+    /// sur un **troisième** site synthétique, et rester muet sur les trois
+    /// formes qui nomment le lecteur sans l'appeler.
+    #[test]
+    fn mika2854_le_scan_rougit_sur_un_troisieme_lecteur() {
+        let fautif = "\
+impl LiveState<'_> {
+    async fn issue_has_active_task(&self, u: &str) -> anyhow::Result<bool> {
+        self.db.has_active_self_dev_task_for_issue(u).await
+    }
+}
+
+async fn un_troisieme_lecteur(db: &AsyncDatabase, u: &str) -> bool {
+    db.has_active_self_dev_task_for_issue(u).await.unwrap_or(false)
+}
+";
+        assert_eq!(
+            closure_task_reader_sites(fautif),
+            vec![
+                "issue_has_active_task".to_string(),
+                "un_troisieme_lecteur".to_string()
+            ],
+            "le scan doit voir le lecteur légitime ET le troisième site, chacun \
+             sous le nom de sa fonction englobante — sans quoi le message \
+             d'échec ne dirait pas OÙ retirer la lecture"
+        );
+
+        // 1. La prose d'un doc-comment — la forme réelle de
+        //    `upstream_close_handler.rs:420`.
+        let prose = "/// la clé de `has_active_self_dev_task_for_issue` doit \
+                     coïncider.\n";
+        assert!(
+            closure_task_reader_sites(prose).is_empty(),
+            "nommer le lecteur dans un commentaire n'est pas l'appeler"
+        );
+
+        // 2. Un commentaire de bloc, et une ligne de continuation.
+        let bloc = "/* has_active_self_dev_task_for_issue */\n \
+                    * has_active_self_dev_task_for_issue\n";
+        assert!(
+            closure_task_reader_sites(bloc).is_empty(),
+            "un commentaire de bloc n'est pas un appel"
+        );
+
+        // 3. La DÉFINITION elle-même — c'est ce qui dispense d'exempter
+        //    `async_db.rs`, une exemption de fichier aveuglant aussi tout appel
+        //    qu'il viendrait à contenir.
+        let definition = "    pub async fn has_active_self_dev_task_for_issue(\n";
+        assert!(
+            closure_task_reader_sites(definition).is_empty(),
+            "la ligne de définition n'est pas un site d'appel"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#2995 — aucun prompt bundlé ne prescrit au moteur de poser `ready`
+    // -----------------------------------------------------------------------
+
+    /// **Livrée vide, et un test sœur l'assert.**
+    ///
+    /// Une entrée ici autoriserait un prompt à enseigner à l'agent le geste par
+    /// lequel il se donne le consentement que la garde de mika#2772 exige d'un
+    /// autre (mika#841) : ce n'est pas une exception, c'est le défaut. Quand ce
+    /// scan tire, on **retire la prescription** et on la remplace par la sortie
+    /// correcte — la promotion appartient à l'opérateur.
+    const READY_PRESCRIPTION_EXCEPTIONS: &[(&str, &str)] = &[];
+
+    /// Tous les prompts bundlés, chemin relatif + contenu.
+    ///
+    /// `system_prompt*.md` et pas `system_prompt.md` seul : le système de skills
+    /// porte des variantes par fournisseur et par modèle, et une variante hors
+    /// population serait un trou que rien ne signale.
+    fn bundled_prompts() -> Vec<(String, String)> {
+        let root = repo_root();
+        let mut out = Vec::new();
+        let mut stack = vec![root.join("skills").join("bundled")];
+
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.expect("entrée de répertoire lisible").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if !name.starts_with("system_prompt") || !name.ends_with(".md") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("chemin sous la racine")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // Un prompt illisible ÉCHOUE plutôt que de rendre une
+                // population plus petite : un scan qui ne lit rien se lit comme
+                // un scan d'accord (motif mika#2641).
+                let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    panic!("mika#2995 — {rel} doit être lisible pour que ce scan vérifie quelque chose : {e}")
+                });
+                out.push((rel, src));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Les lignes (1-indexées) d'un prompt qui prescrivent la pose du label de
+    /// déclenchement.
+    fn ready_prescription_lines(src: &str) -> Vec<usize> {
+        src.lines()
+            .enumerate()
+            .filter(|(_, line)| line_prescribes_dispatch_trigger_write(line))
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// Vrai si la ligne porte un drapeau d'ajout d'étiquette dont la **valeur**
+    /// est le label de déclenchement.
+    ///
+    /// La valeur est lue au jeton, jamais par sous-chaîne : `--add-label
+    /// ready-for-review` ne prescrit pas `ready`, et un `contains("ready")`
+    /// l'accuserait — un faux rouge est ce qui fait désarmer un scan.
+    ///
+    /// Le prédicat ne cherche **pas** à distinguer la prescription de
+    /// l'interdiction. Un prompt qui nomme le geste l'enseigne, même pour le
+    /// défendre : un refus qui nomme son contournement est un refus contourné
+    /// (mika#2520).
+    fn line_prescribes_dispatch_trigger_write(line: &str) -> bool {
+        use crate::evidence::guards::{ADD_LABEL_FLAGS, DISPATCH_TRIGGER_LABEL};
+
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for (i, raw) in tokens.iter().enumerate() {
+            let token = unquote(raw);
+            for flag in ADD_LABEL_FLAGS {
+                let value = if token == *flag {
+                    // `--add-label ready` : la valeur est le jeton SUIVANT.
+                    tokens.get(i + 1).map(|t| unquote(t))
+                } else {
+                    // `--add-label=ready` : la valeur est collée au drapeau.
+                    token.strip_prefix(flag).and_then(|r| r.strip_prefix('='))
+                };
+                let Some(value) = value else { continue };
+                // `gh` accepte une liste : `--add-label ready,urgent`.
+                if value
+                    .split(',')
+                    .any(|l| unquote(l).eq_ignore_ascii_case(DISPATCH_TRIGGER_LABEL))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Retire la ponctuation de citation autour d'un jeton de prose.
+    ///
+    /// Un prompt écrit la commande dans un littéral markdown :
+    /// `` `run_gh("issue edit <n> --add-label ready")` ``. Sans ce décapage, le
+    /// jeton de valeur serait `ready")` et le scan ne verrait rien.
+    fn unquote(token: &str) -> &str {
+        token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | ','
+                    | '.'
+                    | ';'
+                    | ':'
+                    | '*'
+                    | '\\'
+                    | '>'
+            )
+        })
+    }
+
+    /// **mika#2995 AC1 — aucun prompt bundlé ne prescrit la pose de `ready`.**
+    ///
+    /// Un scan de source, et il n'y a pas d'autre forme possible : la ligne
+    /// fautive ne rend **aucune** décision fausse. Elle enseigne à l'agent le
+    /// geste par lequel il se donne lui-même le consentement positif que la
+    /// garde de mika#2772 exige d'un opérateur — exactement l'incident du
+    /// 2026-10-31 sur mika#2958. Chaque assertion de comportement de cette
+    /// caisse reste verte pendant que le prompt porte la prescription, parce
+    /// que le prompt n'est pas du code : il est lu par un modèle, au build
+    /// (mika#2340), et son absence de défaut n'est observable que par une
+    /// lecture de sa prose.
+    ///
+    /// **Résolution quand il tire : retirer la prescription.** Ajouter une
+    /// entrée à `READY_PRESCRIPTION_EXCEPTIONS` rend au moteur la capacité que
+    /// ce vol lui retire.
+    #[test]
+    fn mika2995_aucun_prompt_bundle_ne_prescrit_la_pose_de_ready() {
+        let prompts = bundled_prompts();
+
+        // Assertion de population non vide : un scan dont le walk ne résout
+        // aucun fichier passe vert par construction (classes mika#2578 /
+        // mika#2752). Le seuil est bas et le nom est cité : les deux pannes à
+        // couvrir sont « la racine a bougé » et « le filtre de nom ne reconnaît
+        // plus rien ».
+        assert!(
+            prompts.len() >= 10,
+            "mika#2995 — seulement {} prompt(s) bundlé(s) trouvé(s) sous skills/bundled : \
+             ce scan ne regarde plus la population qu'il existe pour couvrir",
+            prompts.len()
+        );
+        assert!(
+            prompts
+                .iter()
+                .any(|(rel, _)| rel == "skills/bundled/self-dev-callback/system_prompt.md"),
+            "mika#2995 — le prompt du callback n'est plus dans la population du scan ; \
+             c'est le site de l'incident fondateur, il doit y rester"
+        );
+
+        let violations: Vec<String> = prompts
+            .iter()
+            .flat_map(|(rel, src)| {
+                ready_prescription_lines(src)
+                    .into_iter()
+                    .map(move |line| format!("{rel}:{line}"))
+            })
+            .collect();
+
+        let allowed: Vec<&str> = READY_PRESCRIPTION_EXCEPTIONS
+            .iter()
+            .map(|(rel, _)| *rel)
+            .collect();
+        let unexpected: Vec<&String> = violations
+            .iter()
+            .filter(|v| {
+                let rel = v.rsplit_once(':').map(|(r, _)| r).unwrap_or(v.as_str());
+                !allowed.contains(&rel)
+            })
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "mika#2995 VIOLÉ — ces prompts bundlés prescrivent la pose du label `ready` : \
+             {unexpected:?}.\n\n\
+             `ready` est le consentement positif au dispatch autonome (mika#841), et la garde \
+             de mika#2772 n'en lit que la PRÉSENCE. Un prompt qui enseigne ce geste rend le \
+             self-consent possible : l'agent que la garde retient se la lève à lui-même avec \
+             `run_gh`.\n\n\
+             RÉSOLUTION : retirer la prescription et nommer la sortie correcte — la promotion \
+             appartient à l'opérateur. Ne pas ajouter d'entrée à \
+             READY_PRESCRIPTION_EXCEPTIONS."
+        );
+
+        // Moitié auto-nettoyante : une entrée qui ne correspond plus à une
+        // violation réelle est une permission périmée, et une permission
+        // périmée est la façon dont une exception survit à sa raison.
+        for (rel, ticket) in READY_PRESCRIPTION_EXCEPTIONS {
+            assert!(
+                violations.iter().any(|v| v.starts_with(&format!("{rel}:"))),
+                "entrée d'allowlist périmée {rel:?} (ticket {ticket}) — ce prompt ne \
+                 prescrit plus la pose de `ready` ; retirer l'entrée"
+            );
+        }
+    }
+
+    /// **L'allowlist du scan ci-dessus est livrée vide.**
+    #[test]
+    fn mika2995_lallowlist_des_prescriptions_est_vide() {
+        assert!(
+            READY_PRESCRIPTION_EXCEPTIONS.is_empty(),
+            "READY_PRESCRIPTION_EXCEPTIONS est livrée vide et doit le rester : quand le scan \
+             tire, on retire la prescription du prompt (mika#2995)."
+        );
+    }
+
+    /// **Contrôle de bonne foi du scan ci-dessus.**
+    ///
+    /// Il pourrait être vert parce qu'il ne reconnaît plus la forme qu'il
+    /// cherche — le mode de panne qu'il existe pour rendre visible. On le montre
+    /// donc rougir sur les trois syntaxes d'ajout, et rester muet sur les
+    /// quatre formes qui nomment le label sans prescrire sa pose.
+    #[test]
+    fn mika2995_le_scan_rougit_sur_une_prescription_plantee() {
+        // La forme exacte de l'incident, puis les deux autres syntaxes.
+        let fautif = "\
+> Nothing to see on this line.
+>      b. Call `run_gh(\"issue edit <n> --add-label ready --repo senara-solutions/<repo>\")`.
+Then `run_gh(\"issue edit <n> --label=ready\")` also posts it.
+And `run_gh(\"issue create --title t -l ready,urgent\")` creates it promoted.
+";
+        assert_eq!(
+            ready_prescription_lines(fautif),
+            vec![2, 3, 4],
+            "le scan doit voir les trois syntaxes d'ajout — `--add-label <v>`, `--label=<v>` \
+             et `-l <liste>` — chacune sous son numéro de ligne, sans quoi le message \
+             d'échec ne dirait pas OÙ retirer la prescription"
+        );
+
+        // 1. Le label nommé en prose, sans drapeau : c'est la forme de la
+        //    sortie correcte que ce vol écrit à la place de la prescription.
+        let prose = "The `ready` label is posted by the operator, never by you.\n";
+        assert!(
+            ready_prescription_lines(prose).is_empty(),
+            "nommer le label n'est pas prescrire sa pose — sans quoi le remède correct \
+             serait lui-même une violation"
+        );
+
+        // 2. Un autre label sous le même drapeau. `dispatch:loop` est posé par
+        //    `dispatch-lib.sh` sous l'autorité de l'opérateur, et n'est pas un
+        //    consentement.
+        let autre = "run `gh issue edit 7 --add-label dispatch:loop` to stamp the seat\n";
+        assert!(
+            ready_prescription_lines(autre).is_empty(),
+            "un autre label sous le même drapeau n'est pas le label de déclenchement"
+        );
+
+        // 3. Le piège du préfixe : la valeur est lue au jeton, pas par
+        //    sous-chaîne.
+        let prefixe = "`gh pr edit 12 --add-label ready-for-review` is a review signal\n";
+        assert!(
+            ready_prescription_lines(prefixe).is_empty(),
+            "`ready-for-review` n'est pas `ready` : un scan par sous-chaîne l'accuserait, \
+             et un faux rouge est ce qui fait désarmer un scan"
+        );
+
+        // 4. Le RETRAIT. Il n'est pas un consentement — et il est la moitié
+        //    que l'opérateur garde (`remove → add`, mika#2323).
+        let retrait = "`gh issue edit 7 --remove-label ready` demotes the ticket\n";
+        assert!(
+            ready_prescription_lines(retrait).is_empty(),
+            "retirer `ready` n'est pas se donner le consentement"
         );
     }
 }

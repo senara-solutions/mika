@@ -26,15 +26,16 @@ use std::sync::LazyLock;
 use tracing::{info, warn};
 
 use crate::async_db::AsyncDatabase;
-use crate::messaging::MessageSender;
+use crate::messaging::{MessageSender, NotificationSeverity};
 use crate::perimeter::{self, Classification};
 use crate::skills::SkillRegistry;
 use crate::task_state::merge_metadata;
 use crate::tools::pr_merge_with_gate::{
-    BehindMainInfo, BehindMainRemediation, CheckClassification, classify_checks,
-    describe_behind_main_remediation, is_behind_main, mpc_gate_clearance, remediate_behind_main,
-    run_gh_checks, run_gh_merge, run_gh_pr_view, run_gh_subprocess,
+    BehindMainInfo, BehindMainRemediation, CheckClassification, ci_read_token_or_pat,
+    classify_checks, describe_behind_main_remediation, is_behind_main, mpc_gate_clearance,
+    remediate_behind_main, run_gh_checks, run_gh_merge, run_gh_pr_view, run_gh_subprocess,
 };
+use mika_common::ci_read::CiReadToken;
 
 use super::verdict::{
     PrReviewEvent, Verdict, parse_pr_review_event, parse_review_depth, parse_verdict,
@@ -138,11 +139,19 @@ pub enum VerdictAction {
 /// Returns `VerdictAction::Handled` when the handler acted on a recognized
 /// verdict (merge, dispatch, escalation, hold). Returns `VerdictAction::Passthrough`
 /// only for non-review events or unrecognized block/hold subtypes.
+///
+/// `ci_read_token` est le jeton de **lecture** de CI (mika#2963, câblé par
+/// mika#2965), résolu une seule fois dans `server/handlers.rs`. Il est distinct
+/// de `github_token` et ne le remplace pas : celui-ci est PAT-first et porte les
+/// identités de post (ADR-008), celui-là est App-first parce qu'un PAT
+/// fine-grained ne peut pas lire `statusCheckRollup`. `None` dégrade vers le PAT
+/// — déploiement sans App, ou échange d'App échoué — et le log le dit.
 #[allow(clippy::too_many_arguments)]
 pub async fn try_handle_pr_review_verdict(
     text: &str,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -273,6 +282,7 @@ pub async fn try_handle_pr_review_verdict(
                 &event,
                 db,
                 github_token,
+                ci_read_token,
                 message_sender,
                 session_id,
                 trace_id,
@@ -400,10 +410,12 @@ async fn refuse_pass_from_non_reviewer(
 }
 
 /// Handle a VERDICT: pass — look up task, initiate merge, update metadata.
+#[allow(clippy::too_many_arguments)]
 async fn handle_pass_verdict(
     event: &PrReviewEvent,
     db: &AsyncDatabase,
     github_token: Option<&str>,
+    ci_read_token: Option<&CiReadToken>,
     message_sender: Option<&Arc<dyn MessageSender>>,
     session_id: &str,
     trace_id: &str,
@@ -533,6 +545,7 @@ async fn handle_pass_verdict(
         if let Some(sender) = message_sender {
             send_notification(
                 sender,
+                NotificationSeverity::P2,
                 &format!(
                     "PR #{} on {} — VERDICT: pass from @{}, but touches DECISION-CORE zone(s). \
                      Auto-merge blocked by forge-gate (mika#1829/#1853). {}. \
@@ -608,7 +621,21 @@ async fn handle_pass_verdict(
     // Run CI check classification (reuse pr_merge_with_gate logic).
     // Wrap in a 60-second timeout matching PrMergeWithGateTool::timeout_secs()
     // to prevent a hanging gh subprocess from blocking the agent lock.
-    let checks_future = run_gh_checks(event.pr_number, &event.repo, token);
+    // mika#2963, câblé par mika#2965 — le jeton de lecture CI est résolu une
+    // seule fois dans `server/handlers.rs`, à côté du `verdict_github_token`
+    // PAT-first qui porte les identités de post, et descend jusqu'ici en
+    // paramètre. Il est App-first : GitHub n'accorde pas la permission Checks à
+    // un PAT fine-grained, et c'est ce webhook-ci — celui qui décide d'un merge
+    // sur un `VERDICT: pass` — qui lisait la CI avec le jeton qui ne sait pas la
+    // lire.
+    //
+    // Le repli au PAT subsiste et reste légitime : déploiement sans App
+    // configurée, ou échange de jeton d'installation échoué. Il dégrade vers
+    // exactement le régime d'avant mika#2963 — échec sur `statusCheckRollup`,
+    // gate fermé sur une erreur de lecture, jamais du vert — et la ligne
+    // `ci_read_token_source` dit laquelle des deux sources a servi.
+    let ci_token = ci_read_token_or_pat(ci_read_token, token);
+    let checks_future = run_gh_checks(event.pr_number, &event.repo, &ci_token);
     let checks = match tokio::time::timeout(std::time::Duration::from_secs(60), checks_future).await
     {
         Ok(Ok(c)) => c,
@@ -912,7 +939,7 @@ async fn handle_pass_verdict(
                              Merge initiated (squash, delete branch).",
                             event.pr_number, event.repo, event.reviewer
                         );
-                        send_notification(sender, &notification).await;
+                        send_notification(sender, NotificationSeverity::P2, &notification).await;
                     }
 
                     info!(
@@ -1372,6 +1399,7 @@ async fn handle_block_ac(
         if let Some(sender) = message_sender {
             send_notification(
                 sender,
+                NotificationSeverity::P0,
                 &format!(
                     "PR #{} on {} — block[ac] retry limit ({}) reached from @{}. \
                      Task {} marked blocked. Operator review required.",
@@ -1441,6 +1469,7 @@ async fn handle_block_ac(
     if let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P2,
             &format!(
                 "PR #{} on {} — VERDICT: block[ac] from @{}. \
                  AC-fix dispatch preparing (attempt {new_count}/{BLOCK_AC_MAX_RETRIES}). Task: {}",
@@ -1659,6 +1688,7 @@ async fn handle_block_ci(
         if let Some(sender) = message_sender {
             send_notification(
                 sender,
+                NotificationSeverity::P0,
                 &format!(
                     "PR #{} on {} — block[ci] retry limit ({}) reached from @{}. \
                      Task {} marked blocked. Operator review required.",
@@ -1710,6 +1740,7 @@ async fn handle_block_ci(
     if let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P2,
             &format!(
                 "PR #{} on {} — VERDICT: block[ci] from @{}. \
                  CI-fix dispatch preparing (attempt {new_count}/{BLOCK_CI_MAX_RETRIES}). Task: {}",
@@ -1867,6 +1898,7 @@ async fn handle_escalate(
     if let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P0,
             &format!(
                 "PR #{} on {} — VERDICT: block[{reason}] from @{}. \
                  Task {} marked blocked. Operator review required.",
@@ -1934,6 +1966,7 @@ async fn hold_review_without_task(
     if let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P2,
             &format!(
                 "PR #{} on {} — VERDICT: hold[review] from @{}, and no active task matches this \
                  PR. Handed back to the operator: no task is created and nothing is dispatched \
@@ -2036,6 +2069,7 @@ async fn handle_hold_review(
     if let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P2,
             &format!(
                 "PR #{} on {} — VERDICT: hold[review] from @{}. \
                  Awaiting operator decision. Task: {}",
@@ -2161,6 +2195,7 @@ async fn handle_missing_verdict(
         if let Some(sender) = message_sender {
             send_notification(
                 sender,
+                NotificationSeverity::P2,
                 &format!(
                     "PR #{} on {} — no parseable VERDICT line in review from @{}. \
                      Operator attention needed. Task: {}",
@@ -2192,6 +2227,7 @@ async fn handle_missing_verdict(
         if let Some(sender) = message_sender {
             send_notification(
                 sender,
+                NotificationSeverity::P2,
                 &format!(
                     "PR #{} on {} — no parseable VERDICT line in review from @{}. \
                      No active task found. Operator attention needed.",
@@ -2345,6 +2381,7 @@ async fn pr_circuit_breaker_check(
     if let Some(sender) = message_sender {
         send_notification(
             sender,
+            NotificationSeverity::P0,
             &format!(
                 "PR #{} on {} — circuit breaker tripped after {} blocking-verdict observations \
                  in {} min. Latest from @{}. Autonomous dispatch halted — operator triage required.",
@@ -2633,6 +2670,7 @@ async fn check_identical_diff_circuit_breaker(
         if let Some(sender) = message_sender {
             send_notification(
                 sender,
+                NotificationSeverity::P0,
                 &format!(
                     "PR #{} on {} — identical-diff circuit breaker fired ({verdict_class}). \
                      Same diff (SHA: {}) rejected {identical_count}x. \
@@ -2695,18 +2733,45 @@ fn truncate_body_for_log(body: &str) -> &str {
     &body[..boundary]
 }
 
-/// Send a notification via the message sender, absorbing errors.
-async fn send_notification(sender: &Arc<dyn MessageSender>, message: &str) {
-    match sender.send(message).await {
+/// Send a notification via the message sender, absorbing errors — the **only**
+/// way out of this module towards the operator (mika#1381 vol 2).
+///
+/// `severity` is a parameter, not a choice of helper, and it has no default: a
+/// new notification site cannot compile without naming its tier. `P0` — "the
+/// loop is dead, a human must step in" — is routed to
+/// `MIKA_OPERATOR_ESCALATION_CHAT_ID` when one is configured, and to the normal
+/// chat with a named WARN when not; `P2` goes to the chat the operator may mute.
+///
+/// It sits in **second** position because thirteen of the sixteen sites pass a
+/// multi-line `format!`: at the tail of such a call the tier would be a line a
+/// reviewer scrolls past, here it reads on the line that opens the call.
+async fn send_notification(
+    sender: &Arc<dyn MessageSender>,
+    severity: NotificationSeverity,
+    message: &str,
+) {
+    report_notification_outcome(sender.send_with_severity(message, severity).await, severity);
+}
+
+/// Shared outcome handling for both tiers — one copy, so what gets logged cannot
+/// drift from one tier to the other.
+fn report_notification_outcome(
+    outcome: anyhow::Result<crate::messaging::SendOutcome>,
+    severity: NotificationSeverity,
+) {
+    match outcome {
         Ok(crate::messaging::SendOutcome::Delivered) => {}
         Ok(crate::messaging::SendOutcome::Failed { reason }) => {
-            warn!(reason = %reason, "Verdict handler notification delivery failed");
+            warn!(reason = %reason, severity = severity.as_str(), "Verdict handler notification delivery failed");
         }
         Ok(crate::messaging::SendOutcome::NoChannel) => {
-            warn!("Verdict handler notification skipped — no reply channel (chat_id=0)");
+            warn!(
+                severity = severity.as_str(),
+                "Verdict handler notification skipped — no reply channel (chat_id=0)"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Failed to send verdict handler notification");
+            warn!(error = %e, severity = severity.as_str(), "Failed to send verdict handler notification");
         }
     }
 }
@@ -4860,8 +4925,17 @@ mod mika2667_tests {
     async fn run(db: &AsyncDatabase, text: &str) -> VerdictAction {
         let tmp = tempfile::tempdir().unwrap();
         let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
-        try_handle_pr_review_verdict(text, db, None, None, "mika2667-session", "trace", &skills)
-            .await
+        try_handle_pr_review_verdict(
+            text,
+            db,
+            None,
+            None,
+            None,
+            "mika2667-session",
+            "trace",
+            &skills,
+        )
+        .await
     }
 
     async fn audit(db: &AsyncDatabase, tool: &str, pr: u64) -> i64 {
@@ -4977,6 +5051,536 @@ mod mika2667_tests {
             assert!(
                 !err.contains("hold_review_without_task_no_dispatch"),
                 "{err}"
+            );
+        }
+    }
+}
+
+/// Tests négatifs de mika#1381 — ce que la frontière `MessageSender` ne doit
+/// **jamais** observer. Module séparé, comme `mika2667_tests`, pour que ses
+/// imports nomment exactement la surface sous test.
+#[cfg(test)]
+mod mika1381_tests {
+    use super::{MessageSender, NotificationSeverity, send_notification};
+    use anyhow::Result;
+    use std::sync::Arc;
+
+    // --- l'état interdit --------------------------------------------------
+    //
+    // Depuis la fusion des deux aides (mika#1381 vol 2), l'état interdit s'est
+    // déplacé. Il n'est plus « l'appelant a choisi la mauvaise aide » — il n'y
+    // en a plus qu'une, et son paramètre `severity` n'a pas de défaut, donc
+    // **omettre** la sévérité ne compile pas. Ce qui reste observable au niveau
+    // de l'aide, et que ces deux tests tiennent, c'est : **la sévérité que le
+    // site a nommée est-elle encore celle que la frontière voit ?**
+    //
+    // La question n'est pas rhétorique, et c'est le défaut du trait qui la
+    // rend réelle : `MessageSender::send_with_severity` a un corps par défaut
+    // qui appelle `self.send(text)` et **perd l'axe de sévérité en route**. Une
+    // aide qui repasserait par `send` — la forme d'avant le vol 1,
+    // textuellement — rendrait toujours `Delivered`, et le P0 atterrirait sur
+    // le chat que l'opérateur peut muter : le diagnostic #4 de *Loop
+    // Trustworthiness*, l'alarme dans le vide. D'où l'observation de la
+    // **sévérité au passage de la frontière**, jamais du résultat de l'envoi.
+    //
+    // Ce que ces deux tests ne tiennent pas, et qui n'est pas observable ici :
+    // qu'un site donné nomme le bon palier. Cela ne se ferme que site par
+    // site — `ci_failure_handler.rs` §
+    // `mika1381_un_accuse_de_surface_natteint_pas_la_surface_jamais_muette`
+    // pour le seul des seize qui soit atteignable depuis un test unitaire.
+
+    /// Sentinelle enregistrée quand une notification franchit la frontière par
+    /// l'entrée **sans axe de sévérité**, `MessageSender::send`.
+    ///
+    /// Plus aucun chemin de ce module n'y mène : l'aide fusionnée appelle
+    /// toujours `send_with_severity`. Cette valeur observée est donc le témoin
+    /// d'une **fuite de sévérité** — un chemin qui l'a perdue en route — et non
+    /// un échafaudage de test. Sur un vrai `GatewayMessageSender`, `send`
+    /// délègue à `send_with_severity(.., P2)` et se route vers le chat normal,
+    /// celui que l'opérateur peut muter.
+    const SEVERITE_ABSENTE: &str = "aucune-severite";
+
+    /// Un double qui enregistre la sévérité portée par chaque notification au
+    /// passage de la frontière `MessageSender`.
+    ///
+    /// Surcharger les **deux** entrées est ce qui rend l'observation possible :
+    /// le défaut du trait `send_with_severity` délègue à `send` et *perd* la
+    /// sévérité, donc un double qui ne surcharge que `send` ne peut pas
+    /// distinguer un P0 d'un P2 — il enregistrerait les deux à l'identique et
+    /// le test passerait au vert sur l'état interdit.
+    ///
+    /// L'entrée `send` n'est donc pas de l'échafaudage : depuis la fusion des
+    /// deux aides (mika#1381 vol 2), aucun chemin de ce module n'y mène, et
+    /// voir [`SEVERITE_ABSENTE`] dans `observe()` est le témoin d'une **fuite
+    /// de sévérité** — l'aide a perdu l'axe en route. C'est la panne que les
+    /// `assert_ne!` du vol 1 laissaient passer du côté P2, où seule
+    /// l'inégalité avec `P0` était assertée.
+    #[derive(Default)]
+    struct SeverityRecordingSender {
+        franchissements: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl SeverityRecordingSender {
+        fn observe(&self) -> Vec<(String, String)> {
+            self.franchissements.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageSender for SeverityRecordingSender {
+        async fn send(&self, text: &str) -> Result<crate::messaging::SendOutcome> {
+            self.franchissements
+                .lock()
+                .unwrap()
+                .push((text.to_string(), SEVERITE_ABSENTE.to_string()));
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+
+        async fn send_with_severity(
+            &self,
+            text: &str,
+            severity: NotificationSeverity,
+        ) -> Result<crate::messaging::SendOutcome> {
+            self.franchissements
+                .lock()
+                .unwrap()
+                .push((text.to_string(), severity.as_str().to_string()));
+            Ok(crate::messaging::SendOutcome::Delivered)
+        }
+    }
+
+    /// **Test négatif (règle 13).** État interdit : un site nomme `P0`, et la
+    /// frontière observe autre chose.
+    ///
+    /// L'assertion est sur la **valeur** observée, pas sur deux `!=` : depuis
+    /// la fusion, « ce n'est pas `P2` » et « ce n'est pas la sentinelle » ne
+    /// couvrent plus l'espace — l'énumération peut gagner un palier, et un
+    /// troisième nom passerait les deux `!=` en escaladant sur rien. Ce que la
+    /// valeur attendue ferme, et que l'inégalité laissait ouvert, c'est le
+    /// chemin : seul `send_with_severity` rend `"p0"`, donc une aide repassée
+    /// par `MessageSender::send` rend la sentinelle et rougit ici.
+    ///
+    /// Ce que ce test **n'**assertionne **pas**, délibérément : que l'envoi
+    /// réussisse. Le code d'avant le vol 1 rendait déjà `Delivered` en
+    /// atterrissant sur le chat mutable — c'est précisément pourquoi aucune
+    /// assertion d'issue ne peut tenir l'invariant.
+    #[tokio::test]
+    async fn mika1381_un_p0_de_handler_natteint_jamais_la_surface_mutable() {
+        let temoin = Arc::new(SeverityRecordingSender::default());
+        let sender: Arc<dyn MessageSender> = temoin.clone();
+
+        // La forme verbatim du site `verdict_handler.rs` ~:1868 — `VERDICT:
+        // block[security]`, classe P0 nommée par mika#1381.
+        send_notification(
+            &sender,
+            NotificationSeverity::P0,
+            "PR #2813 on senara-solutions/mika — VERDICT: block[security] from @mika-qa. \
+             NO auto-dispatch. Manual intervention required.",
+        )
+        .await;
+
+        let observe = temoin.observe();
+        assert_eq!(
+            observe.len(),
+            1,
+            "le P0 doit franchir la frontière exactement une fois"
+        );
+        let (_, severite) = &observe[0];
+
+        assert_eq!(
+            severite,
+            NotificationSeverity::P0.as_str(),
+            "état interdit : le site a nommé P0 et la frontière observe {severite}. \
+             `{SEVERITE_ABSENTE}` signifie que l'aide est repassée par `MessageSender::send`, \
+             l'entrée sans axe de sévérité que GatewayMessageSender résout vers le chat normal \
+             — l'alarme « la boucle est morte » est redevenue mutable, c'est-à-dire le \
+             diagnostic #4 de Loop Trustworthiness, l'alarme dans le vide. Toute autre valeur \
+             est une inversion de sévérité en route"
+        );
+    }
+
+    /// **Test négatif (règle 13), moitié symétrique.** État interdit : un site
+    /// nomme `P2`, et la frontière observe autre chose.
+    ///
+    /// Cette direction n'a pas de précédent dans le code livré, mais c'est la
+    /// panne sans laquelle la séparation en deux paliers ne vaut rien : une
+    /// surface « jamais mutée » qui reçoit les dix-sept classes est une surface
+    /// qui finira mutée — et les deux paliers se taisent alors ensemble. Avec
+    /// une seule aide, plus rien ne sépare structurellement les huit sites
+    /// routine des cinq sites de rupture : ce test est ce qui reste quand
+    /// quelqu'un « harmonisera » la sévérité par défaut de l'aide.
+    #[tokio::test]
+    async fn mika1381_un_p2_de_handler_nescalade_jamais() {
+        let temoin = Arc::new(SeverityRecordingSender::default());
+        let sender: Arc<dyn MessageSender> = temoin.clone();
+
+        // La forme d'un des huit sites P2 — un accusé de réception où la
+        // machine a fait son travail.
+        send_notification(
+            &sender,
+            NotificationSeverity::P2,
+            "PR #2813 on senara-solutions/mika — VERDICT: pass from @mika-qa. Merging.",
+        )
+        .await;
+
+        let observe = temoin.observe();
+        assert_eq!(
+            observe.len(),
+            1,
+            "le P2 doit franchir la frontière exactement une fois"
+        );
+        let (_, severite) = &observe[0];
+
+        assert_eq!(
+            severite,
+            NotificationSeverity::P2.as_str(),
+            "état interdit : le site a nommé P2 et la frontière observe {severite}. `p0` fait \
+             atterrir un accusé de réception routine sur la surface jamais mutée — qui finira \
+             mutée, et les deux paliers se taisent ensemble. `{SEVERITE_ABSENTE}` est une fuite \
+             de sévérité : le routage retombe sur le chat normal par accident et non par choix"
+        );
+    }
+}
+
+/// mika#2965 — AC2 : **ce handler-ci** lit la CI en `app` quand l'App est là, en
+/// `pat` sinon.
+///
+/// # Pourquoi ce test est inline et pas sous `tests/eval/`
+///
+/// Il installe un abonné `tracing` de capture, et le site d'installation unique
+/// de mika#2646 — `crate::test_utils::test_helpers::install_capturing_subscriber`
+/// — est `#[cfg(test)]`, donc hors d'atteinte d'une cible d'intégration. Un
+/// second site d'installation écrit pour l'occasion est exactement ce que ce
+/// ticket-là a retiré.
+///
+/// # Ce qu'il mesure, et ce qui le rend falsifiable
+///
+/// Les **deux** provenances dans le **même** corps, sur **deux numéros de PR
+/// distincts**, et chaque ligne est assertée sur son numéro. C'est cette
+/// croisée qui porte tout : deux tests séparés, ou une assertion sur `source`
+/// seule, resteraient verts sur un arbre où le champ est écrit en dur, ou sur un
+/// arbre où le paramètre est ignoré et la source toujours `pat`. Même raison que
+/// `pr_merge_with_gate.rs § mika2963_ac4_la_provenance_est_dite`, dont ce test
+/// est la suite : là-bas l'émetteur était appelé à nu, ici il est atteint **à
+/// travers le handler**, par le chemin de production entier.
+///
+/// # Les quatre portes à franchir avant la lecture, et pourquoi elles comptent
+///
+/// Un test naïf de ce chemin est **vert sans jamais lire la CI** : la
+/// classification de périmètre est fail-closed, donc un `gh` absent la fait
+/// retomber sur `DecisionCore` et le handler rend `Handled` **avant** la
+/// lecture. Il faut donc, dans l'ordre : `state == "approved"` ; un auteur égal
+/// à [`mika_common::forge_identity::REVIEWER_FORGE_LOGIN`] ; une liste de
+/// fichiers que `perimeter` classe MECHANICAL — d'où le faux `gh` qui répond
+/// `docs/plans/…` à `pr view --json files` ; et une tâche `in_progress` portant
+/// l'URL de la PR. L'absence de la ligne de capture **est** le signal qu'une de
+/// ces portes a fermé plus tôt, et le message d'assertion le dit.
+///
+/// Le faux `gh` répond ensuite un check au `bucket: "fail"`, pour que le flot
+/// s'arrête **juste après** la lecture : `classify_checks` rend `HasFailures`,
+/// `link: null` désarme la relance de mika#2617 sans un appel de plus, et le
+/// handler rend un `Passthrough`. Aucun merge, aucun effet de bord sur la forge.
+///
+/// `#[serial_test::serial]` pour deux raisons indépendantes : `set_var("PATH")`
+/// est un état de processus, et l'abonné de capture touche le cache de
+/// callsites global — dont la doc de `install_capturing_subscriber` dit que
+/// `#[serial]` est « la moitié porteuse ».
+#[cfg(test)]
+mod mika2965_tests {
+    use super::{VerdictAction, try_handle_pr_review_verdict};
+    use crate::async_db::AsyncDatabase;
+    use crate::db::NewTask;
+    use mika_common::config::Settings;
+    use mika_common::github_app::GitHubApp;
+    use std::path::Path;
+
+    const REPO: &str = "senara-solutions/mika";
+    const SESSION: &str = "mika2965-session";
+    /// La PR lue avec le jeton d'installation de l'App.
+    const PR_APP: u64 = 29651;
+    /// La PR lue avec le PAT, faute d'App.
+    const PR_PAT: u64 = 29652;
+    const JETON_APP: &str = "ghs-app-mika2965-ne-doit-jamais-fuiter";
+    const JETON_PAT: &str = "ghp-pat-mika2965-ne-doit-jamais-fuiter";
+
+    // --- le harnais ------------------------------------------------------
+    //
+    // `PathGuard` / `prepend_to_path` / `install_fake_gh` reprennent la forme de
+    // `wip_rescue.rs § mod tests`, et l'abonné de capture celle de
+    // `pr_merge_with_gate.rs § abonne_capteur`.
+
+    struct PathGuard(Option<std::ffi::OsString>);
+
+    impl Drop for PathGuard {
+        fn drop(&mut self) {
+            // SAFETY: le test est `#[serial]`, la fenêtre est bornée au corps.
+            unsafe {
+                match self.0.take() {
+                    Some(prev) => std::env::set_var("PATH", prev),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
+    fn prepend_to_path(dir: &Path) -> PathGuard {
+        let previous = std::env::var_os("PATH");
+        let mut next = std::ffi::OsString::from(dir);
+        if let Some(prev) = &previous {
+            next.push(":");
+            next.push(prev);
+        }
+        // SAFETY: voir la note du garde ci-dessus.
+        unsafe { std::env::set_var("PATH", &next) };
+        PathGuard(previous)
+    }
+
+    /// Le faux `gh`, en tête de `PATH`.
+    ///
+    /// Le répertoire est **cuit dans le texte du script** et non passé par
+    /// l'environnement : `run_gh_subprocess` appelle `scrub_mika_env_vars`, donc
+    /// aucune variable `MIKA_*` n'atteint l'enfant. `PATH`, lui, survit — c'est
+    /// la seule couture disponible sur ce chemin.
+    fn install_fake_gh(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir.display();
+        let corps = format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> {d}/calls.log\n\
+             if [ \"$1 $2\" = \"pr view\" ]; then\n\
+             \x20 echo '{{\"files\":[{{\"path\":\"docs/plans/2026-11-01-006-mika2965.md\"}}]}}'\n\
+             \x20 exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"pr checks\" ]; then\n\
+             \x20 echo '[{{\"name\":\"Check\",\"state\":\"FAILURE\",\"bucket\":\"fail\",\"link\":null}}]'\n\
+             \x20 exit 0\n\
+             fi\n\
+             exit 1\n"
+        );
+        let path = dir.join("gh");
+        std::fs::write(&path, corps).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn abonne_capteur() -> (
+        impl tracing::Subscriber + Send + Sync,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let tampon = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plume = tampon.clone();
+        let couche = tracing_subscriber::fmt::layer()
+            .with_writer(move || PlumeDeCapture(plume.clone()))
+            .with_ansi(false)
+            .with_target(true);
+        (tracing_subscriber::registry().with(couche), tampon)
+    }
+
+    struct PlumeDeCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for PlumeDeCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // --- les fixtures ----------------------------------------------------
+
+    async fn db() -> AsyncDatabase {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        db.create_session(SESSION, "mika", "github").await.unwrap();
+        db
+    }
+
+    /// Une tâche `in_progress` portant l'URL de la PR — la quatrième porte.
+    async fn seed_task(db: &AsyncDatabase, pr: u64) {
+        let id = db
+            .create_task(NewTask {
+                agent_id: "mika".to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 0,
+                label: format!("mika#2965 fixture PR #{pr}"),
+                trigger_type: "manual".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "none".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: None,
+                created_trace_id: None,
+                reference_url: None,
+                source: None,
+                metadata: None,
+                r#type: None,
+                dispatch_class: None,
+            })
+            .await
+            .unwrap();
+        db.update_task_metadata(
+            &id,
+            &format!(r#"{{"claude_pilot":{{"pr_url":"https://github.com/{REPO}/pull/{pr}"}}}}"#),
+        )
+        .await
+        .unwrap();
+        db.update_task_status(&id, "in_progress").await.unwrap();
+    }
+
+    /// L'événement tel que le gateway le formate : `approved`, par l'identité de
+    /// revue, corps `VERDICT: pass`.
+    fn review(pr: u64) -> String {
+        let relecteur = mika_common::forge_identity::REVIEWER_FORGE_LOGIN;
+        format!(
+            "[GitHub] PR review (approved) on {REPO}#{pr} (fix: mika#2965) by @{relecteur}\n\
+             https://github.com/{REPO}/pull/{pr}#pullrequestreview-1\n\
+             \n\
+             VERDICT: pass\n\nRAS."
+        )
+    }
+
+    /// Un `Settings` ne portant que le PAT — le repli de `resolve_ci_read_token`.
+    fn settings_avec_pat() -> Settings {
+        let mut s = Settings::test_defaults();
+        s.github_token = Some(secrecy::SecretString::from(JETON_PAT.to_string()));
+        s
+    }
+
+    async fn passe(
+        db: &AsyncDatabase,
+        pr: u64,
+        ci_read_token: Option<&mika_common::ci_read::CiReadToken>,
+    ) -> VerdictAction {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = crate::skills::SkillRegistry::from_dir(tmp.path());
+        try_handle_pr_review_verdict(
+            &review(pr),
+            db,
+            // Le jeton de **post** reste le PAT : AC3 dit que les identités de
+            // post ne bougent pas, et la lecture de périmètre (`pr view`) passe
+            // par lui, pas par le jeton de lecture CI.
+            Some(JETON_PAT),
+            ci_read_token,
+            None,
+            SESSION,
+            &format!("trace-2965-{pr}"),
+            &skills,
+        )
+        .await
+    }
+
+    /// La ligne `ci_read_token_source` de la source demandée.
+    fn ligne_de_source<'a>(capture: &'a str, source: &str) -> &'a str {
+        capture
+            .lines()
+            .find(|l| l.contains("ci_read_token_source") && l.contains(&format!("\"{source}\"")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "mika#2965 AC2 — aucune ligne `ci_read_token_source` de source \
+                     `{source}` dans la capture. Soit le handler ne reçoit pas le jeton \
+                     résolu, soit le flot s'est arrêté AVANT la lecture CI : la \
+                     classification de périmètre est fail-closed, donc un faux `gh` qui \
+                     ne répond pas `docs/plans/…` à `pr view --json files` fait rendre \
+                     `Handled` sans jamais lire la CI — et le test serait vert sans rien \
+                     mesurer.\n\ncapture :\n{capture}"
+                )
+            })
+    }
+
+    /// **T1 — AC2.** Le handler lit la CI en `app` puis en `pat`, et chaque
+    /// provenance est attachée à SA lecture.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika2965_ac2_le_handler_lit_la_ci_en_app_puis_en_pat() {
+        let bac = tempfile::tempdir().unwrap();
+        install_fake_gh(bac.path());
+        let _chemin = prepend_to_path(bac.path());
+
+        let db = db().await;
+        seed_task(&db, PR_APP).await;
+        seed_task(&db, PR_PAT).await;
+
+        let reglages = settings_avec_pat();
+        let app = GitHubApp::new_with_test_token(JETON_APP).await;
+
+        let (abonne, tampon) = abonne_capteur();
+        let (action_app, action_pat) = {
+            let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(abonne);
+
+            // Passe 1 — l'App est là : `resolve_ci_read_token` rend sa source.
+            let resolu_app = reglages.resolve_ci_read_token(Some(&app)).await;
+            let a = passe(&db, PR_APP, resolu_app.as_ref()).await;
+
+            // Passe 2 — aucune App : le même résolveur retombe sur le PAT.
+            let resolu_pat = reglages.resolve_ci_read_token(None).await;
+            let p = passe(&db, PR_PAT, resolu_pat.as_ref()).await;
+            (a, p)
+        };
+
+        let capture = String::from_utf8(tampon.lock().unwrap().clone()).expect("capture UTF-8");
+
+        // Contrôle positif du flot : les deux passes doivent s'être arrêtées sur
+        // le bras « CI rouge », qui est la toute première décision APRÈS la
+        // lecture. Toute autre issue signale une porte fermée plus tôt.
+        for (quoi, action) in [("app", &action_app), ("pat", &action_pat)] {
+            match action {
+                VerdictAction::Passthrough {
+                    enrichment: Some(e),
+                } => assert!(
+                    e.contains("CI checks are failing"),
+                    "passe `{quoi}` : le flot devait s'arrêter juste après la lecture CI, \
+                     sur le bras des checks rouges. Enrichissement : {e}"
+                ),
+                autre => panic!(
+                    "passe `{quoi}` : le flot n'a pas atteint la lecture CI — une des \
+                     quatre portes (approved, identité de revue, périmètre MECHANICAL, \
+                     tâche `in_progress`) a fermé plus tôt. Obtenu : {autre:?}"
+                ),
+            }
+        }
+
+        // AC2 — et c'est la croisée qui porte : chaque source est attachée à SA
+        // PR. Une assertion sur `source` seule resterait verte sur un arbre où
+        // le champ est écrit en dur, ou où le paramètre est ignoré.
+        let ligne_app = ligne_de_source(&capture, "app");
+        assert!(
+            ligne_app.contains(&PR_APP.to_string()),
+            "mika#2965 AC2 — la ligne de source `app` doit porter la PR #{PR_APP}, celle \
+             qui a été lue avec le jeton d'installation. ligne = {ligne_app}"
+        );
+        assert!(
+            !ligne_app.contains(&PR_PAT.to_string()),
+            "mika#2965 AC2 — la ligne de source `app` porte la PR #{PR_PAT}, qui a été lue \
+             sans App : la provenance n'est pas attachée à sa lecture. ligne = {ligne_app}"
+        );
+
+        let ligne_pat = ligne_de_source(&capture, "pat");
+        assert!(
+            ligne_pat.contains(&PR_PAT.to_string()),
+            "mika#2965 AC2 — la ligne de source `pat` doit porter la PR #{PR_PAT}, celle \
+             résolue sans App. Le repli au PAT n'est pas une régression : c'est le régime \
+             d'un déploiement sans App, et il doit se dire. ligne = {ligne_pat}"
+        );
+        assert!(
+            !ligne_pat.contains(&PR_APP.to_string()),
+            "mika#2965 AC2 — la ligne de source `pat` porte la PR #{PR_APP}, qui disposait \
+             de l'App : le handler ignore le jeton résolu. ligne = {ligne_pat}"
+        );
+
+        // Le `Debug` de `CiReadToken` rédige le jeton ; aucune ligne de ce
+        // chemin ne doit le réintroduire.
+        for jeton in [JETON_APP, JETON_PAT] {
+            assert!(
+                !capture.contains(jeton),
+                "mika#2965 — le jeton `{jeton}` est apparu dans le log.\n\ncapture :\n{capture}"
             );
         }
     }

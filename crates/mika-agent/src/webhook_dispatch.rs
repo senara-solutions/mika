@@ -18,22 +18,26 @@ pub(crate) use mika_common::github_event_format::READY_LABEL_DISPATCH_MARKER;
 /// retrouve pour la borner à sa cible. Ce qui sort de l'un est exactement ce
 /// qu'il faut borner dans l'autre, donc les deux doivent lire le même octet.
 ///
-/// **Déclarés ICI, en tête de module, et ce n'est pas un choix de mise en
-/// page :** `canonical_tokens`'s `production_sources` tronque chaque fichier à
-/// son premier marqueur d'attribut `cfg(test)` **où qu'il soit, commentaires
-/// compris**, et le doc-comment d'[`ALL_MARKER_CLASSES`] en porte un. Déclarées
-/// plus bas, ces constantes seraient invisibles à
-/// `mika2517_the_fallthrough_domain_has_a_single_definition`, dont
-/// l'anti-vacuité l'a dit en rougissant. Les déplacer ici est ce qui garde ce
-/// scan exact plutôt que vert par troncature — et ce paragraphe lui-même évite
-/// d'écrire la séquence littérale, faute de quoi il tronquerait le fichier juste
-/// au-dessus de la constante qu'il décrit.
-const PR_EVENT_PREFIX: &str = "[GitHub] PR ";
+/// **Déclaré dans `mika_common::github_event_format` depuis mika#2680, et
+/// seulement importé ici :** le producteur de ces deux préfixes est
+/// `mika_gateway::github::format_event_text`, dont le test cross-crate refuse
+/// la dérive producteur/consommateur. Tant que la valeur vivait ici, un
+/// consommateur de plus — la taxonomie [`crate::server::webhook_prefilter`] —
+/// ne pouvait la lire qu'en la recopiant, ce que
+/// `mika2517_the_fallthrough_domain_has_a_single_definition` a refusé en
+/// rougissant. Un `use` n'écrit aucun littéral : le site de définition reste
+/// unique, il a simplement déménagé là où le gateway peut en répondre.
+///
+/// L'`owner` de ce scan est donc désormais `github_event_format.rs`. La
+/// propriété gardée ne change pas d'un octet — un second lecteur qui recopierait
+/// les deux `starts_with` est toujours attrapé — et elle couvre maintenant aussi
+/// ce fichier-ci, qui ne peut plus les réécrire.
+use mika_common::github_event_format::PR_EVENT_PREFIX;
 
 /// Préfixe des événements de territoire ci (suite de checks).
 ///
 /// Même site, même raison que [`PR_EVENT_PREFIX`].
-const CHECK_SUITE_EVENT_PREFIX: &str = "[GitHub] Check suite ";
+use mika_common::github_event_format::CHECK_SUITE_EVENT_PREFIX;
 
 /// True when the message is a `[GitHub]` webhook event in the
 /// **Webhook Fallthrough** domain — i.e., a turn that MUST NOT call
@@ -99,23 +103,74 @@ pub(crate) fn is_webhook_fallthrough_domain(msg: &str) -> bool {
     if msg.starts_with(READY_LABEL_DISPATCH_MARKER) {
         return false;
     }
-    // qa skill territory (Phase 0 prefix surface rows E, F).
+    // Territoire des handlers qa / ci (lignes E, F et G de la surface de
+    // préfixes), **lu en négation depuis le site qui écrit la conjonction** —
+    // [`is_webhook_pr_event_domain`] — plutôt que recopié ici (mika#3004).
     //
-    // Depuis mika#2649 les deux littéraux de préfixe ont un **site de définition
-    // unique** ([`PR_EVENT_PREFIX`], [`CHECK_SUITE_EVENT_PREFIX`]) partagé avec
-    // `webhook_event_target`, qui lit la même frontière depuis l'autre côté : ce
-    // qui sort d'ici est exactement ce qu'il faut borner à sa cible. Même valeur,
-    // même comportement — la matrice à huit lignes de
-    // `test_is_unauthorized_webhook_dispatch_predicate` passe sans modification.
-    if msg.starts_with(PR_EVENT_PREFIX) {
-        return false;
-    }
-    // ci skill territory (Phase 0 prefix surface row G).
-    if msg.starts_with(CHECK_SUITE_EVENT_PREFIX) {
+    // Un seul corps pose la disjonction des deux préfixes ; deux questions la
+    // lisent, de signes opposés. Celle-ci demande « ce tour est-il *hors* de tout
+    // territoire de handler ? » ; le désarmement d'exigence de groom (mika#3004,
+    // `raison_de_desarmement` branche 5) demande « ce tour est-il *dans* l'un
+    // d'eux ? ». Tant que la conjonction s'écrivait deux fois, le premier
+    // territoire ajouté n'en aurait bougé qu'une — et la divergence aurait été
+    // verte à la compilation comme aux tests.
+    //
+    // Depuis mika#2649 les deux littéraux de préfixe ont déjà un **site de
+    // définition unique** ([`PR_EVENT_PREFIX`], [`CHECK_SUITE_EVENT_PREFIX`])
+    // partagé avec `webhook_event_target`, qui lit la même frontière depuis
+    // l'autre côté : ce qui sort d'ici est exactement ce qu'il faut borner à sa
+    // cible. Ce que mika#3004 ajoute est qu'ils ne sont plus lus qu'à **un** seul
+    // endroit de ce domaine. Même valeur, même comportement — la matrice à huit
+    // lignes de `test_is_unauthorized_webhook_dispatch_predicate` passe sans
+    // modification, et `mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs`
+    // devient vrai par construction là où il l'était par coïncidence.
+    if is_webhook_pr_event_domain(msg) {
         return false;
     }
     // Everything else in [GitHub] domain (rows B, C, D, H) is fallthrough.
     true
+}
+
+/// Les deux outils par lesquels un tour dispatche un pilote.
+///
+/// **Site de définition unique de la paire**, lu par les sept prédicats qui
+/// posaient jusqu'ici la même disjonction à la main (mika#2757 D2) :
+///
+///   1. le garde d'anti-fabrication d'argument de dispatch (#1313, inline dans
+///      `run_loop`) ;
+///   2. `ready_label_dispatch_satisfied` (#907/#996/#1089/#1173) ;
+///   3. `webhook_no_unauthorized_dispatch_satisfied` (#910/#1173) ;
+///   4. `deferred_dispatch_satisfied` (mika#1011/#1173) ;
+///   5. `callback_milestone_advance_satisfied`, chemin A (#991/#1173) ;
+///   6. `webhook_milestone_advance_satisfied`, chemin A (#1218) ;
+///   7. `filter_ci_excluded_tools`, qui portait sa propre copie locale
+///      `CI_EXCLUDED_TOOLS` (mika#1324) — supprimée par D2.
+///
+/// **Pourquoi un site unique.** mika#1173 a donné son propre outil à dev-groom
+/// et a dû, dans le même commit, ajouter `run_claude_pilot_groom` à chacun de
+/// ces prédicats ; un oubli y aurait été une porte de dispatch restée ouverte,
+/// verte à la compilation et verte aux tests. mika#2757 ajoute un huitième
+/// lecteur — le désarmement de `required_tools` — qui doit demander *exactement*
+/// la même paire que celle que le tour retire : si les deux listes divergent,
+/// la contradiction que ce ticket ferme se réouvre sans qu'une assertion bouge.
+/// La classe est celle de `grooming_marker` (mika#2158) : une regex recopiée
+/// dont le commentaire disait « Mirrors … » et qui a manqué deux élargissements.
+///
+/// **Ce qui n'est PAS un huitième site :** le garde d'anti-fabrication de
+/// verdict dev-groom (#1133/#1254, `agent_loop/mod.rs`) teste
+/// `s.name == "run_claude_pilot_groom" && s.success`. Il nomme **un** outil, pas
+/// la paire — son sujet est le verdict de grooming, qu'un `run_claude_pilot`
+/// ordinaire ne produit pas. Le convertir élargirait le garde.
+pub(crate) const DISPATCH_TOOLS: &[&str] = &["run_claude_pilot", "run_claude_pilot_groom"];
+
+/// True quand `name` est l'un des deux outils de dispatch de [`DISPATCH_TOOLS`].
+///
+/// La forme que les sept sites de D2 appellent : ils tiennent un nom d'outil
+/// (`ToolCallSummary::name`, `ToolDefinition::name`) et posent une question
+/// booléenne. Les rares lecteurs qui ont besoin de la liste elle-même — un
+/// `retain` sur un tableau d'outils — lisent [`DISPATCH_TOOLS`] directement.
+pub(crate) fn is_dispatch_tool(name: &str) -> bool {
+    DISPATCH_TOOLS.contains(&name)
 }
 
 /// True when `msg` is the turn `verdict_handler` hands to the LLM for a
@@ -235,6 +290,70 @@ pub(crate) fn is_grooming_intent_message(msg: &str) -> bool {
         trimmed.as_bytes().get(GROOMING_INTENT_VERB.len()),
         Some(b' ' | b'\t')
     )
+}
+
+/// Ce dispatch de groom doit-il prouver le consentement du ticket visé ?
+/// (mika#2772)
+///
+/// # Le prédicat n'est pas « le ticket a-t-il `ready` »
+///
+/// Le 2026-10-17 à 08:59:18Z, un `groom` dans le slug `fix/2762/rollback-reaper-groom`
+/// a matché le mot-clé de dev-groom, armé son `required_tools`, et fait groomer
+/// mika#2766 — un ticket sans `ready` et absent du bassin (48 tours, 3,40 $). Le
+/// consentement positif de mika#841 a donc été contourné par une contrainte
+/// d'outil que personne n'avait demandée.
+///
+/// Un gate `ready` aveugle refuserait pourtant un flux réel :
+/// `/mika-groom-ticket` groome légitimement des tickets non promus, sur dispatch
+/// opérateur en texte libre — c'est sa raison d'être (mika#1173). D'où les trois
+/// axes, et pas un seul :
+///
+/// - **la classe** : seul `groom` est concerné. Un `implement` forcé relève
+///   d'une autre question (hors périmètre de mika#2772, cf. § 7 du plan). La
+///   comparaison porte sur la sortie de
+///   `crate::skills::executor::derive_dispatch_class`.
+/// - **le forçage** : `forced` vient de `LongRunningContext::tool_constraint_forced`,
+///   écrit au seul site qui dise au modèle « appelle cet outil » — l'arm de
+///   re-prompt `required_tools` de `run_loop`.
+/// - **la demande** : une intention de grooming explicite rend le dispatch
+///   *demandé*, et le consentement du ticket n'est alors plus la bonne question.
+///
+/// # `intent` arrive **masqué**
+///
+/// L'appelant passe `originating_message` après
+/// `mika_common::github_event_format::mask_cited_branch` (mika#2755/#2768). Sans
+/// ce masque, le slug `fix/2762/rollback-reaper-groom` du texte de l'incident
+/// contient `groom` et un `starts_with` nu lirait l'événement de branche comme
+/// une demande de grooming — c'est-à-dire exactement l'incident, relu comme
+/// consentement. Un test nommé rougit si le masque disparaît du site d'appel.
+pub(crate) fn forced_dispatch_needs_consent(
+    dispatch_class: &str,
+    forced: bool,
+    intent: Option<&str>,
+) -> bool {
+    if dispatch_class != "groom" || !forced {
+        return false;
+    }
+    !intent.is_some_and(is_grooming_intent_message)
+}
+
+/// Ce jeu de labels porte-t-il le consentement positif ? (mika#2772)
+///
+/// Lit [`crate::ready_label::READY_LABEL`] — le label *gouverné*, celui dont
+/// mika#2315 fait de `ready_label.rs` l'écrivain unique — et non le
+/// [`READY_LABEL`] local de ce module, qui nomme le **déclencheur d'événement**
+/// lu par la file webhook. La question posée ici est celle du consentement de
+/// mika#841, pas celle du trigger : les deux constantes portent la même chaîne
+/// aujourd'hui, et c'est précisément pourquoi le site de lecture doit dire
+/// laquelle des deux il interroge.
+///
+/// Comparaison insensible à la casse et tolérante au blanc, comme
+/// [`label_read_by_loop`] : un `Ready` renvoyé par l'API est un consentement.
+pub(crate) fn labels_carry_ready(labels: &[String]) -> bool {
+    labels.iter().any(|l| {
+        l.trim()
+            .eq_ignore_ascii_case(crate::ready_label::READY_LABEL)
+    })
 }
 
 /// Owner applied to a bare `<repo>` reference. The loop only ever operates on
@@ -412,6 +531,16 @@ pub(crate) fn dispatchable_repos_display() -> String {
 /// `operator-gated` is here for the reason mika#2123 gave it to the feeder: it
 /// is what makes a promotion refusal *persist*, and `.github/labels.yml`
 /// already promised "No ready label" for it.
+///
+/// **Every name in this list must stay declared in `.github/labels.yml`**, and
+/// `auto_pull::tests::test_exclusion_labels_are_declared_in_labels_yml`
+/// (mika#2790) is what makes that true rather than hoped-for. It iterates on
+/// *this constant*, so a label added here is guarded by the same edit — but a
+/// label added here and *not* declared in the registry turns that test red, by
+/// design: the sync runs with `delete-other-labels: true`, so an undeclared
+/// name is deleted from the repo and from every ticket carrying it, with no
+/// `unlabeled` event and no log, and this exclusion silently stops excluding
+/// (class mika#2127, 48 occurrences in production).
 pub(crate) const OPERATOR_HELD_LABELS: &[&str] = &["blocked", "operator-review", "operator-gated"];
 
 /// The operator-held label carried by `labels`, if any (mika#2263).
@@ -803,6 +932,20 @@ pub(crate) fn webhook_event_target(msg: &str) -> WebhookEventTarget {
 /// même module* est exactement ce qu'elles existent pour permettre — le scan
 /// `mika2517_the_fallthrough_domain_has_a_single_definition` n'accuse que les
 /// fichiers **hors** de ce module.
+///
+/// # Le sens de lecture, depuis mika#3004
+///
+/// **Ce corps est le seul qui écrive la disjonction des deux préfixes, et
+/// [`is_webhook_fallthrough_domain`] le lit désormais en négation.** La section
+/// ci-dessus explique pourquoi cet axe n'est pas *dérivé* du domaine
+/// Fallthrough ; mika#3004 établit la dépendance **inverse**, qui ne contredit
+/// rien : le domaine Fallthrough est le complément de ce territoire *et* du
+/// marqueur de label `ready`, donc il a toujours eu besoin de cette question
+/// — il la posait simplement en recopiant la conjonction.
+///
+/// La conséquence pratique : ne jamais réécrire ce corps en
+/// `!is_webhook_fallthrough_domain(msg) && …`. Ce serait un cycle, et le
+/// quatrième booléen que la section ci-dessus refuse.
 pub(crate) fn is_webhook_pr_event_domain(msg: &str) -> bool {
     msg.starts_with(PR_EVENT_PREFIX) || msg.starts_with(CHECK_SUITE_EVENT_PREFIX)
 }
@@ -1290,6 +1433,46 @@ mod tests {
         ] {
             assert_eq!(fallthrough_marker_class(msg), MARKER_CLASS_OTHER);
         }
+    }
+
+    /// mika#2757 D1 — la paire, dans les deux sens.
+    ///
+    /// La moitié négative seule serait aussi satisfaite par un prédicat qui
+    /// refuse tout ; la moitié positive est ce qui rend la suite non vacuous.
+    /// `run_claude_pilot_groom` est nommé explicitement parce que c'est l'outil
+    /// que mika#1173 a ajouté aux sept sites un par un, et celui que mika#2757
+    /// désarme.
+    #[test]
+    fn mika2757_la_paire_de_dispatch_est_exactement_deux_outils() {
+        assert!(is_dispatch_tool("run_claude_pilot"));
+        assert!(is_dispatch_tool("run_claude_pilot_groom"));
+        assert_eq!(DISPATCH_TOOLS.len(), 2);
+
+        for name in [
+            "create_task",
+            "update_task_status",
+            "send_message",
+            "deploy_mika",
+            "run_gh",
+            "run_claude",
+            "run_claude_pilot_",
+            "",
+        ] {
+            assert!(
+                !is_dispatch_tool(name),
+                "{name} n'est pas un outil de dispatch"
+            );
+        }
+    }
+
+    /// Le prédicat est une appartenance exacte, pas un préfixe : un futur
+    /// `run_claude_pilot_dry_run` ne doit pas hériter du désarmement sans qu'on
+    /// l'ait inscrit dans [`DISPATCH_TOOLS`].
+    #[test]
+    fn mika2757_le_predicat_nest_pas_un_prefixe() {
+        assert!(!is_dispatch_tool("run_claude_pilot_dry_run"));
+        assert!(!is_dispatch_tool("my_run_claude_pilot"));
+        assert!(!is_dispatch_tool("RUN_CLAUDE_PILOT"));
     }
 
     #[test]
@@ -2094,6 +2277,15 @@ mod tests {
     /// Fallthrough, par exemple) créerait deux axes dont la conjonction n'est
     /// plus vide — et deux gardes qui mordent sur la même population sans que
     /// personne ait tranché laquelle décide.
+    ///
+    /// **Depuis mika#3004 l'invariant est vrai par construction** :
+    /// `is_webhook_fallthrough_domain` lit `is_webhook_pr_event_domain` en
+    /// négation au lieu de recopier sa disjonction. Ce test reste, et il reste le
+    /// détecteur 4 : il est ce qui rougit le jour où quelqu'un défait ce sens de
+    /// lecture — en remettant deux `starts_with` ici, ou en retirant le
+    /// `return false` qu'ils gardent. L'invariant n'a pas changé de contenu, il a
+    /// changé de **raison** d'être vrai, et un détecteur qui ne surveille plus
+    /// qu'une raison de tenir surveille toujours quelque chose.
     #[test]
     fn mika2653_les_deux_axes_de_tour_webhook_sont_exclusifs() {
         for (msg, _) in PR_EVENT_DOMAIN_MATRIX {
@@ -2145,5 +2337,125 @@ mod tests {
                  constantes et doivent rendre le même verdict d'appartenance"
             );
         }
+    }
+
+    // ───────── mika#2772 — consentement d'un dispatch forcé ─────────
+
+    /// Le slug de l'incident du 2026-10-17 08:59:18Z. Il porte `groom`, et c'est
+    /// par son mot-clé que `required_tools` s'est armé.
+    const INCIDENT_SLUG: &str = "fix/2762/rollback-reaper-groom";
+
+    /// La matrice de `forced_dispatch_needs_consent` : `(classe, forcé, intention)`
+    /// → le consentement doit-il être prouvé ?
+    ///
+    /// Les trois `false` sont la raison pour laquelle ce n'est pas un gate `ready`
+    /// aveugle : T1 est l'axe de mika#2757 (hors périmètre), T2a le dispatch
+    /// ordinaire, T2b le groom opérateur en texte libre de mika#1173.
+    #[allow(clippy::type_complexity)]
+    const FORCED_CONSENT_MATRIX: &[(&str, bool, Option<&str>, bool, &str)] = &[
+        (
+            "implement",
+            true,
+            None,
+            false,
+            "T1 — un `implement` forcé n'est pas notre axe (mika#2757)",
+        ),
+        (
+            "groom",
+            false,
+            None,
+            false,
+            "T2a — un groom non forcé a été demandé par construction",
+        ),
+        (
+            "groom",
+            true,
+            Some("groom mika#2766"),
+            false,
+            "T2b — le groom opérateur en texte libre de mika#1173 reste permis",
+        ),
+        (
+            "groom",
+            true,
+            None,
+            true,
+            "forcé, et aucun texte d'intention : le consentement doit être prouvé",
+        ),
+    ];
+
+    #[test]
+    fn mika2772_la_matrice_du_consentement_force() {
+        for (class, forced, intent, expected, why) in FORCED_CONSENT_MATRIX {
+            assert_eq!(
+                forced_dispatch_needs_consent(class, *forced, *intent),
+                *expected,
+                "forced_dispatch_needs_consent({class:?}, {forced}, {intent:?}) — {why}"
+            );
+        }
+    }
+
+    /// Le texte d'événement de l'incident n'est **jamais** une demande de groom.
+    ///
+    /// C'est le cas qui pin le § 2.3 du plan : le site d'appel lit l'intention à
+    /// travers `mask_cited_branch` (mika#2755/#2768), et ce test tient les deux
+    /// moitiés de cette décision —
+    ///
+    /// 1. le masque retire bien le slug cité, donc le `groom` qu'il porte ne peut
+    ///    pas atteindre le prédicat d'intention ;
+    /// 2. le verdict est « consentement requis » sur le texte masqué.
+    ///
+    /// La troisième assertion est la lecture **nue**, et elle dit la vérité
+    /// mesurée plutôt que la crainte : `is_grooming_intent_message` est ancré sur
+    /// le DÉBUT du message, donc un slug au milieu d'un texte d'événement ne le
+    /// satisfait pas aujourd'hui, masque ou pas. Le masque est ici une cohérence,
+    /// pas le seul rempart. Ce que les trois ensemble refusent, c'est la dérive
+    /// réaliste : un `is_grooming_intent_message` élargi un jour en recherche de
+    /// sous-chaîne lirait l'incident comme son propre consentement.
+    #[test]
+    fn mika2772_le_texte_devenement_de_lincident_nest_pas_une_demande_de_groom() {
+        let brut = format!(
+            "[GitHub] Check suite success on senara-solutions/mika (branch: {INCIDENT_SLUG})"
+        );
+        let masque = mika_common::github_event_format::mask_cited_branch(&brut);
+
+        assert!(
+            !masque.contains(INCIDENT_SLUG),
+            "le masque doit retirer le slug cité, sinon le `groom` qu'il porte \
+             atteint le prédicat d'intention : {masque:?}"
+        );
+        assert!(
+            forced_dispatch_needs_consent("groom", true, Some(&masque)),
+            "un groom forcé par un événement de branche n'a pas été demandé — \
+             le consentement du ticket visé doit être prouvé"
+        );
+        assert!(
+            forced_dispatch_needs_consent("groom", true, Some(&brut)),
+            "même lu nu, un slug au milieu du texte ne demande pas un groom : \
+             `is_grooming_intent_message` est ancré sur le début du message. Si \
+             cette assertion rougit, le prédicat d'intention est devenu une \
+             recherche de sous-chaîne et désarme la garde dans l'incident exact \
+             qu'elle refuse"
+        );
+    }
+
+    #[test]
+    fn mika2772_labels_carry_ready_lit_le_consentement_positif() {
+        assert!(
+            labels_carry_ready(&["bug".to_string(), "ready".to_string()]),
+            "le label présent est le consentement de mika#841"
+        );
+        assert!(
+            !labels_carry_ready(&["bug".to_string(), "p1-important".to_string()]),
+            "aucun `ready` : pas de consentement"
+        );
+        assert!(
+            labels_carry_ready(&["  Ready ".to_string()]),
+            "la casse et le blanc viennent de l'API, pas de la décision"
+        );
+        assert!(!labels_carry_ready(&[]), "une liste vide ne consent à rien");
+        assert!(
+            !labels_carry_ready(&["ready-to-groom".to_string()]),
+            "la comparaison est sur le label entier, jamais un préfixe"
+        );
     }
 }

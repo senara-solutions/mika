@@ -6,7 +6,13 @@ use tracing::{debug, info, warn};
 use crate::async_db::AsyncDatabase;
 use crate::db::SessionMessage;
 
-const COMPACTION_THRESHOLD: usize = 50;
+/// Le nombre de messages au-delà duquel `maybe_compact` condense.
+///
+/// `pub(crate)` depuis mika#1748 : [`crate::compaction_handsoff`] exprime son
+/// seuil de cérémonie en pourcentage de **cette** constante. Un seul site de
+/// vérité pour le 50 — une seconde constante dériverait en silence le jour où
+/// l'une des deux bouge.
+pub(crate) const COMPACTION_THRESHOLD: usize = 50;
 const CONTEXT_WINDOW: usize = 20;
 const MAX_COMPACTION_BATCH: usize = 100;
 /// Maximum summary size, in **bytes** — `String::len()` is a byte count,

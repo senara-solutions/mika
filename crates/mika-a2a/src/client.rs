@@ -33,22 +33,66 @@ pub const TIMEOUT_ENV: &str = "MIKA_A2A_TIMEOUT_SECS";
 /// caller cannot configure the client to give up before the engine's own
 /// deadline (mika#2297).
 pub fn resolve_send_timeout() -> Duration {
-    fn env_secs(key: &str) -> Option<u64> {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    }
+    resolve_send_timeout_with_floor(None)
+}
+
+/// Resolve the send budget with a **per-agent envelope** as a third candidate to
+/// the floor (mika#2759).
+///
+/// The `client >= total` floor of [`resolve_send_timeout`] reads the *process*
+/// environment; the per-agent envelopes of mika#2189 live in the target agent's
+/// `config.toml`. The two never met, so a call to an agent declaring
+/// `agent_total_timeout_secs = 900` resolved 600 s and abandoned a generation
+/// the engine still had the right to finish — the 2026-09-11 incident that
+/// motivated 300 → 600 in the first place.
+///
+/// `agent_envelope_secs` is what the *engine* attested for the target agent, not
+/// a value this crate resolved: `mika-a2a` knows no home and no `config.toml`,
+/// and doctrine mika#2457 is that spirit attests and the client renders, never
+/// the inverse. `None` therefore means "nothing was attested" and yields exactly
+/// [`resolve_send_timeout`]'s answer — absent is not zero (mika#2331), and an
+/// envelope below the resolved client budget never lowers it.
+pub fn resolve_send_timeout_with_floor(agent_envelope_secs: Option<u64>) -> Duration {
     let secs = resolve_timeout_secs(
         env_secs(TIMEOUT_ENV),
-        env_secs("MIKA_AGENT_TOTAL_TIMEOUT_SECS"),
+        max_opt(
+            env_secs("MIKA_AGENT_TOTAL_TIMEOUT_SECS"),
+            agent_envelope_secs,
+        ),
     );
     Duration::from_secs(secs)
+}
+
+/// Read a `u64` budget, in seconds, from the process environment.
+fn env_secs(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// The larger of two optional budgets, `None` only when both are absent.
+///
+/// `a.max(b)` on `Option<u64>` would already do this (`None < Some(_)` in the
+/// derived order), but naming it says the intent out loud: a missing candidate
+/// must not out-rank a present one, and must not read as zero either.
+fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (some, None) | (None, some) => some,
+    }
 }
 
 /// Pure core of [`resolve_send_timeout`], separated so the `client >= total`
 /// floor is tested without touching process-global env (which races under
 /// parallel tests).
-fn resolve_timeout_secs(a2a: Option<u64>, total: Option<u64>) -> u64 {
+///
+/// Public since mika#2759 so a caller holding a per-agent envelope can assert
+/// the floor covers it without an env dance: the two candidates are an *A2A
+/// client budget* (a default the env overrides) and a *total the client may
+/// never sit below* (whatever its provenance — process env or an attested
+/// per-agent envelope). The resolution is `max`, so a third candidate joins
+/// without a new rule.
+pub fn resolve_timeout_secs(a2a: Option<u64>, total: Option<u64>) -> u64 {
     a2a.unwrap_or(DEFAULT_TIMEOUT.as_secs())
         .max(total.unwrap_or(0))
 }
@@ -232,6 +276,59 @@ mod tests {
         assert_eq!(resolve_timeout_secs(Some(900), Some(600)), 900);
         // An explicit client budget with no total is honored as-is.
         assert_eq!(resolve_timeout_secs(Some(120), None), 120);
+
+        // mika#2759 — the attested per-agent envelope is a *third* candidate to
+        // the same `max`, joined to the process total by `max_opt`. This is the
+        // composition `resolve_send_timeout_with_floor` performs, asserted here
+        // on the pure core so no process-global env is touched.
+        //
+        // The envelope alone: mika-arch's 900 s pulls the 600 s default up —
+        // the defect this ticket exists to close.
+        assert_eq!(resolve_timeout_secs(None, max_opt(None, Some(900))), 900);
+        // Envelope and process total both present: the larger wins, whichever
+        // side it is on. Neither provenance out-ranks the other.
+        assert_eq!(
+            resolve_timeout_secs(None, max_opt(Some(600), Some(900))),
+            900
+        );
+        assert_eq!(
+            resolve_timeout_secs(None, max_opt(Some(900), Some(600))),
+            900
+        );
+        // An envelope *below* the resolved client budget lowers nothing: the
+        // floor is a floor, never a ceiling (mika#2297).
+        assert_eq!(resolve_timeout_secs(None, max_opt(None, Some(120))), 600);
+        assert_eq!(
+            resolve_timeout_secs(Some(900), max_opt(None, Some(120))),
+            900
+        );
+        // Nothing attested is today's behaviour exactly — absent is not zero,
+        // and it must not erase a process total either (mika#2331).
+        assert_eq!(resolve_timeout_secs(None, max_opt(None, None)), 600);
+        assert_eq!(resolve_timeout_secs(None, max_opt(Some(900), None)), 900);
+    }
+
+    /// `max_opt` is the join between two budget provenances, and its whole
+    /// burden is that a *missing* candidate neither wins nor reads as zero
+    /// (mika#2331). `None` survives only when both sides are absent.
+    #[test]
+    fn mika2759_max_opt_never_lets_an_absent_candidate_decide() {
+        assert_eq!(max_opt(None, None), None);
+        assert_eq!(max_opt(Some(900), None), Some(900));
+        assert_eq!(max_opt(None, Some(900)), Some(900));
+        assert_eq!(max_opt(Some(600), Some(900)), Some(900));
+        assert_eq!(max_opt(Some(900), Some(600)), Some(900));
+    }
+
+    /// `resolve_send_timeout()` is the `None` arm of the floored resolver, not a
+    /// second implementation of it: a divergence between the two would mean the
+    /// per-agent floor changed the budget of every caller that attests nothing.
+    #[test]
+    fn mika2759_the_unattested_path_is_the_pre_existing_behaviour() {
+        assert_eq!(
+            resolve_send_timeout(),
+            resolve_send_timeout_with_floor(None)
+        );
     }
 
     /// A recovery read must not inherit the generation-sized budget.

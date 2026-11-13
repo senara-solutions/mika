@@ -422,7 +422,9 @@ impl AsyncDatabase {
             .await
     }
 
-    pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<()> {
+    /// Returns how many rows were cancelled (mika#2456). See
+    /// [`Database::cancel_recurring_task_by_label`].
+    pub async fn cancel_recurring_task_by_label(&self, label: &str) -> Result<usize> {
         // mika#1758 note: this method cancels 0..N recurring rows keyed by
         // (agent_id, label) without returning the affected task ids. Emitting
         // per-row `TaskCancelled` frames would require an extra pre-fetch
@@ -645,6 +647,38 @@ impl AsyncDatabase {
         Ok(transitioned)
     }
 
+    /// Réhabilite une parente `self_dev` de `failed` → `in_progress`
+    /// (mika#3044).
+    ///
+    /// # Aucune `TaskEventFrame` n'est émise, et c'est un choix
+    ///
+    /// Le contrat mika#1758 n'a **pas** de variante pour `failed → in_progress` :
+    /// ses six formes sont `TaskCreated`, `TaskClaimed`, `TaskCancelled`,
+    /// `completed`, `failed` et `TaskDelivered`. `TaskClaimed` appartient à
+    /// `claim_and_fire_task` et dirait une claim qui n'a pas lieu ici. Inventer une
+    /// forme pour un cas unique mettrait sur le fil un évènement qu'aucun
+    /// consommateur ne sait lire ; la réhabilitation se lit dans `audit_events`,
+    /// où [`crate::parent_rehabilitation`] écrit sa ligne.
+    pub async fn promote_task_in_progress(&self, id: &str) -> Result<bool> {
+        let (i, a) = (id.to_owned(), self.agent_id.clone());
+        self.with_db(move |db| db.promote_task_in_progress(&i, &a))
+            .await
+    }
+
+    /// `(id, result)` des enfants de groom de cette parente livrés après
+    /// `since`, `result` brut (mika#3044, condition (c)).
+    pub async fn groom_children_delivered_since(
+        &self,
+        parent_task_id: &str,
+        since: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let a = self.agent_id.clone();
+        let p = parent_task_id.to_owned();
+        let s = since.to_owned();
+        self.with_db(move |db| db.groom_children_delivered_since(&a, &p, &s))
+            .await
+    }
+
     pub async fn update_task_next_fire_at(&self, id: &str, next_fire_at: &str) -> Result<()> {
         let (i, nf) = (id.to_owned(), next_fire_at.to_owned());
         self.with_db(move |db| db.update_task_next_fire_at(&i, &nf))
@@ -844,6 +878,20 @@ impl AsyncDatabase {
         let tk = target_key.to_owned();
         let sn = since.to_owned();
         self.with_db(move |db| db.latest_audit_event_for_target(&a, &tn, &tk, &sn))
+            .await
+    }
+
+    /// La dernière transition d'état inscrite sur `target_key`, quel que soit
+    /// l'outil : `(tool_name, before_value, after_value, created_at)`
+    /// (mika#3044). Une transition est une ligne qui porte un état avant **et**
+    /// après — une ligne de jugement n'en porte qu'un.
+    pub async fn latest_state_transition_for_target(
+        &self,
+        target_key: &str,
+    ) -> Result<Option<crate::evidence::audit::LatestStateTransitionProjection>> {
+        let a = self.agent_id.clone();
+        let tk = target_key.to_owned();
+        self.with_db(move |db| db.latest_state_transition_for_target(&a, &tk))
             .await
     }
 
@@ -1143,14 +1191,17 @@ impl AsyncDatabase {
         Ok(delivered)
     }
 
-    /// Find orphaned parent self_dev tasks whose callback subtask delivered
-    /// without producing a PR. See [`Database::find_orphaned_parent_tasks`].
+    /// Find orphaned parent self_dev tasks of the given `dispatch_class` whose
+    /// callback subtask delivered without producing a PR (mika#2750 added the
+    /// class parameter). See [`Database::find_orphaned_parent_tasks`].
     pub async fn find_orphaned_parent_tasks(
         &self,
         grace_seconds: i64,
+        dispatch_class: &str,
     ) -> Result<Vec<crate::db::OrphanedParentTask>> {
         let a = self.agent_id.clone();
-        self.with_db(move |db| db.find_orphaned_parent_tasks(&a, grace_seconds))
+        let class = dispatch_class.to_string();
+        self.with_db(move |db| db.find_orphaned_parent_tasks(&a, grace_seconds, &class))
             .await
     }
 
@@ -1172,7 +1223,12 @@ impl AsyncDatabase {
     /// No extra agent scoping: the parent row was already selected by
     /// `find_phantom_tracking_tasks`, which is agent-scoped, and a child is
     /// reachable only through its parent's id.
-    pub async fn find_dispatch_children_with_pid(
+    ///
+    /// **`pub(crate)` since mika#2670**, like the sync handle it wraps: outside
+    /// this crate the only door to *which pilot does this task carry?* is
+    /// `live_pilot::resolve_task_pilot`, terminal filter included. This was the
+    /// handle `mika-cli` reached for, and the filter it skipped.
+    pub(crate) async fn find_dispatch_children_with_pid(
         &self,
         parent_task_id: &str,
     ) -> Result<Vec<crate::db::DispatchChild>> {
@@ -1245,6 +1301,28 @@ impl AsyncDatabase {
         let a = self.agent_id.clone();
         let tn = tool_name.to_owned();
         self.with_db(move |db| db.get_audit_event_rows_by_tool_name(&a, &tn))
+            .await
+    }
+
+    /// Les lignes `audit_events` d'un `tool_name` écrites depuis `since`, avec
+    /// leur `created_at`. Enveloppe de
+    /// [`Database::list_audit_events_for_tool_since`] (mika#2922, vol 3).
+    ///
+    /// Contrairement à ses trois voisines ci-dessus, ce n'est pas un helper de
+    /// test : c'est la lecture de production du compte de concordance. Son
+    /// unique lecteur est `flight_verdict_ledger::read_concordance`, et
+    /// `mika2922_ac3_un_seul_lecteur_du_registre` en fait une assertion.
+    ///
+    /// `agent_id` est injecté par l'enveloppe, jamais passé par l'appelant.
+    pub async fn list_audit_events_for_tool_since(
+        &self,
+        tool_name: &str,
+        since: &str,
+    ) -> Result<Vec<crate::db::AuditEventWindowRow>> {
+        let a = self.agent_id.clone();
+        let tn = tool_name.to_owned();
+        let sn = since.to_owned();
+        self.with_db(move |db| db.list_audit_events_for_tool_since(&a, &tn, &sn))
             .await
     }
 
@@ -1737,27 +1815,51 @@ impl AsyncDatabase {
     /// (fail-closed), et les deux motifs de refus de
     /// [`crate::task_state::tasks::GroomConvergence`] sont distincts pour que la
     /// population du correctif reste comptable.
+    ///
+    /// Depuis mika#2981 la preuve doit porter le plan nommé par le callout du
+    /// corps **courant** : `expected_plan` est ce plan, `None` quand le corps
+    /// n'en porte aucun. Contrat complet au site synchrone
+    /// [`crate::db::Database::has_completed_groom_for_issue`].
     pub async fn has_completed_groom_for_issue(
         &self,
         issue_url: &str,
+        expected_plan: Option<&str>,
     ) -> Result<crate::task_state::tasks::GroomConvergence> {
         let a = self.agent_id.clone();
         let u = issue_url.to_owned();
-        self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u))
+        let p = expected_plan.map(str::to_owned);
+        self.with_db(move |db| db.has_completed_groom_for_issue(&a, &u, p.as_deref()))
             .await
     }
 
-    /// The `result` of the most recent terminal groom callback for an issue
-    /// (mika#2545). Two levels of `Option` and they say different things —
-    /// `None` = no groom ever ran, `Some(None)` = a groom ran and its `result`
-    /// column is NULL. See [`crate::db::Database::latest_groom_verdict_for_issue`].
-    pub async fn latest_groom_verdict_for_issue(
+    /// The `result` of **every** terminal groom callback for an issue, newest
+    /// first (mika#2545, reshaped by mika#2795). An **empty** `Vec` = no groom
+    /// ever ran; a `None` element = that callback's `result` column is NULL.
+    /// The caller walks the list and picks the first row that actually carries
+    /// an `Outcome:` line, because the deferred launcher is a terminal groom
+    /// callback too and used to mask the verdict behind it. See
+    /// [`crate::db::Database::groom_callback_results_newest_first`].
+    pub async fn groom_callback_results_newest_first(
         &self,
         issue_url: &str,
-    ) -> Result<Option<Option<String>>> {
+    ) -> Result<Vec<Option<String>>> {
         let a = self.agent_id.clone();
         let u = issue_url.to_owned();
-        self.with_db(move |db| db.latest_groom_verdict_for_issue(&a, &u))
+        self.with_db(move |db| db.groom_callback_results_newest_first(&a, &u))
+            .await
+    }
+
+    /// `(created_at, result)` of the `limit` most recent terminal groom
+    /// callbacks for an issue, newest first (mika#2786). See
+    /// [`crate::db::Database::recent_groom_results_for_issue`].
+    pub async fn recent_groom_results_for_issue(
+        &self,
+        issue_url: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let a = self.agent_id.clone();
+        let u = issue_url.to_owned();
+        self.with_db(move |db| db.recent_groom_results_for_issue(&a, &u, limit))
             .await
     }
 
@@ -1862,6 +1964,53 @@ impl AsyncDatabase {
             db.get_tasks_by_status_and_label(&id, &refs, label_contains.as_deref())
         })
         .await
+    }
+
+    /// Les vols d'implémentation terminés sur un ensemble de **dépôts**
+    /// (mika#2698, élargi par mika#2921).
+    /// Voir [`crate::db::Database::list_finished_implement_flights_in_container`]
+    /// pour la borne temporelle, le motif `LIKE` par dépôt et le filtre de
+    /// statut terminal. `repos` vide ⇒ aucun vol.
+    ///
+    /// **La seule méthode de ce fichier qui ne lit pas `self.agent_id`**, et
+    /// c'est le correctif de mika#2792 : ce handle ne sert que de **connexion**
+    /// — le conteneur n'a qu'une base — et l'`agent_id` qu'il porte n'entre pas
+    /// dans la requête. Le réintroduire re-scoperait la lecture sur l'agent
+    /// qu'un appelant a emprunté par commodité, qui n'est pas celui chez qui
+    /// vivent les vols.
+    ///
+    /// Rend des [`crate::db::tasks::FinishedFlightRow`] depuis mika#2886 : le
+    /// vol **et** le `result` de son dernier enfant pilote, qui vivent sur deux
+    /// lignes différentes de `tasks`.
+    pub async fn list_finished_implement_flights_in_container(
+        &self,
+        since: Option<String>,
+        repos: Vec<String>,
+    ) -> Result<Vec<crate::db::tasks::FinishedFlightRow>> {
+        self.with_db(move |db| {
+            db.list_finished_implement_flights_in_container(since.as_deref(), &repos)
+        })
+        .await
+    }
+
+    /// Les dispatches de groom portant l'une des `issue_urls` (mika#2958,
+    /// vol 2c).
+    /// Voir [`crate::db::Database::list_groom_dispatches_in_container`] pour
+    /// l'ensemble fermé de variantes d'URL, les deux formes de ligne et le
+    /// statut qui sort **brut**. `issue_urls` vide ⇒ aucune ligne.
+    ///
+    /// **La seconde méthode de ce fichier qui ne lit pas `self.agent_id`**, et
+    /// pour la raison de la précédente (mika#2792) : le manager est une tâche de
+    /// processus sans agent, le handle ne sert que de connexion, et re-scoper la
+    /// lecture sur l'agent emprunté la rendrait constamment vide. L'invariant
+    /// est porté par le nom — `…_in_container` — faute de pouvoir l'être par le
+    /// type.
+    pub async fn list_groom_dispatches_in_container(
+        &self,
+        issue_urls: Vec<String>,
+    ) -> Result<Vec<crate::db::tasks::GroomDispatchRow>> {
+        self.with_db(move |db| db.list_groom_dispatches_in_container(&issue_urls))
+            .await
     }
 
     // -- Sessions --
@@ -2486,9 +2635,9 @@ impl AsyncDatabase {
         self.with_db(|db| db.schema_version()).await
     }
 
-    pub async fn vacuum(&self) -> Result<()> {
-        self.with_db(|db| db.vacuum()).await
-    }
+    // `AsyncDatabase::vacuum` a été supprimée par mika#2735 avec son pendant
+    // synchrone `Database::vacuum` ; le raisonnement est au site de ce dernier,
+    // dans la section « Utilities » de `db.rs`.
 
     // -- Customer Config --
 
@@ -3657,8 +3806,9 @@ impl AsyncDatabase {
         .await
     }
 
-    /// Async wrapper for `Database::find_recent_build_invocation` (mika#2565).
-    pub async fn find_recent_build_invocation(
+    /// Async wrapper for `Database::find_recent_tool_invocation` (mika#2565,
+    /// mika#2687).
+    pub async fn find_recent_tool_invocation(
         &self,
         agent_id: &str,
         session_id: &str,
@@ -3669,7 +3819,7 @@ impl AsyncDatabase {
         let session_id = session_id.to_owned();
         let tool_name = tool_name.to_owned();
         self.with_db(move |db| {
-            db.find_recent_build_invocation(&agent_id, &session_id, &tool_name, window_secs)
+            db.find_recent_tool_invocation(&agent_id, &session_id, &tool_name, window_secs)
         })
         .await
     }

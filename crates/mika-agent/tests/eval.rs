@@ -68,6 +68,20 @@ mod eval {
     // course).
     mod test_ci_success_fanout_2260;
     mod test_completion_claim_guard;
+
+    // mika#1748 — la cérémonie de handsoff au plafond de contexte, lue dans le
+    // prompt système que le modèle a reçu, avec son contrôle négatif à un
+    // message près. Les tests unitaires du prédicat et du builder resteraient
+    // verts si l'entonnoir ne comptait jamais les messages.
+    mod test_compaction_handsoff_1748;
+
+    // mika#2805 — le vol 2 du même entonnoir : la déposition est servie au
+    // successeur, le reçu est posé dans le tour servi, et le second tour ne la
+    // ressert pas. Le troisième test est le contrôle négatif de la porte D2 —
+    // le déclencheur est la condensation passée, jamais la présence d'un
+    // fichier.
+    mod test_compaction_handsoff_ritual_2805;
+
     mod test_context_summary_inject;
 
     // mika#2305 — the scope that decided the window is emitted next to the count
@@ -86,10 +100,21 @@ mod eval {
     // model actually received rather than on the predicates that compute it.
     mod test_context_window_budget_2295;
 
+    // mika#2884 — la ligne d'attribution porte la taille du prompt système
+    // (AC1), et c'est la même valeur que celle du voisin qui la rapportait déjà
+    // (AC2). Un unitaire sur l'émetteur resterait vert si le site d'appel
+    // passait `0` ou la longueur d'un autre `String` : seul un tour réel, lu sur
+    // l'événement émis ET sur la requête capturée, relie les deux bouts.
+    mod test_context_window_system_prompt_bytes_2884;
+
     // mika#1951 — the per-call isolation lever, on both cross-session channels,
     // with a negative control for each. The neighbours above cover the
     // identity-declared scope; this one covers a caller narrowing one turn.
     mod test_correction_message_classifier_guard;
+
+    // mika#2944 — un 402 de crédit retient la ligne au lieu de rejouer la revue,
+    // le retour du crédit la relance, et un 429 garde le backoff de mika#2179.
+    mod test_credit_hold_2944;
     mod test_deadline_in_flight_llm_call;
     mod test_session_isolation_1951;
 
@@ -119,6 +144,20 @@ mod eval {
     // mika#2289 AC1 — la porte : `tour mort sur erreur LLM ⇒ verdict posté`.
     // Frère de `test_deadline_verdict_2276`, sur la branche `Err` de `run_agent`.
     mod test_error_verdict_2289;
+
+    // mika#2784 — ce qu'un agent fail-closed reçoit réellement comme outils.
+    // Les unités de `prompt::fail_closed_identity` lisent les champs de la
+    // structure ; elles resteraient vertes si la posture n'était jamais
+    // consultée au moment de publier le tableau. Frère de
+    // `test_mika_arch_tool_allowlist_2748` sur la posture dégradée, contrôle
+    // négatif compris.
+    mod test_fail_closed_tool_surface_2784;
+
+    // mika#2750 — la faucheuse de parents orphelins balaie aussi la classe
+    // `groom` : le contrôle positif (un groom orphelin atteint un état terminal
+    // nommé), le contrôle négatif (pilote vivant ⇒ rien ne bouge) et la
+    // non-régression mot-pour-mot du format de fil de la classe `implement`.
+    mod test_groom_parent_reap_2750;
     // mika#1784 — une image non lue est un fait dit. Les unités de
     // `image_disposition` ne verraient pas un `decide()` appelé au mauvais moment
     // dans la boucle ; ces tests lisent ce que le modèle a reçu.
@@ -137,12 +176,32 @@ mod eval {
     // lent mais borné ne l'est pas.
     mod test_llm_watchdog_2342;
     mod test_max_steps_continuation;
+    // mika#2877 — à la coupure au plafond de steps, le décompte par outil du
+    // tour est exact (AC1), et un tour qui ne s'épuise pas ne l'émet pas (AC2) :
+    // c'est la paire qui est le livrable, un contrôle d'absence seul n'attestant
+    // rien.
+    mod test_max_steps_tool_census_2877;
+    // mika#2943 (règle 13, mika#2264) — le contrôle NÉGATIF du filet de verdict
+    // sur coupure par pas : la conjonction « tour webhook coupé au plafond &
+    // aucune revue de la session & rien sur la PR » n'est pas atteignable. Seul
+    // test du ticket à traverser le joint où le défaut vivait — entre ce que la
+    // boucle sait de sa coupure et ce que le call-site en lit.
+    mod test_max_steps_verdict_2943;
     // mika#2281 — la frontière de secret du canal MCP, mesurée sur un serveur
     // stdio factice : les noms traversent, la valeur non — et le contrôle
     // positif montre qu'elle traverse bel et bien par le canal FICHIER, qui
     // est le chemin réellement exposé.
     mod test_mcp_secret_boundary_2281;
+    // mika#2814 — l'équivalent L2 côté MCP : un outil dont le serveur déclare
+    // `testimony` n'est jamais PUBLIÉ au modèle, qui ne peut donc plus le
+    // proposer. Mesuré sur les octets soumis, avec le contrôle positif
+    // `operational` qui montre que les mêmes noms traversent sans le grade.
+    mod test_mcp_testimony_non_publication_2814;
     mod test_merge_identity_2248;
+    // mika#2748 — le câblage de l'allowlist d'outils, vu sur le tableau que le
+    // modèle a réellement reçu : ni le prédicat (D8) ni le chargement TOML (D9)
+    // ne rougissent si les sites de production ne passent jamais le champ.
+    mod test_mika_arch_tool_allowlist_2748;
     // mika#2304 — le tour dit sous quel modèle il a tourné, et un modèle nommé
     // par l'appelant l'emporte sur la section `[llm]` d'une skill.
     mod test_model_attestation_2304;
@@ -182,6 +241,16 @@ mod eval {
     // mika#2237, et les six abstentions nommées.
     mod test_qa_ci_coherence_2455;
 
+    // mika#2963 — AC3 : sans jeton d'App ni PAT, le gate de merge refuse en
+    // tête. Il ne lit jamais un échec de lecture comme du vert.
+    mod test_ci_read_token_gate_2963;
+
+    // mika#2965 — AC1 : la résolution du jeton de lecture CI est unique dans
+    // `server/handlers.rs`, et les trois handlers webhook la reçoivent. Un scan
+    // de source, parce que deux résolutions successives rendraient le même
+    // jeton et laisseraient tout test de comportement vert.
+    mod test_ci_read_token_handlers_2965;
+
     // mika#2519 — l'exemption de plan dependabot existait deux fois et ne tenait
     // pas : le `block[pipeline]` que Step 1.6 rend inatteignable est refusé
     // avant le sous-processus, et un `pass` sur un saut de MAJEURE exige une
@@ -195,6 +264,11 @@ mod eval {
     // était hors de B2 par `NoMajorJump`. Le contrôle positif (un build en base
     // laisse passer) et les deux abstentions nommées.
     mod test_dependabot_build_evidence_2565;
+
+    // mika#3004 — un tour `pr_review` n'exige plus l'outil de groom : la trace
+    // `3b771914` rejouée, le contrôle de la cause B (`webhook_event_text`
+    // absent) et le contrôle négatif du label `ready` sans PR.
+    mod test_pr_review_no_groom_requirement_3004;
 
     // mika#2334 — la revue ne dépend plus d'un `pull_request.opened` que rien
     // ne rejoue : l'incident rejoué, plus les trois faits de câblage.
@@ -222,6 +296,12 @@ mod eval {
     // mika#2337 — un trigger enregistré a un destinataire (garde de classe),
     // et une mort par trigger inconnu ne gèle plus la récurrence 24 h.
     mod test_recurring_trigger_wiring_2337;
+
+    // mika#2456 — `enabled = false` niveau-agent éteint les récurrentes : la
+    // porte mord, annule la ligne préexistante, ne ressuscite pas, reste
+    // réversible, et `mika tasks rearm` refuse nommément. Avec son contrôle
+    // négatif à un octet d'écart.
+    mod test_agent_disabled_recurring_gate_2456;
 
     // La porte de mika#2277 : le prédicat de kill est une conjonction sur les
     // trois surfaces du pilote. Contrôle positif + N1..N4, même suite.
@@ -252,13 +332,16 @@ mod eval {
     // la boucle en ayant l'air de fermer le ticket.
     mod test_webhook_fallthrough_no_task_2517;
 
-    // mika#2573 — le frère du précédent, sur l'outil voisin : un tour du domaine
-    // Webhook Fallthrough se voit REFUSER les deux verbes `run_gh` qui créent du
-    // travail (`issue create`, `issue edit --add-label ready`), et garde ses
-    // lectures. Les quatre contrôles négatifs sont porteurs : V1/V2 seuls
-    // seraient satisfaits par une garde qui bloque `run_gh` sur tout tour
-    // Fallthrough, c'est-à-dire qui casse le geste de vérification que la SCOPE
-    // RULE du prompt prescrit littéralement.
+    // mika#2573 — le frère du précédent, sur l'outil voisin : les verbes `run_gh`
+    // qui créent du travail sont REFUSÉS, et les lectures passent. Depuis
+    // mika#2995 les deux motifs n'ont plus la même population, et l'asymétrie EST
+    // la décision : `issue create` garde sa borne de mika#2573 (tours Webhook
+    // Fallthrough seulement), la pose de `ready` est refusée sur TOUT tour —
+    // l'incident du 2026-10-31, où mika-dev s'est posé le consentement de
+    // mika#2772 à lui-même, a eu lieu sur un tour ordinaire. Les contrôles
+    // négatifs sont porteurs des deux côtés : V3/V7 séparent « la garde décide »
+    // de « la garde bloque `run_gh` », V6 sépare « la population dépend du
+    // motif » de « la garde refuse tout, partout ».
     mod test_fallthrough_run_gh_refused_2573;
 
     // mika#2653 — second cas mesuré de la même famille, et le plus coûteux : un
@@ -273,12 +356,38 @@ mod eval {
     // `live_pilot` pour ses deux appelants.
     mod test_cancel_task_live_pilot_2653;
 
+    // mika#2654 — troisième de la famille, ajouté par le recensement AC4 de
+    // mika#2649 : un tour ouvert par un événement PR / check-suite ne force pas
+    // la promotion d'un wrapper différé, donc ne choisit pas quel dispatch prend
+    // le créneau de sa classe. Les unitaires posent
+    // `ctx.is_webhook_pr_event_turn` à la main, donc ce fichier est le SEUL à
+    // attester le câblage au site de conversation — c'est la mutation M4 du plan.
+    // Les deux contrôles sont porteurs : le tour de conversation sépare « la
+    // garde décide » de « la garde bloque la promotion forcée » (~42 appels
+    // mesurés hors canal github), et le tour `[GitHub] Issue …` épingle que le
+    // domaine Webhook Fallthrough reste hors périmètre PAR DÉCISION.
+    mod test_promote_deferred_webhook_pr_2654;
+
     // qa-review skill-scoped run_gh validator wiring test (mika#1196)
     mod test_qa_review_run_gh_scope_validator;
 
     // mika#2355 — le callback de build QA poste son verdict : B2 (carve-out
     // #870 + framing) et B3 (garde positive) sur le chemin silencieux réel.
     mod test_qa_build_callback_verdict_2355;
+
+    // mika#2727 — l'AUTRE bout du même tour : le tour d'OUVERTURE de revue,
+    // ouvert par `[GitHub] PR synchronize: …` en mode conversation, qui finissait
+    // en `EndTurn` avec son verdict en texte et rien sur GitHub. AC3a (la garde
+    // tire) et AC3b (contrôle positif : `pr review` ne re-prompte pas) dans le
+    // même fichier, plus le caractère à un coup du re-prompt.
+    mod test_qa_review_submission_2727;
+
+    // mika#2948 — la SUITE du même tour : la revue est postée, et la tête jugée
+    // n'est pas inscrite, donc le pré-filtre (g′) de mika#2917 lit un registre
+    // vide et paie un tour. AC1 (la ligne atteint `audit_events` par l'outil
+    // réel) et AC2 (post refusé, post absent) dans le MÊME test, plus le
+    // caractère à un coup du re-prompt — qui est la population résiduelle d'AC4.
+    mod test_qa_reviewed_head_record_2948;
 
     // mika#1952 — le schéma SERVI en mode réflexion déclare `evidence` requis,
     // les autres modes sont inchangés, et la garde d'exécution reste la seule
@@ -293,6 +402,12 @@ mod eval {
     // « Force EndTurn » de `send_message` (P0, vu rouge avant U1e) et les deux
     // coupures (deadline, max-steps), avec leurs contrôles négatifs.
     mod test_qa_cut_off_verdict_2515;
+
+    // mika#2926 — le budget de pas d'un tour de revue : le corpus rejoué de
+    // `callback-0f07c520` pose son verdict sous le plafond de mika-qa, la MÊME
+    // séquence l'épuise sur un autre agent (c'est ce qui tient AC3), et le WARN
+    // de coupure annonce le plafond SERVI et non celui du déclencheur.
+    mod test_qa_step_budget_2926;
 
     // mika#2358 — la garde 5e sur le chemin de production : une promesse de
     // fréquence sans acteur est refusée, l'aveu d'incapacité passe, et le
@@ -316,4 +431,59 @@ mod eval {
 
     // Compact provider gate: MikaModel request shape regression (mika#1491)
     mod test_compact_provider_gate;
+
+    // Fenêtre de transmission au changement de modèle : le signal posé atteint
+    // le prompt conversationnel, et son contrôle négatif (mika#1747 vol 1)
+    mod test_model_transmission_1747;
+
+    // La moitié entrante du même rituel : la lettre du prédécesseur atteint le
+    // prompt, une seule fois — le second tour sur la même graine ne la rend
+    // plus (mika#2807 vol 2)
+    mod test_incoming_transmission_2807;
+
+    // Le site P0 amiral atteint le transport en P0, bout en bout à travers
+    // `run_agent`, et son contrôle négatif sur le prédicat (mika#1381 vol 3)
+    mod test_dispatch_stall_p0_1381;
+
+    // L'autre moitié de la même propriété : sur le domaine Webhook Fallthrough
+    // l'accusé P2 ne part à personne, la garde reste armée hors du domaine, et
+    // un accusé passé par l'outil `send_message` arrive sans étage — donc la
+    // suppression est une propriété du garde, jamais du routage (mika#1381 vol 4)
+    mod test_p2_ack_suppression_1381;
+
+    // La classe `fabrication-detected` de mika#1381 a enfin un site, et il est
+    // attesté au transport : la récidive de la garde `assert_grounded` part en
+    // P0 porte ouverte, et rien ne part porte fermée — le défaut livré
+    // (mika#2867)
+    mod test_fabrication_detected_p0_2867;
+
+    // Le second site de la même classe, et le créneau devenu typé : la récidive
+    // de la garde `false_local_hosting_claim` (5d) part en P0 porte ouverte,
+    // rien ne part porte fermée, et la revérification à l'acceptation rejoue le
+    // prédicat DU SITE qui a déposé — le fixture ne porte aucune forme
+    // d'`assert_grounded`, donc le prédicat de l'autre site ne peut pas tenir
+    // ce test par accident (mika#2872)
+    mod test_fabrication_detected_p0_2872;
+
+    // Le troisième site de la même classe, et le premier dont la frontière de
+    // classe passe à l'INTÉRIEUR d'un garde : la récidive de 5e
+    // (`unactioned_frequency_promise`) part en P0 sur sa seule moitié « état
+    // accompli », et sa moitié « engagement sur l'avenir » ne lève rien — porte
+    // armée dans les deux cas, donc seule la nature de l'assertion décide
+    // (mika#2879)
+    mod test_fabrication_detected_p0_2879;
+
+    // Le verrou de CLASSE de la même famille, enfin attesté : un tour qui viole
+    // 5d + 5e + assert_grounded à la fois n'émet qu'une P0, et c'est celle du
+    // premier écrivain de la chaîne ; et un engagement sur l'avenir ne prend pas
+    // le créneau du site aval. Les neuf fixtures mono-site des vols 1 à 3 ne
+    // pouvaient pas le voir — c'est leur R6/R7 resté vert (mika#2879, vol 4/4)
+    mod test_fabrication_detected_p0_2879_collision;
+
+    // Le retrait de `ready` au merge tombe AVANT la porte du pré-filtre, donc
+    // avant le tour LLM — la moitié « quand » d'AC1, qui est une question de
+    // callsite et qu'aucun test de comportement ne peut voir : un handler câblé
+    // après la porte retirerait la même étiquette avec les mêmes tests verts
+    // (mika#3022)
+    mod test_ready_cleanup_on_merge_3022;
 }
