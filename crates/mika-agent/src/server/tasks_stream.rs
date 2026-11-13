@@ -5,11 +5,38 @@
 //! delivered / cancelled) is broadcast on an SSE channel. Consumers see live
 //! task state changes without polling `GET /api/v1/tasks`.
 //!
-//! **Wire-first split (mika#1732 v1).** This module ships the SSE surface —
-//! the enum, the channel primitive, the handler, and the route contract.
-//! Emission from `task_engine` transition sites is deferred to a follow-up
-//! ticket; the wire is dormant until that lands. Same pattern as mika#1741
-//! (`permissions_stream.rs`) and mika#1731 (`mika_a2a::streaming`).
+//! **The wire emits. It stopped being dormant at mika#1758** — this module
+//! shipped wire-first under mika#1732 v1 (enum, channel primitive, handler,
+//! route contract, no emission), and the comment that said so outlived the
+//! follow-up by thirteen months. Four facts a consumer needs:
+//!
+//! 1. **Every terminal transition emits, under a guard.** `AsyncDatabase`'s
+//!    wrapper methods call `emit_task_event` *inside* `if transitioned` — the
+//!    guarded SQL UPDATE's own boolean. One frame per real transition; a
+//!    second call on an already-terminal task returns `Ok(false)` and emits
+//!    nothing. That guard is the only thing bounding a consumer to a single
+//!    delivery, so a consumer may treat a frame as an edge, not a level.
+//! 2. **The channel is attached from two sites, both under `server/`:**
+//!    `run_server` (`server/mod.rs`) at startup, and `AppState::resolve_agent`
+//!    (`server/state.rs`) for agents resolved lazily after it. Attachment is a
+//!    `OnceLock` on `AsyncDatabaseInner`, so it happens at most once per
+//!    process.
+//! 3. **Outside a server process the emission is a silent no-op.** The TUI,
+//!    the CLI and most tests never fill that `OnceLock`, so `emit_task_event`
+//!    returns without broadcasting — no error, no log. A consumer running in
+//!    the TUI process must read mika-spirit's SSE route; it will never observe
+//!    a locally-emitted frame, however correct its subscription.
+//! 4. **The channel is per-process, not per-agent.** Frames carry `agent_id`
+//!    and every subscriber sees every agent's; filtering is the consumer's job.
+//!
+//! **Where the measurement lives, before you write another one:**
+//! `tests/task_event_stream.rs` (mika#1758) drives each transition through the
+//! public wrapper surface against a real attached channel and asserts the exact
+//! frame sequence — including the no-frame-on-`Ok(false)` case for every
+//! emitting method. `async_db.rs::tests` holds the finer per-method invariants.
+//! Same wire-first pattern as mika#1741 (`permissions_stream.rs`) and mika#1731
+//! (`mika_a2a::streaming`) — check whether *their* emission landed too before
+//! trusting a dormancy claim in either.
 //!
 //! **Sibling divergence — do not conflate.** Three sibling SSE surfaces
 //! now coexist, each with a deliberate choice of discriminator key + scope:

@@ -20,6 +20,7 @@ pub mod notify;
 pub mod plan_callout;
 pub mod provider;
 pub mod reminders;
+pub mod rewind_remote;
 pub mod setup;
 pub mod skills;
 pub mod skills_variants;

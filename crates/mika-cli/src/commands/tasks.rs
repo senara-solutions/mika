@@ -1,7 +1,11 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{ForcePromoteResult, Task, format_ts};
 use mika_agent::live_pilot::TaskPilot;
+use mika_agent::server::tasks_stream::TaskEventFrame;
 use mika_agent::task_engine::engine::{HANDLER_FAILURE_METADATA_KEY, HandlerFailure};
 use mika_common::config::Settings;
 use serde_json::{Value, json};
@@ -82,7 +86,19 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
-        Some(TaskCommand::Get { id, format }) => {
+        Some(TaskCommand::Get { id, format, spirit }) => {
+            // `--spirit` sort **avant** le chemin local plutôt que dans un `else` :
+            // ré-indenter le corps d'aujourd'hui en ferait des lignes modifiées, là
+            // où le critère 3 le veut identique à l'octet près. Cette porte ne
+            // résout pas de préfixe — le serveur lit par identifiant exact — et ne
+            // sonde pas la vivacité du pilote, qui est locale.
+            if spirit {
+                let url = super::dashboard::spirit_url();
+                let jeton = super::dashboard::auth_token()?;
+                let mut sortie = std::io::stdout();
+                return get_task_detail_from_spirit_into(&url, &jeton, &id, format, &mut sortie)
+                    .await;
+            }
             let resolved_id = match resolve_task_id(db, &id).await? {
                 Some(id) => id,
                 None => {
@@ -394,8 +410,8 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
                 }
             }
         }
-        Some(TaskCommand::Stream { url }) => {
-            stream_task_events(url).await?;
+        Some(TaskCommand::Stream { url, agent }) => {
+            stream_task_events(url, agent).await?;
         }
     }
 
@@ -406,68 +422,637 @@ pub async fn run(args: TaskArgs, agent_name: &str) -> Result<()> {
 /// print each `TaskEventFrame` JSON payload to stdout (one line per frame).
 ///
 /// Diagnostic — not integrated into the TUI. mika#1727 handles TUI consumption.
-async fn stream_task_events(url_override: Option<String>) -> Result<()> {
-    use std::io::Write;
-
+///
+/// Resolving the base URL and the bearer token lives **here**, never under
+/// [`TaskEventStream::open`]: `dashboard::auth_token` reads the process
+/// environment and fails without it, so a consumer resolving its own
+/// credentials could not be driven from a test at all (mika#1727 vol V2b-1b).
+async fn stream_task_events(url_override: Option<String>, agent: Option<String>) -> Result<()> {
     let base_url = url_override.unwrap_or_else(crate::commands::dashboard::spirit_url);
-    let stream_url = format!(
-        "{}/api/v1/dashboard/tasks/stream",
-        base_url.trim_end_matches('/')
-    );
     let token = crate::commands::dashboard::auth_token()?;
 
-    eprintln!("mika#1758 task-event stream: connecting to {stream_url}");
-    let client = reqwest::Client::new();
-    let mut resp = client
-        .get(&stream_url)
-        .header("authorization", format!("Bearer {token}"))
-        .header("accept", "text/event-stream")
-        .send()
-        .await
-        .with_context(|| format!("failed to open SSE stream at {stream_url}"))?;
+    eprintln!(
+        "mika#1758 task-event stream: connecting to {}",
+        stream_url(&base_url)
+    );
+    stream_task_events_into(&base_url, &token, agent.as_deref(), &mut std::io::stdout()).await
+}
 
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!(
-            "mika-spirit returned {} for {}: {}",
-            status,
-            stream_url,
-            resp.text().await.unwrap_or_default()
-        );
-    }
+/// `mika tasks stream`, with its output sink as a parameter.
+///
+/// The sink is a parameter because the property to hold is "one line per `data:`
+/// payload, **and nothing else**", and that is only measurable by comparing the
+/// whole stream to an expected string — which `std::io::stdout()` does not allow
+/// from a Rust test without a subprocess. The two `eprintln!` stay on stderr and
+/// are therefore absent from the sink: that absence *is* the measurement of
+/// "nothing else", not a restatement of it.
+///
+/// `agent_filter` is `--agent` as [`TaskEventStream::consume`] takes it. The
+/// sink gets the **raw** payload either way — the decode travels so the filter
+/// can read it, not so the output changes shape — which is why `None` yields the
+/// output of before the flag existed, to the byte.
+async fn stream_task_events_into<W: std::io::Write>(
+    base_url: &str,
+    token: &str,
+    agent_filter: Option<&str>,
+    out: &mut W,
+) -> Result<()> {
+    let stream = TaskEventStream::open(base_url, token).await?;
     eprintln!("mika#1758 task-event stream: connected. Streaming frames (Ctrl-C to stop).");
 
-    // Minimal SSE frame parser: buffer bytes, split on double-newline event
-    // separator, extract `data: <payload>` lines. Using `Response::chunk()`
-    // avoids pulling the `futures-util` `Stream` extension (workspace dep is
-    // `default-features = false`).
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let stdout = std::io::stdout();
+    stream
+        .consume(agent_filter, |payload, _frame| {
+            let _ = writeln!(out, "{payload}");
+            let _ = out.flush();
+        })
+        .await
+}
 
-    while let Some(chunk) = resp.chunk().await.context("SSE stream read failed")? {
-        buffer.extend_from_slice(&chunk);
+/// The task-events stream URL for a mika-spirit base URL.
+fn stream_url(base_url: &str) -> String {
+    format!(
+        "{}/api/v1/dashboard/tasks/stream",
+        base_url.trim_end_matches('/')
+    )
+}
 
-        // Split on SSE event separator (`\r\n\r\n` / `\n\n` / `\r\r`, spec
-        // § 9.2). Keep the trailing partial event in the buffer for the
-        // next iteration.
-        while let Some((sep_idx, sep_len)) = find_event_separator(&buffer) {
-            let event_bytes: Vec<u8> = buffer.drain(..sep_idx + sep_len).collect();
-            // Drop the trailing separator; parse the remainder line-by-line.
-            let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - sep_len]);
-            for line in event_str.split(['\n', '\r']) {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim_start();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    let mut handle = stdout.lock();
-                    writeln!(handle, "{data}").ok();
-                    handle.flush().ok();
+/// L'agent qu'une trame du fil nomme, quand elle en nomme un.
+///
+/// Le `match` **énumère les huit variantes**, sans bras `_`, et c'est une garde
+/// de structure et non un goût de style : le fil est additif par contrat — « new
+/// variants may ship additively » dit le doc de [`TaskEventFrame`], qui nomme
+/// déjà mika#1734 et mika#1736. Sous un bras `_ => None`, une variante neuve
+/// portant un `agent_id` tomberait **silencieusement** du bon côté du filtre
+/// d'un autre agent. Énumérées, elle ne compile plus ici, et le compilateur
+/// nomme le site qui doit décider.
+///
+/// `None` pour `OverflowMarker` et `Unknown` : ces deux-là ne portent aucun
+/// agent. Ce que le filtre en fait est la décision de
+/// [`TaskEventStream::consume`] — il n'écarte que ce qu'il a **compris** comme
+/// étranger.
+fn frame_agent_id(frame: &TaskEventFrame) -> Option<&str> {
+    match frame {
+        TaskEventFrame::TaskCreated { agent_id, .. }
+        | TaskEventFrame::TaskClaimed { agent_id, .. }
+        | TaskEventFrame::TaskCompleted { agent_id, .. }
+        | TaskEventFrame::TaskFailed { agent_id, .. }
+        | TaskEventFrame::TaskDelivered { agent_id, .. }
+        | TaskEventFrame::TaskCancelled { agent_id, .. } => Some(agent_id),
+        TaskEventFrame::OverflowMarker { .. } | TaskEventFrame::Unknown => None,
+    }
+}
+
+/// An open task-events stream.
+///
+/// Opening and reading are two gestures rather than one call, because the
+/// callers tell them apart: `mika tasks stream` prints "connected" **between**
+/// the two — a connected-but-idle wire must not read as a hung one — and the
+/// TUI's subscription (vol V2b-2) backs off on a failed **open** while an ended
+/// stream is only a reconnect. A single call would make both the same `Err`.
+pub(crate) struct TaskEventStream {
+    resp: reqwest::Response,
+}
+
+impl TaskEventStream {
+    /// Open the stream against `base_url`, authenticating with `token`.
+    ///
+    /// Both travel by argument and nothing is resolved under here, so a caller
+    /// — a test against a throwaway server included — can drive the consumer
+    /// without touching the process environment the two `dashboard` resolvers
+    /// read.
+    ///
+    /// A non-success status fails explicitly, body included: a stream that
+    /// silently yields nothing is indistinguishable from an agent with no task.
+    pub(crate) async fn open(base_url: &str, token: &str) -> Result<Self> {
+        let url = stream_url(base_url);
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("authorization", format!("Bearer {token}"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .with_context(|| format!("failed to open SSE stream at {url}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "mika-spirit returned {} for {}: {}",
+                status,
+                url,
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(Self { resp })
+    }
+
+    /// Read until the server closes the stream, handing every `data:` payload to
+    /// `on_event` — the bytes as they came off the wire, **and** their decode
+    /// into a [`TaskEventFrame`] when it succeeds — one at a time and in order.
+    ///
+    /// `agent_filter` is a **first, free stage**: under `Some(id)`, a payload
+    /// that decodes to a frame naming another agent never reaches `on_event`.
+    /// What the filter has *not* understood goes through — an `OverflowMarker`
+    /// (the only thing that says information is missing, including possibly the
+    /// caller's own), an `Unknown`, and an undecodable payload. Under `None`
+    /// nothing is dropped and the raw sequence is the one this consumer yielded
+    /// before the filter existed.
+    ///
+    /// The second closure parameter is an `Option<&TaskEventFrame>` rather than
+    /// a `&TaskEventFrame` because the two callers read disjoint halves:
+    /// `mika tasks stream` relays the raw payload and must keep showing what it
+    /// cannot decode — an instrument blind to a malformed frame measures
+    /// nothing — while the TUI's subscription reads the frame and ignores the
+    /// bytes. Returns `Ok(())` on a clean close; the caller decides whether to
+    /// reconnect.
+    pub(crate) async fn consume(
+        mut self,
+        agent_filter: Option<&str>,
+        mut on_event: impl FnMut(&str, Option<&TaskEventFrame>),
+    ) -> Result<()> {
+        // Minimal SSE frame parser: buffer bytes, split on the event separator,
+        // extract `data: <payload>` lines. Using `Response::chunk()` avoids
+        // pulling the `futures-util` `Stream` extension (workspace dep is
+        // `default-features = false`).
+        let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+
+        // The decode and the filter live in this relay, and not in
+        // `drain_events`, whose one responsibility is re-splicing an event cut
+        // across two packets — a property of the buffer alone, attested with no
+        // decode in the way.
+        let mut relay = |payload: &str| {
+            let frame = serde_json::from_str::<TaskEventFrame>(payload).ok();
+            let etrangere = match (agent_filter, frame.as_ref().and_then(frame_agent_id)) {
+                (Some(voulu), Some(porte)) => porte != voulu,
+                _ => false,
+            };
+            if !etrangere {
+                on_event(payload, frame.as_ref());
+            }
+        };
+
+        while let Some(chunk) = self.resp.chunk().await.context("SSE stream read failed")? {
+            buffer.extend_from_slice(&chunk);
+            drain_events(&mut buffer, &mut relay);
+        }
+        Ok(())
+    }
+}
+
+/// Le détail d'une tâche de mika-spirit, réduit aux champs que ce vol lit.
+///
+/// **Miroir local faute d'autre forme disponible** :
+/// `mika_agent::server::dashboard::TaskDetailResponse` ne dérive que
+/// `Serialize`, et ce vol ne modifie pas `crates/mika-agent/`. Ses autres champs
+/// sont ignorés par serde — tolérance voulue, attestée par `corps_de_detail`.
+///
+/// Onze champs, et **chacun a son lecteur dans ce vol** : `Serialize` en rend
+/// onze en `json` et `yaml`, l'écrivain texte en rend les six que l'opérateur
+/// lit, et `trigger_type`, `action_type`, `created_trace_id` et
+/// `parent_task_id` sont lus par la livraison d'un callback (vol V2b-2b-2).
+/// `completed_at` est entré au vol V2b-2b-3 pour un **lecteur unique** : la garde
+/// d'ancienneté du drainage, qui écarte un `failed` plus vieux que
+/// `STALE_FAILED_CALLBACK_MINUTES`. Le miroir ne prend **aucun champ « pour plus
+/// tard »** : c'est l'arrivée d'un lecteur, pas la largeur du serveur, qui fait
+/// entrer un champ ici.
+///
+/// La visibilité le dit champ par champ. `id` (vol V2b-2b-2, qui le passe à
+/// `mark_task_delivered`), `label`, `status`, `result`, `created_trace_id`,
+/// `parent_task_id` et `completed_at` sont `pub(crate)` parce que le drainage les
+/// lit depuis `tui/app.rs` — `status` depuis le vol V2b-2b-3, qui en tire
+/// l'`original_status` au lieu de l'écrire en dur. Les quatre autres restent
+/// **privés** : leur seul lecteur hors des trois formats est le prédicat du poll,
+/// qui est une méthode d'ici.
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(crate) struct TaskDetailMirror {
+    pub(crate) id: String,
+    agent_id: String,
+    pub(crate) label: String,
+    pub(crate) status: String,
+    trigger_type: String,
+    action_type: String,
+    created_by_session: Option<String>,
+    pub(crate) result: Option<String>,
+    pub(crate) created_trace_id: Option<String>,
+    pub(crate) parent_task_id: Option<String>,
+    pub(crate) completed_at: Option<String>,
+}
+
+/// Lire `GET /api/v1/tasks/{task_id}` sur mika-spirit.
+///
+/// URL de base et jeton voyagent **par argument**, pour la raison déjà écrite
+/// sur [`TaskEventStream::open`] : un consommateur qui résout ses propres accès
+/// ne se pilote pas depuis un test.
+///
+/// **Échoue, là où le matériau de #3062 rendait `None`.** Ce `None` était juste
+/// dans `tui/app.rs` — la ligne restait non réclamée et le tour suivant la
+/// reprenait. Ici il n'y a aucun repli, et un échec avalé rendrait un détail vide
+/// comme un succès ; au drainage (vol V2b-2b-2), c'est **l'appelant** qui traduira
+/// ce `Err` en « je passe et je ne réclame pas ». Le `timeout` de 5 s vient du
+/// matériau : un flux a le droit de se taire, une requête courte non.
+pub(crate) async fn fetch_task_detail(
+    base_url: &str,
+    token: &str,
+    task_id: &str,
+) -> Result<TaskDetailMirror> {
+    let url = format!("{}/api/v1/tasks/{task_id}", base_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("authorization", format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch task detail at {url}"))?;
+
+    let statut = resp.status();
+    if !statut.is_success() {
+        let corps = resp.text().await.unwrap_or_default();
+        anyhow::bail!("mika-spirit returned {statut} for {url}: {corps}");
+    }
+    resp.json::<TaskDetailMirror>()
+        .await
+        .with_context(|| format!("unreadable task detail for '{task_id}' from {url}"))
+}
+
+/// Le `task_id` d'une trame qui **mène à une livraison**, et de nulle autre.
+///
+/// **Deux** trames en sont depuis le vol V2b-2b-3, et elles ont en commun
+/// d'annoncer une tâche *terminée dont le résultat n'est pas encore remis* —
+/// exactement la population que `mark_task_delivered` accepte
+/// (`status IN ('completed','failed')`). Les deux voisines qui pourraient le
+/// laisser croire n'en sont pas : `TaskDelivered` annonce une remise **déjà
+/// faite**, et `TaskCancelled` une tâche qui n'a aucun résultat à rendre. Le
+/// `match` **énumère les huit variantes** sans bras `_`, pour la raison déjà
+/// écrite sur [`frame_agent_id`] : sous un `_`, une variante neuve qui mériterait
+/// une livraison tomberait du côté « rien » en silence.
+fn terminal_callback_frame(frame: Option<&TaskEventFrame>) -> Option<String> {
+    match frame? {
+        TaskEventFrame::TaskCompleted { task_id, .. }
+        | TaskEventFrame::TaskFailed { task_id, .. } => Some(task_id.clone()),
+        TaskEventFrame::TaskCreated { .. }
+        | TaskEventFrame::TaskClaimed { .. }
+        | TaskEventFrame::TaskDelivered { .. }
+        | TaskEventFrame::TaskCancelled { .. }
+        | TaskEventFrame::OverflowMarker { .. }
+        | TaskEventFrame::Unknown => None,
+    }
+}
+
+/// La trame dit-elle **qu'il manque quelque chose**, sans dire quoi ?
+///
+/// Une seule des huit en est : [`TaskEventFrame::OverflowMarker`]. Son
+/// `dropped_count` n'est **pas** lu — le balayage qu'il déclenche relit la
+/// session entière, donc le compte des trames tombées n'y changerait rien. Le
+/// `match` énumère les huit variantes sans bras `_`, et un `matches!` est
+/// refusé pour la même raison : sous l'un comme sous l'autre, une variante
+/// neuve qui annoncerait une perte tomberait du côté « rien » en silence.
+fn frame_annonce_un_trou(frame: Option<&TaskEventFrame>) -> bool {
+    match frame {
+        Some(TaskEventFrame::OverflowMarker { .. }) => true,
+        Some(
+            TaskEventFrame::TaskCreated { .. }
+            | TaskEventFrame::TaskClaimed { .. }
+            | TaskEventFrame::TaskCompleted { .. }
+            | TaskEventFrame::TaskFailed { .. }
+            | TaskEventFrame::TaskDelivered { .. }
+            | TaskEventFrame::TaskCancelled { .. }
+            | TaskEventFrame::Unknown,
+        )
+        | None => false,
+    }
+}
+
+/// Ce que le superviseur fait d'**une** trame : au plus une livraison dans le
+/// canal, au plus un armement du rattrapage, les deux indépendants.
+///
+/// Fonction **nommée** plutôt que corps de fermeture, pour que le critère 2 du
+/// vol se mesure **sans serveur** : dans une fermeture, il aurait fallu un faux
+/// spirit capable de produire un `Lagged`, c'est-à-dire une course à gagner.
+fn appliquer_la_trame(
+    trame: Option<&TaskEventFrame>,
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+    rattrapage: &AtomicBool,
+) {
+    if let Some(id) = terminal_callback_frame(trame) {
+        let _ = tx.send(id);
+    }
+    if frame_annonce_un_trou(trame) {
+        rattrapage.store(true, Ordering::SeqCst);
+    }
+}
+
+impl TaskDetailMirror {
+    /// Le prédicat de `get_undelivered_callback_tasks_for_session`, porté sur le
+    /// détail. Une tâche qui n'y répond pas n'est **ni livrée ni réclamée**.
+    ///
+    /// Le `matches!` est **fermé sur deux statuts**, et non écrit « tout sauf
+    /// `pending` » : un `delivered` est précisément la ligne que le poll vient de
+    /// prendre, et un `running` n'a pas encore de résultat. C'est aussi lui qui
+    /// rend vrai, par le type, l'`original_status` que le drainage lit sur ce
+    /// champ — il vaut `completed` ou `failed`, et rien d'autre.
+    fn est_un_callback_a_livrer(&self, agent_id: &str, session_id: &str) -> bool {
+        self.agent_id == agent_id
+            && self.trigger_type == "callback"
+            && self.action_type == "resume_agent"
+            && matches!(self.status.as_str(), "completed" | "failed")
+            && self.created_by_session.as_deref() == Some(session_id)
+    }
+}
+
+/// Le délai entre deux ouvertures du fil (mika#1727, vol V2b-2b-4).
+///
+/// Fonction **pure** de la tentative : elle se mesure sans suspendre d'horloge,
+/// d'où l'absence de `tokio/test-util`. **1 s en initial**, parce que le cas
+/// nominal est un redémarrage de mika-spirit : 100 ms y produiraient une rafale
+/// de refus pour rien, 10 s feraient payer dix secondes à une coupure passagère,
+/// et une seconde reste sous le filet du poll (~5 s). **30 s en plafond** — six
+/// passages du poll, qui couvre pendant ce temps ; plus bas, un daemon
+/// durablement à terre se ferait marteler, ce que le recul existe pour éviter.
+struct Recul {
+    initial_ms: u64,
+    plafond_ms: u64,
+}
+
+impl Recul {
+    const DEFAUT: Self = Self {
+        initial_ms: 1_000,
+        plafond_ms: 30_000,
+    };
+
+    /// **`checked_pow` puis `checked_mul`, et non un décalage** : `checked_shl` ne
+    /// valide que la **largeur** du décalage, pas la perte de bits, donc
+    /// `1_000u64 << 60` rendrait un nombre tronqué plutôt que `None` — un recul
+    /// redevenu court après avoir été long.
+    fn delai(&self, tentative: u32) -> std::time::Duration {
+        let ms = 2u64
+            .checked_pow(tentative)
+            .and_then(|facteur| self.initial_ms.checked_mul(facteur))
+            .unwrap_or(self.plafond_ms)
+            .min(self.plafond_ms);
+        std::time::Duration::from_millis(ms)
+    }
+}
+
+/// La couture entre le fil des tâches et la TUI.
+///
+/// Elle porte **ensemble** le canal, l'URL de base, le jeton et le drapeau de
+/// rattrapage, et n'expose que des gestes. C'est ce qui rend vraie *par le type*
+/// la contrainte « `tui/app.rs` ne détient ni l'URL, ni le jeton, ni le nom de
+/// la lecture HTTP », et ce qui garde exacte la déclaration `cli-spirit-tasks`
+/// du manifeste egress, dont le périmètre est ce fichier.
+///
+/// **Le canal ne porte qu'un `task_id`**, et **pas** le statut de la trame : le
+/// détail est l'autorité sur le statut, et un second champ en serait une
+/// seconde — capable de diverger le jour où la trame dit `failed` et où le
+/// détail, repris entre-temps, dit `completed`. `original_status` mentirait
+/// alors à l'agent. Un lecteur, une source.
+///
+/// **Le rattrapage voyage à côté du canal, et non dedans** (vol V2b-3a). Un
+/// `AtomicBool` ne s'empile pas, donc dix signaux ne donnent qu'un balayage
+/// sans qu'aucune garde ne l'écrive ; il ne porte ni statut ni `task_id`, donc
+/// il ne rouvre pas la question tranchée au paragraphe précédent. L'ordre entre
+/// les deux est sans objet : le signal dit seulement « il a pu manquer quelque
+/// chose », et la base reste l'autorité sur ce qui reste à livrer.
+///
+/// **L'agent du type n'est pas celui de [`CallbackFeed::next_candidate`]**
+/// (vol V2b-3b). Celui-ci est figé à l'ouverture, parce que c'est sur lui que
+/// `consume` filtre les trames, et rien ne rouvre le fil quand l'agent courant
+/// change. Celui de `next_candidate` voyage par appel, parce qu'il est l'agent
+/// **courant** de la TUI. Un changement d'agent les sépare, et c'est cette
+/// divergence que le minuteur doit couvrir.
+pub(crate) struct CallbackFeed {
+    rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    agent_id: String,
+    base_url: String,
+    token: String,
+    rattrapage: Arc<AtomicBool>,
+}
+
+impl CallbackFeed {
+    /// Lancer le superviseur du fil de `agent_id` (mika#1727, vol V2b-2b-4).
+    ///
+    /// **Ce qu'il garantit.** Le fil se rouvre de lui-même après une fermeture
+    /// comme après un échec d'ouverture, en attendant le [`Recul`]. La couture est
+    /// donc rendue **même si la première ouverture échoue** — plus d'`Option`,
+    /// parce qu'il n'y a plus d'échec à rendre. Le cas du jeton absent reste celui
+    /// de l'appelant.
+    ///
+    /// **Ce qu'il garantit depuis le vol V2b-3a : il dit qu'il a pu manquer
+    /// quelque chose.** Le serveur diffuse par un `broadcast` sans reprise par
+    /// curseur, donc une trame émise pendant une coupure est perdue, comme
+    /// celles qu'un `OverflowMarker` déclare perdues. Le fil ne les rejoue pas :
+    /// il **arme le rattrapage** à chaque ouverture réussie et à chaque
+    /// `OverflowMarker`, et c'est le drainage qui en fait un balayage.
+    ///
+    /// **Ce qu'il ne garantit toujours pas : le compte des trous.** Le drapeau
+    /// est un booléen, donc `dropped_count` n'est pas conservé — coût assumé.
+    pub(crate) fn open_for(agent_id: &str, base_url: String, token: String) -> Self {
+        Self::open_for_avec_recul(agent_id, base_url, token, Recul::DEFAUT)
+    }
+
+    /// Le corps d'[`CallbackFeed::open_for`], avec le recul en paramètre pour que
+    /// les tests prennent des délais en millisecondes sans suspendre d'horloge.
+    fn open_for_avec_recul(agent_id: &str, base_url: String, token: String, recul: Recul) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let rattrapage = Arc::new(AtomicBool::new(false));
+        let agent = agent_id.to_string();
+        let base = base_url.clone();
+        let jeton = token.clone();
+        let drapeau = Arc::clone(&rattrapage);
+        tokio::spawn(async move {
+            let mut tentative: u32 = 0;
+            loop {
+                // L'arrêt se lit sur l'expéditeur : la couture possède le
+                // récepteur, donc `is_closed` suffit — aucune seconde voie
+                // d'annulation. **Avant l'ouverture** plutôt que dans un `select!`
+                // parce que c'est la connexion qu'il s'agit de ne pas faire ; la
+                // tâche survit au lâcher jusqu'à son réveil, au plus un recul.
+                if tx.is_closed() {
+                    return;
                 }
+                // Un échec d'ouverture et une fin de flux tombent tous les deux
+                // sur le `sleep` qui suit : le `if let Ok` sans `else` *est* la
+                // forme qui les rend équivalents, et l'`Err` de `consume` (lecture
+                // coupée) y vaut son `Ok` (fermeture propre).
+                if let Ok(flux) = TaskEventStream::open(&base, &jeton).await {
+                    // Sur l'**ouverture**, pas sur la livraison : un flux calme est
+                    // un fil sain (keep-alive), pas un recul à faire grandir.
+                    tentative = 0;
+                    // Le rattrapage s'arme sur l'**ouverture** et non sur la
+                    // première trame : ce qui a été manqué l'a été *avant* elle,
+                    // et un fil qui s'ouvre sur un silence complet est le cas même
+                    // où le balayage sert. La première ouverture n'est pas un cas
+                    // à part — au lancement, tout callback fini est un trou.
+                    drapeau.store(true, Ordering::SeqCst);
+                    let _ = flux
+                        .consume(Some(&agent), |_, trame| {
+                            appliquer_la_trame(trame, &tx, &drapeau);
+                        })
+                        .await;
+                }
+                tokio::time::sleep(recul.delai(tentative)).await;
+                // `saturating_add` parce qu'une TUI laissée ouverte un week-end
+                // contre un daemon mort ne doit pas déborder son compteur : au
+                // plafond depuis longtemps, elle ne doit pas non plus paniquer.
+                tentative = tentative.saturating_add(1);
+            }
+        });
+        Self {
+            rx,
+            agent_id: agent_id.to_string(),
+            base_url,
+            token,
+            rattrapage,
+        }
+    }
+
+    /// Quel agent ce fil suit-il — et est-ce celui que la TUI sert en ce moment ?
+    ///
+    /// Un prédicat plutôt qu'un accesseur : rendre la chaîne laisserait
+    /// l'appelant la comparer, donc se tromper de côté. La comparaison vit là où
+    /// vit la donnée (mika#1727, vol V2b-3b).
+    pub(crate) fn suit_lagent(&self, agent_id: &str) -> bool {
+        self.agent_id == agent_id
+    }
+
+    /// Prendre le signal de rattrapage : vrai **au plus une fois** par salve.
+    ///
+    /// `swap(false)` et non un `load` : le signal est consommé par sa lecture,
+    /// donc une réouverture suivie de deux `OverflowMarker` ne donne qu'un seul
+    /// balayage — propriété du type, pas garde à tenir.
+    pub(crate) fn prendre_le_rattrapage(&self) -> bool {
+        self.rattrapage.swap(false, Ordering::SeqCst)
+    }
+
+    /// Armer le signal depuis un test, sans fil ni serveur. C'est ce qui laisse
+    /// [`CallbackFeed::from_channel`] garder sa signature, donc les tests qui
+    /// lisent le canal à nu intacts (critère 5 du vol).
+    #[cfg(test)]
+    pub(crate) fn armer_le_rattrapage(&self) {
+        self.rattrapage.store(true, Ordering::SeqCst);
+    }
+
+    /// Le prochain candidat **recevable**, ou rien. Les gardes 1 et 2 du vol, et
+    /// **aucune ne réclame** : canal vide, détail en erreur HTTP, détail
+    /// illisible, prédicat non satisfait — les quatre refus rendent `None`, et la
+    /// ligne reste `completed` pour le poll.
+    ///
+    /// `session_id` voyage **par appel** et non dans le type : `/new` et un
+    /// changement d'agent réassignent `app.session_id` sans rouvrir le fil, donc
+    /// une session figée à l'ouverture livrerait à la mauvaise conversation.
+    pub(crate) async fn next_candidate(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Option<TaskDetailMirror> {
+        let task_id = self.rx.try_recv().ok()?;
+        let detail = fetch_task_detail(&self.base_url, &self.token, &task_id)
+            .await
+            .ok()?;
+        detail
+            .est_un_callback_a_livrer(agent_id, session_id)
+            .then_some(detail)
+    }
+
+    /// Une couture dont le canal est **alimenté par le test**, pour mesurer
+    /// `next_candidate` seule : `spawn_detail` sert le détail, pas le flux.
+    ///
+    /// L'agent suivi est **nommé**, sans valeur par défaut : un défaut ferait
+    /// passer un test pour vert sur un agent qu'il n'a pas choisi.
+    #[cfg(test)]
+    pub(crate) fn from_channel(
+        agent_id: &str,
+        base_url: String,
+        token: String,
+    ) -> (tokio::sync::mpsc::UnboundedSender<String>, Self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            tx,
+            Self {
+                rx,
+                agent_id: agent_id.to_string(),
+                base_url,
+                token,
+                rattrapage: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+}
+
+/// Rendre le miroir en texte, sur le modèle visuel de [`print_task_detail`].
+///
+/// Un écrivain **neuf** pour trois raisons dont aucune n'est de goût. Un critère
+/// de ce vol : `print_task_detail` n'est pas modifiée. Son type : elle prend un
+/// `&Task` de vingt champs que le miroir n'a pas. Son second argument : la
+/// vivacité du pilote est **locale**, donc sans réponse sous `--spirit`, et
+/// l'absence de ligne `Dispatch pilot:` est exacte, pas incomplète.
+fn write_task_detail_text<W: std::io::Write>(detail: &TaskDetailMirror, out: &mut W) -> Result<()> {
+    let session = detail.created_by_session.as_deref().unwrap_or("—");
+    let resultat = detail.result.as_deref().unwrap_or("—");
+    writeln!(out, "\n  Task Detail (mika-spirit)")?;
+    writeln!(out, "  ───────────────────────────────────")?;
+    for (etiquette, valeur) in [
+        ("ID:", detail.id.as_str()),
+        ("Label:", &detail.label),
+        ("Status:", &detail.status),
+        ("Agent:", &detail.agent_id),
+        ("Session:", session),
+        ("Result:", resultat),
+    ] {
+        writeln!(out, "  {etiquette:<15}{valeur}")?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Ce que `mika tasks get <id> --spirit` rend, avec son puits en paramètre.
+///
+/// Le puits est un paramètre pour la raison déjà écrite sur
+/// [`stream_task_events_into`] : la propriété à tenir est « le détail, **et rien
+/// d'autre** », et elle ne se mesure qu'en comparant tout le puits. Et **l'ordre
+/// des gestes porte la moitié du critère 2** : lecture, puis `?`, puis écriture —
+/// un échec laisse donc le puits vide par conséquence, non par politique.
+async fn get_task_detail_from_spirit_into<W: std::io::Write>(
+    base_url: &str,
+    token: &str,
+    task_id: &str,
+    format: OutputFormat,
+    out: &mut W,
+) -> Result<()> {
+    let detail = fetch_task_detail(base_url, token, task_id).await?;
+    match format {
+        OutputFormat::Text => write_task_detail_text(&detail, out)?,
+        OutputFormat::Json => writeln!(out, "{}", serde_json::to_string_pretty(&detail)?)?,
+        OutputFormat::Yaml => write!(out, "{}", yaml_serde::to_string(&detail)?)?,
+    }
+    Ok(())
+}
+
+/// Hand every **complete** event sitting in `buffer` to `on_payload`, and leave
+/// a trailing partial one in place for the next read.
+///
+/// A free function rather than the body of the read loop, because that is the
+/// only way to attest the re-splicing without depending on a timing: an event
+/// cut across two packets is a property of the **buffer**, and a test making the
+/// server emit in two `sleep`-separated writes would go green without measuring
+/// anything on the day a layer coalesced them.
+fn drain_events(buffer: &mut Vec<u8>, on_payload: &mut impl FnMut(&str)) {
+    // Split on SSE event separator (`\r\n\r\n` / `\n\n` / `\r\r`, spec § 9.2).
+    // Keep the trailing partial event in the buffer for the next read.
+    while let Some((sep_idx, sep_len)) = find_event_separator(buffer) {
+        let event_bytes: Vec<u8> = buffer.drain(..sep_idx + sep_len).collect();
+        // Drop the trailing separator; parse the remainder line-by-line.
+        let event_str = String::from_utf8_lossy(&event_bytes[..event_bytes.len() - sep_len]);
+        for line in event_str.split(['\n', '\r']) {
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim_start();
+                if data.is_empty() {
+                    continue;
+                }
+                on_payload(data);
             }
         }
     }
-    Ok(())
 }
 
 /// Locate the first SSE event separator in the buffer, and return
@@ -860,6 +1445,754 @@ fn task_to_json(t: &Task) -> Value {
 mod tests {
     use super::*;
     use mika_agent::db::OrphanedPendingTask;
+
+    // -- la découpe d'événements SSE est attestée (mika#1727, vol V2b-1b) --
+    //
+    // `find_event_separator` est arrivée ici avec le consommateur de diagnostic
+    // (mika#1758) et **rien ne la mesurait** : son doc-comment nomme l'ordre
+    // d'essai des trois terminateurs, et c'était une affirmation sur du code.
+    // Ces trois tests atterrissent **avant** que le consommateur bouge — écrits
+    // après, ils n'attesteraient que l'état d'arrivée du refactor.
+
+    #[test]
+    fn mika1727_v2b1b_les_trois_separateurs_sont_reconnus() {
+        assert_eq!(find_event_separator(b"data: x\n\n"), Some((7, 2)));
+        assert_eq!(find_event_separator(b"data: x\r\n\r\n"), Some((7, 4)));
+        assert_eq!(find_event_separator(b"data: x\r\r"), Some((7, 2)));
+        assert_eq!(find_event_separator(b"data: x\n"), None);
+    }
+
+    /// L'ordre d'essai est la moitié porteuse : un `\r\n\r\n` doit se lire comme
+    /// un seul terminateur de 4 octets, jamais comme le `\n\n` qui siège à
+    /// l'offset+1 — ce qui laisserait un `\r` orphelin en tête de l'événement
+    /// suivant.
+    #[test]
+    fn mika1727_v2b1b_un_crlfcrlf_nest_pas_lu_comme_un_lflf_decale() {
+        let (idx, len) = find_event_separator(b"a\r\n\r\nb").unwrap();
+        assert_eq!((idx, len), (1, 4));
+        assert_eq!(&b"a\r\n\r\nb"[idx + len..], b"b");
+    }
+
+    #[test]
+    fn mika1727_v2b1b_le_premier_separateur_gagne() {
+        assert_eq!(find_event_separator(b"a\n\nb\n\nc"), Some((1, 2)));
+    }
+
+    /// Le recollage se mesure sur le **tampon**, et pas sur une socket : un
+    /// serveur factice qui écrirait en deux paquets séparés d'un `sleep`
+    /// passerait au vert le jour où une couche les fusionne, sans plus rien
+    /// mesurer. Ici les deux moitiés sont choisies à la main, donc la coupure
+    /// est la propriété tenue et non un effet de cadence.
+    #[test]
+    fn mika1727_v2b1b_un_evenement_coupe_en_deux_paquets_est_rendu_entier_une_fois() {
+        let mut rendues: Vec<String> = Vec::new();
+        let mut buffer: Vec<u8> = Vec::new();
+
+        // Premier paquet : la charge est tronquée en plein milieu du JSON, et
+        // aucun séparateur n'est encore arrivé.
+        buffer.extend_from_slice(b"data: {\"task_id\":\"t-1\",\"sta");
+        drain_events(&mut buffer, &mut |charge: &str| {
+            rendues.push(charge.to_string())
+        });
+        assert!(
+            rendues.is_empty(),
+            "un événement incomplet ne doit rien rendre : {rendues:?}"
+        );
+
+        // Second paquet : la fin de la charge, son séparateur, puis le début
+        // d'un troisième événement qui doit rester en attente.
+        buffer.extend_from_slice(b"tus\":\"done\"}\n\ndata: {\"task_id\":\"t-2\"");
+        drain_events(&mut buffer, &mut |charge: &str| {
+            rendues.push(charge.to_string())
+        });
+        assert_eq!(rendues, vec![r#"{"task_id":"t-1","status":"done"}"#]);
+
+        // Et le résidu est conservé tel quel pour la lecture suivante.
+        assert_eq!(buffer, b"data: {\"task_id\":\"t-2\"");
+    }
+
+    /// Le consommateur s'ouvre sur une URL et un jeton **donnés**, et rend ses
+    /// trames une fois chacune, dans l'ordre : une trame perdue ou doublée fait
+    /// rougir l'égalité.
+    #[tokio::test]
+    async fn mika1727_v2b1b_le_consommateur_rend_ses_trames_dans_lordre() {
+        let charges = [
+            r#"{"task_id":"t-1","status":"pending"}"#,
+            r#"{"task_id":"t-2","status":"in_progress"}"#,
+            r#"{"task_id":"t-3","status":"completed"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let flux = TaskEventStream::open(&base, "jeton-de-test").await.unwrap();
+        let mut rendues: Vec<String> = Vec::new();
+        flux.consume(None, |charge, _| rendues.push(charge.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(rendues, charges);
+    }
+
+    /// `mika tasks stream` écrit une ligne par charge `data:` et **rien
+    /// d'autre** : l'assertion est une égalité sur tout le puits, jamais un
+    /// `contains`. Les deux lignes de connexion partent sur stderr, donc leur
+    /// absence d'ici *est* la mesure de « rien d'autre » — pas une redite.
+    #[tokio::test]
+    async fn mika1727_v2b1b_mika_tasks_stream_ecrit_une_ligne_par_charge_et_rien_dautre() {
+        let charges = [
+            r#"{"task_id":"t-1"}"#,
+            r#"{"task_id":"t-2"}"#,
+            r#"{"task_id":"t-3"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut puits: Vec<u8> = Vec::new();
+        stream_task_events_into(&base, "jeton-de-test", None, &mut puits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(puits).unwrap(),
+            "{\"task_id\":\"t-1\"}\n{\"task_id\":\"t-2\"}\n{\"task_id\":\"t-3\"}\n"
+        );
+    }
+
+    /// `mika tasks stream --agent <id>` n'écrit que les lignes de cet agent.
+    /// C'est ce test qui fait du flag un **lecteur mesuré** du filtre : l'égalité
+    /// porte sur tout le puits, donc une ligne fuitée rougit autant qu'une ligne
+    /// perdue, et la sortie reste la charge **brute** — le décodage voyage pour
+    /// le filtre, pas pour changer la forme de l'écriture.
+    #[tokio::test]
+    async fn mika1727_v2b2a_mika_tasks_stream_agent_necrit_que_les_lignes_de_lagent_demande() {
+        let charges = [
+            r#"{"event":"task_completed","task_id":"t-1","agent_id":"mika-dev","completed_at":"2026-11-09T10:00:00Z","result_preview":null}"#,
+            r#"{"event":"task_completed","task_id":"t-2","agent_id":"mika-qa","completed_at":"2026-11-09T10:00:01Z","result_preview":null}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut puits: Vec<u8> = Vec::new();
+        stream_task_events_into(&base, "jeton-de-test", Some("mika-dev"), &mut puits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(puits).unwrap(),
+            format!("{}\n", charges[0])
+        );
+    }
+
+    // -- le filtre par agent du fil des tâches (mika#1727, vol V2b-2a) --
+
+    /// Chaque variante du fil dit, ou non, son agent. Ce test mesure le
+    /// **choix** — six variantes en portent un, `OverflowMarker` et `Unknown`
+    /// n'en portent pas — et non l'exhaustivité du `match`, qui est tenue par le
+    /// compilateur et n'a pas besoin d'un test pour l'être.
+    #[test]
+    fn mika1727_v2b2a_chaque_variante_du_fil_dit_ou_non_son_agent() {
+        let quand = "2026-11-09T10:00:00Z".to_string();
+        let porteuses = [
+            TaskEventFrame::TaskCreated {
+                task_id: "t-1".to_string(),
+                agent_id: "mika-dev".to_string(),
+                kind: "callback".to_string(),
+                action_type: "resume_agent".to_string(),
+                label: None,
+                parent_task_id: None,
+                created_at: quand.clone(),
+            },
+            TaskEventFrame::TaskClaimed {
+                task_id: "t-2".to_string(),
+                agent_id: "mika-dev".to_string(),
+                claimed_at: quand.clone(),
+            },
+            TaskEventFrame::TaskCompleted {
+                task_id: "t-3".to_string(),
+                agent_id: "mika-dev".to_string(),
+                completed_at: quand.clone(),
+                result_preview: None,
+            },
+            TaskEventFrame::TaskFailed {
+                task_id: "t-4".to_string(),
+                agent_id: "mika-dev".to_string(),
+                failed_at: quand.clone(),
+                error_preview: None,
+            },
+            TaskEventFrame::TaskDelivered {
+                task_id: "t-5".to_string(),
+                agent_id: "mika-dev".to_string(),
+                delivered_at: quand.clone(),
+            },
+            TaskEventFrame::TaskCancelled {
+                task_id: "t-6".to_string(),
+                agent_id: "mika-dev".to_string(),
+                cancelled_at: quand,
+                reason: None,
+            },
+        ];
+        for trame in &porteuses {
+            assert_eq!(frame_agent_id(trame), Some("mika-dev"), "{trame:?}");
+        }
+
+        assert_eq!(
+            frame_agent_id(&TaskEventFrame::OverflowMarker { dropped_count: 7 }),
+            None
+        );
+        assert_eq!(frame_agent_id(&TaskEventFrame::Unknown), None);
+    }
+
+    /// Les charges de test sont des JSON **littéraux**, et non des
+    /// `TaskEventFrame` sérialisés : un aller-retour `to_string` → `from_str` du
+    /// même type ne mesurerait que la symétrie de serde avec elle-même, et
+    /// resterait vert le jour où le tag cesserait d'être `event` — c'est-à-dire
+    /// le jour où le consommateur cesserait de comprendre ce que le serveur
+    /// émet. Le littéral épingle le format du **fil**, qui est le contrat réel
+    /// entre `mika-agent` et `mika-cli`.
+    ///
+    /// Le contrôle négatif vit dans ce test : sous `None`, les trois trames
+    /// passent. Sans lui, un filtre qui écarterait *tout* serait vert.
+    #[tokio::test]
+    async fn mika1727_v2b2a_une_trame_dun_autre_agent_est_ecartee_du_fil() {
+        let charges = [
+            r#"{"event":"task_claimed","task_id":"t-1","agent_id":"mika-dev","claimed_at":"2026-11-09T10:00:00Z"}"#,
+            r#"{"event":"task_claimed","task_id":"t-2","agent_id":"mika-qa","claimed_at":"2026-11-09T10:00:01Z"}"#,
+            r#"{"event":"task_completed","task_id":"t-3","agent_id":"mika-dev","completed_at":"2026-11-09T10:00:02Z","result_preview":"fait"}"#,
+        ];
+
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+        let mut filtrees: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(Some("mika-dev"), |charge, _| {
+                filtrees.push(charge.to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(filtrees, vec![charges[0], charges[2]]);
+
+        let mut toutes: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(None, |charge, _| toutes.push(charge.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(toutes, charges);
+    }
+
+    /// Le filtre n'écarte que ce qu'il a **compris** comme étranger. Un
+    /// `overflow_marker` dit à un consommateur filtré qu'il a perdu des trames,
+    /// dont peut-être les siennes : l'écarter serait perdre la seule information
+    /// qui dit que l'information manque.
+    ///
+    /// L'égalité porte sur toute la séquence, ce qui mesure du même coup que
+    /// `consume` est allée **jusqu'au bout du corps** : une charge indécodable
+    /// qui interromprait la lecture tronquerait la séquence au lieu de la
+    /// changer.
+    #[tokio::test]
+    async fn mika1727_v2b2a_le_filtre_laisse_passer_ce_quil_ne_comprend_pas() {
+        let charges = [
+            r#"{"event":"overflow_marker","dropped_count":3}"#,
+            r#"{"event":"trame_du_futur","task_id":"t-9","agent_id":"mika-qa"}"#,
+            r#"ceci n'est pas du JSON"#,
+            r#"{"event":"task_failed","task_id":"t-2","agent_id":"mika-qa","failed_at":"2026-11-09T10:00:01Z","error_preview":null}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut rendues: Vec<String> = Vec::new();
+        TaskEventStream::open(&base, "jeton-de-test")
+            .await
+            .unwrap()
+            .consume(Some("mika-dev"), |charge, _| {
+                rendues.push(charge.to_string())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(rendues, vec![charges[0], charges[1], charges[2]]);
+    }
+
+    // -- le détail se lit sur mika-spirit (mika#1727, vol V2b-2b-1) --
+
+    /// Un corps tel que `dashboard::handle_task_detail` le rend : les onze champs
+    /// du miroir, **plus deux** qu'il laisse tomber — et qui mesurent la
+    /// tolérance, sans quoi elle resterait une affirmation du commentaire.
+    fn corps_de_detail() -> String {
+        json!({"id": "t-42", "agent_id": "mika-qa", "label": "sonde:detail",
+               "status": "completed", "trigger_type": "callback",
+               "action_type": "resume_agent", "created_by_session": "s-7",
+               "result": "ok", "created_trace_id": "tr-9", "parent_task_id": "t-41",
+               "completed_at": "2026-11-11T10:00:00Z",
+               "depth": 1, "action_config": "{}"})
+        .to_string()
+    }
+
+    /// Lire le détail sur `base` et rendre les deux moitiés que ces tests mesurent.
+    async fn lire_detail(base: &str, id: &str, format: OutputFormat) -> (Vec<u8>, Result<()>) {
+        let mut puits: Vec<u8> = Vec::new();
+        let issue = get_task_detail_from_spirit_into(base, "jeton", id, format, &mut puits).await;
+        (puits, issue)
+    }
+
+    /// **Critère 1** — `mika tasks get <id> --spirit` rend le détail lu sur
+    /// mika-spirit, et le jeton part en `Bearer`. Deux mesures dans un test parce
+    /// qu'elles portent sur **la même requête** : ce qui en est revenu, et ce qui y
+    /// est parti. L'égalité porte sur tout le puits, donc elle mesure aussi
+    /// l'absence de la ligne `Dispatch pilot:`.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_mika_tasks_get_spirit_rend_le_detail_lu_sur_mika_spirit() {
+        let (base, recu) = fake_spirit::spawn_detail(200, corps_de_detail()).await;
+
+        let (puits, issue) = lire_detail(&base, "t-42", OutputFormat::Text).await;
+
+        issue.unwrap();
+        let attendu = concat!(
+            "\n  Task Detail (mika-spirit)\n",
+            "  ───────────────────────────────────\n",
+            "  ID:            t-42\n  Label:         sonde:detail\n",
+            "  Status:        completed\n  Agent:         mika-qa\n",
+            "  Session:       s-7\n  Result:        ok\n\n",
+        );
+        assert_eq!(String::from_utf8(puits).unwrap(), attendu);
+        let entete = recu.lock().unwrap().clone();
+        assert_eq!(entete.as_deref(), Some("Bearer jeton"));
+    }
+
+    /// **Critère 1** — `json` et `yaml` rendent le même miroir, ni un champ de plus
+    /// ni un de moins : les deux attentes se dérivent d'**une** liste de onze
+    /// paires, donc un douzième champ rendu ne peut pas être vert ici.
+    ///
+    /// La liste est à onze depuis le vol V2b-2b-3, et l'attente du **texte** ne l'a
+    /// pas suivie : elle reste les six paires du test précédent, parce que
+    /// l'écrivain texte ne rend pas `trigger_type` ni `action_type` — des colonnes
+    /// de machine, pas une lecture d'opérateur. L'invariant « ni un de plus ni un de
+    /// moins » survit donc sur chaque format, pris séparément.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_les_trois_formats_rendent_le_meme_miroir() {
+        let (base, _) = fake_spirit::spawn_detail(200, corps_de_detail()).await;
+        let champs = [
+            ("id", "t-42"),
+            ("agent_id", "mika-qa"),
+            ("label", "sonde:detail"),
+            ("status", "completed"),
+            ("trigger_type", "callback"),
+            ("action_type", "resume_agent"),
+            ("created_by_session", "s-7"),
+            ("result", "ok"),
+            ("created_trace_id", "tr-9"),
+            ("parent_task_id", "t-41"),
+            ("completed_at", "2026-11-11T10:00:00Z"),
+        ];
+
+        let (rendu, issue) = lire_detail(&base, "t-42", OutputFormat::Json).await;
+        issue.unwrap();
+        let lignes = champs.map(|(c, v)| format!("  \"{c}\": \"{v}\""));
+        let attendu = format!("{{\n{}\n}}\n", lignes.join(",\n"));
+        assert_eq!(String::from_utf8(rendu).unwrap(), attendu);
+
+        let (rendu, issue) = lire_detail(&base, "t-42", OutputFormat::Yaml).await;
+        issue.unwrap();
+        let corps: String = champs.iter().map(|(c, v)| format!("{c}: {v}\n")).collect();
+        assert_eq!(String::from_utf8(rendu).unwrap(), corps);
+    }
+
+    /// **Critère 2** — un 404 échoue explicitement et n'écrit rien. Le corps est
+    /// celui que `dashboard::handle_task_detail` rend vraiment. « Explicitement » se
+    /// mesure par le statut présent dans le message ; « n'écrit rien » par le puits
+    /// vide, qui tient à l'ordre des gestes et non à une politique d'écriture.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_un_404_echoue_explicitement_et_necrit_rien() {
+        let (base, _) =
+            fake_spirit::spawn_detail(404, r#"{"error":"task 't-absente' not found"}"#.to_string())
+                .await;
+
+        let (puits, issue) = lire_detail(&base, "t-absente", OutputFormat::Text).await;
+
+        let message = format!("{:#}", issue.expect_err("un 404 doit échouer"));
+        assert!(message.contains("404"), "le statut est nommé : {message}");
+        assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
+    /// **Critère 2** — un 500 échoue explicitement et n'écrit rien. Deux tests et non
+    /// un seul paramétré : le critère demande « un test pour chacun des trois cas »,
+    /// et 404 et 500 ne diront pas la même chose au vol V2b-2b-2 qui lira l'erreur.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_un_500_echoue_explicitement_et_necrit_rien() {
+        let (base, _) =
+            fake_spirit::spawn_detail(500, r#"{"error":"database is locked"}"#.to_string()).await;
+
+        let (puits, issue) = lire_detail(&base, "t-1", OutputFormat::Json).await;
+
+        let message = format!("{:#}", issue.expect_err("un 500 doit échouer"));
+        assert!(message.contains("500"), "le statut est nommé : {message}");
+        assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
+    /// **Critère 2** — un corps illisible échoue explicitement et n'écrit rien. Un
+    /// **200**, un JSON valide, et `agent_id` absent : c'est le cas qui compte, car
+    /// c'est la forme qu'un serveur ayant dérivé rendrait, et elle ne doit jamais
+    /// passer pour un succès.
+    #[tokio::test]
+    async fn mika1727_v2b2b1_un_corps_illisible_echoue_explicitement_et_necrit_rien() {
+        let (base, _) = fake_spirit::spawn_detail(200, r#"{"id":"t-1"}"#.to_string()).await;
+
+        let (puits, issue) = lire_detail(&base, "t-1", OutputFormat::Text).await;
+
+        let message = format!("{:#}", issue.expect_err("un corps illisible doit échouer"));
+        assert!(message.contains("t-1"), "la tâche est nommée : {message}");
+        assert!(puits.is_empty(), "rien n'est écrit : {puits:?}");
+    }
+
+    // -- la couture du fil vers la TUI (mika#1727, vol V2b-2b-2) --
+
+    /// **Critère 4** — une seule séquence, parce que les propriétés mesurées sont
+    /// celles de *la même* souscription : une trame d'un autre agent est écartée,
+    /// `OverflowMarker`, une trame incomprise et un `task_claimed` ne mènent à
+    /// rien, le `TaskFailed` de l'agent entre depuis le vol V2b-2b-3, et le
+    /// `TaskCompleted` qui les **suit tous** entre encore — donc l'abonnement n'a
+    /// pas cassé, ce que cinq tests sur cinq serveurs ne diraient pas. Le canal
+    /// se lit à nu : y ajouter une lecture HTTP mesurerait la garde suivante.
+    /// Charges littérales, comme au vol V2b-2a : c'est le contrat de fil qui est
+    /// épinglé.
+    #[tokio::test]
+    async fn mika1727_v2b2b3_un_completed_et_un_failed_de_lagent_entrent_dans_le_canal() {
+        let charges = [
+            r#"{"event":"task_completed","task_id":"t-1","agent_id":"mika-qa","completed_at":"2026-11-10T10:00:00Z","result_preview":"fait"}"#,
+            r#"{"event":"task_failed","task_id":"t-2","agent_id":"mika-dev","failed_at":"2026-11-10T10:00:01Z","error_preview":"boum"}"#,
+            r#"{"event":"overflow_marker","dropped_count":3}"#,
+            r#"{"event":"trame_du_futur","task_id":"t-4","agent_id":"mika-dev"}"#,
+            r#"{"event":"task_claimed","task_id":"t-5","agent_id":"mika-dev","claimed_at":"2026-11-10T10:00:02Z"}"#,
+            r#"{"event":"task_completed","task_id":"t-6","agent_id":"mika-dev","completed_at":"2026-11-10T10:00:03Z","result_preview":"fait"}"#,
+        ];
+        let base = fake_spirit::spawn(fake_spirit::sse_payload(&charges)).await;
+
+        let mut couture = CallbackFeed::open_for("mika-dev", base, "jeton".to_string());
+        // Le superviseur **ne lâche plus** son expéditeur à la fin du corps : il
+        // rouvre, donc `recv` ne rend plus `None`. La fenêtre de silence est à 5×
+        // sous le premier recul par défaut (1 s) — aucune seconde connexion ne
+        // peut y rejouer `t-2`, et la borne est une constante du code.
+        let mut recus: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+                .await
+                .expect("les deux identifiants arrivent")
+                .expect("le canal reste ouvert");
+            recus.push(id);
+        }
+        let silence =
+            tokio::time::timeout(std::time::Duration::from_millis(200), couture.rx.recv()).await;
+        assert!(silence.is_err(), "rien ne suit les deux identifiants");
+
+        assert_eq!(recus, vec!["t-2".to_string(), "t-6".to_string()]);
+    }
+
+    // -- la reconnexion et le recul (mika#1727, vol V2b-2b-4) --
+
+    /// **Critère 1** — les trois dernières tentatives sont les trois populations
+    /// de débordement : `64` déborde sur `checked_mul`, `1 000` sur `checked_pow`,
+    /// `u32::MAX` sur les deux — aucune ne panique.
+    #[test]
+    fn mika1727_v2b2b4_le_recul_double_jusquau_plafond_et_ne_panique_pas() {
+        let recul = Recul::DEFAUT;
+        let ms = |tentative| recul.delai(tentative).as_millis();
+
+        assert_eq!(
+            [ms(0), ms(1), ms(2), ms(3), ms(4)],
+            [1_000, 2_000, 4_000, 8_000, 16_000]
+        );
+        assert_eq!(ms(5), 30_000, "32 s est plafonnée");
+        assert_eq!([ms(64), ms(1_000), ms(u32::MAX)], [30_000; 3]);
+    }
+
+    /// **Critère 2** — la première connexion sert un `task_claimed` : le filtre
+    /// d'agent le laisse passer mais `terminal_callback_frame` ne le retient pas,
+    /// donc **rien n'entre dans le canal par elle**. `t-7` n'a pu arriver que par
+    /// la seconde — ce que le compteur confirme indépendamment.
+    #[tokio::test]
+    async fn mika1727_v2b2b4_apres_une_fermeture_le_fil_se_rouvre() {
+        let premiere = fake_spirit::sse_payload(&[
+            r#"{"event":"task_claimed","task_id":"t-5","agent_id":"mika-dev","claimed_at":"2026-11-11T10:00:00Z"}"#,
+        ]);
+        let seconde = fake_spirit::sse_payload(&[
+            r#"{"event":"task_completed","task_id":"t-7","agent_id":"mika-dev","completed_at":"2026-11-11T10:00:01Z","result_preview":"fait"}"#,
+        ]);
+        let (base, connexions) =
+            fake_spirit::spawn_sequence(vec![(200, premiere), (200, seconde)]).await;
+
+        let mut couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        let recu = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+            .await
+            .expect("la trame de la seconde connexion arrive")
+            .expect("le canal reste ouvert");
+        assert_eq!(recu, "t-7");
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "la trame n'a pu arriver que par la seconde connexion"
+        );
+    }
+
+    /// **Critère 3** — que la couture soit rendue malgré un échec d'ouverture est
+    /// d'abord un fait de **type**, `open_for_avec_recul` ne rendant pas d'`Option`
+    /// ; ce test l'exerce sur le cas « daemon à terre au lancement de la TUI ».
+    #[tokio::test]
+    async fn mika1727_v2b2b4_un_echec_douverture_rend_quand_meme_la_couture() {
+        let retour = fake_spirit::sse_payload(&[
+            r#"{"event":"task_completed","task_id":"t-8","agent_id":"mika-dev","completed_at":"2026-11-11T10:00:02Z","result_preview":"fait"}"#,
+        ]);
+        let (base, connexions) =
+            fake_spirit::spawn_sequence(vec![(503, "daemon à terre".to_string()), (200, retour)])
+                .await;
+
+        let mut couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        let recu = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+            .await
+            .expect("le fil se rouvre après le 503")
+            .expect("le canal reste ouvert");
+        assert_eq!(recu, "t-8");
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "le 503 a été suivi d'une seconde ouverture"
+        );
+    }
+
+    /// **Critère 4** — la séquence est vide, donc chaque connexion reçoit un corps
+    /// vide et se referme aussitôt : le compteur monte à chaque recul. La première
+    /// assertion est le **témoin positif** que mika#2205 réclame à côté d'un refus
+    /// — sans elle, un superviseur qui n'aurait jamais rouvert passerait aussi.
+    #[tokio::test]
+    async fn mika1727_v2b2b4_une_couture_lachee_ne_rouvre_plus_le_fil() {
+        let (base, connexions) = fake_spirit::spawn_sequence(Vec::new()).await;
+        let couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            Recul {
+                initial_ms: 20,
+                plafond_ms: 20,
+            },
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "le fil se rouvrait bien tant que la couture vivait"
+        );
+
+        drop(couture);
+        // Le lâcher ne réveille pas la tâche : elle dort jusqu'à son recul, lit
+        // alors `is_closed` et rend la main. Ce délai lui laisse ce réveil.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let apres_lacher = connexions.load(std::sync::atomic::Ordering::SeqCst);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            connexions.load(std::sync::atomic::Ordering::SeqCst),
+            apres_lacher,
+            "le compteur ne monte plus après le lâcher"
+        );
+    }
+
+    // -- le signal de rattrapage (mika#1727, vol V2b-3a) --
+
+    /// **Critère 1** — la première connexion sert un `task_claimed` : il passe le
+    /// filtre d'agent, n'est pas terminal et n'annonce aucun trou, donc un
+    /// drapeau armé ne peut venir que de l'**ouverture**. Le compteur de
+    /// connexions est le témoin positif des deux moitiés.
+    #[tokio::test]
+    async fn mika1727_v2b3a_la_premiere_ouverture_et_la_reouverture_arment_le_rattrapage() {
+        let premiere = fake_spirit::sse_payload(&[
+            r#"{"event":"task_claimed","task_id":"t-5","agent_id":"mika-dev","claimed_at":"2026-11-11T10:00:00Z"}"#,
+        ]);
+        let seconde = fake_spirit::sse_payload(&[
+            r#"{"event":"task_completed","task_id":"t-7","agent_id":"mika-dev","completed_at":"2026-11-11T10:00:01Z","result_preview":"fait"}"#,
+        ]);
+        let (base, connexions) =
+            fake_spirit::spawn_sequence(vec![(200, premiere), (200, seconde)]).await;
+
+        let mut couture = CallbackFeed::open_for_avec_recul(
+            "mika-dev",
+            base,
+            "jeton".to_string(),
+            // Une seconde, et non les 20 ms des tests voisins : c'est la fenêtre
+            // qui laisse **prendre** le signal de la première ouverture avant que
+            // la seconde ne le réarme. Sans elle les deux armements se
+            // confondraient et la réouverture ne serait plus mesurée.
+            Recul {
+                initial_ms: 1_000,
+                plafond_ms: 1_000,
+            },
+        );
+
+        let arme = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !couture.prendre_le_rattrapage() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(arme.is_ok(), "la première ouverture arme le rattrapage");
+        assert!(
+            connexions.load(Ordering::SeqCst) >= 1,
+            "le fil s'est ouvert"
+        );
+
+        let recu = tokio::time::timeout(std::time::Duration::from_secs(5), couture.rx.recv())
+            .await
+            .expect("la trame de la seconde connexion arrive")
+            .expect("le canal reste ouvert");
+        assert_eq!(recu, "t-7");
+        assert!(
+            connexions.load(Ordering::SeqCst) >= 2,
+            "par la seconde, donc"
+        );
+        assert!(couture.prendre_le_rattrapage(), "la réouverture a réarmé");
+    }
+
+    /// **Critère 2** — mesuré sur [`appliquer_la_trame`], donc sans serveur et
+    /// sans course : un `Lagged` ne se commande pas depuis un faux spirit. Le
+    /// troisième cas est le témoin positif que mika#2205 réclame — sans lui, une
+    /// fonction devenue vide passerait les deux refus qui précèdent.
+    #[test]
+    fn mika1727_v2b3a_un_overflow_arme_le_rattrapage_sans_rien_mettre_dans_le_canal() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let rattrapage = AtomicBool::new(false);
+
+        appliquer_la_trame(
+            Some(&TaskEventFrame::OverflowMarker { dropped_count: 3 }),
+            &tx,
+            &rattrapage,
+        );
+        assert!(rattrapage.swap(false, Ordering::SeqCst), "l'overflow arme");
+        assert!(rx.try_recv().is_err(), "et ne livre aucun `task_id`");
+
+        appliquer_la_trame(Some(&TaskEventFrame::Unknown), &tx, &rattrapage);
+        assert!(
+            !rattrapage.load(Ordering::SeqCst),
+            "`Unknown` est sans effet"
+        );
+        assert!(rx.try_recv().is_err(), "`Unknown` ne livre rien non plus");
+
+        appliquer_la_trame(
+            Some(&TaskEventFrame::TaskCompleted {
+                task_id: "t-1".to_string(),
+                agent_id: "mika-dev".to_string(),
+                completed_at: "2026-11-11T10:00:00Z".to_string(),
+                result_preview: Some("fait".to_string()),
+            }),
+            &tx,
+            &rattrapage,
+        );
+        assert_eq!(rx.try_recv().ok(), Some("t-1".to_string()));
+        assert!(
+            !rattrapage.load(Ordering::SeqCst),
+            "elle n'annonce aucun trou"
+        );
+    }
+
+    /// Un candidat tiré d'une couture dont le canal porte `t-42`.
+    async fn candidat(
+        statut: u16,
+        corps: String,
+        agent: &str,
+        session: &str,
+    ) -> Option<TaskDetailMirror> {
+        let (base, _) = fake_spirit::spawn_detail(statut, corps).await;
+        let (tx, mut couture) = CallbackFeed::from_channel(agent, base, "jeton".to_string());
+        tx.send("t-42".to_string()).expect("le canal est ouvert");
+        couture.next_candidate(agent, session).await
+    }
+
+    /// **Vol V2b-3b** — la couture dit quel agent elle suit, et le dit des deux
+    /// côtés. Le témoin négatif est ce qui sépare « la méthode répond » de « la
+    /// méthode rend toujours vrai ».
+    #[tokio::test]
+    async fn mika1727_v2b3b_la_couture_dit_quel_agent_elle_suit() {
+        let (_tx, couture) = CallbackFeed::from_channel("mika-dev", String::new(), String::new());
+
+        assert!(
+            couture.suit_lagent("mika-dev"),
+            "elle suit l'agent de son ouverture"
+        );
+        assert!(
+            !couture.suit_lagent("mika-qa"),
+            "et elle ne suit pas un autre"
+        );
+    }
+
+    /// **Critères 1, 2, 3 et 4** — `next_candidate` enchaîne les gardes 1 et 2, et
+    /// **aucune ne réclame** : rien ici ne touche à une base, donc la ligne reste
+    /// intacte pour le poll dans les six refus. Les deux témoins positifs vivent
+    /// dans le même test qu'eux : c'est eux qui séparent « la garde mord » de
+    /// « rien ne passe jamais » (mika#2205), et le second atteste que le `failed`
+    /// du vol V2b-2b-3 passe le prédicat comme le `completed`. Le refus d'un
+    /// `delivered` est ce qui empêche le `matches!` de devenir un jour « tout sauf
+    /// `pending` ». Chaque cas a son serveur parce que statut et corps sont figés
+    /// à la construction du factice.
+    #[tokio::test]
+    async fn mika1727_v2b2b3_le_candidat_passe_les_deux_gardes_ou_ne_passe_pas() {
+        let temoin = candidat(200, corps_de_detail(), "mika-qa", "s-7")
+            .await
+            .expect("le témoin positif doit passer");
+        assert_eq!(temoin.id, "t-42");
+        assert_eq!(temoin.result.as_deref(), Some("ok"));
+        assert_eq!(temoin.created_trace_id.as_deref(), Some("tr-9"));
+        assert_eq!(temoin.parent_task_id.as_deref(), Some("t-41"));
+        assert_eq!(temoin.completed_at.as_deref(), Some("2026-11-11T10:00:00Z"));
+
+        let echoue = corps_de_detail().replace("\"completed\"", "\"failed\"");
+        let temoin_echoue = candidat(200, echoue, "mika-qa", "s-7")
+            .await
+            .expect("un `failed` doit passer le prédicat");
+        assert_eq!(temoin_echoue.status, "failed");
+
+        let remise = corps_de_detail().replace("\"completed\"", "\"delivered\"");
+        let deja_remise = candidat(200, remise, "mika-qa", "s-7").await;
+        assert!(
+            deja_remise.is_none(),
+            "un détail déjà `delivered` ne passe pas"
+        );
+
+        let autre_session = candidat(200, corps_de_detail(), "mika-qa", "s-autre").await;
+        assert!(autre_session.is_none(), "une autre session ne passe pas");
+
+        let autre_agent = candidat(200, corps_de_detail(), "mika-dev", "s-7").await;
+        assert!(autre_agent.is_none(), "un autre agent ne passe pas");
+
+        let recurrente = corps_de_detail().replace("\"callback\"", "\"recurring\"");
+        let pas_un_callback = candidat(200, recurrente, "mika-qa", "s-7").await;
+        assert!(
+            pas_un_callback.is_none(),
+            "ce qui n'est pas callback / resume_agent ne passe pas"
+        );
+
+        let erreur_http = candidat(
+            500,
+            r#"{"error":"database is locked"}"#.to_string(),
+            "mika-qa",
+            "s-7",
+        )
+        .await;
+        assert!(erreur_http.is_none(), "un détail en erreur ne passe pas");
+
+        let illisible = candidat(200, r#"{"id":"t-42"}"#.to_string(), "mika-qa", "s-7").await;
+        assert!(illisible.is_none(), "un détail illisible ne passe pas");
+    }
 
     // -- the terminal filter reaches the operator's surface (mika#2670) --
 
@@ -1373,5 +2706,148 @@ mod tests {
             read_handler_failure(Some(r#"{"handler_failure":"a string"}"#)).is_none(),
             "the key present but not the expected shape"
         );
+    }
+}
+
+/// Un serveur SSE factice pour le flux task-events de mika-spirit, sur le patron
+/// `axum::serve` du crate (`commands/chat_turn.rs`, `commands/agents.rs`,
+/// `budget_floor.rs`).
+///
+/// **`pub(crate)` pour que le vol V2b-2 le reprenne** depuis les tests de la
+/// TUI, au lieu d'en écrire un second.
+///
+/// Deux choses sur son emplacement, qui ne sont pas des détails de goût :
+///
+/// - c'est un **bloc** `#[cfg(test)] pub(crate) mod …`, et non un `#[cfg(test)]`
+///   posé sur des `fn` isolées : le scanner egress
+///   (`scripts/lib/egress_manifest_lint.py`) n'écarte le code de test que sous
+///   cette forme, et une `fn` annotée seule serait lue comme de la production ;
+/// - il est posé **après** le module `tests`, en fin de fichier, là où la coupure
+///   du scanner a déjà eu lieu. Le placer plus haut déplacerait cette coupure
+///   vers lui et rendrait invisibles au lint toutes les lignes qui suivent.
+#[cfg(test)]
+pub(crate) mod fake_spirit {
+    use axum::Router;
+    use axum::routing::get;
+    use std::sync::{Arc, Mutex};
+    use tokio::net::TcpListener;
+
+    /// Encode une suite de charges en un corps SSE : un événement par charge,
+    /// terminé par `\n\n`.
+    pub(crate) fn sse_payload(charges: &[&str]) -> String {
+        charges
+            .iter()
+            .map(|charge| format!("data: {charge}\n\n"))
+            .collect()
+    }
+
+    /// Sert `payload` sur `/api/v1/dashboard/tasks/stream`, puis ferme.
+    ///
+    /// Le corps est **fini** : à la fermeture `consume` rend `Ok(())`, donc un
+    /// test assertant toute la séquence s'arrête de lui-même, sans timeout ni
+    /// `abort`. Un flux qui reste ouvert est ce dont la souscription de la TUI
+    /// aura besoin (vol V2b-2) ; il arrivera avec son appelant, pas avant.
+    ///
+    /// Rend l'URL de **base**, celle que [`super::TaskEventStream::open`]
+    /// complète.
+    pub(crate) async fn spawn(payload: String) -> String {
+        let router = Router::new().route(
+            "/api/v1/dashboard/tasks/stream",
+            get(move || {
+                let corps = payload.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps SSE factice")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Sert une **séquence** de réponses sur `/api/v1/dashboard/tasks/stream`,
+    /// une par connexion, et compte les connexions (mika#1727, vol V2b-2b-4).
+    ///
+    /// La n-ième connexion reçoit `reponses[n]` ; **au-delà de la séquence**, un
+    /// `200` à corps vide, qui se ferme aussitôt et provoque une reconnexion de
+    /// plus — ce dont le test du lâcher a besoin pour voir un compteur monter
+    /// avant de s'arrêter. Le compteur est le nombre de requêtes **reçues sur
+    /// cette route**, incrémenté avant de servir : c'est la définition de
+    /// « connexion » dans ces tests, écrite ici plutôt que supposée.
+    pub(crate) async fn spawn_sequence(
+        reponses: Vec<(u16, String)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let connexions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compteur = Arc::clone(&connexions);
+        let router = Router::new().route(
+            "/api/v1/dashboard/tasks/stream",
+            get(move || {
+                let reponses = reponses.clone();
+                let compteur = Arc::clone(&compteur);
+                async move {
+                    let rang = compteur.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (statut, corps) = reponses
+                        .get(rang)
+                        .cloned()
+                        .unwrap_or_else(|| (200, String::new()));
+                    axum::response::Response::builder()
+                        .status(statut)
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps SSE factice à séquence")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        (format!("http://{addr}"), connexions)
+    }
+
+    /// L'en-tête `authorization` tel que la socket l'a reçu, `None` avant la requête.
+    pub(crate) type EnTeteRecu = Arc<Mutex<Option<String>>>;
+
+    /// Sert `/api/v1/tasks/{task_id}` avec le `statut` et le `corps` que le test
+    /// choisit, et rend l'URL de base avec le témoin de l'en-tête reçu.
+    ///
+    /// Le chemin est **paramétré** et le corps cloné par le gestionnaire : un seul
+    /// serveur répond donc à plusieurs identifiants et à plusieurs requêtes, ce dont
+    /// le test des trois formats a besoin. Le témoin fait de « le jeton part en
+    /// `Bearer` » une mesure prise **sur la socket**, non une relecture du code.
+    pub(crate) async fn spawn_detail(statut: u16, corps: String) -> (String, EnTeteRecu) {
+        let recu: EnTeteRecu = Arc::new(Mutex::new(None));
+        let temoin = Arc::clone(&recu);
+        let router = Router::new().route(
+            "/api/v1/tasks/{task_id}",
+            get(move |en_tetes: axum::http::HeaderMap| {
+                let corps = corps.clone();
+                let temoin = Arc::clone(&temoin);
+                async move {
+                    *temoin.lock().expect("témoin d'en-tête") = en_tetes
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    axum::response::Response::builder()
+                        .status(statut)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(corps))
+                        .expect("corps de détail factice")
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router.into_make_service()).await;
+        });
+        (format!("http://{addr}"), recu)
     }
 }
