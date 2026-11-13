@@ -3,21 +3,25 @@
 //! miroirs du fil, vocabulaire d'erreur, et un `post` unique. L'URL de base et
 //! le jeton arrivent **par argument**, pour la raison déjà écrite sur
 //! [`super::tasks::fetch_task_detail`] : un client qui résout ses propres accès
-//! ne se pilote pas depuis un test. La porte [`preview`] et la conversion vers
-//! [`RewindPreview`] sont câblées (vol V2c-1a-2a) ; `resolve` et `execute` vont
-//! à V2c-1a-2b, et c'est pourquoi `ResolveMirror` et `ResultMirror` gardent seuls
-//! leur `expect(dead_code)`. L'appelant de [`preview`] arrive avec V2c-1b.
+//! ne se pilote pas depuis un test. Les portes [`preview`] et la conversion vers
+//! [`RewindPreview`] (vol V2c-1a-2a), puis [`execute`] (vol V2c-1a-2b), sont
+//! posées ; `resolve` va à V2c-1a-2c, et c'est pourquoi `ResolveMirror` garde un
+//! `expect(dead_code)` de type mort, là où celui de `ResultMirror` ne couvre plus
+//! que des champs non lus. Les appelants des deux portes arrivent avec V2c-1b.
 
 use mika_agent::rewind::{
     MessagePreview, ReversalAction, ReversalPreview, RewindPreview, TaskPreview,
 };
 use serde::Deserialize;
 
-// Les six miroirs du fil. Les réponses de `mika-agent/src/server/rewind.rs` ne
+// Les sept miroirs du fil. Les réponses de `mika-agent/src/server/rewind.rs` ne
 // dérivent que `Serialize`, et `crates/mika-agent/` est hors périmètre : ces
 // structs *sont* le contrat de fil côté client, sans règle de domaine (§ 2.4).
 
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "câblé par V2c-1a-2c, mika#1727")
+)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResolveMirror {
     pub(crate) session_id: String,
@@ -58,7 +62,15 @@ pub(crate) struct TaskMirror {
     pub(crate) actioned: bool,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1a-2, mika#1727"))]
+// L'attribut reste, mais sa raison change : le type n'est plus mort — [`execute`]
+// le rend —, ce sont ses **champs** que personne ne lit encore, la porte les
+// passant à son appelant sans les ouvrir. Mesuré à `cargo clippy -p mika-cli
+// --all-targets` : « multiple fields are never read », et non « struct is never
+// constructed » comme pour `ResolveMirror` ci-dessus.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "champs lus par V2c-1b, mika#1727")
+)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResultMirror {
     pub(crate) messages_deleted: usize,
@@ -69,6 +81,21 @@ pub(crate) struct ResultMirror {
     pub(crate) warnings: Vec<String>,
     pub(crate) reversal_descriptions: Vec<String>,
     pub(crate) rewind_trace_id: String,
+}
+
+/// Le corps du 422 d'`execute` : `{"error": "…"}`, et non l'aperçu entier que
+/// `preview` renvoie sous le même statut (F5).
+///
+/// **Pourquoi un type, et non un `serde_json::Value`.** Lire la raison par
+/// `valeur.get("error").and_then(Value::as_str)` tiendrait en une ligne, et
+/// c'est cette ligne qui serait fragile : la clé ne serait alors déclarée nulle
+/// part comme un contrat, et un `error` renommé côté serveur donnerait
+/// silencieusement le repli de la porte — un refus affiché comme « sans raison
+/// lisible » là où le serveur a dit pourquoi. Déclaré ici, c'est `from_str` qui
+/// échoue, dans le bras même que les tests mesurent.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ErrorMirror {
+    pub(crate) error: String,
 }
 
 /// Le vocabulaire d'erreur que les trois routes partagent. `Blocked` n'a aucun
@@ -345,6 +372,85 @@ pub(crate) async fn preview(
         status: Some(statut),
         url: rewind_url(base_url, "preview"),
         body: cause,
+    })
+}
+
+/// Le rembobinage **appliqué** sur mika-spirit, et son résultat tel que le
+/// serveur l'a écrit.
+///
+/// Rendu en `ResultMirror` et non converti vers `mika_agent::rewind::RewindResult`,
+/// parce qu'il n'existe aucun formateur de domaine pour un résultat — `rewind.rs`
+/// n'expose que `format_preview`, et la mise en forme vit en ligne chez
+/// l'appelant, dans un fichier que ce vol n'ouvre pas. Recopier huit champs
+/// identiques vers un type que personne ne lit avant V2c-1b trancherait à la
+/// place de V2c-1b entre convertir ici et déplacer ce formatage.
+///
+/// `Option<&str>` pour l'origine : l'appelant tient son `session_id` d'origine
+/// dans son propre état et n'a pas à l'allouer pour le prêter.
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1b, mika#1727"))]
+pub(crate) async fn execute(
+    base_url: &str,
+    token: &str,
+    agent: &str,
+    session_id: &str,
+    after_message_id: i64,
+    originating_session_id: Option<&str>,
+) -> Result<ResultMirror, RewindRemoteIssue> {
+    // `agent` part **toujours**, pour la raison écrite sur [`preview`] — et ici
+    // elle est d'un cran plus grave : `handle_rewind_execute` résout l'agent en
+    // *première* instruction, avant même de valider la requête, donc un champ
+    // absent ne ferait pas afficher le mauvais aperçu, il **appliquerait** le
+    // rembobinage sur la base d'un autre fil.
+    let mut envoye = serde_json::json!({
+        "session_id": session_id,
+        "after_message_id": after_message_id,
+        "agent": agent,
+    });
+    // Une clé **absente**, et non un `null` — d'où le `mut`, `json!` ne sachant
+    // pas omettre. Les deux se valent aujourd'hui (le champ est `Option<String>`
+    // avec `#[serde(default)]` côté serveur), mais le jour où il deviendrait
+    // `String` + `default` — la forme que `agent` porte déjà trois lignes plus
+    // haut — l'absence prendrait le défaut tandis que le `null` ferait échouer la
+    // désérialisation **entière**, donc le rembobinage. L'absence est strictement
+    // plus robuste, pas seulement plus propre.
+    if let Some(origine) = originating_session_id {
+        envoye["originating_session_id"] = serde_json::Value::String(origine.to_string());
+    }
+    let (statut, corps) = post(base_url, token, "execute", &envoye).await?;
+
+    // Le statut est lu **avant** la forme, et c'est le 422 qui passe en premier :
+    // `post` rend 200 *et* 422 sur son chemin `Ok`, donc tenter `ResultMirror`
+    // d'abord ferait sortir un 422 — dont le corps n'a aucun des huit champs — en
+    // `Unexpected`, et un refus du serveur se lirait comme un écart de version.
+    if statut == 422 {
+        // Un 422 est `Blocked` quelle que soit la lisibilité de son corps, et
+        // c'est l'inverse de la conduite de `preview` ci-dessus, pour la règle
+        // qu'elle énonce : la forme du corps renseigne sur le *client*, le statut
+        // 422 est une décision du *serveur*.
+        let reason = serde_json::from_str::<ErrorMirror>(&corps)
+            .map(|miroir| miroir.error)
+            // Le repli nomme ce qui s'est passé et **cite le corps reçu**, seul
+            // matériau d'un diagnostic. Il ne se mutualise pas avec celui de
+            // `preview` : là-bas le corps est parfaitement lisible et c'est
+            // `block_reason` qui manque (le serveur a refusé sans dire pourquoi) ;
+            // ici le client ne sait pas lire le corps du tout (écart de version).
+            // Deux populations, deux remèdes — élargir le domaine contre
+            // réaligner les versions.
+            .unwrap_or_else(|_| format!("the 422 body carries no readable reason: {corps}"));
+        // `preview: None` : le 422 d'`execute` ne porte aucun aperçu (F5), et en
+        // fabriquer un serait une invention.
+        return Err(RewindRemoteIssue::Blocked {
+            reason,
+            preview: None,
+        });
+    }
+
+    // Un 200 illisible n'a aucun refus à préserver, lui : le taire rendrait un
+    // résultat vide en position de succès.
+    serde_json::from_str(&corps).map_err(|cause| RewindRemoteIssue::Unexpected {
+        status: Some(statut),
+        url: rewind_url(base_url, "execute"),
+        body: format!("unreadable rewind result ({cause}): {corps}"),
     })
 }
 
@@ -912,5 +1018,157 @@ mod tests {
             }
             autre => panic!("{autre:?}"),
         }
+    }
+
+    /// Un résultat à huit champs, tous distincts : cinq compteurs permutés
+    /// entre eux resteraient verts sur des valeurs égales.
+    const UN_RESULTAT: &str = r#"{"messages_deleted":2,"reversals_applied":3,
+        "reversals_skipped":1,"tasks_deleted":4,"tasks_cancelled":5,
+        "warnings":["un avertissement"],"reversal_descriptions":["restaure la fiche"],
+        "rewind_trace_id":"rw-7"}"#;
+
+    /// La porte `execute` contre un factice qui sert `statut`/`corps` sur
+    /// `execute`, et le témoin de ce qu'il a vu sur la socket. Frère de
+    /// [`par_la_porte`], spécifique à `preview` et qui rend un aperçu. L'origine
+    /// est un paramètre parce que deux tests mesurent la clé qu'elle fait
+    /// apparaître — ou pas.
+    async fn par_la_porte_execute(
+        statut: StatusCode,
+        corps: &str,
+        origine: Option<&str>,
+    ) -> (
+        Result<ResultMirror, RewindRemoteIssue>,
+        Arc<Mutex<Vec<RequeteRecue>>>,
+    ) {
+        let (base, recues) = fake_spirit(&[("/api/v1/rewind/execute", statut, corps)]).await;
+        let rendu = execute(&base, "jeton", "mika-dev", "s-1", 42, origine).await;
+        (rendu, recues)
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_porte_execute_rend_le_resultat_servi() {
+        let (rendu, _) = par_la_porte_execute(StatusCode::OK, UN_RESULTAT, None).await;
+        let resultat =
+            rendu.unwrap_or_else(|erreur| panic!("un 200 lisible passe la porte : {erreur}"));
+        // Les **huit** champs un à un : ni `ResultMirror` ni `RewindResult` ne
+        // dérive `PartialEq`, donc l'énumération est la seule mesure disponible
+        // — et c'est aussi la seule qui dit *lequel* a dérivé. Ce test ne double
+        // pas `mika1727_les_miroirs_se_lisent_depuis_la_forme_du_serveur`, qui
+        // appelle `from_str` en direct et mesure serde : si la porte régressait
+        // vers `Unexpected`, celui-là resterait vert.
+        assert_eq!(resultat.messages_deleted, 2);
+        assert_eq!(resultat.reversals_applied, 3);
+        assert_eq!(resultat.reversals_skipped, 1);
+        assert_eq!(resultat.tasks_deleted, 4);
+        assert_eq!(resultat.tasks_cancelled, 5);
+        assert_eq!(resultat.warnings, vec!["un avertissement".to_string()]);
+        assert_eq!(
+            resultat.reversal_descriptions,
+            vec!["restaure la fiche".to_string()]
+        );
+        assert_eq!(resultat.rewind_trace_id, "rw-7");
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_corps_dexecute_porte_son_origine_quand_elle_existe() {
+        let (rendu, recues) =
+            par_la_porte_execute(StatusCode::OK, UN_RESULTAT, Some("sess-b")).await;
+        rendu.expect("le factice sert un résultat lisible");
+
+        let vues = recues.lock().unwrap();
+        let corps: serde_json::Value =
+            serde_json::from_str(&vues[0].corps).expect("le corps envoyé est du JSON");
+        // Lu sur la socket, et non sur la valeur passée à `post` : la seule
+        // lecture qui mesure ce que le serveur recevra.
+        assert_eq!(corps["session_id"], "s-1");
+        assert_eq!(corps["after_message_id"], 42);
+        assert_eq!(corps["agent"], "mika-dev");
+        assert_eq!(corps["originating_session_id"], "sess-b");
+    }
+
+    #[tokio::test]
+    async fn mika1727_sans_origine_la_cle_dorigine_est_absente_et_non_nulle() {
+        let (rendu, recues) = par_la_porte_execute(StatusCode::OK, UN_RESULTAT, None).await;
+        rendu.expect("le factice sert un résultat lisible");
+
+        let vues = recues.lock().unwrap();
+        let corps: serde_json::Value =
+            serde_json::from_str(&vues[0].corps).expect("le corps envoyé est du JSON");
+        // `is_none()` et non `!= ""` : un `null` passerait un test sur la valeur,
+        // et c'est exactement la forme que la clé absente existe pour éviter.
+        assert!(corps.get("originating_session_id").is_none(), "{corps}");
+        // Les trois autres toujours là : ce test et son frère ci-dessus sont une
+        // paire, et ni l'un ni l'autre ne suffit. Celui-là seul passerait sur une
+        // porte qui n'écrit **jamais** la clé — c'est-à-dire qui perd en silence
+        // le rembobinage inter-sessions ; l'autre seul passerait sur une porte
+        // qui l'écrit toujours, en `null` quand l'origine est absente.
+        assert_eq!(corps["session_id"], "s-1");
+        assert_eq!(corps["after_message_id"], 42);
+        assert_eq!(corps["agent"], "mika-dev");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_422_dexecute_rend_la_raison_du_serveur() {
+        const CORPS: &str = r#"{"error":"Rewind blocked: a task holds the lock"}"#;
+        let (rendu, _) = par_la_porte_execute(StatusCode::UNPROCESSABLE_ENTITY, CORPS, None).await;
+
+        match rendu.expect_err("un 422 est un refus du serveur") {
+            RewindRemoteIssue::Blocked { reason, preview } => {
+                // Égale, et non `contains` : la raison arrive à l'opérateur telle
+                // que le serveur l'a écrite.
+                assert_eq!(reason, "Rewind blocked: a task holds the lock");
+                // Le 422 d'`execute` ne porte aucun aperçu, contrairement à celui
+                // de `preview` : même refus, autre forme.
+                assert!(preview.is_none());
+            }
+            autre => panic!("{autre:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_422_dexecute_illisible_reste_un_refus_et_cite_son_corps() {
+        // La clé `error` renommée : l'écart de version, et non un corps absurde.
+        const CORPS: &str = r#"{"message":"refusé, mais sous une autre clé"}"#;
+        let (rendu, _) = par_la_porte_execute(StatusCode::UNPROCESSABLE_ENTITY, CORPS, None).await;
+
+        // Le témoin négatif du test précédent, et le seul qui mesure le critère
+        // en entier : si le bras 422 se repliait sur `Unexpected`, l'autre
+        // resterait vert — son corps est lisible — et seul celui-ci rougirait.
+        match rendu.expect_err("un 422 reste un refus") {
+            RewindRemoteIssue::Blocked { reason, preview } => {
+                assert!(reason.contains("no readable reason"), "{reason}");
+                // Le corps reçu est cité : le seul matériau d'un diagnostic.
+                assert!(reason.contains("une autre clé"), "{reason}");
+                assert!(preview.is_none());
+            }
+            autre => panic!("{autre:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_200_dexecute_illisible_porte_son_statut() {
+        // Un objet JSON **valide mais tronqué**, et non « pas du json » : aucun
+        // des huit champs ne porte `#[serde(default)]`, donc c'est là la forme
+        // réelle de l'écart de version — un serveur qui retire ou renomme un
+        // champ —, et la seule des deux qu'une lecture en `Value` à défauts
+        // laisserait passer, en rendant un résultat à sept zéros en position de
+        // succès.
+        let (rendu, _) =
+            par_la_porte_execute(StatusCode::OK, r#"{"messages_deleted":3}"#, None).await;
+        let erreur = rendu.expect_err("un corps tronqué n'est pas un succès");
+        // Le statut est lu *dans* l'`Unexpected` : sans statut, le message dit
+        // « injoignable » — une autre cause, et un autre geste pour l'opérateur.
+        assert!(
+            matches!(
+                erreur,
+                RewindRemoteIssue::Unexpected {
+                    status: Some(200),
+                    ..
+                }
+            ),
+            "{erreur:?}"
+        );
+        let message = erreur.to_string();
+        assert!(message.contains("/api/v1/rewind/execute"), "{message}");
     }
 }
