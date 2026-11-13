@@ -6282,7 +6282,9 @@ mod tests {
     async fn mika1727_au_dela_du_seuil_la_route_compacte_avec_le_llm_de_lagent() {
         let mock = Arc::new(
             MockLlmProvider::builder()
-                .responses(vec![text_response("Fact: la conversation a été condensée.")])
+                .responses(vec![text_response(
+                    "Fact: la conversation a été condensée.",
+                )])
                 .build(),
         );
         let state = mika1727_state_compact(mock.clone());
