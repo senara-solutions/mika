@@ -3,11 +3,12 @@
 //! miroirs du fil, vocabulaire d'erreur, et un `post` unique. L'URL de base et
 //! le jeton arrivent **par argument**, pour la raison déjà écrite sur
 //! [`super::tasks::fetch_task_detail`] : un client qui résout ses propres accès
-//! ne se pilote pas depuis un test. Les portes [`preview`] et la conversion vers
-//! [`RewindPreview`] (vol V2c-1a-2a), puis [`execute`] (vol V2c-1a-2b), sont
-//! posées ; `resolve` va à V2c-1a-2c, et c'est pourquoi `ResolveMirror` garde un
-//! `expect(dead_code)` de type mort, là où celui de `ResultMirror` ne couvre plus
-//! que des champs non lus. Les appelants des deux portes arrivent avec V2c-1b.
+//! ne se pilote pas depuis un test. Les **trois** portes sont posées —
+//! [`preview`] et la conversion vers [`RewindPreview`] (vol V2c-1a-2a),
+//! [`execute`] (vol V2c-1a-2b), [`resolve`] (vol V2c-1a-2c) — et **leurs
+//! appelants arrivent avec V2c-1b** : c'est pourquoi chaque porte garde un
+//! `expect(dead_code)`, et pourquoi les miroirs qu'elles rendent gardent le leur
+//! sur des champs que personne ne lit encore.
 
 use mika_agent::rewind::{
     MessagePreview, ReversalAction, ReversalPreview, RewindPreview, TaskPreview,
@@ -18,9 +19,13 @@ use serde::Deserialize;
 // dérivent que `Serialize`, et `crates/mika-agent/` est hors périmètre : ces
 // structs *sont* le contrat de fil côté client, sans règle de domaine (§ 2.4).
 
+// Le type n'est plus mort — [`resolve`] le rend —, ce sont ses **champs** que
+// personne ne lit encore. Mesuré à `cargo clippy -p mika-cli` : « fields
+// `session_id`, `after_message_id`, and `trace_ids` are never read », et non
+// « struct is never constructed » comme avant ce vol.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "câblé par V2c-1a-2c, mika#1727")
+    expect(dead_code, reason = "champs lus par V2c-1b, mika#1727")
 )]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResolveMirror {
@@ -65,8 +70,8 @@ pub(crate) struct TaskMirror {
 // L'attribut reste, mais sa raison change : le type n'est plus mort — [`execute`]
 // le rend —, ce sont ses **champs** que personne ne lit encore, la porte les
 // passant à son appelant sans les ouvrir. Mesuré à `cargo clippy -p mika-cli
-// --all-targets` : « multiple fields are never read », et non « struct is never
-// constructed » comme pour `ResolveMirror` ci-dessus.
+// --all-targets` : « multiple fields are never read », comme pour
+// `ResolveMirror` ci-dessus depuis que [`resolve`] le construit.
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "champs lus par V2c-1b, mika#1727")
@@ -203,6 +208,71 @@ async fn post(
             body: corps,
         }),
     }
+}
+
+/// L'ancrage d'un rembobinage de `count` échanges, tel que mika-spirit le
+/// calcule : la session visée, le `after_message_id` jusqu'où remonter, et les
+/// `trace_ids` des tours concernés.
+///
+/// Rendu en [`ResolveMirror`] et non converti vers un type de domaine, parce
+/// qu'il n'y en a pas : les trois champs repartent tels quels vers [`preview`]
+/// puis [`execute`], et l'ancrage n'est jamais montré à l'opérateur.
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2c-1b, mika#1727"))]
+pub(crate) async fn resolve(
+    base_url: &str,
+    token: &str,
+    agent: &str,
+    session_id: &str,
+    count: usize,
+) -> Result<ResolveMirror, RewindRemoteIssue> {
+    // `agent` part **toujours**, pour la raison écrite sur [`preview`]. La
+    // conséquence immédiate d'une omission est ici plus douce — un ancrage lu sur
+    // le fil d'un autre agent, pas un rembobinage appliqué dessus — mais c'est
+    // **le même ancrage** que V2c-1b passera ensuite à [`execute`] : l'erreur ne
+    // serait pas rattrapée plus loin, elle serait seulement commise plus tôt.
+    //
+    // `count` part toujours lui aussi : le serveur le déclare
+    // `#[serde(default = "default_count")]` à **1**, donc une clé absente ferait
+    // rembobiner un seul échange là où l'appelant en demande N, en silence et
+    // sous un 200.
+    //
+    // Pas de garde client sur `count == 0` : le serveur rend un 400 avec sa
+    // raison, que `post` transmet en `Unexpected`. Une garde ici dupliquerait la
+    // validation du serveur — deux vérités pour une règle — et masquerait le jour
+    // où la règle change là-bas.
+    let envoye = serde_json::json!({
+        "session_id": session_id,
+        "count": count,
+        "agent": agent,
+    });
+    let (statut, corps) = post(base_url, token, "resolve", &envoye).await?;
+
+    // Le statut est lu **avant** la forme, comme sur [`execute`] : `post` rend
+    // 200 *et* 422 sur son chemin `Ok`, et tenter `ResolveMirror` d'abord ferait
+    // porter au message d'un 422 une cause de serde au lieu du statut reçu.
+    //
+    // Un statut autre que 200 est `Unexpected`, **jamais** `Blocked`, et c'est la
+    // conduite inverse de celle d'`execute` pour la même règle : le statut dit ce
+    // que le serveur a décidé, et `handle_rewind_resolve` n'émet aucun 422 — il
+    // ne refuse pas un rembobinage, il cherche un ancrage. Rendre `Blocked`
+    // inventerait une décision que le serveur n'a pas prise ; le lire comme un
+    // succès donnerait un ancrage vide.
+    //
+    // La condition est `!= 200` et non `== 422` : rien ne garantit que le chemin
+    // `Ok` de `post` restera à deux statuts.
+    if statut != 200 {
+        return Err(RewindRemoteIssue::Unexpected {
+            status: Some(statut),
+            url: rewind_url(base_url, "resolve"),
+            body: corps,
+        });
+    }
+
+    serde_json::from_str(&corps).map_err(|cause| RewindRemoteIssue::Unexpected {
+        status: Some(statut),
+        url: rewind_url(base_url, "resolve"),
+        body: format!("unreadable rewind anchor ({cause}): {corps}"),
+    })
 }
 
 /// Les trois graphies que le serveur écrit par `format!("{:?}")`, et le refus de
@@ -1170,5 +1240,118 @@ mod tests {
         );
         let message = erreur.to_string();
         assert!(message.contains("/api/v1/rewind/execute"), "{message}");
+    }
+
+    /// Un ancrage à trois champs, tous distincts de leurs voisins : deux
+    /// `trace_ids` parce qu'un seul ne dirait pas que la liste est reprise en
+    /// entier.
+    const UN_ANCRAGE: &str =
+        r#"{"session_id":"s-1","after_message_id":40,"trace_ids":["tr-1","tr-2"]}"#;
+
+    /// La porte `resolve` contre un factice qui sert `statut`/`corps` sur
+    /// `resolve`, et le témoin de ce qu'il a vu sur la socket. `count` est un
+    /// paramètre parce qu'un test le mesure sur le corps envoyé.
+    async fn par_la_porte_resolve(
+        statut: StatusCode,
+        corps: &str,
+        count: usize,
+    ) -> (
+        Result<ResolveMirror, RewindRemoteIssue>,
+        Arc<Mutex<Vec<RequeteRecue>>>,
+    ) {
+        let (base, recues) = fake_spirit(&[("/api/v1/rewind/resolve", statut, corps)]).await;
+        let rendu = resolve(&base, "jeton", "mika-dev", "s-1", count).await;
+        (rendu, recues)
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_porte_resolve_rend_lancrage_servi() {
+        let (rendu, _) = par_la_porte_resolve(StatusCode::OK, UN_ANCRAGE, 1).await;
+        let ancrage =
+            rendu.unwrap_or_else(|erreur| panic!("un 200 lisible passe la porte : {erreur}"));
+        // Les trois champs un à un : `ResolveMirror` ne dérive pas `PartialEq`,
+        // et l'énumération est seule à dire *lequel* a dérivé.
+        assert_eq!(ancrage.session_id, "s-1");
+        assert_eq!(ancrage.after_message_id, 40);
+        // Sur le contenu, et non sur la longueur : deux `trace_ids` permutés ou
+        // vidés garderaient un `len() == 2`.
+        assert_eq!(
+            ancrage.trace_ids,
+            vec!["tr-1".to_string(), "tr-2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_corps_de_resolve_porte_son_compte_tel_quel() {
+        // `3` et non `1` : le serveur défaute `count` à 1, donc une clé omise
+        // resterait verte sur la valeur par défaut.
+        let (rendu, recues) = par_la_porte_resolve(StatusCode::OK, UN_ANCRAGE, 3).await;
+        rendu.expect("le factice sert un ancrage lisible");
+
+        let vues = recues.lock().unwrap();
+        let corps: serde_json::Value =
+            serde_json::from_str(&vues[0].corps).expect("le corps envoyé est du JSON");
+        // Lu sur la socket, et non sur la valeur passée à `post` : la seule
+        // lecture qui mesure ce que le serveur recevra.
+        assert_eq!(corps["session_id"], "s-1");
+        assert_eq!(corps["agent"], "mika-dev");
+        assert_eq!(corps["count"], 3);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_422_de_resolve_est_un_ecart_et_non_un_refus() {
+        // `handle_rewind_resolve` n'émet aucun 422 ; `post` en rend pourtant un à
+        // l'appelant sur son chemin `Ok`. C'est donc l'incohérence serveur que ce
+        // test mesure, et la porte doit la nommer telle quelle.
+        let (rendu, _) =
+            par_la_porte_resolve(StatusCode::UNPROCESSABLE_ENTITY, r#"{"error":"refusé"}"#, 1)
+                .await;
+
+        let erreur = rendu.expect_err("un 422 ne passe pas la porte");
+        assert!(
+            matches!(
+                erreur,
+                RewindRemoteIssue::Unexpected {
+                    status: Some(422),
+                    ..
+                }
+            ),
+            "{erreur:?}"
+        );
+        // La seconde moitié du critère, et pas une redite : un corps portant la
+        // clé `error` est exactement celui qu'un bras `Blocked` copié depuis
+        // `execute` saurait lire, donc l'assertion de forme ci-dessus ne suffit
+        // pas à dire que ce bras n'existe pas.
+        assert!(
+            !matches!(erreur, RewindRemoteIssue::Blocked { .. }),
+            "{erreur:?}"
+        );
+        let message = erreur.to_string();
+        assert!(message.contains("422"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_200_de_resolve_illisible_porte_son_statut() {
+        // Un objet JSON **valide mais tronqué**, et non « pas du json » : aucun
+        // des trois champs ne porte `#[serde(default)]`, donc c'est là la forme
+        // réelle de l'écart de version, et la seule qu'une lecture à défauts
+        // laisserait passer — en rendant un ancrage à `after_message_id` nul, qui
+        // rembobinerait le fil entier.
+        let (rendu, _) = par_la_porte_resolve(StatusCode::OK, r#"{"session_id":"s-1"}"#, 1).await;
+        let erreur = rendu.expect_err("un corps tronqué n'est pas un succès");
+        // Le statut est lu *dans* l'`Unexpected` : sans statut, le message dit
+        // « injoignable » — une autre cause, et un autre geste pour l'opérateur.
+        assert!(
+            matches!(
+                erreur,
+                RewindRemoteIssue::Unexpected {
+                    status: Some(200),
+                    ..
+                }
+            ),
+            "{erreur:?}"
+        );
+        let message = erreur.to_string();
+        assert!(message.contains("/api/v1/rewind/resolve"), "{message}");
     }
 }
