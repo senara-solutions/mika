@@ -371,6 +371,17 @@ call_site          = "crates/mika-cli/src/commands/rewind_remote.rs"
 owner              = "@samidarko"
 
 [[sink]]
+id                 = "cli-spirit-sessions"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "un POST générique vers les trois routes de session de mika-spirit (POST /api/v1/sessions, POST /api/v1/sessions/{id}/end, POST /api/v1/compact) : le corps JSON que l'appelant fournit — le nom de l'agent servi, et pour la clôture l'identifiant de session, qui voyage dans le chemin — et le jeton interne en en-tête Authorization"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/session_remote.rs"
+call_site          = "crates/mika-cli/src/commands/session_remote.rs"
+owner              = "@samidarko"
+
+[[sink]]
 id                 = "cli-spirit-iterate"
 destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
 destination_source = "config"
