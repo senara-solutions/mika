@@ -17,8 +17,27 @@
 //!
 //! **État du vol.** Une seule porte ici, `ouvrir`. « Clore » et « compacter »
 //! arrivent en V2d-3b sur ce même transport, et **aucun appelant** ne les
-//! atteint avant V2d-4 : c'est pourquoi les items portent un
-//! `expect(dead_code)` hors test.
+//! atteint avant V2d-4. Le seul `expect(dead_code)` du module est donc sur
+//! `CreatedSessionMirror`, dont hors test personne ne lit les deux champs : les
+//! attributs se **mesurent** sous `cargo clippy --all-targets`, ils ne se
+//! devinent pas — un `expect` posé par symétrie sur `ouvrir` ou sur `post`
+//! serait rendu « unfulfilled », donc un avertissement de plus.
+
+use serde::Deserialize;
+
+// Le miroir du fil. `CreateSessionResponse` ne dérive que `Serialize` et vit
+// dans `crates/mika-agent/`, hors périmètre : ce miroir **est** le contrat de
+// fil côté client, sans règle de domaine — la même phrase que
+// `rewind_remote.rs:19-21`, et la même raison.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
+pub(crate) struct CreatedSessionMirror {
+    pub(crate) session_id: String,
+    /// Vrai quand l'identifiant rendu est la session canonique de l'agent
+    /// (mika#1401) : le client ne la clôt **jamais**. C'est V2d-4 qui lira ce
+    /// champ pour décider s'il appelle `clore` en fin de session.
+    pub(crate) canonical: bool,
+}
 
 /// Le vocabulaire d'erreur que les trois routes partagent.
 ///
@@ -82,7 +101,6 @@ fn session_url(base_url: &str, chemin: &str) -> String {
 /// `/api/v1/compact` ne partagent que `/api/v1`, donc un préfixe commun collé
 /// ici mentirait sur deux des trois. Et il reste un `&str` plutôt qu'un enum
 /// sans producteur : la socket mesure, pas le typage.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
 async fn post(
     base_url: &str,
     token: &str,
@@ -125,6 +143,41 @@ async fn post(
     }
 }
 
+const ROUTE_SESSIONS: &str = "/api/v1/sessions";
+
+/// Ouvre une session pour l'agent servi, et rend ce que mika-spirit a inscrit.
+///
+/// `agent` part **toujours**, y compris vide : c'est le serveur qui décide ce
+/// qu'un nom vide vaut (`#[serde(default)]` puis 404 sur agent inconnu), et un
+/// client qui tranche ici se mettrait à répondre à sa place.
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
+pub(crate) async fn ouvrir(
+    base_url: &str,
+    token: &str,
+    agent: &str,
+) -> Result<CreatedSessionMirror, SessionRemoteIssue> {
+    let envoye = serde_json::json!({ "agent": agent });
+    let (statut, corps) = post(base_url, token, ROUTE_SESSIONS, &envoye).await?;
+    // Statut lu avant la forme : `post` ne rend `Ok` que sur 200, mais la
+    // condition est écrite ici plutôt que supposée — le jour où un bras de
+    // `post` rendrait un autre statut sur son chemin `Ok`, un corps d'erreur
+    // serait désérialisé comme un succès.
+    if statut != 200 {
+        return Err(SessionRemoteIssue::Unexpected {
+            status: Some(statut),
+            url: session_url(base_url, ROUTE_SESSIONS),
+            body: corps,
+        });
+    }
+    serde_json::from_str(&corps).map_err(|cause| SessionRemoteIssue::Unexpected {
+        status: Some(statut),
+        url: session_url(base_url, ROUTE_SESSIONS),
+        // Le corps reçu voyage avec la cause : sans lui, « champ manquant
+        // `canonical` » ne dit pas si le serveur a répondu autre chose.
+        body: format!("unreadable created session ({cause}): {corps}"),
+    })
+}
+
 // Les tests vivent ici, **en fin de fichier** : le scanner d'egress coupe la
 // production au premier `#[cfg(test)]`, et un item d'après en sortirait.
 #[cfg(test)]
@@ -135,8 +188,6 @@ mod tests {
     // diverger. Il est `pub(crate)` depuis V2c-1b, pour ce motif-là.
     use crate::commands::rewind_remote::tests::fake_spirit;
     use axum::http::StatusCode;
-
-    const ROUTE_SESSIONS: &str = "/api/v1/sessions";
 
     /// Un factice qui ne sert qu'un couple sur `chemin`, et l'appel que `post` y
     /// fait. L'URL de base revient avec, parce que le critère 3 l'attend dans le
@@ -149,6 +200,38 @@ mod tests {
         let (base, _) = fake_spirit(&[(chemin, statut, corps)]).await;
         let rendu = post(&base, "jeton", chemin, &serde_json::json!({})).await;
         (base, rendu)
+    }
+
+    #[tokio::test]
+    async fn mika1727_ouvrir_vise_la_route_des_sessions_avec_son_jeton() {
+        let (base, recues) = fake_spirit(&[(
+            ROUTE_SESSIONS,
+            StatusCode::OK,
+            r#"{"session_id":"s-neuve","canonical":false}"#,
+        )])
+        .await;
+
+        let rendu = ouvrir(&base, "jeton-secret", "mika-dev")
+            .await
+            .expect("un 200 au corps lisible est un succès");
+
+        // Les trois faits se lisent sur la socket et non sur l'appel : c'est ce
+        // que le serveur reçoit qui tient le contrat, pas ce qu'on croit poster.
+        let vues = recues.lock().expect("le témoin du banc");
+        // Le compte sans rendu `Debug` : `RequeteRecue` n'en dérive pas, et le
+        // banc du voisin reste intact dans ce vol.
+        assert_eq!(vues.len(), 1, "un seul appel attendu");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "POST");
+        assert_eq!(vue.chemin, ROUTE_SESSIONS);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        // Le corps se lit désérialisé plutôt qu'octet pour octet : le serveur
+        // lit un champ, pas un ordre de clés.
+        let envoye: serde_json::Value = serde_json::from_str(&vue.corps).expect("un corps JSON");
+        assert_eq!(envoye["agent"], "mika-dev");
+
+        assert_eq!(rendu.session_id, "s-neuve");
+        assert!(!rendu.canonical);
     }
 
     #[tokio::test]
