@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use uuid::Uuid;
 
 use crate::commands::chat_turn;
+use crate::commands::session_remote;
 use crate::commands::tasks::CallbackFeed;
 use crate::commands::team_outcome::TeamOutcome;
 use crate::init::{self, AppContext};
@@ -27,6 +27,7 @@ use crate::tui::event::{AppEvent, EventReader};
 use crate::tui::input;
 use crate::tui::ui;
 use mika_agent::agent;
+use mika_agent::async_db::AsyncDatabase;
 use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::assembly::assemble_agent_registry;
@@ -47,6 +48,97 @@ struct AgentWorker {
     /// so the supervisor exits silently on the resulting `Ok(())` from the worker loop.
     shutdown_initiated: Arc<AtomicBool>,
     _ctx: AppContext,
+}
+
+/// La source d'environnement arrive en paramètre : un test de refus qui
+/// muterait l'environnement du process serait `unsafe` en édition 2024, et faux
+/// sous `cargo test`, qui parallélise. La même forme que
+/// `tui/commands/handlers.rs::SourceEnv`.
+type SourceEnv<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Le jeton que les routes de session exigent, lu **strictement**.
+///
+/// La seconde phrase du refus n'est pas de la politesse : `dashboard.rs:37-38`
+/// accepte aussi `MIKA_DASHBOARD_TOKEN` pour la sonde, là où le tour et les
+/// routes de session ne l'acceptent pas. Un shell qui ne porte que ce jeton
+/// passait donc la sonde de démarrage et prenait un 401 à chaque tour ; c'est
+/// ici le seul endroit du code où cet écart se dit à qui le subit.
+///
+/// Pas de règle de non-vacuité, délibérément : une variable posée à vide est
+/// une *configuration fausse*, pas une absence. Elle part sur le fil et revient
+/// en 401, dont le message nomme déjà la variable.
+fn jeton_interne(lire: SourceEnv<'_>) -> Result<String> {
+    lire("MIKA_INTERNAL_TOKEN").ok_or_else(|| {
+        anyhow::anyhow!(
+            "La TUI exige MIKA_INTERNAL_TOKEN pour ouvrir sa session sur \
+             mika-spirit. Pose-la dans ~/.mika/.env — MIKA_DASHBOARD_TOKEN n'est \
+             pas accepté par les routes de session, même s'il suffit à la sonde \
+             du tableau de bord."
+        )
+    })
+}
+
+/// Ouvre — ou reprend — la session de la TUI (mika#1727, vol V2d-4a).
+///
+/// Tout ce qui touche le monde arrive par argument, donc un test pilote la
+/// source d'environnement, la base et l'URL du banc sans construire
+/// d'`AppContext` : c'est la forme de `rewind_par_spirit`. Elle prend
+/// `&AsyncDatabase` et non `&AppContext` pour la même raison.
+///
+/// Le booléen rendu est `is_singleton_session`. Sur le chemin nominal il vient
+/// **du fil** et non de `resolve_canonical_session_id` : la route rend la
+/// session canonique de l'agent au lieu d'en créer une
+/// (`mika-agent/src/server/sessions.rs`), donc le serveur est la seule autorité
+/// sur ce fait.
+async fn ouvrir_session_par_spirit(
+    db: &AsyncDatabase,
+    base_url: &str,
+    lire_env: SourceEnv<'_>,
+    agent: &str,
+    session_id: Option<&str>,
+    canonical_session_id: Option<&str>,
+) -> Result<(String, bool)> {
+    // Avant toute construction de client, et sur les **deux** bras : le premier
+    // tour part sur le fil de toute façon, et un refus qui attendrait le tour
+    // nommerait le transport là où la cause est la configuration du shell.
+    let jeton = jeton_interne(lire_env)?;
+
+    let Some(id) = session_id else {
+        let miroir = session_remote::ouvrir(base_url, &jeton, agent)
+            .await
+            .map_err(|probleme| {
+                anyhow::anyhow!("La TUI n'a pas pu ouvrir sa session : {probleme}")
+            })?;
+        return Ok((miroir.session_id, miroir.canonical));
+    };
+
+    // Le bras `--session-id` : une reprise, et jamais une ouverture. La route
+    // ne prend aucun identifiant dans son corps, donc elle ne sait pas créer
+    // une session à l'identifiant que l'opérateur a choisi.
+    match db.get_session(id).await {
+        Ok(Some(existante)) if existante.agent_id != db.agent_id() => anyhow::bail!(
+            "Session '{}' belongs to agent '{}', not '{}'",
+            id,
+            existante.agent_id,
+            db.agent_id()
+        ),
+        Ok(Some(_)) => Ok((id.to_string(), canonical_session_id == Some(id))),
+        Ok(None) => anyhow::bail!(
+            "La session '{id}' est inconnue de cette base. La route d'ouverture \
+             de mika-spirit ne prend aucun identifiant : elle ne sait pas créer \
+             une session à identifiant choisi. Lance la TUI sans --session-id, \
+             ou donne l'identifiant d'une session qui existe."
+        ),
+        // Cette erreur est **avalée** sur main (`if let Ok(Some(existing))`), et
+        // la session était créée en local derrière. Une base illisible ne doit
+        // pas se lire comme « session inconnue » : motif mika#2331, une
+        // provenance fausse coûte plus cher qu'une provenance absente.
+        Err(e) => anyhow::bail!(
+            "La session '{id}' n'a pas pu être lue dans la base locale : {e}. \
+             Tant que la base ne répond pas, la TUI ne sait pas à qui cette \
+             session appartient et ne la reprend pas."
+        ),
+    }
 }
 
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
@@ -71,47 +163,26 @@ async fn spawn_agent_worker(
     {
         anyhow::bail!("--session-id value must not be empty");
     }
-    let reusing_session = session_id.is_some();
     // Resolve the canonical session for singleton agents (mika#1401). An explicit
     // --session-id wins; otherwise a singleton agent reuses its one canonical
     // session on launch (and `/clear` preserves it — see App.is_singleton_session).
     let canonical_session_id =
         prompt::resolve_canonical_session_id(&identity, ctx.async_db.agent_id());
-    let session_id = if let Some(s) = session_id {
-        s.to_string()
-    } else if let Some(ref canonical) = canonical_session_id {
-        canonical.clone()
-    } else {
-        Uuid::new_v4().to_string()
-    };
-    let is_singleton_session = canonical_session_id.as_deref() == Some(session_id.as_str());
-    // Validate session ownership if reusing an existing session
-    if reusing_session
-        && let Ok(Some(existing)) = ctx.async_db.get_session(&session_id).await
-        && existing.agent_id != ctx.async_db.agent_id()
-    {
-        anyhow::bail!(
-            "Session '{}' belongs to agent '{}', not '{}'",
-            session_id,
-            existing.agent_id,
-            ctx.async_db.agent_id()
-        );
-    }
-    if is_singleton_session {
-        if let Err(e) = ctx
-            .async_db
-            .get_or_create_canonical_session(&session_id, "cli")
-            .await
-        {
-            tracing::warn!(error = %e, "failed to create canonical session");
-        }
-    } else if let Err(e) = ctx
-        .async_db
-        .create_session(&session_id, ctx.async_db.agent_id(), "cli")
-        .await
-    {
-        tracing::warn!(error = %e, "failed to create session");
-    }
+    // mika#1727 vol V2d-4a — la session de la TUI s'ouvre sur mika-spirit, ou
+    // la TUI ne démarre pas. Les deux créations locales qui vivaient ici
+    // n'avaient qu'un `tracing::warn!` sur échec : la TUI continuait sans
+    // session, et chaque tour prenait la panne plus loin, là où elle ne se lit
+    // plus. Le `?` remonte au site d'appel du démarrage (l. 543), avant
+    // l'installation du terminal.
+    let (session_id, is_singleton_session) = ouvrir_session_par_spirit(
+        &ctx.async_db,
+        &crate::commands::dashboard::spirit_url(),
+        &|nom| std::env::var(nom).ok(),
+        agent_name,
+        session_id,
+        canonical_session_id.as_deref(),
+    )
+    .await?;
     let mut tool_registry = tools::default_tools();
     for tool in tools::management_tools_if_needed(
         &ctx.global_home,
@@ -1250,4 +1321,276 @@ fn restore_terminal() -> Result<()> {
         DisableBracketedPaste
     )?;
     Ok(())
+}
+
+// Les tests vivent ici, **en fin de fichier** : le balayeur de
+// `mika_common::source_guard` coupe la production au premier `#[cfg(test)]`, et
+// un item de production posé après en sortirait sans bruit.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Banc **emprunté** au voisin, et non recopié : un second témoin de socket
+    // ouvrirait une seconde vérité sur ce que le serveur reçoit, libre d'en
+    // diverger. Il est `pub(crate)` depuis V2c-1b, pour ce motif-là.
+    use crate::commands::rewind_remote::tests::fake_spirit;
+    use axum::http::StatusCode;
+    use mika_agent::db::Database;
+    use mika_common::dead_endpoint::DeadEndpoint;
+
+    /// Le chemin tel que le banc doit le voir : `fake_spirit` associe par le
+    /// chemin **brut**. Un `format!` mal composé dans la porte tombe sur son
+    /// `fallback` à 501, qu'aucun bras de `post` ne traduit.
+    const ROUTE_SESSIONS: &str = "/api/v1/sessions";
+    const CORPS_OUVERT: &str = r#"{"session_id":"s-du-fil","canonical":false}"#;
+
+    /// La base de la TUI, en mémoire, comme `handlers.rs::test_app()` :
+    /// `ouvrir_session_par_spirit` prend `&AsyncDatabase` et non `&AppContext`,
+    /// donc la fixture n'a ni home, ni `Settings`, ni registre de skills.
+    fn base_en_memoire() -> AsyncDatabase {
+        AsyncDatabase::new(Database::open_in_memory().expect("une base en mémoire"))
+    }
+
+    /// Une source qui ne porte que `MIKA_INTERNAL_TOKEN`.
+    fn jeton_pose(valeur: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |nom| (nom == "MIKA_INTERNAL_TOKEN").then(|| valeur.to_string())
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_sans_jeton_interne_le_demarrage_refuse_avant_tout_appel() {
+        let db = base_en_memoire();
+        // Le banc est **armé** et ne verra rien : c'est ce qui distingue
+        // « refusé avant tout appel » de « refusé par le serveur ».
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+
+        let refus = ouvrir_session_par_spirit(&db, &base, &|_| None, "mika-dev", None, None)
+            .await
+            .expect_err("sans jeton, le démarrage refuse");
+
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+        let vues = recues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 0, "aucune requête ne doit partir");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_un_jeton_de_tableau_de_bord_ne_suffit_pas() {
+        let db = base_en_memoire();
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+        let tableau_seul =
+            |nom: &str| (nom == "MIKA_DASHBOARD_TOKEN").then(|| "jeton-tableau".to_string());
+
+        let refus = ouvrir_session_par_spirit(&db, &base, &tableau_seul, "mika-dev", None, None)
+            .await
+            .expect_err("le jeton du tableau de bord n'ouvre pas de session");
+
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+        assert!(message.contains("MIKA_DASHBOARD_TOKEN"), "{message}");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+
+        // Contrôle positif, et pas une décoration : sans lui, un refus tombé
+        // pour toute autre raison — une URL mal bâtie, un banc non armé —
+        // rendrait ce test et le précédent verts en mesurant autre chose que la
+        // lecture du jeton.
+        let les_deux = |nom: &str| match nom {
+            "MIKA_DASHBOARD_TOKEN" => Some("jeton-tableau".to_string()),
+            "MIKA_INTERNAL_TOKEN" => Some("jeton-interne".to_string()),
+            _ => None,
+        };
+        let (session_id, _) =
+            ouvrir_session_par_spirit(&db, &base, &les_deux, "mika-dev", None, None)
+                .await
+                .expect("la même source, plus le jeton interne, ouvre");
+        assert_eq!(session_id, "s-du-fil");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une requête attendue"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_louverture_poste_sur_la_route_des_sessions_avec_son_jeton() {
+        let db = base_en_memoire();
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+
+        let (session_id, _) = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton-secret"),
+            "mika-dev",
+            None,
+            None,
+        )
+        .await
+        .expect("un 200 au corps lisible ouvre la session");
+
+        // Les faits se lisent sur la socket et non sur l'appel : c'est ce que le
+        // serveur reçoit qui tient le contrat, pas ce qu'on croit poster.
+        let vues = recues.lock().expect("le témoin du banc");
+        // Le compte sans rendu `Debug` : `RequeteRecue` n'en dérive pas, et le
+        // banc du voisin reste intact dans ce vol.
+        assert_eq!(vues.len(), 1, "un seul appel attendu");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "POST");
+        assert_eq!(vue.chemin, ROUTE_SESSIONS);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        let envoye: serde_json::Value = serde_json::from_str(&vue.corps).expect("un corps JSON");
+        assert_eq!(envoye["agent"], "mika-dev");
+
+        // La session de la TUI est celle du fil, et non un UUID tiré ici : c'est
+        // le geste que ce vol remplace.
+        assert_eq!(session_id, "s-du-fil");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_canonical_vrai_donne_une_session_singleton() {
+        let db = base_en_memoire();
+        let (base, _) = fake_spirit(&[(
+            ROUTE_SESSIONS,
+            StatusCode::OK,
+            r#"{"session_id":"s-canonique","canonical":true}"#,
+        )])
+        .await;
+
+        // `canonical_session_id` est volontairement `None` : si la TUI lisait
+        // encore son identité locale pour ce booléen, ce test serait faux.
+        let (session_id, is_singleton_session) =
+            ouvrir_session_par_spirit(&db, &base, &jeton_pose("jeton"), "mika-dev", None, None)
+                .await
+                .expect("un 200 au corps lisible ouvre la session");
+
+        assert_eq!(session_id, "s-canonique");
+        assert!(
+            is_singleton_session,
+            "le `canonical` du fil est la seule autorité sur ce fait"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_canonical_faux_ne_donne_pas_de_singleton() {
+        let db = base_en_memoire();
+        let (base, _) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+
+        let (_, is_singleton_session) =
+            ouvrir_session_par_spirit(&db, &base, &jeton_pose("jeton"), "mika-dev", None, None)
+                .await
+                .expect("un 200 au corps lisible ouvre la session");
+
+        assert!(!is_singleton_session);
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_un_401_nomme_la_variable_a_poser() {
+        let db = base_en_memoire();
+        let (base, _) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::UNAUTHORIZED, "")]).await;
+
+        let refus = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("mauvais-jeton"),
+            "mika-dev",
+            None,
+            None,
+        )
+        .await
+        .expect_err("un 401 arrête le démarrage");
+
+        // Un jeton posé mais faux est la panne la plus coûteuse à diagnostiquer :
+        // le message doit nommer la variable, et non le transport.
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_un_point_injoignable_nomme_lurl() {
+        let db = base_en_memoire();
+        // mika#2569 : le port est **tenu** pour toute la durée de l'appel. Le
+        // motif qui liait puis libérait a vu un factice voisin du même binaire
+        // servir l'appel censé échouer.
+        let dead = DeadEndpoint::reserve();
+        let base = format!("http://{}", dead.addr());
+
+        let refus =
+            ouvrir_session_par_spirit(&db, &base, &jeton_pose("jeton"), "mika-dev", None, None)
+                .await
+                .expect_err("rien n'écoute : le démarrage doit s'arrêter");
+
+        let message = refus.to_string();
+        assert!(message.contains("unreachable"), "{message}");
+        assert!(
+            message.contains(&format!("{base}{ROUTE_SESSIONS}")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_une_session_inconnue_est_refusee_en_nommant_son_identifiant() {
+        let db = base_en_memoire();
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+
+        let refus = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton"),
+            "mika-dev",
+            Some("s-absente"),
+            None,
+        )
+        .await
+        .expect_err("une session inconnue ne se reprend pas");
+
+        let message = refus.to_string();
+        assert!(message.contains("s-absente"), "{message}");
+        // Aucune ligne n'est écrite derrière le refus : la base reste vide, et le
+        // banc n'a rien vu — la route ne sait pas créer une session à
+        // identifiant choisi, donc le refus est la seule issue.
+        assert!(
+            db.get_session("s-absente")
+                .await
+                .expect("la base répond")
+                .is_none(),
+            "le refus ne doit créer aucune ligne"
+        );
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4a_une_session_connue_est_reprise_sans_ouverture() {
+        let db = base_en_memoire();
+        db.create_session("s-connue", db.agent_id(), "cli")
+            .await
+            .expect("la fixture pose la session de l'agent");
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+
+        let (session_id, is_singleton_session) = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton"),
+            "mika-dev",
+            Some("s-connue"),
+            None,
+        )
+        .await
+        .expect("une session de l'agent se reprend");
+
+        // Rendue telle quelle, et surtout : `ouvrir` n'est pas appelée. Si elle
+        // l'était, le fil rendrait `s-du-fil` et l'opérateur perdrait la session
+        // qu'il a nommée.
+        assert_eq!(session_id, "s-connue");
+        assert!(!is_singleton_session);
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "une reprise n'ouvre rien sur le fil"
+        );
+    }
 }
