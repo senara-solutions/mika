@@ -3008,4 +3008,67 @@ mod tests {
             _ => panic!("expected NewSession request"),
         }
     }
+
+    /// T-E — la garde structurelle : la TUI ne touche plus la table `sessions`
+    /// en local.
+    ///
+    /// Elle n'est **pas fondue** avec celle de V2c-1b. Les deux refusent des
+    /// gestes différents pour des raisons différentes, et une garde fondue
+    /// rougirait sous un seul message : celui qui la lirait au prochain vol ne
+    /// saurait plus laquelle des deux portes lui est demandée.
+    ///
+    /// `maybe_compact(` n'est pas un motif de ce vol : il appartient à V2d-4c,
+    /// avec la porte `compacter` et sa propre garde. Une garde qui refuserait
+    /// aujourd'hui un geste que rien ne remplace encore ne laisserait d'autre
+    /// issue qu'une entrée d'allowlist — exactement ce qu'elle existe pour
+    /// éviter.
+    #[test]
+    fn mika1727_v2d4b_la_tui_ne_clot_plus_la_base_en_local() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le
+        // remède est la porte que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+        const MOTIFS: &[(&str, &str)] = &[
+            ("create_session(", "session_remote::ouvrir"),
+            ("end_session(", "session_remote::clore"),
+        ];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let site = scanner.src_root().join("tui/commands/handlers.rs");
+        let production = scanner.production_of(&site);
+
+        // Témoin : sans lui, une garde qui balaie un chemin faux serait verte
+        // **par cécité** — l'exact défaut que `ProductionScanner` existe pour
+        // refuser (mika#2398).
+        assert!(
+            production.contains("async fn handle_clear("),
+            "la garde n'a pas lu la moitié production de handlers.rs"
+        );
+        // Contre-témoin : `production_of` **masque** les régions `#[cfg(test)]`
+        // sans jamais tronquer, donc la moitié test doit être absente alors que
+        // tout ce qui la suit reste visible. Sans cette assertion, les deux
+        // `create_session(` et `end_session(` des tests ci-dessus feraient
+        // rougir la garde, et on l'aurait « réparée » par une allowlist.
+        assert!(
+            !production.contains("fn test_clear_singleton_does_not_end_session"),
+            "la garde n'a pas masqué la moitié test de handlers.rs"
+        );
+
+        for (motif, porte) in MOTIFS {
+            let violations: Vec<String> = production
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
+                .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+                .collect();
+            assert!(
+                violations.is_empty(),
+                "mika#1727 V2d-4b — `{motif}` touche la table `sessions` dans le \
+                 processus de la TUI. Le remède est de passer par `{porte}`, jamais \
+                 une entrée d'allowlist :\n{}",
+                violations.join("\n")
+            );
+        }
+    }
 }
