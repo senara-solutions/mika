@@ -1210,31 +1210,18 @@ async fn handle_rewind(app: &mut App<'_>, args: &str) -> String {
     }
 }
 
-/// Une source de variables d'environnement. `&dyn` et non un générique : la
-/// lecture est appelée depuis un seul site de production ; un paramètre de type
-/// ferait monomorphiser pour rien et se propagerait dans la signature de tout ce
-/// qui l'appelle.
-type SourceEnv<'a> = &'a dyn Fn(&str) -> Option<String>;
-
-/// Lit le jeton que les trois portes rewind de mika-spirit exigent.
-///
-/// Pas de repli sur `MIKA_DASHBOARD_TOKEN`, contrairement à
-/// `commands::dashboard::auth_token()`. Les trois routes rewind sont montées sous
-/// `require_internal_token` (`server/mod.rs:368-376`) : ce jeton-là y prend un 401,
-/// donc un refus **après** l'appel. `commands/iterate.rs:72-79` a tranché l'inverse
-/// pour une route qui *lance* un dispatch — un aller-retour pour un 401 lisible n'y
-/// coûte qu'un appel sans effet. Ici l'appel qui suivrait n'est pas sans effet :
-/// c'est `resolve` puis `preview` puis `execute`, et le 401 tomberait sur la
-/// première des trois, laissant à l'opérateur un message qui nomme le transport là
-/// où la cause est sa configuration. Refuser avant l'appel nomme la cause, et ne
-/// touche à rien.
-fn jeton_interne(lire: SourceEnv<'_>) -> Result<String, String> {
-    lire("MIKA_INTERNAL_TOKEN").ok_or_else(|| {
-        "Rewind requires MIKA_INTERNAL_TOKEN to reach mika-spirit. Set it in ~/.mika/.env \
-         (MIKA_DASHBOARD_TOKEN is not accepted by the rewind routes)."
-            .to_string()
-    })
-}
+// La lecture stricte du jeton et sa source vivent chez les portes depuis
+// V2d-4b (`commands/session_remote.rs`) : `/rewind` et `/clear` la partagent
+// avec le démarrage de la TUI, et la copie locale qu'elle remplace nommait le
+// rembobinage dans un refus que trois appelants se partagent désormais.
+//
+// Refuser **avant** l'appel reste le geste : les routes sont montées sous
+// `require_internal_token`, donc un jeton absent y prendrait un 401 dont le
+// message nomme le transport là où la cause est la configuration du shell.
+// `commands/iterate.rs:72-79` a tranché l'inverse pour une route qui *lance*
+// un dispatch — un aller-retour pour un 401 lisible n'y coûte qu'un appel sans
+// effet. Ici l'appel qui suivrait n'est pas sans effet.
+use crate::commands::session_remote::{SourceEnv, jeton_interne};
 
 async fn handle_rewind_impl(
     app: &mut App<'_>,

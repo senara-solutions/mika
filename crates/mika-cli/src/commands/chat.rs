@@ -50,33 +50,12 @@ struct AgentWorker {
     _ctx: AppContext,
 }
 
-/// La source d'environnement arrive en paramètre : un test de refus qui
-/// muterait l'environnement du process serait `unsafe` en édition 2024, et faux
-/// sous `cargo test`, qui parallélise. La même forme que
-/// `tui/commands/handlers.rs::SourceEnv`.
-type SourceEnv<'a> = &'a dyn Fn(&str) -> Option<String>;
-
-/// Le jeton que les routes de session exigent, lu **strictement**.
-///
-/// La seconde phrase du refus n'est pas de la politesse : `dashboard.rs:37-38`
-/// accepte aussi `MIKA_DASHBOARD_TOKEN` pour la sonde, là où le tour et les
-/// routes de session ne l'acceptent pas. Un shell qui ne porte que ce jeton
-/// passait donc la sonde de démarrage et prenait un 401 à chaque tour ; c'est
-/// ici le seul endroit du code où cet écart se dit à qui le subit.
-///
-/// Pas de règle de non-vacuité, délibérément : une variable posée à vide est
-/// une *configuration fausse*, pas une absence. Elle part sur le fil et revient
-/// en 401, dont le message nomme déjà la variable.
-fn jeton_interne(lire: SourceEnv<'_>) -> Result<String> {
-    lire("MIKA_INTERNAL_TOKEN").ok_or_else(|| {
-        anyhow::anyhow!(
-            "La TUI exige MIKA_INTERNAL_TOKEN pour ouvrir sa session sur \
-             mika-spirit. Pose-la dans ~/.mika/.env — MIKA_DASHBOARD_TOKEN n'est \
-             pas accepté par les routes de session, même s'il suffit à la sonde \
-             du tableau de bord."
-        )
-    })
-}
+// La lecture stricte du jeton et sa source vivent chez les portes depuis
+// V2d-4b (`commands/session_remote.rs`) : le démarrage la partage avec
+// `/rewind` et `/clear`, et la copie locale qu'elle remplace nommait
+// l'ouverture de session — en français, là où l'autre copie était en anglais.
+// Les deux avaient déjà divergé ; c'était l'argument de leur mise en commun.
+use crate::commands::session_remote::{SourceEnv, jeton_interne};
 
 /// Ouvre — ou reprend — la session de la TUI (mika#1727, vol V2d-4a).
 ///
@@ -101,7 +80,9 @@ async fn ouvrir_session_par_spirit(
     // Avant toute construction de client, et sur les **deux** bras : le premier
     // tour part sur le fil de toute façon, et un refus qui attendrait le tour
     // nommerait le transport là où la cause est la configuration du shell.
-    let jeton = jeton_interne(lire_env)?;
+    // `map_err` et non un `?` direct : la lecture commune rend un `String`,
+    // parce qu'une variable absente n'a ni statut ni URL à porter.
+    let jeton = jeton_interne(lire_env).map_err(anyhow::Error::msg)?;
 
     let Some(id) = session_id else {
         let miroir = session_remote::ouvrir(base_url, &jeton, agent)

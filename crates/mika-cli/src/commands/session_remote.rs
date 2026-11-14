@@ -5,6 +5,10 @@
 //! la raison déjà écrite sur [`super::rewind_remote`] : un client qui résout
 //! ses propres accès ne se pilote pas depuis un test.
 //!
+//! La lecture stricte de ce jeton vit ici aussi depuis V2d-4b — [`jeton_interne`]
+//! —, parce qu'elle est partagée par le démarrage de la TUI, le rembobinage et
+//! `/clear`, et qu'aucun de ces trois sites n'a autorité sur les deux autres.
+//!
 //! **Pourquoi ce transport n'est pas mis en commun avec `rewind_remote.rs`.**
 //! Une entrée d'egress déclare **un** site de construction de client, et sa
 //! ligne `data` décrit ce qui part de ce site. Un `post` partagé obligerait soit
@@ -127,6 +131,54 @@ impl std::fmt::Display for SessionRemoteIssue {
             },
         }
     }
+}
+
+/// Une source de variables d'environnement. `&dyn` et non un générique : la
+/// lecture est appelée depuis trois sites de production seulement ; un paramètre
+/// de type ferait monomorphiser pour rien et se propagerait dans la signature de
+/// tout ce qui l'appelle.
+///
+/// Elle arrive en paramètre, et non lue du process : un test de refus qui
+/// muterait l'environnement serait `unsafe` en édition 2024, et faux sous
+/// `cargo test`, qui parallélise.
+pub(crate) type SourceEnv<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Le jeton que les routes de mika-spirit exigent, lu **strictement**.
+///
+/// Une seule copie depuis V2d-4b. Elle vit dans ce module, et non chez l'un de
+/// ses trois appelants — `chat.rs` au démarrage, `tui/commands/handlers.rs`
+/// pour `/rewind` et pour `/clear` —, parce qu'aucun d'eux n'a autorité sur les
+/// deux autres : les deux copies qu'elle remplace avaient déjà divergé de
+/// langue et de texte.
+///
+/// `Err(String)` et non [`SessionRemoteIssue`] : une variable absente n'a ni
+/// statut ni URL, et `Unexpected { status: None, .. }` se lirait « mika-spirit
+/// injoignable » là où rien n'a été tenté. Une provenance fausse coûte plus
+/// cher qu'une provenance absente (motif mika#2331).
+///
+/// Pas de repli sur `MIKA_DASHBOARD_TOKEN`, contrairement à
+/// `commands::dashboard::auth_token()`, et la seconde phrase du refus n'est pas
+/// de la politesse : `dashboard.rs:37-38` accepte ce jeton pour la sonde, là où
+/// les routes de session et de rembobinage sont montées sous
+/// `require_internal_token` (`server/mod.rs:368-376`) et le refusent. Un shell
+/// qui ne porte que lui passait donc la sonde et prenait un 401 à chaque appel ;
+/// c'est ici le seul endroit du code où cet écart se dit à qui le subit.
+///
+/// Le refus ne nomme **aucun geste**. Les trois appelants n'en partagent aucun,
+/// donc un texte qui nommerait le rembobinage — ce que faisait la copie de
+/// `handlers.rs` — mentirait au démarrage et sur `/clear`.
+///
+/// Pas de règle de non-vacuité, délibérément : une variable posée à vide est une
+/// *configuration fausse*, pas une absence. Elle part sur le fil et revient en
+/// 401, dont le message nomme déjà la variable.
+pub(crate) fn jeton_interne(lire: SourceEnv<'_>) -> Result<String, String> {
+    lire("MIKA_INTERNAL_TOKEN").ok_or_else(|| {
+        "MIKA_INTERNAL_TOKEN is required to reach mika-spirit. Set it in \
+         ~/.mika/.env — MIKA_DASHBOARD_TOKEN is not accepted by mika-spirit's \
+         session and rewind routes, even though it is enough for the dashboard \
+         probe."
+            .to_string()
+    })
 }
 
 /// L'URL d'une route de session, extraite parce qu'elle a **deux** lecteurs :
