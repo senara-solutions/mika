@@ -110,11 +110,41 @@ fn handle_help() -> String {
 }
 
 async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
+    // Le `.env` de la home et l'URL de base, comme `handle_rewind_impl` : la
+    // lecture du jeton prend sa source en paramètre pour qu'un test la pilote,
+    // et un chargement caché derrière ce paramètre ferait mentir sa signature.
+    if let Ok(home) = mika_common::home::resolve_home_dir() {
+        mika_common::dotenv::load_dotenv(&home);
+    }
+    let base_url = crate::commands::dashboard::spirit_url();
+    clear_par_spirit(app, &base_url, &|nom| std::env::var(nom).ok()).await
+}
+
+/// `/clear` tel que mika-spirit l'applique : la nouvelle session est **ouverte**
+/// par la porte `ouvrir`, et l'ancienne **close** par la porte `clore`
+/// (mika#1727, vol V2d-4b). Plus rien n'écrit la table `sessions` dans le
+/// processus de la TUI, ce que la garde structurelle de ce fichier tient.
+///
+/// L'URL de base et la source d'environnement arrivent **par argument**, comme
+/// [`rewind_par_spirit`] : c'est ce qui permet aux tests de viser un factice et
+/// de lire ce qui est parti sur la socket, plutôt que de relire le code qui
+/// l'écrit.
+///
+/// **`ouvrir` avant `clore`, et l'ordre est le livrable.** L'inverse perdrait
+/// l'historique le jour où `ouvrir` échoue après un `clore` réussi : la TUI
+/// n'aurait plus de session, et l'ancienne serait déjà close. Dans cet ordre,
+/// un `ouvrir` qui échoue ne touche à rien.
+async fn clear_par_spirit(app: &mut App<'_>, base_url: &str, lire_env: SourceEnv<'_>) -> String {
+    use crate::commands::session_remote;
+
     // Singleton agents (mika#1401) are single-session-by-nature: the canonical
     // session must never be ended or replaced. `/clear` therefore resets only the
     // visual display — the session ID and the agent worker's loaded context are
     // preserved, and the DB history (the canonical thread) is left intact. This is
     // the TUI counterpart of `end_session_unless_canonical` on the CLI exit paths.
+    //
+    // Ce bras ne lit pas le jeton et n'appelle rien : il n'y a rien à demander
+    // au serveur pour une session qu'on ne remplace pas.
     if app.is_singleton_session {
         app.messages.clear();
         app.scroll_offset = 0;
@@ -135,25 +165,36 @@ async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
         return "Display cleared. This agent is single-session-by-nature (mika#1401) — the canonical session is preserved.".to_string();
     }
 
-    // End the current session
-    let old_session = app.session_id.clone();
-    if let Err(e) = app.db.end_session(&old_session).await {
-        tracing::warn!(error = %e, "failed to end session on /clear");
-    }
+    // Le jeton, **avant toute construction de client**. Un refus qui attendrait
+    // l'appel nommerait le transport là où la cause est la configuration du
+    // shell, et il tomberait sur un `ouvrir` qui aurait déjà inscrit une session
+    // que plus personne ne reprendrait.
+    let jeton = match jeton_interne(lire_env) {
+        Ok(jeton) => jeton,
+        Err(refus) => return refus,
+    };
 
-    // Create a new session
-    let new_session = uuid::Uuid::new_v4().to_string();
-    let agent_id = app.db.agent_id().to_owned();
-    if let Err(e) = app.db.create_session(&new_session, &agent_id, "cli").await {
-        tracing::warn!(error = %e, "failed to create new session on /clear");
-        // Continue anyway — the display clear still works
-    }
+    // La nouvelle session. Sur un `Err`, rien n'est clos et rien ne change : ni
+    // `session_id`, ni l'affichage, ni le worker. C'est la moitié de la raison
+    // pour laquelle `ouvrir` passe avant `clore`.
+    let ouverte = match session_remote::ouvrir(base_url, &jeton, &app.agent_name).await {
+        Ok(miroir) => miroir,
+        Err(probleme) => return format!("Error opening a new session: {probleme}"),
+    };
+
+    // L'ancienne, et l'appel part **inconditionnellement** : le serveur est
+    // seul juge de ce qui est canonique (`server/sessions.rs:162-164`), donc une
+    // TUI qui trancherait ici rejouerait une autorité qu'elle vient de lui
+    // rendre. Le résultat n'est lu qu'après la remise à zéro : un échec de
+    // clôture ne défait rien, il se **dit**.
+    let ancienne = app.session_id.clone();
+    let cloture = session_remote::clore(base_url, &jeton, &app.agent_name, &ancienne).await;
 
     // Notify the agent worker of the new session
     if app
         .agent_tx
         .send(AgentRequest::NewSession {
-            session_id: new_session.clone(),
+            session_id: ouverte.session_id.clone(),
         })
         .is_err()
     {
@@ -164,7 +205,11 @@ async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
     while app.agent_rx.try_recv().is_ok() {}
 
     // Update app state — session
-    app.session_id = new_session;
+    app.session_id = ouverte.session_id;
+    // Le serveur est seule autorité sur ce fait, comme au démarrage (V2d-4a) :
+    // la route rend la session canonique de l'agent au lieu d'en créer une, donc
+    // une TUI peut entrer non-singleton et sortir singleton.
+    app.is_singleton_session = ouverte.canonical;
     app.messages.clear();
     app.scroll_offset = 0;
     app.last_seen_msg_id = app.db.max_message_id().await.unwrap_or(0);
@@ -188,7 +233,30 @@ async fn handle_clear(app: &mut App<'_>, _args: &str) -> String {
 
     app.needs_redraw = true;
 
-    "Chat cleared and session reset.".to_string()
+    // Les **deux** champs du miroir sont lus, et c'est ce qui retire son
+    // `expect(dead_code)` : `ended: false` seul ne dit pas si mika-spirit a
+    // refusé de clore la canonique — un 200 normal (mika#1401) — ou s'il n'a
+    // rien clos sans le dire.
+    match cloture {
+        Ok(miroir) if miroir.ended => "Chat cleared and session reset.".to_string(),
+        Ok(miroir) if miroir.canonical => format!(
+            "Chat cleared and session reset. The previous session ({ancienne}) is this \
+             agent's canonical session (mika#1401) and was kept open."
+        ),
+        // mika-spirit n'a pas clos et n'a pas dit pourquoi : le message ne
+        // l'invente pas (motif mika#2331 — une provenance fausse coûte plus
+        // cher qu'une provenance absente).
+        Ok(_) => format!(
+            "Chat cleared and session reset. mika-spirit did not end the previous \
+             session ({ancienne}) and gave no reason."
+        ),
+        // La nouvelle session est **gardée** : le worker l'a déjà reçue, et la
+        // défaire coûterait l'affichage pour une cause qui n'est pas la sienne.
+        Err(probleme) => format!(
+            "Chat cleared and session reset, but the previous session ({ancienne}) was \
+             not ended: {probleme}"
+        ),
+    }
 }
 
 async fn handle_compact(app: &mut App<'_>) -> String {
@@ -1556,6 +1624,52 @@ mod tests {
 
     // --- /clear tests ---
 
+    /// Les chemins tels que le banc doit les voir : `fake_spirit` associe par le
+    /// chemin **brut**. Un `format!` mal composé dans la porte tombe sur son
+    /// `fallback` à 501, qu'aucun bras de `post` ne traduit.
+    const ROUTE_SESSIONS: &str = "/api/v1/sessions";
+    const CORPS_OUVERT: &str = r#"{"session_id":"s-du-fil","canonical":false}"#;
+    const CORPS_CLOS: &str = r#"{"ended":true,"canonical":false}"#;
+
+    /// Monte le banc sur `reponses` et fait passer un `/clear` dessus.
+    async fn par_le_banc(
+        app: &mut App<'_>,
+        reponses: &[(&str, axum::http::StatusCode, String)],
+        lire_env: SourceEnv<'_>,
+    ) -> (String, Arc<Mutex<Vec<RequeteRecue>>>) {
+        let empruntes = reponses
+            .iter()
+            .map(|(chemin, statut, corps)| (*chemin, *statut, corps.as_str()))
+            .collect::<Vec<_>>();
+        let (base, vues) = fake_spirit(&empruntes).await;
+        let sortie = clear_par_spirit(app, &base, lire_env).await;
+        (sortie, vues)
+    }
+
+    /// Le chemin nominal : les deux routes servies, et le jeton posé. C'est ce
+    /// que les tests existants de `/clear` attendaient de la base locale ;
+    /// chacun garde son intention, seule la façon d'y arriver change.
+    ///
+    /// Le chemin de clôture est composé depuis `app.session_id` **avant**
+    /// l'appel : c'est l'ancienne session qui le porte, et le banc associe par
+    /// chemin brut.
+    async fn clear_nominal(app: &mut App<'_>) -> (String, Arc<Mutex<Vec<RequeteRecue>>>) {
+        let fin = format!("{ROUTE_SESSIONS}/{}/end", app.session_id);
+        let reponses = [
+            (
+                ROUTE_SESSIONS,
+                axum::http::StatusCode::OK,
+                CORPS_OUVERT.to_string(),
+            ),
+            (
+                fin.as_str(),
+                axum::http::StatusCode::OK,
+                CORPS_CLOS.to_string(),
+            ),
+        ];
+        par_le_banc(app, &reponses, &avec_jeton).await
+    }
+
     #[tokio::test]
     async fn test_clear_creates_new_session() {
         let (mut app, _rx, _tmp) = test_app().await;
@@ -1569,7 +1683,7 @@ mod tests {
             channel: None,
         });
 
-        let output = handle_clear(&mut app, "").await;
+        let (output, _) = clear_nominal(&mut app).await;
 
         assert!(output.contains("session reset"));
         assert_ne!(app.session_id, old_session, "session_id should change");
@@ -1584,7 +1698,7 @@ mod tests {
     async fn test_clear_sends_new_session_request() {
         let (mut app, mut rx, _tmp) = test_app().await;
 
-        handle_clear(&mut app, "").await;
+        clear_nominal(&mut app).await;
 
         let requests = drain_requests(&mut rx);
         assert_eq!(requests.len(), 1, "should send exactly one request");
@@ -1599,19 +1713,26 @@ mod tests {
         }
     }
 
+    /// L'intention est la même qu'avant ce vol — « l'ancienne session est
+    /// close » — mais le fait se lit désormais **sur la socket** : la clôture
+    /// est un geste de mika-spirit, et `ended_at` en base locale n'en serait
+    /// plus qu'un reflet, écrit par un autre processus.
     #[tokio::test]
     async fn test_clear_ends_old_session() {
         let (mut app, _rx, _tmp) = test_app().await;
         let old_session = app.session_id.clone();
 
-        handle_clear(&mut app, "").await;
+        let (_, vues) = clear_nominal(&mut app).await;
 
-        // Verify old session is ended (has ended_at set)
-        let old = app.db.get_session(&old_session).await.unwrap();
-        assert!(
-            old.map(|s| s.ended_at.is_some()).unwrap_or(false),
-            "old session should have ended_at set"
-        );
+        let vues = vues.lock().expect("le témoin du banc");
+        let fin = vues
+            .iter()
+            .find(|v| v.chemin == format!("{ROUTE_SESSIONS}/{old_session}/end"))
+            .expect("la route de clôture est atteinte, sur l'ancienne session");
+        assert_eq!(fin.methode, "POST");
+        // L'agent part dans le corps : sans lui, le serveur résoudrait *son*
+        // agent par défaut et clorait la session d'un tiers (`clore`, l. 275).
+        assert!(fin.corps.contains(r#""agent":"mika""#), "{}", fin.corps);
     }
 
     // --- /clear singleton tests (mika#1401) ---
@@ -1629,7 +1750,28 @@ mod tests {
             channel: None,
         });
 
-        let output = handle_clear(&mut app, "").await;
+        // Le banc est **armé** et la source est **vide** : si le bras singleton
+        // lisait le jeton ou appelait une porte, il refuserait au lieu
+        // d'effacer, et le témoin montrerait une requête (critère 6).
+        let fin = format!("{ROUTE_SESSIONS}/{}/end", app.session_id);
+        let reponses = [
+            (
+                ROUTE_SESSIONS,
+                axum::http::StatusCode::OK,
+                CORPS_OUVERT.to_string(),
+            ),
+            (
+                fin.as_str(),
+                axum::http::StatusCode::OK,
+                CORPS_CLOS.to_string(),
+            ),
+        ];
+        let (output, vues) = par_le_banc(&mut app, &reponses, &|_| None).await;
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            0,
+            "un singleton n'appelle rien, même sans jeton"
+        );
 
         // Session ID is preserved (single-session-by-nature).
         assert_eq!(
@@ -1658,7 +1800,19 @@ mod tests {
         app.is_singleton_session = true;
         let session_id = app.session_id.clone();
 
-        handle_clear(&mut app, "").await;
+        // Celui-ci garde son assertion sur `ended_at` : elle mesure que *rien*
+        // n'a touché la base locale, et c'est encore vrai — et la seule chose
+        // qu'un témoin de socket ne dirait pas.
+        let (_, _) = par_le_banc(
+            &mut app,
+            &[(
+                ROUTE_SESSIONS,
+                axum::http::StatusCode::OK,
+                CORPS_OUVERT.to_string(),
+            )],
+            &|_| None,
+        )
+        .await;
 
         // The canonical session's ended_at must stay NULL.
         let session = app.db.get_session(&session_id).await.unwrap();
@@ -1816,7 +1970,7 @@ mod tests {
         app.queued_task_count = 2;
         app.status = AgentStatus::Thinking;
 
-        handle_clear(&mut app, "").await;
+        clear_nominal(&mut app).await;
 
         assert!(
             app.pending_response.is_none(),
@@ -1849,7 +2003,7 @@ mod tests {
         let (mut app, _rx, _tmp) = test_app().await;
         app.status = AgentStatus::Thinking;
 
-        handle_clear(&mut app, "").await;
+        clear_nominal(&mut app).await;
 
         assert_eq!(app.status, AgentStatus::Idle);
     }
@@ -1861,7 +2015,7 @@ mod tests {
         app.pending_response = Some("partial output being revealed".to_string());
         app.reveal_index = 10;
 
-        handle_clear(&mut app, "").await;
+        clear_nominal(&mut app).await;
 
         assert_eq!(app.status, AgentStatus::Idle);
         assert!(app.pending_response.is_none());
@@ -1880,7 +2034,7 @@ mod tests {
             label: "test.png".to_string(),
         });
 
-        handle_clear(&mut app, "").await;
+        clear_nominal(&mut app).await;
 
         assert!(
             app.pending_images.is_empty(),
@@ -1895,7 +2049,7 @@ mod tests {
         let original_model = app.model.clone();
         let original_provider = app.provider;
 
-        handle_clear(&mut app, "").await;
+        clear_nominal(&mut app).await;
 
         assert_eq!(
             app.thinking_level,
@@ -1973,7 +2127,7 @@ mod tests {
         // Drop the receiver to close the channel
         drop(rx);
 
-        let output = handle_clear(&mut app, "").await;
+        let (output, _) = clear_nominal(&mut app).await;
 
         assert!(
             output.contains("not responding"),
@@ -2693,6 +2847,165 @@ mod tests {
                  d'allowlist :\n{}",
                 violations.join("\n")
             );
+        }
+    }
+
+    // --- `/clear` par mika-spirit (mika#1727, vol V2d-4b) ---
+
+    /// T-A — critère 2 : les deux portes, dans cet ordre, sous le jeton et sous
+    /// l'agent de la TUI ; la session vient du fil, et le worker en reçoit une.
+    #[tokio::test]
+    async fn mika1727_v2d4b_clear_ouvre_puis_clot_dans_cet_ordre() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        let ancienne = app.session_id.clone();
+
+        let (_, vues) = clear_nominal(&mut app).await;
+
+        let vues = vues.lock().expect("le témoin du banc");
+        let chemins = vues.iter().map(|v| v.chemin.as_str()).collect::<Vec<_>>();
+        // L'ordre est le livrable de ce vol : `clore` d'abord perdrait
+        // l'historique le jour où `ouvrir` échoue.
+        assert_eq!(
+            chemins,
+            [ROUTE_SESSIONS, &format!("{ROUTE_SESSIONS}/{ancienne}/end")],
+            "ouvrir puis clore, et rien d'autre"
+        );
+        for vue in vues.iter() {
+            assert_eq!(vue.methode, "POST");
+            assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-interne"));
+            assert!(vue.corps.contains(r#""agent":"mika""#), "{}", vue.corps);
+        }
+
+        // La session de la TUI est celle du fil, et non un UUID tiré ici : c'est
+        // le geste que ce vol remplace.
+        assert_eq!(app.session_id, "s-du-fil");
+        let requests = drain_requests(&mut rx);
+        assert_eq!(requests.len(), 1, "un seul NewSession");
+        match &requests[0] {
+            AgentRequest::NewSession { session_id } => assert_eq!(session_id, "s-du-fil"),
+            _ => panic!("expected NewSession request"),
+        }
+    }
+
+    /// T-B — critère 3 : sans jeton, le refus tombe **avant tout appel**, et
+    /// c'est la socket qui l'atteste — un message exact ne dirait pas qu'aucun
+    /// `ouvrir` n'est parti.
+    #[tokio::test]
+    async fn mika1727_v2d4b_sans_jeton_clear_refuse_avant_tout_appel() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        let ancienne = app.session_id.clone();
+        app.messages.push(ChatMessage {
+            role: ChatRole::User,
+            content: "hello".to_string(),
+            rendered: None,
+            channel: None,
+        });
+
+        let fin = format!("{ROUTE_SESSIONS}/{ancienne}/end");
+        let reponses = [
+            (
+                ROUTE_SESSIONS,
+                axum::http::StatusCode::OK,
+                CORPS_OUVERT.to_string(),
+            ),
+            (
+                fin.as_str(),
+                axum::http::StatusCode::OK,
+                CORPS_CLOS.to_string(),
+            ),
+        ];
+        let (sortie, vues) = par_le_banc(&mut app, &reponses, &|_| None).await;
+
+        assert!(sortie.contains("MIKA_INTERNAL_TOKEN"), "{sortie}");
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+        assert_eq!(app.session_id, ancienne, "la session ne bouge pas");
+        assert_eq!(app.messages.len(), 1, "l'affichage reste");
+        assert!(
+            drain_requests(&mut rx).is_empty(),
+            "le worker ne reçoit rien"
+        );
+    }
+
+    /// T-C — critère 4 : un `ouvrir` refusé ne clôt rien.
+    #[tokio::test]
+    async fn mika1727_v2d4b_un_ouvrir_refuse_ne_clot_rien() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        let ancienne = app.session_id.clone();
+
+        // Les deux routes sont servies ; seule l'ouverture refuse. Sans la
+        // seconde armée, « aucun `end` n'est parti » serait vrai par
+        // construction du banc.
+        let fin = format!("{ROUTE_SESSIONS}/{ancienne}/end");
+        let reponses = [
+            (
+                ROUTE_SESSIONS,
+                axum::http::StatusCode::UNAUTHORIZED,
+                String::new(),
+            ),
+            (
+                fin.as_str(),
+                axum::http::StatusCode::OK,
+                CORPS_CLOS.to_string(),
+            ),
+        ];
+        let (sortie, vues) = par_le_banc(&mut app, &reponses, &avec_jeton).await;
+
+        // Un jeton posé mais faux est la panne la plus coûteuse à diagnostiquer :
+        // le message nomme la variable, et non le transport.
+        assert!(sortie.contains("MIKA_INTERNAL_TOKEN"), "{sortie}");
+        let vues = vues.lock().expect("le témoin du banc");
+        // Le **chemin** de la vue unique, et non son seul compte : un `len() == 1`
+        // serait vert si la TUI avait appelé `clore` et rien d'autre.
+        let chemins = vues.iter().map(|v| v.chemin.as_str()).collect::<Vec<_>>();
+        assert_eq!(chemins, [ROUTE_SESSIONS], "l'ouverture, et rien après");
+        assert_eq!(app.session_id, ancienne, "la session ne bouge pas");
+        assert!(
+            drain_requests(&mut rx).is_empty(),
+            "le worker ne reçoit rien"
+        );
+    }
+
+    /// T-D — critère 5 : une clôture en échec garde la nouvelle session, et le
+    /// message nomme la cause.
+    #[tokio::test]
+    async fn mika1727_v2d4b_une_cloture_en_echec_garde_la_nouvelle_session() {
+        let (mut app, mut rx, _tmp) = test_app().await;
+        let ancienne = app.session_id.clone();
+
+        // Le 500 des trois routes sur échec d'écriture : l'ancienne session est
+        // là, le serveur l'a vue, et il n'a pas pu la clore.
+        let fin = format!("{ROUTE_SESSIONS}/{ancienne}/end");
+        let reponses = [
+            (
+                ROUTE_SESSIONS,
+                axum::http::StatusCode::OK,
+                CORPS_OUVERT.to_string(),
+            ),
+            (
+                fin.as_str(),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "disk full".to_string(),
+            ),
+        ];
+        let (sortie, _) = par_le_banc(&mut app, &reponses, &avec_jeton).await;
+
+        assert!(sortie.contains("not ended"), "{sortie}");
+        assert!(sortie.contains(&ancienne), "{sortie}");
+        // La cause vient du `Display` de `SessionRemoteIssue`, et non d'une
+        // paraphrase écrite ici.
+        assert!(sortie.contains("500"), "{sortie}");
+
+        // Rien n'est défait : la nouvelle session est gardée, et le worker l'a.
+        assert_eq!(app.session_id, "s-du-fil");
+        let requests = drain_requests(&mut rx);
+        assert_eq!(requests.len(), 1, "un seul NewSession");
+        match &requests[0] {
+            AgentRequest::NewSession { session_id } => assert_eq!(session_id, "s-du-fil"),
+            _ => panic!("expected NewSession request"),
         }
     }
 }

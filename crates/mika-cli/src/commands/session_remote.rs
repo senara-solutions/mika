@@ -20,17 +20,18 @@
 //! est construit au site de l'appel parce que c'est ce que l'entrée déclare.
 //!
 //! **État du vol.** Les trois portes sont là — `ouvrir`, `clore` et
-//! `compacter` — et le vol V2d-4a en a câblé **une** : `commands/chat.rs`
-//! atteint `ouvrir` au démarrage de la TUI, et lit les deux champs de
-//! `CreatedSessionMirror`. `clore` et `compacter`, avec `EndedSessionMirror` et
-//! `CompactedMirror`, attendent V2d-4b : hors test, personne ne les atteint
-//! encore. Les `expect(dead_code)` qui le disent sont donc **quatre** — deux
-//! portes, deux miroirs —, et ce chiffre se **mesure** sous
+//! `compacter` — et **deux** sont câblées : `commands/chat.rs` atteint `ouvrir`
+//! au démarrage de la TUI (V2d-4a), et
+//! `tui/commands/handlers.rs::clear_par_spirit` atteint `ouvrir` puis `clore`
+//! sur `/clear` (V2d-4b), en lisant les deux champs de `CreatedSessionMirror`
+//! comme ceux d'`EndedSessionMirror`. Restent `compacter` et `CompactedMirror`,
+//! que personne n'atteint hors test : les `expect(dead_code)` qui le disent
+//! sont donc **deux** — une porte, un miroir —, et ce chiffre se **mesure** sous
 //! `cargo clippy -p mika-cli --all-targets`, il ne se devine pas. Une passe
 //! verte le tient exact dans les deux sens : un `expect` de trop, laissé sur un
 //! item qu'un appelant vient d'atteindre, serait rendu « unfulfilled » ; un de
 //! moins laisserait un `dead_code` nu. C'est la seule chose qui le tiendra à
-//! jour quand V2d-4b câblera les deux dernières.
+//! jour quand V2d-4c câblera la dernière.
 
 use serde::Deserialize;
 
@@ -52,12 +53,14 @@ pub(crate) struct CreatedSessionMirror {
 // Même raison que ci-dessus pour `Deserialize` seul : `EndSessionResponse` ne
 // dérive que `Serialize` et vit dans `crates/mika-agent/`, hors périmètre.
 #[derive(Debug, Deserialize)]
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
 pub(crate) struct EndedSessionMirror {
     /// Faux **sans erreur** quand la session visée est la canonique de l'agent :
     /// elle ne se clôt jamais (mika#1401, `server/sessions.rs:162-164`). La
-    /// porte rend le couple tel quel ; c'est V2d-4 qui le lira.
+    /// porte rend le couple tel quel ; depuis V2d-4b c'est `/clear` qui le lit.
     pub(crate) ended: bool,
+    /// Lu avec `ended`, et non à sa place : les deux ensemble distinguent « la
+    /// canonique, qu'on ne clôt jamais » de « rien n'a été clos, sans raison
+    /// dite ». `/clear` rend un message différent dans chacun des deux cas.
     pub(crate) canonical: bool,
 }
 
@@ -306,9 +309,9 @@ pub(crate) async fn ouvrir(
 /// `{ended: false, canonical: true}` est un 200, pas un refus — la session
 /// canonique de l'agent ne se clôt jamais (mika#1401,
 /// `server/sessions.rs:162-164`). Les convertir en erreur inventerait un échec
-/// là où le serveur a répondu normalement ; les jeter priverait V2d-4 de la
-/// seule chose dont il a besoin au moment de décider s'il rouvre une session.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
+/// là où le serveur a répondu normalement ; les jeter priverait l'appelant de la
+/// seule chose dont il a besoin pour dire ce qui s'est passé. Depuis V2d-4b,
+/// `tui/commands/handlers.rs::clear_par_spirit` lit les deux.
 pub(crate) async fn clore(
     base_url: &str,
     token: &str,
