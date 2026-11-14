@@ -15,12 +15,12 @@
 //! voisine de ce raisonnement est écrite sur `rewind_remote::post` : le client
 //! est construit au site de l'appel parce que c'est ce que l'entrée déclare.
 //!
-//! **État du vol.** Une seule porte ici, `ouvrir`. « Clore » et « compacter »
-//! arrivent en V2d-3b sur ce même transport, et **aucun appelant** ne les
-//! atteint avant V2d-4. Le seul `expect(dead_code)` du module est donc sur
-//! `CreatedSessionMirror`, dont hors test personne ne lit les deux champs : les
-//! attributs se **mesurent** sous `cargo clippy --all-targets`, ils ne se
-//! devinent pas — un `expect` posé par symétrie sur `ouvrir` ou sur `post`
+//! **État du vol.** Deux portes ici, `ouvrir` et `clore`. « Compacter » arrive
+//! dans ce même vol V2d-3b, sur ce même transport, et **aucun appelant**
+//! n'atteint aucune des trois avant V2d-4 : hors test, personne ne lit les
+//! champs des miroirs ni n'appelle les portes. Les `expect(dead_code)` qui le
+//! disent se **mesurent** sous `cargo clippy --all-targets`, ils ne se devinent
+//! pas — un `expect` posé par symétrie sur un item que le lint ne vise pas
 //! serait rendu « unfulfilled », donc un avertissement de plus.
 
 use serde::Deserialize;
@@ -36,6 +36,18 @@ pub(crate) struct CreatedSessionMirror {
     /// Vrai quand l'identifiant rendu est la session canonique de l'agent
     /// (mika#1401) : le client ne la clôt **jamais**. C'est V2d-4 qui lira ce
     /// champ pour décider s'il appelle `clore` en fin de session.
+    pub(crate) canonical: bool,
+}
+
+// Même raison que ci-dessus pour `Deserialize` seul : `EndSessionResponse` ne
+// dérive que `Serialize` et vit dans `crates/mika-agent/`, hors périmètre.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
+pub(crate) struct EndedSessionMirror {
+    /// Faux **sans erreur** quand la session visée est la canonique de l'agent :
+    /// elle ne se clôt jamais (mika#1401, `server/sessions.rs:162-164`). La
+    /// porte rend le couple tel quel ; c'est V2d-4 qui le lira.
+    pub(crate) ended: bool,
     pub(crate) canonical: bool,
 }
 
@@ -143,6 +155,41 @@ async fn post(
     }
 }
 
+/// Le dernier geste des trois portes : relire le statut, puis désérialiser le
+/// corps en traduisant l'échec de lecture.
+///
+/// Extraite parce que « un 200 au corps illisible n'est **jamais** un succès »
+/// est une propriété des trois portes et non de chacune : tenue en trois
+/// exemplaires, elle dériverait sur deux d'entre eux sans qu'un test rougisse —
+/// la panne que le § V3 de mika#1727 nomme déjà pour l'assemblage du
+/// `SkillRegistry`. `quoi` nomme ce qui n'a pas pu être lu, et c'est tout ce
+/// qui varie d'une porte à l'autre.
+fn lire_json<T: serde::de::DeserializeOwned>(
+    statut: u16,
+    corps: String,
+    url: String,
+    quoi: &str,
+) -> Result<T, SessionRemoteIssue> {
+    // Statut lu avant la forme : `post` ne rend `Ok` que sur 200, mais la
+    // condition est écrite ici plutôt que supposée — le jour où un bras de
+    // `post` rendrait un autre statut sur son chemin `Ok`, un corps d'erreur
+    // serait désérialisé comme un succès.
+    if statut != 200 {
+        return Err(SessionRemoteIssue::Unexpected {
+            status: Some(statut),
+            url,
+            body: corps,
+        });
+    }
+    serde_json::from_str(&corps).map_err(|cause| SessionRemoteIssue::Unexpected {
+        status: Some(statut),
+        url,
+        // Le corps reçu voyage avec la cause : sans lui, « champ manquant
+        // `canonical` » ne dit pas si le serveur a répondu autre chose.
+        body: format!("unreadable {quoi} ({cause}): {corps}"),
+    })
+}
+
 const ROUTE_SESSIONS: &str = "/api/v1/sessions";
 
 /// Ouvre une session pour l'agent servi, et rend ce que mika-spirit a inscrit.
@@ -158,24 +205,51 @@ pub(crate) async fn ouvrir(
 ) -> Result<CreatedSessionMirror, SessionRemoteIssue> {
     let envoye = serde_json::json!({ "agent": agent });
     let (statut, corps) = post(base_url, token, ROUTE_SESSIONS, &envoye).await?;
-    // Statut lu avant la forme : `post` ne rend `Ok` que sur 200, mais la
-    // condition est écrite ici plutôt que supposée — le jour où un bras de
-    // `post` rendrait un autre statut sur son chemin `Ok`, un corps d'erreur
-    // serait désérialisé comme un succès.
-    if statut != 200 {
-        return Err(SessionRemoteIssue::Unexpected {
-            status: Some(statut),
-            url: session_url(base_url, ROUTE_SESSIONS),
-            body: corps,
-        });
-    }
-    serde_json::from_str(&corps).map_err(|cause| SessionRemoteIssue::Unexpected {
-        status: Some(statut),
-        url: session_url(base_url, ROUTE_SESSIONS),
-        // Le corps reçu voyage avec la cause : sans lui, « champ manquant
-        // `canonical` » ne dit pas si le serveur a répondu autre chose.
-        body: format!("unreadable created session ({cause}): {corps}"),
-    })
+    lire_json(
+        statut,
+        corps,
+        session_url(base_url, ROUTE_SESSIONS),
+        "created session",
+    )
+}
+
+/// Clôt une session de l'agent servi, et rend ce que mika-spirit a décidé.
+///
+/// Les deux champs rendus ne sont **ni lus ni interprétés ici** :
+/// `{ended: false, canonical: true}` est un 200, pas un refus — la session
+/// canonique de l'agent ne se clôt jamais (mika#1401,
+/// `server/sessions.rs:162-164`). Les convertir en erreur inventerait un échec
+/// là où le serveur a répondu normalement ; les jeter priverait V2d-4 de la
+/// seule chose dont il a besoin au moment de décider s'il rouvre une session.
+#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
+pub(crate) async fn clore(
+    base_url: &str,
+    token: &str,
+    agent: &str,
+    session_id: &str,
+) -> Result<EndedSessionMirror, SessionRemoteIssue> {
+    // L'identifiant est inséré **tel quel**, sans encodage, et c'est une dette
+    // bornée par le corps de mika#1727 : mesure de Vincent du 2026-11-14 sur la
+    // table `sessions` de gentux (aucune ligne ne porte `/`, `?`, `#`, `%` ni
+    // d'espace), et V2d-4 ne clôt que des identifiants rendus par `ouvrir`
+    // (UUIDv4, ou la canonique). `Tracked in: senara-solutions/mika#1727`.
+    //
+    // Composé une fois parce qu'il a deux lecteurs : `post` et le `session_url`
+    // que `lire_json` recompose pour nommer l'URL dans un `Unexpected`.
+    let chemin = format!("{ROUTE_SESSIONS}/{session_id}/end");
+    // `agent` part **toujours**, y compris vide, pour la raison d'`ouvrir` et
+    // une de plus : le serveur déclare le champ `#[serde(default)]`, donc un
+    // corps sans `agent` lui fait résoudre *son* agent par défaut. La porte
+    // clorait la session d'un autre agent, et le contrôle d'appartenance ne la
+    // rattraperait pas — `resolve_agent` aurait réussi.
+    let envoye = serde_json::json!({ "agent": agent });
+    let (statut, corps) = post(base_url, token, &chemin, &envoye).await?;
+    lire_json(
+        statut,
+        corps,
+        session_url(base_url, &chemin),
+        "ended session",
+    )
 }
 
 // Les tests vivent ici, **en fin de fichier** : le scanner d'egress coupe la
@@ -233,6 +307,106 @@ mod tests {
 
         assert_eq!(rendu.session_id, "s-neuve");
         assert!(!rendu.canonical);
+    }
+
+    /// Le chemin de clôture tel que le banc doit le voir : `fake_spirit` associe
+    /// par le chemin **brut**, donc l'identifiant concret en fait partie. Un
+    /// `format!` mal composé dans la porte tombe sur le `fallback` à 501,
+    /// qu'aucun bras de `post` ne traduit — c'est ce qui fait de ces tests une
+    /// mesure de la **visée** du chemin, et pas seulement du statut rendu.
+    const CHEMIN_FIN: &str = "/api/v1/sessions/s-1/end";
+
+    #[tokio::test]
+    async fn mika1727_clore_vise_la_route_de_fin_avec_son_jeton() {
+        let (base, recues) = fake_spirit(&[(
+            CHEMIN_FIN,
+            StatusCode::OK,
+            r#"{"ended":true,"canonical":false}"#,
+        )])
+        .await;
+
+        let rendu = clore(&base, "jeton-secret", "mika-dev", "s-1")
+            .await
+            .expect("un 200 au corps lisible est un succès");
+
+        // Les trois faits se lisent sur la socket et non sur l'appel, comme
+        // pour `ouvrir` : c'est ce que le serveur reçoit qui tient le contrat.
+        let vues = recues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel attendu");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "POST");
+        assert_eq!(vue.chemin, CHEMIN_FIN);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        let envoye: serde_json::Value = serde_json::from_str(&vue.corps).expect("un corps JSON");
+        assert_eq!(envoye["agent"], "mika-dev");
+
+        assert!(rendu.ended);
+        assert!(!rendu.canonical);
+    }
+
+    #[tokio::test]
+    async fn mika1727_clore_rend_la_canonique_telle_quelle() {
+        let (base, _) = fake_spirit(&[(
+            CHEMIN_FIN,
+            StatusCode::OK,
+            r#"{"ended":false,"canonical":true}"#,
+        )])
+        .await;
+
+        // `expect` et non `expect_err` **est** la mesure : la traduction tentante
+        // est de rendre une erreur sur `ended: false`, et le serveur n'a rien
+        // refusé — la canonique ne se clôt simplement jamais.
+        let rendu = clore(&base, "jeton", "mika-dev", "s-1")
+            .await
+            .expect("la canonique non close est un fait, pas une erreur");
+        assert!(!rendu.ended);
+        assert!(rendu.canonical);
+    }
+
+    #[tokio::test]
+    async fn mika1727_clore_sur_404_rend_notfound() {
+        // Par la **porte** et non par `un_statut` : le 404 du transport est déjà
+        // mesuré plus bas, et le critère porte sur `clore`.
+        let (base, _) = fake_spirit(&[(CHEMIN_FIN, StatusCode::NOT_FOUND, "")]).await;
+
+        let probleme = clore(&base, "jeton", "mika-dev", "s-1")
+            .await
+            .expect_err("un 404 est une erreur");
+        assert!(
+            matches!(probleme, SessionRemoteIssue::NotFound { .. }),
+            "{probleme:?}"
+        );
+        // Les deux causes du 404 sont nommées sans qu'une soit choisie : le
+        // serveur rend le même 404 pour un agent inconnu, une session inconnue
+        // et une session étrangère, par un seul site.
+        let message = probleme.to_string();
+        assert!(message.contains("unknown agent"), "{message}");
+        assert!(message.contains("unknown session"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_clore_un_200_illisible_nest_jamais_un_succes() {
+        // `canonical` manquant : la forme qu'un écart de version produit
+        // réellement, et le champ dont un repli silencieux coûterait le plus —
+        // c'est lui qui décidera si V2d-4 réouvre une session.
+        let (base, _) = fake_spirit(&[(CHEMIN_FIN, StatusCode::OK, r#"{"ended":true}"#)]).await;
+
+        let probleme = clore(&base, "jeton", "mika-dev", "s-1")
+            .await
+            .expect_err("un corps illisible n'est jamais un succès");
+        assert!(
+            matches!(
+                probleme,
+                SessionRemoteIssue::Unexpected {
+                    status: Some(200),
+                    ..
+                }
+            ),
+            "{probleme:?}"
+        );
+        let message = probleme.to_string();
+        assert!(message.contains("unreadable ended session"), "{message}");
+        assert!(message.contains(r#"{"ended":true}"#), "{message}");
     }
 
     #[tokio::test]
