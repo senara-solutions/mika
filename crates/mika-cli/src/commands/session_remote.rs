@@ -262,7 +262,7 @@ pub(crate) async fn clore(
     session_id: &str,
 ) -> Result<EndedSessionMirror, SessionRemoteIssue> {
     // L'identifiant est inséré **tel quel**, sans encodage, et c'est une dette
-    // bornée par le corps de mika#1727 : mesure de Vincent du 2026-11-14 sur la
+    // bornée par le corps de mika#1727 : mesuré le 2026-11-14 sur la
     // table `sessions` de gentux (aucune ligne ne porte `/`, `?`, `#`, `%` ni
     // d'espace), et V2d-4 ne clôt que des identifiants rendus par `ouvrir`
     // (UUIDv4, ou la canonique). `Tracked in: senara-solutions/mika#1727`.
