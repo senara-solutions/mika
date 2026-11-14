@@ -1593,4 +1593,60 @@ mod tests {
             "une reprise n'ouvre rien sur le fil"
         );
     }
+
+    /// mika#1727 V2d-4a — la création de session de la TUI est passée à
+    /// `session_remote::ouvrir`. Cette garde refuse son retour en local dans la
+    /// moitié *production* de ce fichier.
+    ///
+    /// Le scan porte sur les deux gestes qui *créent une session en base dans
+    /// le processus de la TUI*, et sur rien d'autre : `end_session(` y reste
+    /// jusqu'à V2d-4b, qui porte la porte `clore` et sa propre garde.
+    #[test]
+    fn mika1727_v2d4a_la_tui_ne_cree_plus_sa_session_en_local() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le
+        // remède est la porte que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+        const MOTIFS: &[(&str, &str)] = &[
+            ("create_session(", "session_remote::ouvrir"),
+            ("get_or_create_canonical_session(", "session_remote::ouvrir"),
+        ];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let site = scanner.src_root().join("commands/chat.rs");
+        let production = scanner.production_of(&site);
+
+        // Sans ce témoin, une garde qui balaie un chemin faux, ou un balayeur
+        // qui masquerait le fichier entier, serait verte **par cécité** —
+        // l'exact défaut que `ProductionScanner` existe pour refuser
+        // (mika#2398). Le témoin vise un nom de la moitié *production* : s'il
+        // disparaît, la garde rougit et demande qu'on la re-vise, au lieu de
+        // continuer à ne rien regarder.
+        assert!(
+            production.contains("async fn spawn_agent_worker("),
+            "la garde n'a pas lu la moitié production de chat.rs"
+        );
+
+        // Les deux motifs sont balayés avant le refus, et non refusés l'un après
+        // l'autre : un `assert!` par motif n'aurait montré que le premier site,
+        // et le rouge doit nommer tout ce qu'il y a à déplacer, pas une moitié.
+        let violations: Vec<String> = MOTIFS
+            .iter()
+            .flat_map(|(motif, porte)| {
+                production
+                    .lines()
+                    .enumerate()
+                    .filter(move |(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
+                    .map(move |(i, l)| format!("{}: {} (remède : {porte})", i + 1, l.trim()))
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "mika#1727 V2d-4a — la TUI crée sa session dans son propre processus. \
+             Le remède est de passer par la porte que chaque ligne nomme, jamais \
+             une entrée d'allowlist :\n{}",
+            violations.join("\n")
+        );
+    }
 }
