@@ -188,6 +188,7 @@ mod tests {
     // diverger. Il est `pub(crate)` depuis V2c-1b, pour ce motif-là.
     use crate::commands::rewind_remote::tests::fake_spirit;
     use axum::http::StatusCode;
+    use mika_common::dead_endpoint::DeadEndpoint;
 
     /// Un factice qui ne sert qu'un couple sur `chemin`, et l'appel que `post` y
     /// fait. L'URL de base revient avec, parce que le critère 3 l'attend dans le
@@ -289,6 +290,68 @@ mod tests {
         assert!(
             message.contains(&format!("{base}{ROUTE_SESSIONS}")),
             "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_point_injoignable_na_pas_de_statut() {
+        // mika#2569 : le port est **tenu** pour toute la durée de l'appel. Le
+        // motif qui liait puis libérait a vu un factice voisin du même binaire
+        // servir l'appel censé échouer (2026-09-28, job `Check` de mika#2561).
+        let dead = DeadEndpoint::reserve();
+        let base = format!("http://{}", dead.addr());
+
+        let probleme = ouvrir(&base, "jeton", "mika-dev")
+            .await
+            .expect_err("rien n'écoute : l'appel doit échouer");
+        assert!(
+            matches!(
+                probleme,
+                SessionRemoteIssue::Unexpected { status: None, .. }
+            ),
+            "{probleme:?}"
+        );
+        // `None` et non `0` : l'opérateur doit lire « injoignable » et non un
+        // statut que le serveur n'a jamais rendu.
+        let message = probleme.to_string();
+        assert!(message.contains("unreachable"), "{message}");
+        assert!(
+            message.contains(&format!("{base}{ROUTE_SESSIONS}")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_200_illisible_nest_jamais_un_succes() {
+        // Un corps plausible auquel `canonical` manque : c'est la panne d'un
+        // serveur d'une autre version, pas un corps absurde.
+        let (base, recues) =
+            fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, r#"{"session_id":"s-1"}"#)]).await;
+
+        let probleme = ouvrir(&base, "jeton", "mika-dev")
+            .await
+            .expect_err("un corps illisible n'est jamais un succès");
+        assert!(
+            matches!(
+                probleme,
+                SessionRemoteIssue::Unexpected {
+                    status: Some(200),
+                    ..
+                }
+            ),
+            "{probleme:?}"
+        );
+        // Le corps reçu voyage dans le message : sans lui, « champ manquant
+        // `canonical` » ne dit pas ce que le serveur a répondu.
+        let message = probleme.to_string();
+        assert!(message.contains("unreadable created session"), "{message}");
+        assert!(message.contains(r#"{"session_id":"s-1"}"#), "{message}");
+        // L'appel est bien parti : l'échec est une lecture, pas un refus posé
+        // avant le fil.
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "un seul appel attendu"
         );
     }
 }
