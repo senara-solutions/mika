@@ -525,11 +525,68 @@ de `commands/chat.rs`) balaie la moitié production du fichier par
 `ProductionScanner` et refuse `create_session(` et
 `get_or_create_canonical_session(`. Son **allowlist est livrée vide et assertie
 vide** : quand elle rougit, le remède est de passer par `session_remote::ouvrir`,
-jamais d'y ajouter une ligne. `end_session(` n'est **pas** un motif — il part au
-vol V2d-4b, avec la porte `clore` et sa propre garde.
+jamais d'y ajouter une ligne. `end_session(` n'est **pas** un motif de *cette*
+garde — il est refusé depuis le vol V2d-4b par celle de `handlers.rs`, avec la
+porte `clore` (voir juste en dessous). Les deux ne sont pas fondues : elles
+balaient deux fichiers et nomment deux portes différentes, et une garde fondue
+rougirait sous un seul message.
+
+### `/clear` passe par mika-spirit (mika#1727, vol V2d-4b)
+
+`/clear` **ne clôt plus et ne crée plus sa session en local**.
+`tui/commands/handlers.rs::clear_par_spirit` traverse deux portes de
+`commands/session_remote.rs` : **`ouvrir` d'abord, `clore` ensuite — et cet ordre
+est le livrable.** L'inverse perdrait la session courante avant de savoir si une
+nouvelle peut naître, et laisserait la TUI sans session sur un spirit qui refuse.
+`handle_clear` charge le `.env` de la home, lit `dashboard::spirit_url()` et
+délègue, comme `handle_rewind_impl`.
+
+Ce que chaque issue rend, et pourquoi elle est distincte :
+
+| cas | effet sur l'état | message |
+|---|---|---|
+| singleton | rien n'est appelé, pas même la lecture du jeton ; la session est gardée | « Display cleared… » (inchangé) |
+| sans `MIKA_INTERNAL_TOKEN` | refus **avant tout appel**, état intact, aucun `NewSession` | le refus commun, qui nomme la variable |
+| `ouvrir` échoue | rien n'est clos, `session_id` ne change pas, aucun `NewSession` | `Error opening a new session: <issue>` |
+| `clore` échoue | la **nouvelle** session est gardée, le worker l'a | dit que l'ancienne n'a pas été close, et nomme la cause |
+| `ended: false`, `canonical: true` | la nouvelle session est gardée | dit que l'ancienne est la session canonique de l'agent (mika#1401) et reste ouverte |
+
+`is_singleton_session` prend le `canonical` rendu par `ouvrir` : la route rend la
+session canonique de l'agent au lieu d'en créer une, donc le serveur est la seule
+autorité sur ce fait (même raison qu'au vol V2d-4a). Et `clore` rend
+`{ended, canonical}` en **200** sur une session canonique, qui ne se clôt jamais
+— d'où la lecture des **deux** champs, et non d'`ended` seul : un `ended: false`
+canonique est le régime nominal de mika#1401, un `ended: false` non canonique est
+un refus sans raison donnée, et les confondre dirait à l'opérateur qu'un geste a
+échoué alors qu'il n'avait pas lieu d'être.
+
+**Le refus structurel.**
+`mika1727_v2d4b_la_tui_ne_clot_plus_la_base_en_local` (module `tests` de
+`handlers.rs`) balaie la moitié production du fichier par `ProductionScanner` et
+refuse `create_session(` (remède : `session_remote::ouvrir`) et `end_session(`
+(remède : `session_remote::clore`). Son **allowlist est livrée vide et assertie
+vide**. Elle porte un témoin *et* un contre-témoin : `production_of` masque les
+régions `#[cfg(test)]` sans jamais tronquer, donc le premier atteste que le
+balayage a lu la production (un chemin faux serait vert par cécité) et le second
+qu'il a masqué la moitié test — sans lui, les appels des tests de ce même fichier
+feraient rougir la garde, et on l'aurait « réparée » par une entrée d'allowlist.
+`maybe_compact(` n'est pas un motif : il part au vol V2d-4c, avec la porte
+`compacter`.
+
+**Une seule lecture du jeton dans tout le crate.**
+`session_remote::jeton_interne(SourceEnv)` remplace les deux copies que portaient
+`chat.rs` (refus en français nommant l'ouverture de session) et `handlers.rs`
+(refus en anglais nommant le rembobinage) : elles avaient déjà divergé, et c'était
+l'argument de leur mise en commun. Le refus nomme `MIKA_INTERNAL_TOKEN`, dit que
+`MIKA_DASHBOARD_TOKEN` **n'est pas accepté** par les routes de session et de
+rembobinage, et **ne nomme aucun geste** — trois sites l'appellent, et aucun n'a
+autorité sur les deux autres. Il rend un `Err(String)` et non un
+`SessionRemoteIssue` : une variable absente n'a ni statut ni URL, et un
+`Unexpected { status: None }` se lirait « spirit injoignable » (motif mika#2331).
+`grep -rn "fn jeton_interne" crates/mika-cli/src` rend **une** ligne.
 
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
-- `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)
+- `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session
 - `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
 - `/provider` and `/model` pre-validate via `Settings::make_llm_provider()` before updating the UI. `/provider` switch persists default `{provider}_model` when none exists, warns about stale fields and max_tokens limits, and spawns a background `get_models()` to pre-warm the model list cache. `/model` lists available models from cache/API, supports aliases and direct `provider/model` format with cross-provider switching
 - **Footer badges:** `[N tasks]` (Cyan) for pending reminders, `[N running]` (Yellow) for active background callback tasks (polled every ~5s), `[N hidden]` (DarkGray) for suppressed internal messages in inbox mode, and dashboard status indicator with clickable `[start]`/`[stop]` and `[open]` buttons
