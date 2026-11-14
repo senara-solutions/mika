@@ -735,18 +735,20 @@ pub async fn run(
     let dashboard_status = crate::commands::dashboard::query_dashboard_status().await;
     app.dashboard_running = dashboard_status.is_some_and(|(enabled, _, _)| enabled);
     if dashboard_status.is_none() {
-        // La cause n'est pas résolue ici : la sonde rend `None` pour un daemon
-        // injoignable comme pour un shell sans jeton, et en désigner une seule
-        // serait une fausse provenance. Les deux sont nommées, et avec elles le
-        // geste qui les lève.
+        // mika#1727 V2d-4a — le jeton n'est plus une cause possible à ce point du
+        // démarrage : l'écran n'existe que si `ouvrir_session_par_spirit` a lu
+        // `MIKA_INTERNAL_TOKEN`, et sur le chemin nominal spirit a répondu à
+        // l'ouverture. Nommer encore la variable enverrait l'opérateur vérifier
+        // sa configuration pour une panne survenue depuis — l'inverse de ce que
+        // ce message doit faire.
         app.messages.push(ChatMessage {
             role: ChatRole::System,
             content: format!(
-                "\u{26a0} mika#1727 — mika-spirit n'a pas répondu sur {}. Depuis ce vol, \
-                 chaque tour de la TUI y est envoyé : sans lui, le prochain message \
-                 échouera en nommant l'endpoint. Démarre le daemon (`mika-spirit`), ou \
-                 vérifie `MIKA_INTERNAL_TOKEN` dans ce shell — la sonde rend la même \
-                 absence dans les deux cas.",
+                "\u{26a0} mika#1727 — mika-spirit n'a pas répondu sur {} à la sonde du \
+                 tableau de bord, alors que la session de la TUI s'y est ouverte. \
+                 Chaque tour y est envoyé : s'il reste muet, le prochain message \
+                 échouera en nommant l'endpoint. Vérifie que le daemon \
+                 (`mika-spirit`) tourne toujours.",
                 crate::commands::dashboard::spirit_url()
             ),
             rendered: None,
