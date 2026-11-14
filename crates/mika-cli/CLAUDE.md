@@ -415,11 +415,15 @@ seul n'envoie plus.
 `dashboard::query_dashboard_status()` et non `is_dashboard_running()` : la même
 sonde répond désormais à deux questions, et le `bool` les écrasait — un daemon à
 terre y était indiscernable d'un tableau de bord désactivé. Un `None` pousse un
-message `System` qui nomme l'endpoint et **les deux** causes possibles, parce que
-la sonde rend la même absence pour un daemon injoignable et pour un shell sans
-`MIKA_INTERNAL_TOKEN` ; en désigner une seule serait une fausse provenance
-(motif mika#2331). Le chemin `--team` garde `is_dashboard_running()` — son tour
-ne passe pas par ce bras, et il part au vol V4.
+message `System` qui nomme l'endpoint. **Il ne nomme plus le jeton depuis le vol
+V2d-4a** (voir plus bas) : ce message disait les **deux** causes possibles, parce
+que la sonde rend la même absence pour un daemon injoignable et pour un shell
+sans `MIKA_INTERNAL_TOKEN`, et en désigner une seule aurait été une fausse
+provenance (motif mika#2331). Depuis que l'écran n'existe que si la session s'est
+ouverte sur spirit, le jeton **a été lu** à ce point du démarrage : la seule
+cause restante est un daemon qui s'est tu entre l'ouverture et la sonde. Le
+chemin `--team` garde `is_dashboard_running()` — son tour ne passe pas par ce
+bras, et il part au vol V4.
 
 ### La TUI ne possède plus de moteur de tâches (mika#1727, vol V2a sur 4)
 
@@ -481,6 +485,48 @@ ne suffit pas** — les routes rewind ne l'acceptent pas. Le refus est posé ava
 `resolve`, parce que l'appel qui suivrait n'est pas sans effet : un 401 tomberait
 sur la première des trois portes et nommerait le transport là où la cause est la
 configuration du shell.
+
+### Le démarrage de la TUI passe par mika-spirit (mika#1727, vol V2d-4a)
+
+`mika` / `mika chat` **ne crée plus sa session en local**.
+`chat::ouvrir_session_par_spirit` remplace les deux appels de
+`spawn_agent_worker` (`get_or_create_canonical_session` pour un singleton,
+`create_session` sinon), dont l'échec ne donnait qu'un `tracing::warn!` : la TUI
+démarrait sans session et la panne se disait au premier tour, là où elle ne se
+lit plus.
+
+**Ce que le démarrage exige.** `MIKA_INTERNAL_TOKEN`, lu avant tout appel, sur
+les **deux** chemins (avec et sans `--session-id`) — le premier tour part sur le
+fil de toute façon. Le refus nomme la variable et dit que
+`MIKA_DASHBOARD_TOKEN` **ne suffit pas** : `dashboard::auth_token()` l'accepte
+pour la sonde, les routes de session non. C'est l'angle mort que ce vol ferme —
+un shell qui ne portait que le jeton du tableau de bord passait la sonde, puis
+prenait un 401 à chaque tour. Sans jeton, ou si `ouvrir` échoue (401, 404,
+injoignable), le `?` de `run` sort en non-zéro **avant** le hook de panique et
+`enable_raw_mode` : l'écran ne s'affiche jamais. Au changement d'agent et à
+`/restart`, les chemins d'erreur existants poussent le message dans la
+conversation sans quitter la TUI.
+
+**D'où vient `is_singleton_session`.** Du **fil**, et non de l'identité locale :
+la route rend la session canonique de l'agent au lieu d'en créer une, donc le
+serveur est la seule autorité sur ce fait. `resolve_canonical_session_id` ne sert
+plus qu'au bras de reprise.
+
+**Ce que le démarrage refuse.** Sous `--session-id`, une session que la base
+locale ne connaît pas — la route ne prend aucun identifiant dans son corps, donc
+elle ne sait pas en créer une à identifiant choisi, et le refus nomme
+l'identifiant. Une session étrangère reste refusée au texte inchangé, et une base
+illisible ne se lit plus comme « session inconnue » (cette erreur était avalée).
+Une session connue et à l'agent est reprise **sans appeler `ouvrir`**.
+
+**Le refus structurel.**
+`mika1727_v2d4a_la_tui_ne_cree_plus_sa_session_en_local` (module `tests` en fin
+de `commands/chat.rs`) balaie la moitié production du fichier par
+`ProductionScanner` et refuse `create_session(` et
+`get_or_create_canonical_session(`. Son **allowlist est livrée vide et assertie
+vide** : quand elle rougit, le remède est de passer par `session_remote::ouvrir`,
+jamais d'y ajouter une ligne. `end_session(` n'est **pas** un motif — il part au
+vol V2d-4b, avec la porte `clore` et sa propre garde.
 
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)

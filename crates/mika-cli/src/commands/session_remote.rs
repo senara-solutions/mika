@@ -16,15 +16,17 @@
 //! est construit au site de l'appel parce que c'est ce que l'entrée déclare.
 //!
 //! **État du vol.** Les trois portes sont là — `ouvrir`, `clore` et
-//! `compacter` — et **aucun appelant** n'en atteint aucune avant V2d-4 : hors
-//! test, personne ne lit les champs des miroirs ni n'appelle les portes. Les
-//! `expect(dead_code)` qui le disent sont **six** — un par porte, un par
-//! miroir —, et ce chiffre se **mesure** sous `cargo clippy --all-targets`, il
-//! ne se devine pas. Une passe verte le tient exact dans les deux sens : un
-//! `expect` de trop, posé par symétrie sur un item que le lint ne vise pas,
-//! serait rendu « unfulfilled » ; un de moins laisserait un `dead_code` nu.
-//! C'est la seule chose qui le tiendra à jour quand V2d-4 câblera les
-//! appelants, un par un.
+//! `compacter` — et le vol V2d-4a en a câblé **une** : `commands/chat.rs`
+//! atteint `ouvrir` au démarrage de la TUI, et lit les deux champs de
+//! `CreatedSessionMirror`. `clore` et `compacter`, avec `EndedSessionMirror` et
+//! `CompactedMirror`, attendent V2d-4b : hors test, personne ne les atteint
+//! encore. Les `expect(dead_code)` qui le disent sont donc **quatre** — deux
+//! portes, deux miroirs —, et ce chiffre se **mesure** sous
+//! `cargo clippy -p mika-cli --all-targets`, il ne se devine pas. Une passe
+//! verte le tient exact dans les deux sens : un `expect` de trop, laissé sur un
+//! item qu'un appelant vient d'atteindre, serait rendu « unfulfilled » ; un de
+//! moins laisserait un `dead_code` nu. C'est la seule chose qui le tiendra à
+//! jour quand V2d-4b câblera les deux dernières.
 
 use serde::Deserialize;
 
@@ -33,12 +35,13 @@ use serde::Deserialize;
 // fil côté client, sans règle de domaine — la même phrase que
 // `rewind_remote.rs:19-21`, et la même raison.
 #[derive(Debug, Deserialize)]
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
 pub(crate) struct CreatedSessionMirror {
     pub(crate) session_id: String,
     /// Vrai quand l'identifiant rendu est la session canonique de l'agent
-    /// (mika#1401) : le client ne la clôt **jamais**. C'est V2d-4 qui lira ce
-    /// champ pour décider s'il appelle `clore` en fin de session.
+    /// (mika#1401) : le client ne la clôt **jamais**. Depuis V2d-4a, c'est ce
+    /// champ qui donne `is_singleton_session` à la TUI — le serveur est la
+    /// seule autorité sur ce fait, et V2d-4b s'en servira pour décider s'il
+    /// appelle `clore` en fin de session.
     pub(crate) canonical: bool,
 }
 
@@ -230,7 +233,6 @@ const ROUTE_COMPACT: &str = "/api/v1/compact";
 /// `agent` part **toujours**, y compris vide : c'est le serveur qui décide ce
 /// qu'un nom vide vaut (`#[serde(default)]` puis 404 sur agent inconnu), et un
 /// client qui tranche ici se mettrait à répondre à sa place.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
 pub(crate) async fn ouvrir(
     base_url: &str,
     token: &str,
