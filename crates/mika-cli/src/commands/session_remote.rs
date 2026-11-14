@@ -18,10 +18,13 @@
 //! **État du vol.** Les trois portes sont là — `ouvrir`, `clore` et
 //! `compacter` — et **aucun appelant** n'en atteint aucune avant V2d-4 : hors
 //! test, personne ne lit les champs des miroirs ni n'appelle les portes. Les
-//! `expect(dead_code)` qui le disent se **mesurent** sous
-//! `cargo clippy --all-targets`, ils ne se devinent pas — un `expect` posé par
-//! symétrie sur un item que le lint ne vise pas serait rendu « unfulfilled »,
-//! donc un avertissement de plus.
+//! `expect(dead_code)` qui le disent sont **six** — un par porte, un par
+//! miroir —, et ce chiffre se **mesure** sous `cargo clippy --all-targets`, il
+//! ne se devine pas. Une passe verte le tient exact dans les deux sens : un
+//! `expect` de trop, posé par symétrie sur un item que le lint ne vise pas,
+//! serait rendu « unfulfilled » ; un de moins laisserait un `dead_code` nu.
+//! C'est la seule chose qui le tiendra à jour quand V2d-4 câblera les
+//! appelants, un par un.
 
 use serde::Deserialize;
 
