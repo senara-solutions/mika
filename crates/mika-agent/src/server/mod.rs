@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod ci_failure_handler;
 pub mod ci_success_handler;
 pub(crate) mod comment_triage;
+pub mod compact;
 pub mod dashboard;
 pub mod dashboard_dev_runs;
 pub mod deadline_verdict;
@@ -389,9 +390,14 @@ fn build_router(state: AppState) -> Router {
     // lecture. Deux déclarations pour un même chemin ne se marchent pas dessus :
     // `route_layer` ne s'applique qu'aux méthodes déjà posées sur le groupe.
     // Clore tombe du même côté qu'ouvrir : poser un `ended_at` écrit une ligne.
+    // Compacter aussi, et son chemin est `/compact` et non
+    // `/sessions/{id}/compact` : la compaction porte sur l'agent, pas sur une
+    // session — `count_messages` et `replace_with_summary` sont restreints à
+    // l'agent et ignorent les sessions (mika#1727, vol V2d-2).
     let session_routes = Router::new()
         .route("/sessions", post(sessions::handle_create_session))
         .route("/sessions/{id}/end", post(sessions::handle_end_session))
+        .route("/compact", post(compact::handle_compact))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_internal_token,
@@ -6073,6 +6079,291 @@ mod tests {
             .unwrap()
             .expect("la session canonique doit exister en base");
         assert!(session.ended_at.is_none(), "mika#1401 : elle reste ouverte");
+    }
+
+    // ===== Compaction (mika#1727 V2d-2) =====
+
+    use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+    /// Un `AppState` dont l'agent `mika` fait tourner le mock fourni. Le mock est
+    /// posé sur l'`AgentState` et non sur `AppState.llm` : la route lit
+    /// `agent_state.llm`, et c'est exactement la distinction que ce vol existe
+    /// pour tenir — un mock posé à côté laisserait passer le défaut corrigé.
+    fn mika1727_state_compact(mock: Arc<MockLlmProvider>) -> AppState {
+        let state = test_state();
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .llm = mock;
+        }
+        state
+    }
+
+    /// `n` messages pour l'agent. La session est créée d'abord : `messages`
+    /// porte `session_id TEXT NOT NULL REFERENCES sessions(id)`, et sans elle
+    /// l'insertion rend `FOREIGN KEY constraint failed` (787). Ce que la route
+    /// compte reste pourtant l'agent et non la session — `count_messages` est
+    /// restreint à `agent_id` et ne joint aucune table de session.
+    async fn mika1727_seed_messages(db: &AsyncDatabase, n: usize) {
+        db.create_session("sess-compact-1727", db.agent_id(), "cli")
+            .await
+            .unwrap();
+        for i in 0..n {
+            db.save_message("sess-compact-1727", "user", &format!("message {i}"), None)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_sans_jeton_la_compaction_rend_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 401 et non 404 : la route existe bien, c'est la porte qui refuse.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_jeton_du_tableau_de_bord_est_refuse_a_la_compaction() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Compacter remplace des lignes de messages par une ligne de résumé :
+        // c'est une mutation, et le jeton d'observabilité n'y donne pas droit.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_inconnu_rend_404_sans_appeler_le_llm() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("résumé")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"agent-inexistant-1727"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["error"].as_str().unwrap().is_empty());
+
+        // Le mock est celui de `mika`, pas celui de l'agent demandé — qui n'a pas
+        // d'existence. Ce qu'il mesure est qu'un 404 se décide avant tout appel.
+        assert_eq!(mock.calls_made(), 0);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_occupe_rend_409_sans_appeler_le_llm() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("résumé")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+
+        // L'`Arc` du verrou est cloné **avant** que `test_app` consomme l'état.
+        let agent_lock = state.agents.get("mika").unwrap().agent_lock.clone();
+        let app = test_app(state);
+
+        // Variable nommée : un `let _ =` relâcherait le verrou sur place et le
+        // test passerait en mesurant le contraire de ce qu'il annonce.
+        let _occupe = agent_lock
+            .try_lock_owned()
+            .expect("le verrou est libre au départ");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(mock.calls_made(), 0);
+    }
+
+    #[tokio::test]
+    async fn mika1727_sous_le_seuil_la_route_ne_compacte_pas() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("résumé")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        // Le rang **exact** du seuil, parce que la comparaison est un `<=` : la
+        // route et `compaction.rs` doivent répondre pareil sur ce rang-là, et
+        // c'est le seul que ni l'un ni l'autre ne traite comme un intérieur.
+        let seuil = crate::compaction::COMPACTION_THRESHOLD;
+        mika1727_seed_messages(&db, seuil).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["compacted"], serde_json::Value::Bool(false));
+        assert_eq!(json["messages"], serde_json::json!(avant));
+
+        assert_eq!(mock.calls_made(), 0, "aucun appel au LLM sous le seuil");
+
+        // Un couple avant/après, et non un `== 50` : ce qui est mesuré est que
+        // la route n'a rien touché, pas que la base contenait un nombre connu.
+        assert_eq!(db.count_messages().await.unwrap(), avant);
+    }
+
+    #[tokio::test]
+    async fn mika1727_au_dela_du_seuil_la_route_compacte_avec_le_llm_de_lagent() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response(
+                    "Fact: la conversation a été condensée.",
+                )])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        mika1727_seed_messages(&db, crate::compaction::COMPACTION_THRESHOLD + 1).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["compacted"], serde_json::Value::Bool(true));
+        assert_eq!(json["messages"], serde_json::json!(avant));
+
+        // Le compte **d'avant** dans l'issue, et le mock de l'`AgentState` appelé
+        // une fois : c'est tout l'objet du vol. Un appel par le LLM de la TUI
+        // laisserait ce compteur à zéro tout en condensant quand même.
+        assert_eq!(mock.calls_made(), 1, "le LLM de l'agent, une fois");
+
+        let resume = db.load_conversation_summary().await.unwrap();
+        assert!(resume.is_some(), "une ligne summary existe en base");
+        assert!(
+            db.count_messages().await.unwrap() < avant,
+            "le compte a baissé"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_erreur_du_llm_rend_500_sans_toucher_au_compte() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .error(mika_common::llm::LlmError::ProviderError(
+                    "fournisseur à bout".to_string(),
+                ))
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        mika1727_seed_messages(&db, crate::compaction::COMPACTION_THRESHOLD + 1).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Rien n'a été écrit, et ce n'est pas une garde de la route : l'appel au
+        // LLM arrive **avant** `replace_with_summary` dans `maybe_compact`, donc
+        // l'échec laisse l'historique entier. Le test l'atteste plutôt que de le
+        // supposer — si cet ordre changeait, un 500 pourrait perdre des messages.
+        assert_eq!(db.count_messages().await.unwrap(), avant);
     }
 
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
