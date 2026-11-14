@@ -59,6 +59,18 @@
 #                                                     --ensure-relay cannot see
 #                                                     that state. Runbook:
 #                                                     docs/operator/pilot-egress-relay.md
+#   ./scripts/canary-pilot-containment --check-flight
+#                                                   # ask ONLY "does a sibling
+#                                                     pilot fly right now?" and
+#                                                     exit on that answer,
+#                                                     installing nothing and
+#                                                     touching no relay
+#                                                     (mika#3051). 0 = no pilot,
+#                                                     3 = one flies, 4 =
+#                                                     undecidable. This is the
+#                                                     "canary only on an idle
+#                                                     engine" hand-check, handed
+#                                                     back to the machine.
 
 set -euo pipefail
 
@@ -76,9 +88,13 @@ if [ ! -f "$DISPATCH_LIB" ]; then
     exit 1
 fi
 
-# Install the proxy binary to ~/.local/bin (mimics `make install`). Safe:
-# same path production uses; overwrite is idempotent.
-install -Dm755 "$SCRIPT" "$INSTALLED_PROXY"
+# mika#3051 — L'INSTALLATION DU PROXY A QUITTÉ CET ENDROIT. Elle est posée plus
+# bas, immédiatement après la garde « un pilote frère vole-t-il ? », qui ne peut
+# pas être posée ici : le prédicat qui y répond vient du `source` de
+# dispatch-lib, et le `source` est plus bas que ce point. Rien, entre l'ancien
+# site et le nouveau, ne lit le proxy installé — le bloc mika#2578 ci-dessous
+# n'en dépend pas, et `$INSTALLED_PROXY` n'est relu que par l'en-tête du mode
+# défaut. Le déplacement ne touche donc pas l'ordre que mika#2578 a posé.
 
 # ---------------------------------------------------------------------------
 # mika#2578 — the canary must not write the host's GitHub credential.
@@ -266,6 +282,90 @@ export _PILOT_GH_TOKEN_FILE="$_CANARY_TOKEN_STAGE_DIR/pilot-gh-token"
 export WORKTREE_DIR="$REPO_ROOT"
 # shellcheck source=/dev/null
 source "$DISPATCH_LIB"
+
+# ---------------------------------------------------------------------------
+# mika#3051 — un pilote frère vole-t-il ? Posée ICI, immédiatement après le
+# `source` et AVANT l'installation du proxy, donc avant tout mode : les six
+# modes touchent au relais ou au proxy (`--show-args` et `--enter` par
+# `_run_pilot_sandboxed`, qui appelle `_ensure_pilot_helper` +
+# `_ensure_pilot_egress_proxy` ; les deux modes relais les appellent en clair ;
+# le mode défaut les appelle aux lignes `_ensure_*` plus bas). Une seule garde
+# les couvre par construction — et ajouter un mode demain ne demande aucun geste.
+#
+# CE QUE L'INSTALLATION DÉCLENCHE EN AVAL, qui est tout le défaut. `install
+# -Dm755` réécrit le binaire, donc son mtime devient plus récent que le
+# démarrage du démon en place ; `_pilot_daemon_code_is_newer` le juge alors
+# périmé et `_ensure_pilot_egress_proxy` le relance ; le nouveau pid prend le
+# socket et les tunnels CONNECT du pilote qui vole à cet instant sont coupés.
+# Mesuré le 2026-11-01 : installation à 13:57:51Z, relance à 13:57:52Z,
+# `API Error: 502 … inference gateway` au tour 18 du pilote en vol à 14:00:53Z,
+# sortie sans plan (18 tours, 1,35 $), relance du groom par le moteur 38 min
+# plus tard.
+#
+# LE PRÉDICAT EST CELUI DE dispatch-lib, réutilisé tel quel. Pas un second scan
+# écrit ici : il nommerait possiblement un autre fichier que celui qui a décidé,
+# et il divergerait du jour où l'un des deux est touché. Le chemin arrive par
+# `_PILOT_SIBLING_IN_FLIGHT_LOG`, que le prédicat publie (mika#3051).
+#
+# DEUX CODES DE SORTIE, ET TOUS DEUX DISTINCTS DE 1. Le canari sort déjà 1 sur
+# fichier manquant, sur relais en échec et sur `VIOLATION` du self-check de
+# jeton : un refus de voler doit se lire autrement qu'un contrôle rouge. Une
+# cause, un code — même doctrine que les jetons nommés de
+# `_pilot_daemon_freshness`. Le trap `EXIT` préserve 3 et 4 : seule sa branche
+# `VIOLATION` réécrit `rc`.
+# ---------------------------------------------------------------------------
+_canary_refuse_if_pilot_in_flight() {
+    # `|| _rc=$?` et non un appel nu : ce script tourne sous `set -e`, où un
+    # retour 1 ou 2 d'un appel nu avorterait le canari sans imprimer la moindre
+    # cause — un refus muet, c'est-à-dire exactement ce qu'un fail-closed ne
+    # doit pas être.
+    local _rc=0
+    _pilot_sibling_pilot_in_flight || _rc=$?
+    case "$_rc" in
+        0)  echo "canary: refus (3) — un pilote frère vole. Rien n'a été installé," >&2
+            echo "  et aucun relais n'a été touché (mika#3051)." >&2
+            echo "  pilote vivant: ${_PILOT_SIBLING_IN_FLIGHT_LOG:-<non publié>}" >&2
+            echo "  geste: attendre la fin de ce vol, puis relancer le canari." >&2
+            echo "  pour ne poser que cette question: --check-flight" >&2
+            exit 3 ;;
+        # Fail-closed, et nommé : le prédicat a déjà écrit sa ligne
+        # `pilot_sibling_in_flight.undecidable` sur stderr juste au-dessus, avec
+        # sa cause. Les deux replis muets sont faux dans les deux sens — refuser
+        # toujours gèle le canari, installer quand même réintroduit en silence la
+        # coupure du 01/11.
+        2)  echo "canary: refus (4) — « un pilote frère vole-t-il ? » est resté sans" >&2
+            echo "  réponse, donc le canari s'abstient (fail-closed). La cause est la" >&2
+            echo "  ligne pilot_sibling_in_flight.undecidable ci-dessus. Rien n'a été" >&2
+            echo "  installé, et aucun relais n'a été touché (mika#3051)." >&2
+            exit 4 ;;
+    esac
+    echo "ok:   no_sibling_pilot_in_flight"
+}
+_canary_refuse_if_pilot_in_flight
+
+# --check-flight mode (mika#3051): la garde SEULE, et rien d'autre. Placé après
+# l'appel ci-dessus, qui a déjà sorti 3 ou 4 sur un refus : arriver ici signifie
+# « aucun pilote ne vole », donc 0.
+#
+# Deux raisons d'en faire un mode public plutôt qu'un drapeau de test caché.
+# D'abord c'est la gestuelle que la règle opératrice réclamait déjà — « canari
+# seulement sur moteur vide » était un contrôle à la main, celui-ci est le même
+# rendu à la machine. Ensuite c'est ce qui rend le cas passant observable hors
+# hôte de boucle, où aucun des cinq autres modes ne peut tourner. Un drapeau
+# caché aurait coûté la même chose en n'étant utile qu'une fois.
+if [ "${1:-}" = "--check-flight" ]; then
+    exit 0
+fi
+
+# Install the proxy binary to ~/.local/bin (mimics `make install`). Safe:
+# same path production uses; overwrite is idempotent.
+#
+# mika#3051 — « idempotente » parle du CONTENU, pas du mtime, et c'est le mtime
+# qui coupe les tunnels : voir la garde juste au-dessus, qui précède désormais
+# cette ligne pour cette seule raison. Site UNIQUE dans ce fichier, et le scan
+# d'ordre de scripts/test-canary-pilot-containment.sh refuse à la fois un second
+# site et un retour de celui-ci au-dessus de la garde.
+install -Dm755 "$SCRIPT" "$INSTALLED_PROXY"
 
 # --show-args mode: print the exact bwrap args + exit. For coherence to
 # review without running the sandbox. Runs the helper under bash -x so
