@@ -142,6 +142,35 @@ pas.
   visibilité (critère : *aucune ligne de visibilité n'est à ouvrir*). Le
   ré-export existe déjà ; on y ajoute un nom.
 
+> **Amendement du pilote (2026-11-15) — la constante se lit par `params::`, pas
+> par la racine de `mika_a2a`.**
+>
+> **Le point.** Le plan écrivait « ajoutée au `pub use mika_a2a::{…}` … à côté de
+> `SESSION_ISOLATED_KEY` », en supposant `CALLBACK_TURN_KEY` ré-exportée par la
+> racine du crate comme ses quatre sœurs. Elle ne l'est pas :
+> `crates/mika-a2a/src/lib.rs:12-17` ré-exporte les quatre autres clés de requête
+> et pas celle-là, qui n'existe qu'en `mika_a2a::params::CALLBACK_TURN_KEY`
+> (`params.rs:196`). Écrit tel quel, le `pub use` ne compile pas :
+> `error[E0432]: no CALLBACK_TURN_KEY in the root`.
+>
+> **La raison de ne pas corriger en amont.** L'ajouter au `pub use` de
+> `crates/mika-a2a/src/lib.rs` serait le geste le plus propre, mais
+> `crates/mika-a2a/` est **hors périmètre** par la tête du ticket (« Restent
+> intacts … `crates/mika-a2a/` (`CALLBACK_TURN_KEY` y existe déjà) »). Le vol ne
+> l'élargit pas pour une ligne de confort.
+>
+> **Ce qui est écrit à la place.** Le nom est ajouté **dans le même bloc
+> `pub use`**, par son chemin de module : `params::CALLBACK_TURN_KEY`. Les deux
+> propriétés que D3 porte tiennent inchangées — le module `tests` de
+> `remote_ask.rs` nomme la constante sans préfixe, et le test de fil de
+> `chat_turn.rs` la lit en `mika_cli::remote_ask::CALLBACK_TURN_KEY` comme T2 lit
+> `CALLER_SESSION_ID_KEY` — et **aucune ligne de visibilité n'est ouverte** : le
+> bloc existe, on y ajoute un nom, exactement comme le plan le disait. Un
+> commentaire sur place dit pourquoi ce nom-là est qualifié quand ses sœurs ne le
+> sont pas, pour qu'un lecteur n'y lise pas une étourderie.
+>
+> Coût : 5 lignes de commentaire, comptées en § Taille estimée.
+
 ### D4 — La doc dit ce que la clé demande, sa forme, et ce que vaut l'absence
 
 Trois endroits, et rien de plus :
