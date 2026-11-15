@@ -382,12 +382,15 @@ n'en tolère **qu'un**. Quand l'une rougit, le remède est de router le nouvel
 appelant par l'envoi existant, jamais d'élargir l'allowlist.
 
 **L'unique appel local restant est le bras `CallbackResult`, et il est borné.**
-La porte A2A écrit `is_callback_turn: false` en dur (`server/a2a.rs:343`), donc
-le fil ne sait pas exprimer un tour de callback ; le réparer demande une clé
-dans `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/`. Il part avec le
-poll des callbacks au vol V2b, et l'entrée d'allowlist avec lui ; le
-`TaskEngine`, lui, est déjà parti (vol V2a, voir plus bas). Le périmètre des
-quatre vols est dans le corps de mika#1727.
+Le fil sait désormais exprimer un tour de callback des deux côtés : la porte A2A
+lit `mika.callback_turn` en booléen strict depuis le vol V3a-1, et depuis V3a-2a
+**le client sait poser la clé**, par le seul site où se bâtissent les métadonnées
+de requête — `remote_ask::build_send_params`, que `callback_turn: bool` traverse
+jusqu'à la chaîne `send_turn_to_spirit`. **Aucun appelant ne la pose avant le vol
+V3a-2b** : tous passent `false`, et le bras tourne donc encore en processus. Il
+part avec le poll des callbacks au vol V3a-2b, et l'entrée d'allowlist avec lui ;
+le `TaskEngine`, lui, est déjà parti (vol V2a, voir plus bas). Le périmètre des
+vols est dans le corps de mika#1727.
 
 **Trois entrées de la TUI n'atteignent plus le tour, et se disent à voix haute.**
 `chat_turn::inertia_notice` rend un avis **à chaque tour qui les exerce** — pas
