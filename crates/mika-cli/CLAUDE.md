@@ -571,10 +571,12 @@ régions `#[cfg(test)]` sans jamais tronquer, donc le premier atteste que le
 balayage a lu la production (un chemin faux serait vert par cécité) et le second
 qu'il a masqué la moitié test — sans lui, les appels des tests de ce même fichier
 feraient rougir la garde, et on l'aurait « réparée » par une entrée d'allowlist.
-`maybe_compact(` n'est pas un motif : il part au vol suivant, avec la porte
-`compacter` — `/compact` compacte encore en local, et une garde qui refuserait
-un geste que rien ne remplace ne laisserait d'autre issue qu'une entrée
-d'allowlist.
+Depuis le vol V2d-4d elle refuse un **troisième** motif, `maybe_compact(`
+(remède : `session_remote::compacter`). Il n'était pas un motif de ce vol-ci :
+une garde qui refuse un geste que rien ne remplace encore ne laisse d'autre
+issue qu'une entrée d'allowlist, donc le motif est arrivé dans le commit qui a
+câblé `/compact`, et pas avant. Le nom de la garde n'a pas changé : c'est une
+garde **par fichier**, pas par vol.
 
 **Une seule lecture du jeton dans tout le crate.**
 `session_remote::jeton_interne(SourceEnv)` remplace les deux copies que portaient
@@ -638,11 +640,78 @@ d'écran où porter la disjonction de mika#1401 ; le leur rendre les obligerait 
 rejouer trois fois la même lecture sans destinataire. `/clear` la rend à l'écran
 parce que `/clear` **a** un écran.
 
-Ce vol ne câble pas `compacter` : `/compact` compacte encore en local, et les
-deux `expect(dead_code)` de `session_remote.rs` restent **deux**.
+Ce vol ne câble pas `compacter` ; le suivant le fait, et il ne reste alors plus
+aucune attente `dead_code` dans `session_remote.rs`.
 
-- **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
+### `/compact` passe par mika-spirit (mika#1727, vol V2d-4d)
+
+`/compact` **ne compacte plus la conversation en local**. `handle_compact` n'est
+plus qu'une enveloppe — le `.env` de la home et `spirit_url()`, la forme de
+`handle_clear` — et délègue à `compact_par_spirit`, qui prend l'URL de base et la
+source d'environnement **par argument** et passe par `session_remote::compacter`.
+
+La fonction prend **`&App` et non `&mut App`**, seule différence de forme avec
+`clear_par_spirit` : `/compact` ne modifie aucun champ, la conversation étant
+recomposée côté serveur et relue au prochain poll comme n'importe quelle autre
+écriture de la base. Un `&mut` que le corps n'utilise pas annoncerait une
+mutation dans la signature et laisserait un appelant futur en glisser une sans
+que la revue la voie.
+
+**L'ordre du corps est le contrat**, et il se mesure : pas-au-repos → jeton →
+appel.
+
+| cas | ce qui part sur le fil | ce qui est rendu |
+|---|---|---|
+| `app.status != Idle` | rien, pas même la lecture du jeton | « Cannot compact while agent is busy. » |
+| sans `MIKA_INTERNAL_TOKEN`, au repos | rien | le refus de `jeton_interne`, qui nomme la variable |
+| `{compacted: false, messages: n}` en 200 | l'appel a eu lieu | « Nothing to compact (*n* messages). » |
+| `{compacted: true, messages: n}` en 200 | l'appel a eu lieu | « Compaction requested (*n* messages before)… » |
+| 409 | l'appel a eu lieu | un message qui dit l'occupation **par un autre client**, et le nouvel essai |
+| 401, 404, 500, injoignable | l'appel a eu lieu | le `Display` de `SessionRemoteIssue` |
+
+**Pourquoi le seuil n'est plus côté client.** Avant ce vol, `handlers.rs`
+comparait `count_messages()` à `50` écrit en dur, et affichait `50` comme
+dénominateur, tandis que le serveur **lit** `compaction::COMPACTION_THRESHOLD`.
+Deux vérités sur le même seuil, dont l'une était déjà une copie figée : le jour
+où la constante bouge, le client refuse ou accepte au mauvais rang et affiche un
+dénominateur faux, en silence. Le client ne compare donc plus rien et ne connaît
+plus de seuil ; le serveur rend le fait **et** le compte. Le message de
+`compacted: false` porte le compte rendu et **aucun dénominateur** — en afficher
+un redemanderait au client de connaître le seuil qu'il vient de cesser de
+connaître. `count_messages()` reste appelé par `/status`, ce qui est pourquoi il
+ne peut pas devenir un motif de garde.
+
+**Pourquoi `compacted: true` veut dire « demandée ».** La porte déclare que le
+booléen signifie « la compaction a été **demandée et n'a pas échoué** », jamais
+« une ligne `summary` a été écrite » : les deux booléens sont des 200, et `true`
+dit que `maybe_compact` a rendu `Ok` — mais elle relit le seuil elle-même et peut
+légitimement n'avoir rien fait. Un message qui dirait « Compacted conversation »
+— ce que disait le code d'avant — affirmerait un état du système que le serveur
+s'est gardé d'attester : c'est la grounding rule du dépôt, et un test l'atteste
+par un `assert!` négatif sur « compacted » et « compactée », pas par relecture.
+
+**Pourquoi le refus « pas au repos » reste local.** On pourrait croire qu'il
+double le 409, que mika-spirit sait rendre. Tant que V1 n'est pas livré, le tour
+de la TUI tourne **dans le processus de la TUI** (`chat.rs` appelle
+`agent::run_agent`), donc il ne détient pas le verrou d'agent que
+`/api/v1/compact` tente de prendre : un `/compact` lancé pendant ce tour
+obtiendrait un **200**, et la compaction remplacerait par un résumé les messages
+que le tour local est en train de relire. De ce fait-là, le refus local est le
+**seul** juge, et il le restera jusqu'à V1. Les deux refus disent donc deux
+choses différentes et gardent deux messages distincts : le local dit « ton propre
+tour tourne », le 409 dit « un autre client tient le verrou de cet agent ». Les
+fondre enverrait l'opérateur attendre la fin de son propre tour alors qu'un autre
+client est en cause, ou l'inverse.
+
+**V2d-4 est fini.** Le démarrage (V2d-4a), `/clear` (V2d-4b), les trois sorties
+(V2d-4c) et `/compact` (V2d-4d) passent tous par mika-spirit ; les trois portes
+de `session_remote.rs` sont câblées et il n'y reste **aucune** attente
+`dead_code`, ce que `cargo clippy -p mika-cli --all-targets` mesure. `App.llm`
+est parti avec le dernier lecteur local. La suite du ticket est V3 puis V4.
+
+- **Slash commands:** `/clear`, `/compact`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session
+- `/compact` asks mika-spirit to compact the conversation through `session_remote::compacter` (mika#1727, vol V2d-4d; see above for the body order and what each arm returns). It refuses locally — **before reading the token and before any call** — while the agent is not idle, because the TUI's own turn runs in-process and does not hold the server-side agent lock. No threshold is written client-side: the server reads `COMPACTION_THRESHOLD` and returns both the fact and the count. `compacted: true` means the compaction was **requested** and did not fail, never that a summary was written
 - `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
 - `/provider` and `/model` pre-validate via `Settings::make_llm_provider()` before updating the UI. `/provider` switch persists default `{provider}_model` when none exists, warns about stale fields and max_tokens limits, and spawns a background `get_models()` to pre-warm the model list cache. `/model` lists available models from cache/API, supports aliases and direct `provider/model` format with cross-provider switching
 - **Footer badges:** `[N tasks]` (Cyan) for pending reminders, `[N running]` (Yellow) for active background callback tasks (polled every ~5s), `[N hidden]` (DarkGray) for suppressed internal messages in inbox mode, and dashboard status indicator with clickable `[start]`/`[stop]` and `[open]` buttons
