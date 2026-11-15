@@ -667,7 +667,6 @@ pub async fn run(
         model,
         identity_name,
         worker._ctx.async_db.clone(),
-        worker._ctx.llm.clone(),
         worker._ctx.home_dir.clone(),
         skill_registry,
         agent_name.to_string(),
@@ -932,7 +931,6 @@ pub async fn run(
                             app.model = new_model.clone();
                             app.identity_name = new_identity;
                             app.db = new_worker._ctx.async_db.clone();
-                            app.llm = new_worker._ctx.llm.clone();
                             app.home_dir = new_worker._ctx.home_dir.clone();
                             app.skills = new_skills;
                             app.agent_name = target_name.clone();
@@ -1039,7 +1037,6 @@ pub async fn run(
                             app.session_id = new_session;
                             app.model = new_model;
                             app.db = new_worker._ctx.async_db.clone();
-                            app.llm = new_worker._ctx.llm.clone();
                             app.skills = new_skills;
                             app.worker_crashed = false;
 

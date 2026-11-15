@@ -10,7 +10,6 @@ use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::TeamRunSummary;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::teams::types::{TeamEvent, TeamPhase};
-use mika_common::llm::LlmProvider;
 
 use crate::commands::tasks::CallbackFeed;
 use crate::tui::attachment::ImageAttachment;
@@ -575,7 +574,6 @@ pub struct App<'a> {
 
     // Shared resources for slash commands
     pub db: AsyncDatabase,
-    pub llm: Arc<dyn LlmProvider>,
     pub home_dir: PathBuf,
     pub skills: Arc<SkillRegistry>,
 
@@ -688,7 +686,6 @@ impl<'a> App<'a> {
         model: String,
         identity_name: String,
         db: AsyncDatabase,
-        llm: Arc<dyn LlmProvider>,
         home_dir: PathBuf,
         skills: Arc<SkillRegistry>,
         agent_name: String,
@@ -727,7 +724,6 @@ impl<'a> App<'a> {
             textarea_scroll_offset: 0,
             textarea_selecting: false,
             db,
-            llm,
             home_dir,
             skills,
             autocomplete: AutocompleteState::new(),
@@ -822,7 +818,6 @@ impl<'a> App<'a> {
             // safe defaults. Slash command handlers check `is_team_mode()` before
             // accessing them.
             db,
-            llm: mika_common::llm::dummy_provider(),
             home_dir: team_dir.clone(),
             skills: Arc::new(SkillRegistry::empty()),
             autocomplete: AutocompleteState::new(),
@@ -2358,7 +2353,6 @@ mod tests {
             "test-model".to_string(),
             "Mika".to_string(),
             async_db,
-            mika_common::llm::dummy_provider(),
             home_dir,
             Arc::new(SkillRegistry::empty()),
             "mika".to_string(),
