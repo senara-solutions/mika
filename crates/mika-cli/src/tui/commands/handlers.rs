@@ -259,20 +259,88 @@ async fn clear_par_spirit(app: &mut App<'_>, base_url: &str, lire_env: SourceEnv
     }
 }
 
-async fn handle_compact(app: &mut App<'_>) -> String {
+async fn handle_compact(app: &App<'_>) -> String {
+    // L'enveloppe de `handle_clear`, pour sa raison : le `.env` et l'URL de base
+    // sont chargés ici, et la fonction déléguée les reçoit en argument — un
+    // chargement caché derrière ce paramètre ferait mentir sa signature.
+    if let Ok(home) = mika_common::home::resolve_home_dir() {
+        mika_common::dotenv::load_dotenv(&home);
+    }
+    let base_url = crate::commands::dashboard::spirit_url();
+    compact_par_spirit(app, &base_url, &|nom| std::env::var(nom).ok()).await
+}
+
+/// `/compact` tel que mika-spirit l'applique : la conversation est recomposée par
+/// la porte `compacter` (mika#1727, vol V2d-4d). Plus rien ne compacte dans le
+/// processus de la TUI, ce que la garde structurelle de ce fichier tient.
+///
+/// **`&App` et non `&mut App`**, à la différence de [`clear_par_spirit`] : cette
+/// commande ne modifie aucun champ. La conversation est réécrite côté serveur, et
+/// la TUI la relira au prochain poll comme n'importe quelle autre écriture de la
+/// base. Un `&mut` que le corps n'utilise pas annoncerait une mutation dans la
+/// signature et laisserait un appelant futur en glisser une sans que la revue la
+/// voie.
+///
+/// **Aucun seuil n'est écrit ici.** Le serveur lit `COMPACTION_THRESHOLD`
+/// (`server/compact.rs:93`) et rend le fait **et** le compte ; le client qui en
+/// gardait une copie figée (le `50` écrit deux fois avant ce vol) refusait ou
+/// acceptait au mauvais rang dès que la constante bougeait, et affichait un
+/// dénominateur faux, en silence. Le message de `compacted: false` porte donc le
+/// compte rendu et **aucun dénominateur** : en afficher un redemanderait au
+/// client de connaître le seuil qu'il vient de cesser de connaître.
+async fn compact_par_spirit(app: &App<'_>, base_url: &str, lire_env: SourceEnv<'_>) -> String {
+    use crate::commands::session_remote;
+
+    // Le refus **local**, et il n'est pas un doublon du 409 du serveur. Tant que
+    // V1 n'est pas livré, le tour de la TUI tourne dans le processus de la TUI
+    // (`chat.rs:341` et `chat.rs:468` appellent `agent::run_agent`), donc il ne
+    // détient **pas** le verrou d'agent que `/api/v1/compact` tente de prendre :
+    // un `/compact` lancé pendant ce tour obtiendrait un 200, et la compaction
+    // remplacerait par un résumé les messages que le tour local est en train de
+    // relire. De ce fait-là, ce refus est le seul juge, et il le restera jusqu'à
+    // V1.
     if app.status != AgentStatus::Idle {
         return "Cannot compact while agent is busy.".to_string();
     }
-    let count = match app.db.count_messages().await {
-        Ok(c) => c,
-        Err(e) => return format!("Failed to check message count: {e}"),
+
+    // Le jeton, **avant tout appel**, pour la raison de `clear_par_spirit` : un
+    // refus qui attendrait l'appel nommerait le transport là où la cause est la
+    // configuration du shell. La lecture reste unique dans le crate.
+    let jeton = match jeton_interne(lire_env) {
+        Ok(jeton) => jeton,
+        Err(refus) => return refus,
     };
-    if count <= 50 {
-        return format!("Nothing to compact ({count}/50 messages).");
-    }
-    match mika_agent::compaction::maybe_compact(&app.db, app.llm.as_ref()).await {
-        Ok(()) => format!("Compacted conversation ({count} messages)."),
-        Err(e) => format!("Compaction failed: {e}"),
+
+    match session_remote::compacter(base_url, &jeton, &app.agent_name).await {
+        // Les deux booléens sont des 200, et `messages` est le compte **d'avant**
+        // dans les deux cas.
+        Ok(miroir) if !miroir.compacted => {
+            format!("Nothing to compact ({} messages).", miroir.messages)
+        }
+        // « demandée », jamais « faite » : la porte déclare que `compacted` veut
+        // dire « la compaction a été demandée et n'a pas échoué », et le serveur
+        // ne dit nulle part qu'une ligne `summary` a été écrite — `maybe_compact`
+        // relit le seuil elle-même et peut légitimement n'avoir rien fait.
+        // Affirmer « Compacted conversation », ce que disait le code d'avant,
+        // attesterait un état du système que rien n'a confirmé.
+        Ok(miroir) => format!(
+            "Compaction requested ({} messages before). mika-spirit does not report \
+             whether a summary was written.",
+            miroir.messages
+        ),
+        // Le `Display` de `Busy` dit la cause (« another turn holds its lock ») et
+        // non le remède. Devant une TUI c'est le remède qui décide de la seconde
+        // qui suit, et dire que l'occupant n'est pas son propre tour évite
+        // d'envoyer l'opérateur attendre la fin d'un tour qui n'existe pas — le
+        // refus local ci-dessus aurait déjà intercepté ce cas-là.
+        Err(session_remote::SessionRemoteIssue::Busy) => {
+            "mika-spirit is busy with this agent — another client holds its turn lock. \
+             Try /compact again when it is idle."
+                .to_string()
+        }
+        // Tout le reste porte le `Display` de la porte, déjà écrit pour nommer sa
+        // cause sans en inventer une (motif mika#2331).
+        Err(probleme) => format!("Compaction failed: {probleme}"),
     }
 }
 
@@ -3010,18 +3078,25 @@ mod tests {
     }
 
     /// T-E — la garde structurelle : la TUI ne touche plus la table `sessions`
-    /// en local.
+    /// en local, et depuis V2d-4d elle ne compacte plus la conversation en
+    /// local.
     ///
     /// Elle n'est **pas fondue** avec celle de V2c-1b. Les deux refusent des
     /// gestes différents pour des raisons différentes, et une garde fondue
     /// rougirait sous un seul message : celui qui la lirait au prochain vol ne
     /// saurait plus laquelle des deux portes lui est demandée.
     ///
-    /// `maybe_compact(` n'est pas un motif de ce vol : il appartient à V2d-4c,
-    /// avec la porte `compacter` et sa propre garde. Une garde qui refuserait
-    /// aujourd'hui un geste que rien ne remplace encore ne laisserait d'autre
+    /// `maybe_compact(` est devenu un motif à V2d-4d, et pas avant : la porte
+    /// `compacter` existait depuis V2d-3b mais rien ne l'atteignait, et une
+    /// garde qui refuse un geste que rien ne remplace encore ne laisse d'autre
     /// issue qu'une entrée d'allowlist — exactement ce qu'elle existe pour
-    /// éviter.
+    /// éviter. Le motif arrive donc dans le commit qui câble
+    /// `compact_par_spirit`, et son rouge-avant nommait la seule ligne de
+    /// production qui appelait `maybe_compact`.
+    ///
+    /// Le nom de la garde reste `mika1727_v2d4b_…` : c'est une garde **par
+    /// fichier**, pas par vol, et la renommer casserait la trace des trois vols
+    /// qui la citent pour un gain nul.
     #[test]
     fn mika1727_v2d4b_la_tui_ne_clot_plus_la_base_en_local() {
         // Livrée vide, et vide par construction : quand la garde rougit, le
@@ -3031,6 +3106,7 @@ mod tests {
         const MOTIFS: &[(&str, &str)] = &[
             ("create_session(", "session_remote::ouvrir"),
             ("end_session(", "session_remote::clore"),
+            ("maybe_compact(", "session_remote::compacter"),
         ];
 
         let scanner =
@@ -3062,11 +3138,16 @@ mod tests {
                 .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
                 .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
                 .collect();
+            // Le message dit « ce que mika-spirit décide » et non « la table
+            // `sessions` » : depuis V2d-4d les trois motifs ne visent plus la
+            // même table, et un rouge qui nommerait `sessions` sur
+            // `maybe_compact(` enverrait son lecteur chercher la panne au
+            // mauvais endroit.
             assert!(
                 violations.is_empty(),
-                "mika#1727 V2d-4b — `{motif}` touche la table `sessions` dans le \
-                 processus de la TUI. Le remède est de passer par `{porte}`, jamais \
-                 une entrée d'allowlist :\n{}",
+                "mika#1727 V2d-4b/V2d-4d — `{motif}` fait dans le processus de la TUI \
+                 ce que mika-spirit décide. Le remède est de passer par `{porte}`, \
+                 jamais une entrée d'allowlist :\n{}",
                 violations.join("\n")
             );
         }

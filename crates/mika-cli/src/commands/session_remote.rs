@@ -20,18 +20,19 @@
 //! est construit au site de l'appel parce que c'est ce que l'entrée déclare.
 //!
 //! **État du vol.** Les trois portes sont là — `ouvrir`, `clore` et
-//! `compacter` — et **deux** sont câblées : `commands/chat.rs` atteint `ouvrir`
-//! au démarrage de la TUI (V2d-4a), et
+//! `compacter` — et **toutes les trois** sont câblées : `commands/chat.rs`
+//! atteint `ouvrir` au démarrage de la TUI (V2d-4a),
 //! `tui/commands/handlers.rs::clear_par_spirit` atteint `ouvrir` puis `clore`
-//! sur `/clear` (V2d-4b), en lisant les deux champs de `CreatedSessionMirror`
-//! comme ceux d'`EndedSessionMirror`. Restent `compacter` et `CompactedMirror`,
-//! que personne n'atteint hors test : les `expect(dead_code)` qui le disent
-//! sont donc **deux** — une porte, un miroir —, et ce chiffre se **mesure** sous
-//! `cargo clippy -p mika-cli --all-targets`, il ne se devine pas. Une passe
+//! sur `/clear` (V2d-4b), les trois sorties de la TUI atteignent `clore`
+//! (V2d-4c), et `tui/commands/handlers.rs::compact_par_spirit` atteint
+//! `compacter` sur `/compact` (V2d-4d), en lisant les **deux** champs de
+//! `CompactedMirror` comme ceux des deux autres miroirs. Il ne reste donc
+//! **aucune** attente `dead_code` dans ce fichier, et ce chiffre se **mesure**
+//! sous `cargo clippy -p mika-cli --all-targets`, il ne se devine pas. Une passe
 //! verte le tient exact dans les deux sens : un `expect` de trop, laissé sur un
 //! item qu'un appelant vient d'atteindre, serait rendu « unfulfilled » ; un de
 //! moins laisserait un `dead_code` nu. C'est la seule chose qui le tiendra à
-//! jour quand V2d-4c câblera la dernière.
+//! jour si une porte perd son dernier appelant.
 
 use serde::Deserialize;
 
@@ -67,7 +68,6 @@ pub(crate) struct EndedSessionMirror {
 // Même raison encore pour `Deserialize` seul : `CompactResponse` ne dérive que
 // `Serialize` et vit dans `crates/mika-agent/`, hors périmètre.
 #[derive(Debug, Deserialize)]
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
 pub(crate) struct CompactedMirror {
     /// « La compaction a été **demandée et n'a pas échoué** », et jamais « une
     /// ligne `summary` a été écrite ». Les deux booléens sont des 200 : `false`
@@ -349,7 +349,6 @@ pub(crate) async fn clore(
 /// `try_lock_owned` échoue (`server/compact.rs:73-82`). C'est un refus
 /// temporaire, pas une panne — V2d-4 a de quoi proposer un nouvel essai, ce
 /// qu'un `Unexpected` lui aurait retiré.
-#[cfg_attr(not(test), expect(dead_code, reason = "câblé par V2d-4, mika#1727"))]
 pub(crate) async fn compacter(
     base_url: &str,
     token: &str,
