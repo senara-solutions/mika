@@ -2945,6 +2945,218 @@ mod tests {
         );
     }
 
+    // --- mika#1727: the fact is read loop-side, after a real turn -------------
+    //
+    // **Why this state fixture is local.** The crate's test-state constructors
+    // live in the private `#[cfg(test)] mod tests` of `server/mod.rs` — a cousin
+    // of this module, not an ancestor, so they are invisible from here. Making
+    // them `pub(super)` would cost one line inside a `#[cfg(test)]` block, but
+    // in a **fifth** file, and this flight's declared perimeter is four
+    // (criterion 7). What repeats here is the *form* of the state, never
+    // knowledge about it: a new field on `AppState` or `AgentState` breaks this
+    // literal's compilation, so the compiler holds the drift rather than a
+    // reviewer. mika#2070 took the other side of the same trade — an end-to-end
+    // test in `server/mod.rs::tests` — and that tension is declared in this
+    // flight's PR rather than settled by it.
+    fn callback_fixture(
+        mock: Arc<mika_common::llm::mock::MockLlmProvider>,
+    ) -> (AppState, Arc<AgentState>) {
+        use crate::skills::SkillRegistry;
+        use crate::task_engine::{TaskDispatcher, TaskEngine};
+        use crate::tools;
+        use std::sync::atomic::AtomicBool;
+
+        let db = crate::test_utils::test_helpers::test_async_db();
+        let settings = mika_common::config::Settings::test_defaults();
+        let home_dir = std::path::PathBuf::from("/tmp/mika-test");
+        let dispatcher = Arc::new(TaskDispatcher {
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            db: db.clone(),
+            llm: mock.clone(),
+            tools: Arc::new(tools::default_tools()),
+            skills: Arc::new(SkillRegistry::empty()),
+            message_sender: None,
+            home_dir: home_dir.clone(),
+            global_home_dir: home_dir.clone(),
+            embedding_client: None,
+            brave_api_key: None,
+            github_token: None,
+            gateway_url: None,
+            internal_token: None,
+            github_app: None,
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            agent_lock: None,
+            cli_mode: false,
+            settings: settings.clone(),
+            pr_reviews_posted: None,
+            auto_pull_stop_armed: AtomicBool::new(false),
+            worktree_reap_stop_armed: AtomicBool::new(false),
+            proactive_budget_reported: std::sync::Mutex::new(None),
+        });
+        let agent_state = Arc::new(AgentState {
+            tier: mika_common::home::AgentTier::Default,
+            deployment: mika_common::home::Deployment::Unknown,
+            db: db.clone(),
+            skills: std::sync::Mutex::new(Arc::new(SkillRegistry::empty())),
+            skills_dirty: Arc::new(AtomicBool::new(false)),
+            skill_nudge: Arc::new(crate::agent_loop::skill_nudge::SkillNudgeState::default()),
+            task_engine: Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
+                db.clone(),
+                dispatcher.clone(),
+            ))),
+            dispatcher,
+            agent_lock: Arc::new(tokio::sync::Mutex::new(())),
+            a2a_wait_slots: Arc::new(tokio::sync::Semaphore::new(
+                settings.effective_a2a_queue_max_depth(),
+            )),
+            embedding_client: None,
+            mcp_manager: None,
+            llm: mock,
+            github_app: None,
+            webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            webhook_queue_v2: Arc::new(crate::server::webhook_queue_v2::WebhookQueue::new(
+                64,
+                std::time::Duration::from_millis(100),
+            )),
+            sync_debounce: Arc::new(crate::server::sync_debounce::SyncDebounce::default()),
+            kg_config: crate::kg::config::KgAgentConfig::Disabled {
+                reason: crate::kg::config::DisabledReason::OperatorOptOut,
+            },
+            canonical_session_id: None,
+            budget_record: Arc::new(mika_common::llm::resolve_llm_budget_record(
+                "mika", &home_dir, &home_dir,
+            )),
+            model_drift: Arc::new(mika_common::llm::ModelDriftCheck::NotApplicable),
+            home_dir: home_dir.clone(),
+            settings: settings.clone(),
+        });
+        let agents = DashMap::new();
+        agents.insert("mika".to_string(), Arc::clone(&agent_state));
+        let state = AppState {
+            agents: Arc::new(agents),
+            default_agent: "mika".to_string(),
+            tools: Arc::new(tools::default_tools()),
+            ready: Arc::new(AtomicBool::new(true)),
+            internal_token: secrecy::SecretString::from("test-token-secret"),
+            dashboard_token: None,
+            gateway_url: "http://localhost:9999".to_string(),
+            startup_time: std::time::Instant::now(),
+            http_client: reqwest::Client::new(),
+            brave_api_key: None,
+            github_token: None,
+            github_app: None,
+            global_home_dir: home_dir,
+            settings,
+            dashboard_db: db,
+            investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
+            dashboard_enabled: Arc::new(AtomicBool::new(false)),
+            a2a_broadcasters: Arc::new(DashMap::new()),
+            pr_reviews_posted: Arc::new(DashMap::new()),
+            rate_limit_audit_last: Arc::new(DashMap::new()),
+            webhook_queue_audit_last: Arc::new(DashMap::new()),
+            a2a_queue_audit_last: Arc::new(DashMap::new()),
+            webhook_queue_shutdown: tokio_util::sync::CancellationToken::new(),
+            permissions_channel: Arc::new(
+                crate::server::permissions_stream::PermissionsChannel::new(),
+            ),
+            task_events_channel: Arc::new(crate::server::tasks_stream::TaskEventsChannel::new()),
+        };
+        (state, agent_state)
+    }
+
+    /// Run one real A2A turn with the given declaration and report how many
+    /// **user** messages it recorded in its own session.
+    ///
+    /// Effect 3 of `is_callback_turn` is the one read here: the loop skips the
+    /// user-message write because the caller has already stored the raw callback
+    /// result as a `tool_result`. It is a fact on disk, not an intermediate
+    /// variable — which is what criterion 3 asks for.
+    ///
+    /// The mock answers with text that makes **no state claim**: `true` arms
+    /// guard #716, and a mock saying "I posted the comment" would be refused by
+    /// the very guard this flight turns on. Eight entries so the sequence cannot
+    /// be exhausted by a turn that takes one step more than expected.
+    async fn user_messages_recorded(callback_turn: bool) -> usize {
+        let mock = Arc::new(
+            mika_common::llm::mock::MockLlmProvider::builder()
+                .responses(
+                    (0..8)
+                        .map(|_| mika_common::llm::mock::text_response("Bien reçu."))
+                        .collect(),
+                )
+                .build(),
+        );
+        let (state, agent_state) = callback_fixture(mock);
+        let task_id = Uuid::new_v4().to_string();
+        let session_id = agent_state
+            .db
+            .a2a_create_task(&task_id, None, None)
+            .await
+            .expect("the task row and its session must be created");
+
+        // `A2aTurnFailure` carries no `Debug`, so the failure is named here
+        // rather than unwrapped.
+        let outcome = run_a2a_agent(
+            &state,
+            &agent_state,
+            &session_id,
+            "[callback:job-1727] résultat brut",
+            &task_id,
+            None,
+            &[],
+            None,
+            false,
+            callback_turn,
+        )
+        .await;
+        if outcome.is_err() {
+            panic!("the turn must complete (callback_turn = {callback_turn})");
+        }
+
+        let sid = session_id.clone();
+        agent_state
+            .db
+            .with_db(move |d| {
+                Ok(d.conn.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role = 'user'",
+                    [&sid],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .expect("the count must be readable") as usize
+    }
+
+    /// **The key reaches the loop and changes what the turn does** (criterion 3).
+    #[tokio::test]
+    async fn mika1727_un_tour_de_callback_nenregistre_pas_le_message_utilisateur() {
+        assert_eq!(
+            user_messages_recorded(true).await,
+            0,
+            "a callback turn must not record the user message — the caller already \
+             stored the raw result as a `tool_result`, and recording it again puts \
+             the same text in the conversation twice"
+        );
+    }
+
+    /// **The non-vacuity control, and it is the half that counts.**
+    ///
+    /// Without it the test above would also pass on a turn that records nothing
+    /// at all — a broken fixture, a loop that failed early, a session read from
+    /// the wrong id. The pair is what makes the first assertion mean "the flag
+    /// did this" rather than "nothing happened".
+    #[tokio::test]
+    async fn mika1727_un_tour_ordinaire_enregistre_le_message_utilisateur() {
+        assert_eq!(
+            user_messages_recorded(false).await,
+            1,
+            "an ordinary turn records its user message; if it did not, the test \
+             above would prove nothing"
+        );
+    }
+
     // ===================== mika#2304 — the model override =====================
 
     fn openrouter_settings(api_key: Option<&str>) -> mika_common::config::Settings {
