@@ -204,6 +204,27 @@ identifiant de session changé dans un test est un changement de test déguisé 
 formatage, et c'est le genre d'écart que la QA ne peut pas distinguer d'une
 régression. Les trois sites sont comptés à leur coût réel en § Taille estimée.
 
+> **Amendement du pilote (2026-11-15) — rustfmt éclate sept sites, pas trois : le
+> seuil qui décide n'est pas `max_width`.**
+>
+> Cette décision prédit les sites à éclater en mesurant la colonne 100
+> (`max_width`). C'est le mauvais seuil. rustfmt applique d'abord l'heuristique
+> `fn_call_width`, qui vaut `60` par défaut (60 % de `max_width`) et porte sur la
+> **largeur de la liste d'arguments seule**, pas sur celle de la ligne. Un appel
+> dont les arguments rendus dépassent 60 colonnes est éclaté en un argument par
+> ligne *même si la ligne entière tient sous 100*.
+>
+> Mesuré après `cargo fmt` : **cinq** des huit appels de
+> `tests/remote_ask_recovery.rs` sont éclatés, et non un seul, plus les sites de
+> `commands/chat.rs` et de `remote_ask.rs` que D5 avait vus. Sept au total.
+>
+> La conduite de D5 ne change pas d'un iota — le pilote laisse `cargo fmt`
+> éclater, et ne raccourcit aucun littéral de test pour tenir sur une ligne,
+> exactement pour la raison écrite ci-dessus. Seule la **prédiction du nombre de
+> sites** était fausse, et avec elle l'estimation de taille, amendée au § Taille
+> estimée. Un futur plan qui veut prédire ces éclatements mesure la liste
+> d'arguments contre 60, pas la ligne contre 100.
+
 ### D6 — Le test d'indépendance passe de quatre clés à cinq, en place
 
 `mika1951_the_four_metadata_keys_are_independent` (l. 1730) est **étendu** et
@@ -406,3 +427,50 @@ Le vol reste donc **un seul vol**, et il tient pour la raison du § 0 — un
 paramètre, un site, et une propagation dont chaque appel coûte une ligne. La
 suite (`CallbackResult` sur le fil, puis V3b, V3c-1, V3c-2, V4) est nommée par
 `Tracked in: senara-solutions/mika#1727`.
+
+> **Amendement du pilote (2026-11-15) — le réel est 312 pour 450, et non 195.
+> Le vol tient, l'estimation non.**
+>
+> Mesuré par `git diff --numstat origin/main...HEAD`, plan exclu, après les trois
+> commits C1, C2 et C3 :
+>
+> | livrable | estimé | réel |
+> |---|---|---|
+> | `crates/mika-cli/src/remote_ask.rs` | 90 | **139** |
+> | `crates/mika-cli/src/commands/chat_turn.rs` | 75 | **96** |
+> | `crates/mika-cli/src/commands/chat.rs` | 7 | 7 |
+> | `crates/mika-cli/src/commands/ask.rs` | 1 | 1 |
+> | `crates/mika-cli/tests/remote_ask_integration.rs` | 2 | 2 |
+> | `crates/mika-cli/tests/remote_ask_recovery.rs` | 16 | **58** |
+> | `crates/mika-cli/CLAUDE.md` | 4 | **9** |
+> | **total** | **195** | **312** |
+>
+> Trois causes, par ordre de poids :
+>
+> 1. **`remote_ask_recovery.rs`, +42.** La cause est celle de l'amendement de D5 :
+>    cinq appels éclatés au lieu d'un. Le coût d'un appel propagé n'est pas « une
+>    ligne » mais « une ligne, ou autant que d'arguments », et ici c'est quatre à
+>    six arguments par site.
+> 2. **`remote_ask.rs`, +49, et `chat_turn.rs`, +21.** La doc et les corps de test
+>    coûtent plus que prédit. Le § D2 demande à la doc de dire *quatre* choses (ce
+>    que la clé demande au serveur, qu'elle est un booléen et rien d'autre, que
+>    toute autre forme refuse le tour, et que l'absence vaut `false`) ; cela ne
+>    tient pas en les quelques lignes comptées. Les deux tests négatifs des
+>    critères 2 et 3 portent chacun **deux moitiés** — clé absente seule, puis clé
+>    absente à côté d'une clé sœur — avec leur assertion d'anti-vacuité, et une
+>    moitié de test coûte autant qu'un test.
+> 3. **`CLAUDE.md`, +5.** Le § de la section V1 affirmait encore que la porte A2A
+>    écrit `is_callback_turn: false` en dur ; cette phrase est fausse depuis V3a-1
+>    et devait partir, pas seulement être complétée. Corriger un faux voisin coûte
+>    plus que poser deux lignes neuves.
+>
+> **Aucun commentaire n'a été raboté pour tenir la borne**, comme le corps du
+> ticket l'exige : les pourquoi ci-dessus sont dans le code, et c'est eux qui
+> pèsent. La borne du ticket (450) tient avec 138 de marge, et la halte à 410
+> après le premier commit n'a pas été approchée : **201 après C1, 303 après C2,
+> 312 après C3.**
+>
+> Ce que la QA doit juger : le périmètre des fichiers est exactement celui du
+> plan et du corps du ticket, aucun fichier hors liste n'est touché, et la
+> conduite de chaque décision D1 à D8 est respectée. Seules les **quantités**
+> prédites par ce § et par D5 étaient fausses.
