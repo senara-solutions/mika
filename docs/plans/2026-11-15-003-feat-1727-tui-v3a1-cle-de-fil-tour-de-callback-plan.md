@@ -187,6 +187,14 @@ fixture contre **une** ligne de `pub(super)` dans un bloc `#[cfg(test)]` de
 décision : elle élargit le périmètre que le corps du ticket a fermé, et le corps
 dit de le dire plutôt que d'élargir. **Le plan livre sans elle.**
 
+**Amendement du 2026-11-15 : décision de Vincent, voie 1.** Le premier vol a
+dépassé sa borne (484 lignes pour 450), dont une fixture d'état recopiée de 120
+lignes. Vincent a pris la voie 1 : `fn mika1727_state_compact` de
+`server/mod.rs::tests` passe en `pub(super) fn`, et le test de tour réel de
+`server/a2a.rs` réutilise ce constructeur au lieu de sa fixture locale.
+`crates/mika-agent/src/server/mod.rs` entre dans le périmètre pour cette seule
+ligne de visibilité, dans son bloc `#[cfg(test)]` ; rien d'autre n'y change.
+
 ### D6 — le texte du mock ne porte aucune affirmation d'état, et le contrôle positif est obligatoire
 
 `is_callback_turn: true` **arme la garde #716**. Un mock qui répondrait « j'ai
@@ -252,7 +260,8 @@ dite **ici** et dans le corps de la PR, pas dans un ticket.
 |---|---|
 | `crates/mika-a2a/src/params.rs` | `CALLBACK_TURN_KEY` + sa doc (D1) ; son test d'épinglage ; son entrée dans la liste d'unicité |
 | `crates/mika-agent/src/server/a2a.rs` (production) | `requested_callback_turn` (D2) ; dixième paramètre de `run_a2a_agent` et passage à `AgentParams` (D3) ; les deux blocs de lecture et le champ `StreamTurn.callback_turn` (D4) |
-| `crates/mika-agent/src/server/a2a.rs` (tests) | batterie du lecteur (critères 1, 2, 4) ; fixture d'état local + paire de tours réels (critère 3, D5/D6) ; gardes lexicales (critères 5 et 6, D7/D8) |
+| `crates/mika-agent/src/server/a2a.rs` (tests) | batterie du lecteur (critères 1, 2, 4) ; paire de tours réels sur le constructeur partagé `mika1727_state_compact` (critère 3, D5/D6) ; gardes lexicales (critères 5 et 6, D7/D8) |
+| `crates/mika-agent/src/server/mod.rs` (tests) | la seule ligne `pub(super)` sur `fn mika1727_state_compact` (D5, décision de Vincent du 2026-11-15) |
 | `crates/mika-a2a/CLAUDE.md` | la clé parmi les clés de métadonnées (D9) |
 | `crates/mika-agent/CLAUDE.md` | ce que la porte A2A fait de la clé (D9) |
 
@@ -330,7 +339,8 @@ contrôle positif du critère 3 ne les fait pas rougir.
 5. Un tour réel avec la clé à `true` n'enregistre pas le message utilisateur, et le
    même tour avec `false` l'enregistre.
 6. Les deux `CLAUDE.md` portent la clé et disent que rien ne la pose encore.
-7. Seuls les quatre fichiers du § 3 changent.
+7. Seuls les cinq fichiers du § 3 changent, et `crates/mika-agent/src/server/mod.rs`
+   pour sa seule ligne `pub(super)`.
    `cargo clippy --all-targets -p mika-a2a -p mika-agent` vert sans nouvel `allow`.
    `cargo test -p mika-a2a -p mika-agent` vert.
    `bash scripts/verify-egress-manifest.sh --report` vert.
@@ -365,7 +375,10 @@ Transcrits du corps de mika#1727, § « Critères de V3a-1 ».
 6. `grep -n "is_callback_turn: false" crates/mika-agent/src/server/a2a.rs` ne rend
    plus rien en production.
 7. Seuls `crates/mika-a2a/src/params.rs`, `crates/mika-agent/src/server/a2a.rs`,
-   `crates/mika-a2a/CLAUDE.md` et `crates/mika-agent/CLAUDE.md` changent. Le pilote
+   `crates/mika-a2a/CLAUDE.md`, `crates/mika-agent/CLAUDE.md` et
+   `crates/mika-agent/src/server/mod.rs` changent ; ce dernier pour la seule ligne
+   `pub(super)` sur `fn mika1727_state_compact` (D5, décision de Vincent du
+   2026-11-15). Le pilote
    lance `cargo clippy --all-targets` sur `mika-a2a` et `mika-agent`, vert, sans
    `allow`. Il lance aussi `bash scripts/verify-egress-manifest.sh --report` avant
    d'ouvrir la PR. S'il le trouve rouge, il s'arrête et le dit.
