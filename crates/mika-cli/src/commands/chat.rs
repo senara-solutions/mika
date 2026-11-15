@@ -1422,6 +1422,14 @@ mod tests {
     const ROUTE_SESSIONS: &str = "/api/v1/sessions";
     const CORPS_OUVERT: &str = r#"{"session_id":"s-du-fil","canonical":false}"#;
 
+    /// Le chemin de fin, écrit **en entier** et non composé depuis
+    /// `ROUTE_SESSIONS` : le composer ici rejouerait le `format!` de la porte,
+    /// et une faute dans celui-ci passerait inaperçue des deux côtés. Le banc
+    /// associe par le chemin brut, donc un chemin faux tombe sur son `fallback`
+    /// à 501 — qu'aucun bras de `post` ne traduit.
+    const ROUTE_FIN: &str = "/api/v1/sessions/s-du-fil/end";
+    const CORPS_CLOS: &str = r#"{"ended":true,"canonical":false}"#;
+
     /// La base de la TUI, en mémoire, comme `handlers.rs::test_app()` :
     /// `ouvrir_session_par_spirit` prend `&AsyncDatabase` et non `&AppContext`,
     /// donc la fixture n'a ni home, ni `Settings`, ni registre de skills.
@@ -1670,6 +1678,156 @@ mod tests {
             recues.lock().expect("le témoin du banc").len(),
             0,
             "une reprise n'ouvre rien sur le fil"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_la_cloture_de_sortie_poste_sur_la_route_de_fin_avec_son_jeton() {
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::OK, CORPS_CLOS)]).await;
+
+        clore_session_de_sortie(
+            &base,
+            &jeton_pose("jeton-secret"),
+            "agent-quitte",
+            "s-du-fil",
+            false,
+        )
+        .await
+        .expect("un 200 au corps lisible clôt la session");
+
+        // Les faits se lisent sur la socket et non sur l'appel : c'est ce que le
+        // serveur reçoit qui tient le contrat, pas ce qu'on croit poster.
+        let vues = recues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel attendu");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "POST");
+        assert_eq!(vue.chemin, ROUTE_FIN);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        let envoye: serde_json::Value = serde_json::from_str(&vue.corps).expect("un corps JSON");
+        // L'agent **passé**, et c'est tout l'enjeu du critère 3 : au changement
+        // d'agent, celui qui part sur le fil est l'agent quitté. Un corps qui
+        // porterait l'autre clôrait une session qui n'est pas la sienne, et le
+        // contrôle d'appartenance du serveur ne le rattraperait pas.
+        assert_eq!(envoye["agent"], "agent-quitte");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_un_singleton_ne_clot_rien_et_ne_lit_pas_le_jeton() {
+        // Le banc est **armé** et ne verra rien.
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::OK, CORPS_CLOS)]).await;
+
+        // La source d'environnement est **vide**, et c'est le montage : avec un
+        // jeton posé, ce test ne saurait pas distinguer « on n'a pas lu » de
+        // « on a lu puis renoncé ». Vide, il atteste l'ordre du corps — le
+        // singleton tranche avant toute lecture.
+        clore_session_de_sortie(&base, &|_| None, "mika-dev", "s-du-fil", true)
+            .await
+            .expect("la canonique ne se clôt jamais, et ce n'est pas un échec");
+
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_sans_jeton_la_cloture_refuse_avant_tout_appel_en_nommant_la_variable() {
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::OK, CORPS_CLOS)]).await;
+
+        let refus = clore_session_de_sortie(&base, &|_| None, "mika-dev", "s-du-fil", false)
+            .await
+            .expect_err("sans jeton, la clôture refuse");
+
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+
+        // Contrôle positif, et pas une décoration : sans lui, un refus tombé
+        // pour toute autre raison — un chemin mal composé, un banc non armé —
+        // rendrait ce test vert en mesurant autre chose que la lecture du jeton.
+        clore_session_de_sortie(&base, &jeton_pose("jeton"), "mika-dev", "s-du-fil", false)
+            .await
+            .expect("le même montage, plus le jeton, atteint la socket");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une requête attendue"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_un_401_est_rendu_en_erreur() {
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::UNAUTHORIZED, "")]).await;
+
+        let refus = clore_session_de_sortie(
+            &base,
+            &jeton_pose("mauvais-jeton"),
+            "mika-dev",
+            "s-du-fil",
+            false,
+        )
+        .await
+        .expect_err("un 401 est rendu à l'appelant");
+
+        // Le message nomme la variable à poser parce que `Denied` la nomme : un
+        // jeton posé mais faux est la panne la plus coûteuse à diagnostiquer.
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+        // La socket **a** été touchée, et c'est ce qui sépare ce refus de celui
+        // du test précédent : les deux rendent une erreur, un seul a appelé.
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une requête attendue"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_un_point_injoignable_est_rendu_en_erreur() {
+        // mika#2569 : le port est **tenu** pour toute la durée de l'appel. Le
+        // motif qui liait puis libérait a vu un factice voisin du même binaire
+        // servir l'appel censé échouer.
+        let dead = DeadEndpoint::reserve();
+        let base = format!("http://{}", dead.addr());
+
+        let refus =
+            clore_session_de_sortie(&base, &jeton_pose("jeton"), "mika-dev", "s-du-fil", false)
+                .await
+                .expect_err("rien n'écoute : la clôture est rendue en erreur");
+
+        let message = refus.to_string();
+        assert!(message.contains("unreachable"), "{message}");
+        assert!(message.contains(&format!("{base}{ROUTE_FIN}")), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_une_session_canonique_refusee_nest_pas_un_echec() {
+        let (base, recues) = fake_spirit(&[(
+            ROUTE_FIN,
+            StatusCode::OK,
+            r#"{"ended":false,"canonical":true}"#,
+        )])
+        .await;
+
+        // `is_singleton_session` est **faux** ici : le serveur est la seule
+        // autorité sur la canonicité, et le client peut l'ignorer — c'est le cas
+        // d'une session reprise par `--session-id`. Un `ended: false` canonique
+        // en 200 est le régime nominal de mika#1401 : la session ne se clôt
+        // jamais, et le geste n'a pas échoué. Le rendre en `Err` ferait dire au
+        // `warn!` de l'appelant qu'une sortie a mal tourné.
+        clore_session_de_sortie(&base, &jeton_pose("jeton"), "mika-dev", "s-du-fil", false)
+            .await
+            .expect("un refus sur la canonique n'est pas un échec");
+
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "l'appel a bien eu lieu"
         );
     }
 
