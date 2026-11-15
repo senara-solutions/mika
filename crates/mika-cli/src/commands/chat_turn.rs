@@ -80,6 +80,7 @@ async fn send_turn_to_endpoint(text: &str, endpoint: &str, session_id: &str) -> 
         &[],
         None,
         false,
+        false,
     )
     .await
     .map_err(|e| wrap_turn_error(&e, endpoint))?;

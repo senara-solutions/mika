@@ -500,6 +500,7 @@ pub async fn run(
         only_skill,
         model_override,
         session_isolated,
+        false,
     )
     .await
     .map_err(|e| wrap_send_error(&e, &spirit_endpoint))?;

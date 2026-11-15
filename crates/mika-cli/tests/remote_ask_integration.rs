@@ -356,7 +356,7 @@ async fn spirit_dispatch_carries_the_caller_session_id_over_the_wire() {
     .await;
 
     let url = format!("http://{addr}/a2a/cust-9/mika-prime");
-    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[], None, false)
+    let _ = send_message_to_agent("hi", &url, Some("rt005-c1-r7"), &[], None, false, false)
         .await
         .expect("send should succeed");
 
@@ -390,7 +390,7 @@ async fn both_ask_doors_carry_the_isolation_request_over_the_wire() {
 
         match door {
             "spirit" => {
-                send_message_to_agent("hi", &url, Some("sess-1"), &[], None, true)
+                send_message_to_agent("hi", &url, Some("sess-1"), &[], None, true, false)
                     .await
                     .expect("send should succeed");
             }

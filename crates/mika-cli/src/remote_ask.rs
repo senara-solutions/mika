@@ -21,9 +21,25 @@ use mika_a2a::error::TransportFailure;
 pub use mika_a2a::render::{EmptyKind, TaskRenderEmpty};
 use mika_a2a::{A2aError, Message, MessageSendParams, Part, Role, Task, TaskState};
 pub use mika_a2a::{
-    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, ONLY_SKILLS_KEY, RUN_USAGE_KEY,
-    RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY, TURN_FAILURE_CLASS_KEY,
-    attested_model, attested_run_usage, attested_session_isolation, attested_turn_failure_class,
+    CALLER_SESSION_ID_KEY,
+    EFFECTIVE_MODEL_KEY,
+    MODEL_OVERRIDE_KEY,
+    ONLY_SKILLS_KEY,
+    RUN_USAGE_KEY,
+    RunUsage,
+    SESSION_ISOLATED_APPLIED_KEY,
+    SESSION_ISOLATED_KEY,
+    TURN_FAILURE_CLASS_KEY,
+    attested_model,
+    attested_run_usage,
+    attested_session_isolation,
+    attested_turn_failure_class,
+    // Ses quatre sœurs sont ré-exportées par la racine de `mika_a2a` ; celle-ci
+    // ne l'est pas encore, et `crates/mika-a2a/` est hors du périmètre du vol
+    // (mika#1727 V3a-2a). Elle se lit donc par son module, dans ce même bloc :
+    // aucune ligne de visibilité nouvelle, et le nom reste lisible depuis
+    // `chat_turn` en `mika_cli::remote_ask::CALLBACK_TURN_KEY`.
+    params::CALLBACK_TURN_KEY,
 };
 use uuid::Uuid;
 
@@ -279,7 +295,16 @@ pub fn render_task_parts(task: &Task) -> Result<String, TaskRenderEmpty> {
 /// server, and absent is the shape that keeps a non-declaring caller
 /// byte-identical to one that predates the key.
 ///
-/// The four metadata keys are independent and any may be absent. When all are,
+/// `callback_turn` tells the server this turn **is** a callback turn, under
+/// [`CALLBACK_TURN_KEY`] (mika#1727 V3a-2a): the turn's own result is not
+/// re-recorded as a user message, and the #716 grounding guard is armed on it.
+/// The server reads a **JSON bool and nothing else** — any other shape fails
+/// the request instead of degrading to "ordinary turn", because a degraded read
+/// would be a silent one. `false` leaves the key **absent**, and absence is
+/// exactly what the server reads as `false`, so a caller that declares nothing
+/// stays byte-identical to one that predates the key.
+///
+/// The five metadata keys are independent and any may be absent. When all are,
 /// `metadata` itself stays absent so the serialized body is byte-identical to
 /// the pre-mika#2070 shape — the property that makes a caller declaring nothing
 /// indistinguishable from a caller that predates these keys.
@@ -298,6 +323,7 @@ fn build_send_params(
     only_skills: &[String],
     model_override: Option<&str>,
     session_isolated: bool,
+    callback_turn: bool,
 ) -> MessageSendParams {
     let mut fields = std::collections::HashMap::new();
     if let Some(sid) = caller_session_id {
@@ -324,6 +350,14 @@ fn build_send_params(
             SESSION_ISOLATED_KEY.to_string(),
             serde_json::Value::Bool(true),
         );
+    }
+    if callback_turn {
+        // Un bool JSON, la seule forme que le serveur lit : toute autre forme
+        // FAIT ÉCHOUER la requête au lieu de dégrader en « tour ordinaire »
+        // (mika#1727 V3a-1). Un `"true"` lu comme `false` enregistrerait le
+        // résultat brut une seconde fois et désarmerait la garde #716 sur le
+        // tour dont les affirmations sont les moins vérifiables.
+        fields.insert(CALLBACK_TURN_KEY.to_string(), serde_json::Value::Bool(true));
     }
     let metadata = if fields.is_empty() {
         None
@@ -462,6 +496,10 @@ fn transport_error_message(
 ///
 /// The caller is responsible for URL validation with a surface-appropriate error
 /// message (e.g. `--remote` vs. the local spirit endpoint).
+///
+/// `callback_turn` travels straight through to the single metadata construction
+/// site (mika#1727 V3a-2a). No `mika ask` door posts it as `true`: an operator's
+/// own message is never a callback turn, on either door.
 pub async fn send_message_to_agent(
     message: &str,
     url: &str,
@@ -469,6 +507,7 @@ pub async fn send_message_to_agent(
     only_skills: &[String],
     model_override: Option<&str>,
     session_isolated: bool,
+    callback_turn: bool,
 ) -> Result<Task> {
     let auth_token = std::env::var("MIKA_INTERNAL_TOKEN")
         .ok()
@@ -498,6 +537,7 @@ pub async fn send_message_to_agent(
             only_skills,
             model_override,
             session_isolated,
+            callback_turn,
         ))
         .await
     {
@@ -663,6 +703,9 @@ pub async fn dispatch_remote(
     // agent, on any host, without this machine knowing that agent's identity.
     // It is also strictly restrictive by the shape of its wire value, so
     // sending it to a remote agent cannot widen anything there.
+    // `callback_turn` ne voyage pas : un tour `mika ask --remote` n'est jamais
+    // un tour de callback. C'est l'opérateur qui tape le message, et le bras
+    // qui en poserait un (`CallbackResult` de la TUI) ne passe pas par ici.
     let task = send_message_to_agent(
         message,
         remote_url,
@@ -670,6 +713,7 @@ pub async fn dispatch_remote(
         &[],
         model_override,
         session_isolated,
+        false,
     )
     .await?;
     render(&task, format, verbose)
@@ -1279,7 +1323,15 @@ mod tests {
 
     #[test]
     fn send_params_carry_the_caller_session_id() {
-        let params = build_send_params("hello", Some("rt005-c1-r7"), "ctx-1", &[], None, false);
+        let params = build_send_params(
+            "hello",
+            Some("rt005-c1-r7"),
+            "ctx-1",
+            &[],
+            None,
+            false,
+            false,
+        );
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert_eq!(
@@ -1290,7 +1342,7 @@ mod tests {
 
     #[test]
     fn send_params_without_a_session_serialize_without_metadata() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None, false);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false, false);
         assert!(params.metadata.is_none());
         // The pre-mika#2070 body shape is preserved byte-for-byte: `metadata` is
         // `skip_serializing_if = "Option::is_none"`, so the key must be absent
@@ -1307,7 +1359,7 @@ mod tests {
     #[test]
     fn send_params_carry_only_skills_as_an_array_of_strings() {
         let only = vec!["mika-arch-groom-ticket".to_string()];
-        let params = build_send_params("hello", None, "ctx-1", &only, None, false);
+        let params = build_send_params("hello", None, "ctx-1", &only, None, false, false);
         let body = serde_json::to_value(&params).unwrap();
         assert_eq!(
             body["metadata"][ONLY_SKILLS_KEY],
@@ -1322,7 +1374,7 @@ mod tests {
         // Both halves present is the `_arch_ask` shape: a session to continue and
         // a pass to declare. Neither key may shadow the other.
         let only = vec!["mika-arch-second-review".to_string()];
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only, None, false);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &only, None, false, false);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 2);
         assert_eq!(
@@ -1539,7 +1591,7 @@ mod tests {
         // R3: a caller that declares nothing must produce the pre-mika#2363 body.
         // An empty array on the wire would be a different statement — and one the
         // server would have to decide the meaning of.
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false, false);
         let body = serde_json::to_value(&params).unwrap();
         assert!(
             body["metadata"].get(ONLY_SKILLS_KEY).is_none(),
@@ -1557,7 +1609,7 @@ mod tests {
         // `sonnet` is an alias and `moonshotai/kimi-k2.5` is vendor-prefixed:
         // between them they cover both transformations the server owns.
         for raw in ["sonnet", "moonshotai/kimi-k2.5"] {
-            let params = build_send_params("hello", None, "ctx-1", &[], Some(raw), false);
+            let params = build_send_params("hello", None, "ctx-1", &[], Some(raw), false, false);
             let body = serde_json::to_value(&params).unwrap();
             assert_eq!(
                 body["metadata"][MODEL_OVERRIDE_KEY],
@@ -1580,6 +1632,7 @@ mod tests {
             &only,
             Some("moonshotai/kimi-k2.5"),
             false,
+            false,
         );
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 3);
@@ -1598,7 +1651,7 @@ mod tests {
     /// pre-mika#2070 body, byte for byte: `metadata` absent, not `null`.
     #[test]
     fn declaring_no_key_at_all_leaves_metadata_absent() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None, false);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false, false);
         let body = serde_json::to_value(&params).unwrap();
         assert!(
             body.get("metadata").is_none(),
@@ -1609,7 +1662,7 @@ mod tests {
     /// A model override alone must not drag the other two keys along.
     #[test]
     fn a_model_override_alone_carries_only_its_own_key() {
-        let params = build_send_params("hello", None, "ctx-1", &[], Some("sonnet"), false);
+        let params = build_send_params("hello", None, "ctx-1", &[], Some("sonnet"), false, false);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert!(metadata.contains_key(MODEL_OVERRIDE_KEY));
@@ -1691,7 +1744,7 @@ mod tests {
     /// is the flag working.
     #[test]
     fn mika1951_send_params_carry_the_isolation_flag_as_a_json_bool() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None, true);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, true, false);
         let body = serde_json::to_value(&params).unwrap();
         assert_eq!(
             body["metadata"][SESSION_ISOLATED_KEY],
@@ -1706,7 +1759,7 @@ mod tests {
     /// property the three sister keys already have.
     #[test]
     fn mika1951_an_unisolated_call_leaves_the_key_absent_entirely() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None, false);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false, false);
         let body = serde_json::to_value(&params).unwrap();
         assert!(
             body.get("metadata").is_none(),
@@ -1716,7 +1769,7 @@ mod tests {
         // And it must not appear beside a sister key either — a `false` riding
         // along on an otherwise-populated envelope would be just as much a
         // change of shape, only harder to see.
-        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false);
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false, false);
         let metadata = params.metadata.expect("metadata should be present");
         assert!(
             !metadata.contains_key(SESSION_ISOLATED_KEY),
@@ -1724,10 +1777,15 @@ mod tests {
         );
     }
 
-    /// **U2, independence.** With all four keys present none shadows another.
-    /// The direct continuation of `the_three_metadata_keys_are_independent`.
+    /// **U2, independence.** With all five keys present none shadows another.
+    /// The direct continuation of `the_three_metadata_keys_are_independent`, and
+    /// the series is cumulative on purpose: `two` → `three` → `four` → `five` is
+    /// one test extended at each ticket, not four tests side by side. A retained
+    /// four-key test would assert nothing this one does not, and the next key
+    /// would have two places to update — one of which can be forgotten without
+    /// anything going red (mika#1727 V3a-2a).
     #[test]
-    fn mika1951_the_four_metadata_keys_are_independent() {
+    fn mika1727_the_five_metadata_keys_are_independent() {
         let only = vec!["mika-arch-second-review".to_string()];
         let params = build_send_params(
             "hello",
@@ -1736,9 +1794,10 @@ mod tests {
             &only,
             Some("moonshotai/kimi-k2.5"),
             true,
+            true,
         );
         let metadata = params.metadata.expect("metadata should be present");
-        assert_eq!(metadata.len(), 4);
+        assert_eq!(metadata.len(), 5);
         assert_eq!(
             metadata.get(CALLER_SESSION_ID_KEY).and_then(|v| v.as_str()),
             Some("sess-7")
@@ -1752,15 +1811,75 @@ mod tests {
             metadata.get(SESSION_ISOLATED_KEY).and_then(|v| v.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            metadata.get(CALLBACK_TURN_KEY).and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     /// An isolation request alone must not drag the other three keys along.
     #[test]
     fn mika1951_the_isolation_flag_alone_carries_only_its_own_key() {
-        let params = build_send_params("hello", None, "ctx-1", &[], None, true);
+        let params = build_send_params("hello", None, "ctx-1", &[], None, true, false);
         let metadata = params.metadata.expect("metadata should be present");
         assert_eq!(metadata.len(), 1);
         assert!(metadata.contains_key(SESSION_ISOLATED_KEY));
+    }
+
+    // --- mika#1727 V3a-2a : la clé de callback sur le fil ----------------------
+
+    /// **Critère 1.** La clé est posée en booléen JSON `true`, et le test la lit
+    /// **par la constante** : un littéral `"mika.callback_turn"` recopié ici
+    /// resterait vert le jour où la constante change de valeur, ce qui est
+    /// exactement le jour où ce test doit rougir.
+    ///
+    /// La forme compte autant que la présence. La porte A2A du vol V3a-1 lit un
+    /// booléen strict : un `"true"` en chaîne FAIT ÉCHOUER le tour au lieu de le
+    /// dégrader en tour ordinaire. Un échec est lisible ; un no-op silencieux
+    /// réenregistrerait le résultat brut une seconde fois.
+    #[test]
+    fn mika1727_v3a2a_send_params_carry_the_callback_turn_as_a_json_bool() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false, true);
+        let body = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            body["metadata"][CALLBACK_TURN_KEY],
+            serde_json::Value::Bool(true),
+            "the server reads a bool; any other shape fails the request: {body}"
+        );
+    }
+
+    /// **Critère 2.** `false` ne pose **rien**. Absente et `false` disent la même
+    /// chose au serveur, mais seule l'absence garde un appelant qui ne déclare
+    /// rien byte-pour-byte identique à un appelant qui précède la clé — la
+    /// propriété que les quatre clés sœurs ont déjà, et que la cinquième
+    /// n'entame pas.
+    #[test]
+    fn mika1727_v3a2a_an_ordinary_turn_leaves_the_key_absent_entirely() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false, false);
+        let body = serde_json::to_value(&params).unwrap();
+        assert!(
+            body.get("metadata").is_none(),
+            "an ordinary turn must not post a `false`: {body}"
+        );
+
+        // Et pas davantage à côté d'une clé sœur : un `false` embarqué sur une
+        // enveloppe déjà peuplée est le même changement de forme, seulement plus
+        // dur à voir.
+        let params = build_send_params("hello", Some("sess-7"), "ctx-1", &[], None, false, false);
+        let metadata = params.metadata.expect("metadata should be present");
+        assert!(
+            !metadata.contains_key(CALLBACK_TURN_KEY),
+            "unexpected callback key in {metadata:?}"
+        );
+    }
+
+    /// La clé de callback seule ne traîne pas ses quatre sœurs derrière elle.
+    #[test]
+    fn mika1727_v3a2a_the_callback_turn_alone_carries_only_its_own_key() {
+        let params = build_send_params("hello", None, "ctx-1", &[], None, false, true);
+        let metadata = params.metadata.expect("metadata should be present");
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata.contains_key(CALLBACK_TURN_KEY));
     }
 
     /// **Both doors post the key, and it is asserted rather than assumed.**

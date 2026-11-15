@@ -218,6 +218,7 @@ async fn a_generated_response_survives_a_dropped_socket() {
         &[],
         None,
         false,
+        false,
     )
     .await
     .expect("the answer existed server-side and must be reclaimed");
@@ -253,9 +254,17 @@ async fn a_refused_port_errors_without_attempting_a_recovery() {
     let dead = DeadEndpoint::reserve();
     let addr = dead.addr();
 
-    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
-        .await
-        .expect_err("nothing is listening; this must fail");
+    let err = send_message_to_agent(
+        "relis ce plan",
+        &endpoint(addr),
+        None,
+        &[],
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect_err("nothing is listening; this must fail");
     let visible = format!("{err:#}");
 
     assert!(
@@ -276,9 +285,17 @@ async fn a_refused_port_errors_without_attempting_a_recovery() {
 async fn a_still_running_task_says_retry_rather_than_returning_nothing() {
     let (addr, _) = spawn_dropping_server(OnRecovery::StillWorking).await;
 
-    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
-        .await
-        .expect_err("an unfinished generation is not an answer");
+    let err = send_message_to_agent(
+        "relis ce plan",
+        &endpoint(addr),
+        None,
+        &[],
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect_err("an unfinished generation is not an answer");
     let visible = format!("{err:#}");
 
     assert!(
@@ -308,6 +325,7 @@ async fn a_missing_task_is_reported_differently_from_one_in_flight() {
             &[],
             None,
             false,
+            false,
         )
         .await
         .expect_err("no task exists")
@@ -320,6 +338,7 @@ async fn a_missing_task_is_reported_differently_from_one_in_flight() {
             None,
             &[],
             None,
+            false,
             false,
         )
         .await
@@ -353,9 +372,17 @@ async fn a_refused_port_is_retryable_and_exits_75() {
     let dead = DeadEndpoint::reserve();
     let addr = dead.addr();
 
-    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
-        .await
-        .expect_err("nothing is listening; this must fail");
+    let err = send_message_to_agent(
+        "relis ce plan",
+        &endpoint(addr),
+        None,
+        &[],
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect_err("nothing is listening; this must fail");
 
     assert_eq!(
         exit_code_for(&err),
@@ -371,9 +398,17 @@ async fn a_refused_port_is_retryable_and_exits_75() {
 async fn a_dropped_socket_is_retryable_whatever_the_recovery_found() {
     for outcome in [OnRecovery::NotFound, OnRecovery::StillWorking] {
         let (addr, _) = spawn_dropping_server(outcome).await;
-        let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
-            .await
-            .expect_err("a dropped socket is not an answer");
+        let err = send_message_to_agent(
+            "relis ce plan",
+            &endpoint(addr),
+            None,
+            &[],
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect_err("a dropped socket is not an answer");
         assert_eq!(
             exit_code_for(&err),
             EXIT_TRANSPORT_FAILURE,
@@ -393,9 +428,17 @@ async fn a_dropped_socket_is_retryable_whatever_the_recovery_found() {
 async fn a_protocol_refusal_is_definitive_and_exits_1() {
     let (addr, _) = spawn_dropping_server(OnRecovery::RefusedByProtocol).await;
 
-    let err = send_message_to_agent("relis ce plan", &endpoint(addr), None, &[], None, false)
-        .await
-        .expect_err("the server refused the request");
+    let err = send_message_to_agent(
+        "relis ce plan",
+        &endpoint(addr),
+        None,
+        &[],
+        None,
+        false,
+        false,
+    )
+    .await
+    .expect_err("the server refused the request");
 
     assert!(
         format!("{err:#}").contains("paramètres invalides"),
