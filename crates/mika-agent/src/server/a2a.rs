@@ -2946,125 +2946,6 @@ mod tests {
     }
 
     // --- mika#1727: the fact is read loop-side, after a real turn -------------
-    //
-    // **Why this state fixture is local.** The crate's test-state constructors
-    // live in the private `#[cfg(test)] mod tests` of `server/mod.rs` — a cousin
-    // of this module, not an ancestor, so they are invisible from here. Making
-    // them `pub(super)` would cost one line inside a `#[cfg(test)]` block, but
-    // in a **fifth** file, and this flight's declared perimeter is four
-    // (criterion 7). What repeats here is the *form* of the state, never
-    // knowledge about it: a new field on `AppState` or `AgentState` breaks this
-    // literal's compilation, so the compiler holds the drift rather than a
-    // reviewer. mika#2070 took the other side of the same trade — an end-to-end
-    // test in `server/mod.rs::tests` — and that tension is declared in this
-    // flight's PR rather than settled by it.
-    fn callback_fixture(
-        mock: Arc<mika_common::llm::mock::MockLlmProvider>,
-    ) -> (AppState, Arc<AgentState>) {
-        use crate::skills::SkillRegistry;
-        use crate::task_engine::{TaskDispatcher, TaskEngine};
-        use crate::tools;
-        use std::sync::atomic::AtomicBool;
-
-        let db = crate::test_utils::test_helpers::test_async_db();
-        let settings = mika_common::config::Settings::test_defaults();
-        let home_dir = std::path::PathBuf::from("/tmp/mika-test");
-        let dispatcher = Arc::new(TaskDispatcher {
-            tier: mika_common::home::AgentTier::Default,
-            deployment: mika_common::home::Deployment::Unknown,
-            db: db.clone(),
-            llm: mock.clone(),
-            tools: Arc::new(tools::default_tools()),
-            skills: Arc::new(SkillRegistry::empty()),
-            message_sender: None,
-            home_dir: home_dir.clone(),
-            global_home_dir: home_dir.clone(),
-            embedding_client: None,
-            brave_api_key: None,
-            github_token: None,
-            gateway_url: None,
-            internal_token: None,
-            github_app: None,
-            skills_dirty: Arc::new(AtomicBool::new(false)),
-            agent_lock: None,
-            cli_mode: false,
-            settings: settings.clone(),
-            pr_reviews_posted: None,
-            auto_pull_stop_armed: AtomicBool::new(false),
-            worktree_reap_stop_armed: AtomicBool::new(false),
-            proactive_budget_reported: std::sync::Mutex::new(None),
-        });
-        let agent_state = Arc::new(AgentState {
-            tier: mika_common::home::AgentTier::Default,
-            deployment: mika_common::home::Deployment::Unknown,
-            db: db.clone(),
-            skills: std::sync::Mutex::new(Arc::new(SkillRegistry::empty())),
-            skills_dirty: Arc::new(AtomicBool::new(false)),
-            skill_nudge: Arc::new(crate::agent_loop::skill_nudge::SkillNudgeState::default()),
-            task_engine: Arc::new(tokio::sync::Mutex::new(TaskEngine::new(
-                db.clone(),
-                dispatcher.clone(),
-            ))),
-            dispatcher,
-            agent_lock: Arc::new(tokio::sync::Mutex::new(())),
-            a2a_wait_slots: Arc::new(tokio::sync::Semaphore::new(
-                settings.effective_a2a_queue_max_depth(),
-            )),
-            embedding_client: None,
-            mcp_manager: None,
-            llm: mock,
-            github_app: None,
-            webhook_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            webhook_queue_v2: Arc::new(crate::server::webhook_queue_v2::WebhookQueue::new(
-                64,
-                std::time::Duration::from_millis(100),
-            )),
-            sync_debounce: Arc::new(crate::server::sync_debounce::SyncDebounce::default()),
-            kg_config: crate::kg::config::KgAgentConfig::Disabled {
-                reason: crate::kg::config::DisabledReason::OperatorOptOut,
-            },
-            canonical_session_id: None,
-            budget_record: Arc::new(mika_common::llm::resolve_llm_budget_record(
-                "mika", &home_dir, &home_dir,
-            )),
-            model_drift: Arc::new(mika_common::llm::ModelDriftCheck::NotApplicable),
-            home_dir: home_dir.clone(),
-            settings: settings.clone(),
-        });
-        let agents = DashMap::new();
-        agents.insert("mika".to_string(), Arc::clone(&agent_state));
-        let state = AppState {
-            agents: Arc::new(agents),
-            default_agent: "mika".to_string(),
-            tools: Arc::new(tools::default_tools()),
-            ready: Arc::new(AtomicBool::new(true)),
-            internal_token: secrecy::SecretString::from("test-token-secret"),
-            dashboard_token: None,
-            gateway_url: "http://localhost:9999".to_string(),
-            startup_time: std::time::Instant::now(),
-            http_client: reqwest::Client::new(),
-            brave_api_key: None,
-            github_token: None,
-            github_app: None,
-            global_home_dir: home_dir,
-            settings,
-            dashboard_db: db,
-            investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
-            investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
-            dashboard_enabled: Arc::new(AtomicBool::new(false)),
-            a2a_broadcasters: Arc::new(DashMap::new()),
-            pr_reviews_posted: Arc::new(DashMap::new()),
-            rate_limit_audit_last: Arc::new(DashMap::new()),
-            webhook_queue_audit_last: Arc::new(DashMap::new()),
-            a2a_queue_audit_last: Arc::new(DashMap::new()),
-            webhook_queue_shutdown: tokio_util::sync::CancellationToken::new(),
-            permissions_channel: Arc::new(
-                crate::server::permissions_stream::PermissionsChannel::new(),
-            ),
-            task_events_channel: Arc::new(crate::server::tasks_stream::TaskEventsChannel::new()),
-        };
-        (state, agent_state)
-    }
 
     /// Run one real A2A turn with the given declaration and report how many
     /// **user** messages it recorded in its own session.
@@ -3088,7 +2969,18 @@ mod tests {
                 )
                 .build(),
         );
-        let (state, agent_state) = callback_fixture(mock);
+        // The state comes from the crate's own constructor, in `server::tests`:
+        // it posts the mock on the agent's `AgentState`, which is the field
+        // `run_a2a_agent` reads. One literal in the crate rather than two, so a
+        // new field on `AppState` cannot drift between them.
+        let state = crate::server::tests::mika1727_state_compact(mock);
+        let agent_state = Arc::clone(
+            state
+                .agents
+                .get("mika")
+                .expect("the test state carries the agent `mika`")
+                .value(),
+        );
         let task_id = Uuid::new_v4().to_string();
         let session_id = agent_state
             .db

@@ -6089,7 +6089,7 @@ mod tests {
     /// posé sur l'`AgentState` et non sur `AppState.llm` : la route lit
     /// `agent_state.llm`, et c'est exactement la distinction que ce vol existe
     /// pour tenir — un mock posé à côté laisserait passer le défaut corrigé.
-    fn mika1727_state_compact(mock: Arc<MockLlmProvider>) -> AppState {
+    pub(super) fn mika1727_state_compact(mock: Arc<MockLlmProvider>) -> AppState {
         let state = test_state();
         {
             let mut entry = state.agents.get_mut("mika").unwrap();
