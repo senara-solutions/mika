@@ -17,9 +17,9 @@ use mika_a2a::jsonrpc::{
     JsonRpcResponse, METHOD_NOT_FOUND, TASK_NOT_CANCELABLE, TASK_NOT_FOUND,
 };
 use mika_a2a::params::{
-    CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY, MessageSendParams,
-    ONLY_SKILLS_KEY, RUN_USAGE_KEY, RunUsage, SESSION_ISOLATED_APPLIED_KEY, SESSION_ISOLATED_KEY,
-    TURN_FAILURE_CLASS_KEY, TaskIdParams, TaskQueryParams,
+    CALLBACK_TURN_KEY, CALLER_SESSION_ID_KEY, EFFECTIVE_MODEL_KEY, MODEL_OVERRIDE_KEY,
+    MessageSendParams, ONLY_SKILLS_KEY, RUN_USAGE_KEY, RunUsage, SESSION_ISOLATED_APPLIED_KEY,
+    SESSION_ISOLATED_KEY, TURN_FAILURE_CLASS_KEY, TaskIdParams, TaskQueryParams,
 };
 use mika_a2a::state_machine::TaskStateMachine;
 use mika_a2a::streaming::{StreamEvent, TaskStatusUpdateEvent};
@@ -256,6 +256,7 @@ async fn run_a2a_agent(
     only_skills: &[String],
     model_override: Option<&Arc<dyn mika_common::llm::LlmProvider>>,
     session_isolated: bool,
+    callback_turn: bool,
 ) -> Result<A2aTurn, A2aTurnFailure> {
     // Hot-reload skills if dirty. A reload is an assembly, so it goes through the
     // single assembler (mika#2889) — not through a local copy of the sequence.
@@ -340,7 +341,11 @@ async fn run_a2a_agent(
         skill_nudge: Some(&agent_state.skill_nudge),
         mcp_manager: agent_state.mcp_manager.as_ref(),
         global_home_dir: Some(&state.global_home_dir),
-        is_callback_turn: false,
+        // mika#1727: the caller declared the turn a callback turn. Until this
+        // flight the literal was `false`, which made the A2A gate the one door
+        // through which a callback turn could not travel — the reason the TUI
+        // still runs its `CallbackResult` arm in its own process.
+        is_callback_turn: callback_turn,
         settings: Some(&agent_state.settings),
         // mika#2304 D7: when the caller named the model, a matched skill's
         // `[llm]` section must not displace it.
@@ -526,6 +531,50 @@ fn requested_session_isolation(params: &MessageSendParams) -> Result<bool, JsonR
                  A malformed isolation request is refused rather than read as \
                  `false`: a turn that believes it is isolated and is not \
                  produces plausible, contaminated measurements (mika#1951).",
+                shape_of(other)
+            ),
+        )),
+    }
+}
+
+/// Extract the caller's declaration that this turn **is a callback turn**
+/// (mika#1727).
+///
+/// Same skeleton as [`requested_session_isolation`], and deliberately so: both
+/// are booleans on `MessageSendParams.metadata` whose silent mis-reading is
+/// invisible in the answer the caller gets back.
+///
+/// # Absence is soft, a malformed value is not
+///
+/// No metadata, key absent, or `null` → `Ok(false)`: an ordinary turn, identical
+/// to the one this gate produced before the key existed. That is what lets the
+/// whole existing fleet of callers keep working unchanged.
+///
+/// Any **present, non-boolean** value → `Err(INVALID_PARAMS)`. A string `"true"`
+/// read as `false` would do two invisible things on the same turn: record the raw
+/// callback result **a second time** (the loop skips the user-message write
+/// precisely because the caller already stored it as a `tool_result`), and
+/// **disarm guard #716** on the turn whose state claims are least verifiable.
+/// Neither shows up in the response, which is what makes a silent no-op here the
+/// defect rather than a nuance.
+fn requested_callback_turn(params: &MessageSendParams) -> Result<bool, JsonRpcError> {
+    let Some(value) = params
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(CALLBACK_TURN_KEY))
+    else {
+        return Ok(false);
+    };
+    match value {
+        serde_json::Value::Null => Ok(false),
+        serde_json::Value::Bool(b) => Ok(*b),
+        other => Err(JsonRpcError::with_message(
+            INVALID_PARAMS,
+            format!(
+                "`{CALLBACK_TURN_KEY}` must be a boolean; got {}. \
+                 A malformed callback declaration is refused rather than read as \
+                 `false`: the turn would record the callback result twice and run \
+                 with guard #716 disarmed (mika#1727).",
                 shape_of(other)
             ),
         )),
@@ -1225,6 +1274,25 @@ async fn handle_message_send(
         }
     };
 
+    // mika#1727: read here for the same three reasons as its two neighbours
+    // above — before the lock, before the task row, and as a sentence the caller
+    // can read. A malformed declaration must never become a turn: it would
+    // record the callback result twice and disarm guard #716, neither of which
+    // is visible in the Task that comes back.
+    let callback_turn = match requested_callback_turn(&params) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(
+                event = "a2a_callback_turn_refused",
+                agent = %agent_state.db.agent_id(),
+                task_id = %task_id,
+                port = "send",
+                "caller declared `{CALLBACK_TURN_KEY}` with a non-boolean value — refusing the turn (mika#1727)"
+            );
+            return Json(JsonRpcResponse::error(request.id.clone(), err)).into_response();
+        }
+    };
+
     // Bounded wait for the agent lock (mika#2163). Take a place in the line, then
     // wait in it. The wait lives in the handler because `message/send` is
     // synchronous — the caller is holding the connection open for the completed
@@ -1344,6 +1412,7 @@ async fn handle_message_send(
             &only_skills,
             caller_model.as_ref(),
             session_isolated,
+            callback_turn,
         )
         .await
         {
@@ -1546,6 +1615,25 @@ async fn handle_message_stream(
         }
     };
 
+    // mika#1727: same key, same reader, both ports — a flag meaning different
+    // things on two endpoints of the same protocol would be worse than no flag
+    // (mika#2304's wording, and it holds here unchanged). On this port the read
+    // *must* land before the stream opens: mid-SSE there is no way left to tell
+    // a caller its request was malformed.
+    let callback_turn = match requested_callback_turn(&params) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(
+                event = "a2a_callback_turn_refused",
+                agent = %agent_state.db.agent_id(),
+                task_id = %task_id,
+                port = "stream",
+                "caller declared `{CALLBACK_TURN_KEY}` with a non-boolean value — refusing the turn (mika#1727)"
+            );
+            return Json(JsonRpcResponse::error(request.id.clone(), err)).into_response();
+        }
+    };
+
     // Create task in DB
     let session_id = match agent_state
         .db
@@ -1599,6 +1687,7 @@ async fn handle_message_stream(
             only_skills,
             caller_model,
             session_isolated,
+            callback_turn,
         };
 
         // The kill-switch path already holds the lock — it was taken in the
@@ -1753,7 +1842,7 @@ async fn handle_message_stream(
 ///
 /// Bundled rather than passed loose because both paths into the turn — the
 /// kill-switch path, which takes the lock in the handler, and the bounded path,
-/// which waits for it in the spawned task — hand over the same seven values.
+/// which waits for it in the spawned task — hand over the same set of values.
 struct StreamTurn {
     state: AppState,
     agent_state: Arc<AgentState>,
@@ -1776,6 +1865,11 @@ struct StreamTurn {
     /// does not survive the spawn, and the refusal must land before the stream
     /// opens — a caller cannot be told mid-SSE that its request was malformed.
     session_isolated: bool,
+    /// The caller's callback-turn declaration (mika#1727), already validated in
+    /// the handler. Carried for the same two reasons as `session_isolated`:
+    /// `params` does not survive the spawn, and the refusal has to land before
+    /// the stream opens.
+    callback_turn: bool,
 }
 
 /// Run the streaming turn. The guard is taken by value and dropped with this
@@ -1796,6 +1890,7 @@ async fn run_a2a_stream_turn(
         only_skills,
         caller_model,
         session_isolated,
+        callback_turn,
     } = turn;
 
     // Transition to working
@@ -1837,6 +1932,7 @@ async fn run_a2a_stream_turn(
         &only_skills,
         caller_model.as_ref(),
         session_isolated,
+        callback_turn,
     )
     .await
     {
@@ -2733,6 +2829,119 @@ mod tests {
             "expected exactly two read sites (the scope resolution and the summary \
              gate), found {reads} — a third would widen what isolation means \
              without failing any assertion about either channel"
+        );
+    }
+
+    // ================== mika#1727 — the callback-turn declaration ==================
+
+    fn with_callback(value: serde_json::Value) -> MessageSendParams {
+        params_with_metadata(Some(HashMap::from([(
+            CALLBACK_TURN_KEY.to_string(),
+            value,
+        )])))
+    }
+
+    /// **Absence is soft.** No metadata, an empty map, the key absent, `null`,
+    /// and a literal `false` all read as "ordinary turn" — so every caller that
+    /// predates this key produces the turn it always did. `true` is the only
+    /// value that changes anything.
+    #[test]
+    fn mika1727_une_demande_absente_nest_pas_un_tour_de_callback() {
+        assert!(!requested_callback_turn(&params_with_metadata(None)).unwrap());
+        assert!(!requested_callback_turn(&params_with_metadata(Some(HashMap::new()))).unwrap());
+        assert!(!requested_callback_turn(&with_callback(serde_json::Value::Null)).unwrap());
+        assert!(!requested_callback_turn(&with_callback(serde_json::json!(false))).unwrap());
+        assert!(requested_callback_turn(&with_callback(serde_json::json!(true))).unwrap());
+    }
+
+    /// **Reading is fail-closed.** A present, non-boolean value refuses the turn
+    /// before any turn exists; it is never read as `false`.
+    ///
+    /// `"true"` is the shape a hand-written client is most likely to send, and it
+    /// is exactly the one that must not pass: read as `false` it would record the
+    /// callback result a second time and leave guard #716 disarmed, neither of
+    /// which appears in the Task the caller reads back.
+    #[test]
+    fn mika1727_une_demande_malformee_refuse_le_tour() {
+        for value in [
+            serde_json::json!("true"),
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::json!(0),
+            serde_json::json!([true]),
+            serde_json::json!({ "callback": true }),
+            serde_json::json!(""),
+        ] {
+            let err = requested_callback_turn(&with_callback(value.clone()))
+                .expect_err("a non-boolean must refuse the turn, never read as false");
+            assert_eq!(err.code, INVALID_PARAMS, "wrong code for {value}");
+            let message = err.message.clone();
+            assert!(
+                message.contains(CALLBACK_TURN_KEY),
+                "the refusal must name the key an operator has to fix: {message}"
+            );
+        }
+    }
+
+    /// The refusal names the shape it received and never echoes the value — it
+    /// lands in a JSON-RPC error that may be logged, and the caller's payload has
+    /// no business there.
+    #[test]
+    fn mika1727_le_refus_nomme_la_forme_sans_echo_de_la_valeur() {
+        let err = requested_callback_turn(&with_callback(serde_json::json!("hunter2")))
+            .expect_err("a string must refuse");
+        assert!(err.message.contains("a string"), "{}", err.message);
+        assert!(
+            !err.message.contains("hunter2"),
+            "the refusal must not echo the caller's value: {}",
+            err.message
+        );
+    }
+
+    /// **One reader, and both ports call it** (criterion 5).
+    ///
+    /// A second, copy-pasted reader would break no behavioural assertion: it
+    /// would answer identically on the day it was written, then diverge in
+    /// silence the day one of the two was relaxed. That is why this is a lexical
+    /// guard — the same reason `mika1951_the_isolation_flag_has_exactly_two_readers_in_the_loop`
+    /// exists one key over.
+    #[test]
+    fn mika1727_la_cle_na_quun_lecteur_et_deux_appelants() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let source = scanner.production_of(&scanner.src_root().join("server/a2a.rs"));
+
+        assert_eq!(
+            source.matches("fn requested_callback_turn").count(),
+            1,
+            "the key must have exactly one reader in this module"
+        );
+        let calls = source.matches("requested_callback_turn(&params)").count();
+        assert_eq!(
+            calls, 2,
+            "expected both ports (`message/send` and `message/stream`) to call the \
+             single reader; found {calls} call sites"
+        );
+    }
+
+    /// **The hardcoded literal is gone from production** (criterion 6).
+    ///
+    /// Read on production source only, through `ProductionScanner`: the positive
+    /// control of this flight passes `false` explicitly in a `#[cfg(test)]`
+    /// region, and a whole-file scan would redden on it. The needle is assembled
+    /// by `concat!` so this guard does not contain the string it forbids and
+    /// find itself (motif mika#2304).
+    #[test]
+    fn mika1727_la_porte_a2a_necrit_plus_le_litteral_en_dur() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let source = scanner.production_of(&scanner.src_root().join("server/a2a.rs"));
+        let needle = concat!("is_callback_turn", ": false");
+        assert!(
+            !source.contains(needle),
+            "the A2A gate must take the flag from the caller's metadata, never \
+             from a literal — a hardcoded `false` is the door through which a \
+             callback turn cannot travel (mika#1727)"
         );
     }
 
