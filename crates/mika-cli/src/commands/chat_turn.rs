@@ -54,17 +54,27 @@ fn spirit_turn_endpoint(agent_name: &str) -> String {
 /// tour atterrissent donc sur la session que la TUI affiche, et non sur une
 /// session parallèle.
 ///
-/// Les trois autres paramètres de `send_message_to_agent` sont posés vides à
+/// Deux des paramètres de `send_message_to_agent` restent posés vides à
 /// dessein : pas de restriction de skills, pas d'override de modèle (`/model`
-/// reste appliqué en processus en V1, voir `chat.rs`), pas d'isolation de
-/// session — un tour de TUI veut précisément voir ses tours précédents.
+/// reste appliqué en processus en V1, voir `chat.rs`). L'isolation de session
+/// reste `false` pour une raison propre — un tour de TUI veut précisément voir
+/// ses tours précédents.
+///
+/// `callback_turn` est en revanche **un paramètre de cette fonction** depuis le
+/// vol V3a-2a : la TUI est le seul appelant qui aura un jour un tour de callback
+/// à envoyer, et le paramètre existe pour qu'il n'ait pas à rouvrir ce site. Son
+/// unique appelant d'aujourd'hui, le bras `Message` de `chat.rs`, le pose
+/// `false` : un message tapé par l'opérateur n'est pas un callback. **Le premier
+/// appelant à `true` est le vol V3a-2b**, qui fait partir le bras
+/// `CallbackResult` sur le fil au lieu de le faire tourner en processus.
 pub(crate) async fn send_turn_to_spirit(
     text: &str,
     agent_name: &str,
     session_id: &str,
+    callback_turn: bool,
 ) -> Result<TurnReply> {
     let endpoint = spirit_turn_endpoint(agent_name);
-    send_turn_to_endpoint(text, &endpoint, session_id).await
+    send_turn_to_endpoint(text, &endpoint, session_id, callback_turn).await
 }
 
 /// Le corps de [`send_turn_to_spirit`], l'endpoint déjà résolu.
@@ -72,7 +82,12 @@ pub(crate) async fn send_turn_to_spirit(
 /// Séparé pour une seule raison : les tests visent un serveur factice, et
 /// l'alternative serait de muter `MIKA_SPIRIT_URL` — un état global de
 /// processus que les tests `cargo` parallèles se disputent.
-async fn send_turn_to_endpoint(text: &str, endpoint: &str, session_id: &str) -> Result<TurnReply> {
+async fn send_turn_to_endpoint(
+    text: &str,
+    endpoint: &str,
+    session_id: &str,
+    callback_turn: bool,
+) -> Result<TurnReply> {
     let task = mika_cli::remote_ask::send_message_to_agent(
         text,
         endpoint,
@@ -80,7 +95,7 @@ async fn send_turn_to_endpoint(text: &str, endpoint: &str, session_id: &str) -> 
         &[],
         None,
         false,
-        false,
+        callback_turn,
     )
     .await
     .map_err(|e| wrap_turn_error(&e, endpoint))?;
@@ -290,7 +305,7 @@ mod tests {
         .await;
 
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let reply = send_turn_to_endpoint("quoi de neuf", &endpoint, "sess-t1")
+        let reply = send_turn_to_endpoint("quoi de neuf", &endpoint, "sess-t1", false)
             .await
             .expect("un spirit qui répond un Task complété rend son texte");
         assert_eq!(reply.content, "bonjour");
@@ -317,7 +332,7 @@ mod tests {
         .await;
 
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        send_turn_to_endpoint("salut", &endpoint, "sess-t2-abc")
+        send_turn_to_endpoint("salut", &endpoint, "sess-t2-abc", false)
             .await
             .expect("envoi");
 
@@ -341,7 +356,7 @@ mod tests {
         let dead = DeadEndpoint::reserve();
         let endpoint = format!("http://{}/a2a/mika-prime", dead.addr());
 
-        let err = send_turn_to_endpoint("salut", &endpoint, "sess-t3")
+        let err = send_turn_to_endpoint("salut", &endpoint, "sess-t3", false)
             .await
             .expect_err("rien n'écoute : l'appel doit échouer");
         let chain = format!("{err:#}");
@@ -383,7 +398,7 @@ mod tests {
         .await;
 
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let outcome = send_turn_to_endpoint("salut", &endpoint, "sess-t4").await;
+        let outcome = send_turn_to_endpoint("salut", &endpoint, "sess-t4", false).await;
         let err = match outcome {
             Ok(reply) => panic!(
                 "un Task sans texte lisible doit échouer, pas rendre {:?}",
@@ -407,7 +422,7 @@ mod tests {
         let (addr, _) =
             spawn_mock(|_cap, _body| (StatusCode::OK, Json(ok_task_with_text("ok")))).await;
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5a")
+        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5a", false)
             .await
             .expect("envoi");
         assert_eq!(
@@ -423,10 +438,79 @@ mod tests {
         })
         .await;
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5b")
+        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5b", false)
             .await
             .expect("envoi");
         assert_eq!(reply.input_tokens, Some(41_000));
+    }
+
+    /// **Critère 3 de V3a-2a — la clé de callback voyage, et son absence aussi.**
+    ///
+    /// Les deux moitiés vivent dans le **même** test, par deux `spawn_mock`
+    /// dans la même fonction. La moitié négative n'a de valeur que comparée à la
+    /// positive dans la même mesure : séparées, un `spawn_mock` qui capturerait
+    /// mal le corps rendrait la négative verte pour la mauvaise raison, et rien
+    /// ne le dirait.
+    ///
+    /// La clé est lue par la constante, jamais par un littéral — même raison
+    /// qu'en T2.
+    #[tokio::test]
+    async fn mika1727_v3a2a_la_cle_de_callback_voyage_et_son_absence_aussi() {
+        // Moitié positive : `true` pose la clé, et la pose À CÔTÉ de la session.
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("ok")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+        send_turn_to_endpoint("salut", &endpoint, "sess-cb-oui", true)
+            .await
+            .expect("envoi");
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        let metadata = &body["params"]["metadata"];
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLBACK_TURN_KEY],
+            serde_json::Value::Bool(true),
+            "le serveur lit un booléen strict : toute autre forme FAIT ÉCHOUER \
+             le tour au lieu de dégrader en tour ordinaire (V3a-1) ; corps : {body}"
+        );
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLER_SESSION_ID_KEY],
+            "sess-cb-oui",
+            "la clé de callback ne doit pas chasser celle de la session : un \
+             tour de callback doit atterrir sur l'historique que la TUI \
+             affiche ; corps : {body}"
+        );
+
+        // Moitié négative : le MÊME envoi à `false` ne porte pas la clé. Sans
+        // cette moitié, un `insert` rendu inconditionnel passerait la première.
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("ok")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+        send_turn_to_endpoint("salut", &endpoint, "sess-cb-non", false)
+            .await
+            .expect("envoi");
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        let metadata = &body["params"]["metadata"];
+        assert!(
+            metadata
+                .get(mika_cli::remote_ask::CALLBACK_TURN_KEY)
+                .is_none(),
+            "un tour ordinaire ne pose pas la clé, pas même à `false` ; \
+             corps : {body}"
+        );
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLER_SESSION_ID_KEY],
+            "sess-cb-non",
+            "anti-vacuité de la moitié négative : le corps capturé est bien \
+             celui de ce second envoi, et non un corps resté vide ; \
+             corps : {body}"
+        );
     }
 
     /// Une image abandonnée, pour les assertions de l'avis d'inertie.

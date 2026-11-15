@@ -383,9 +383,13 @@ async fn spawn_agent_worker(
                     // mika#1727 V1 § D1 — le tour part vers mika-spirit, qui
                     // possède la boucle, la session et les outils. Plus rien de ce
                     // bras ne fait tourner `agent::run_agent`.
-                    let result =
-                        chat_turn::send_turn_to_spirit(&text, &worker_agent_name, &worker_session)
-                            .await;
+                    let result = chat_turn::send_turn_to_spirit(
+                        &text,
+                        &worker_agent_name,
+                        &worker_session,
+                        false,
+                    )
+                    .await;
 
                     // If the dirty flag is set after this turn, rebuild now so we
                     // can send the updated registry to the TUI for autocomplete.
