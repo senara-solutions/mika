@@ -415,11 +415,15 @@ seul n'envoie plus.
 `dashboard::query_dashboard_status()` et non `is_dashboard_running()` : la même
 sonde répond désormais à deux questions, et le `bool` les écrasait — un daemon à
 terre y était indiscernable d'un tableau de bord désactivé. Un `None` pousse un
-message `System` qui nomme l'endpoint et **les deux** causes possibles, parce que
-la sonde rend la même absence pour un daemon injoignable et pour un shell sans
-`MIKA_INTERNAL_TOKEN` ; en désigner une seule serait une fausse provenance
-(motif mika#2331). Le chemin `--team` garde `is_dashboard_running()` — son tour
-ne passe pas par ce bras, et il part au vol V4.
+message `System` qui nomme l'endpoint. **Il ne nomme plus le jeton depuis le vol
+V2d-4a** (voir plus bas) : ce message disait les **deux** causes possibles, parce
+que la sonde rend la même absence pour un daemon injoignable et pour un shell
+sans `MIKA_INTERNAL_TOKEN`, et en désigner une seule aurait été une fausse
+provenance (motif mika#2331). Depuis que l'écran n'existe que si la session s'est
+ouverte sur spirit, le jeton **a été lu** à ce point du démarrage : la seule
+cause restante est un daemon qui s'est tu entre l'ouverture et la sonde. Le
+chemin `--team` garde `is_dashboard_running()` — son tour ne passe pas par ce
+bras, et il part au vol V4.
 
 ### La TUI ne possède plus de moteur de tâches (mika#1727, vol V2a sur 4)
 
@@ -482,8 +486,232 @@ ne suffit pas** — les routes rewind ne l'acceptent pas. Le refus est posé ava
 sur la première des trois portes et nommerait le transport là où la cause est la
 configuration du shell.
 
-- **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
-- `/clear` ends the current session, creates a new one, notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped)
+### Le démarrage de la TUI passe par mika-spirit (mika#1727, vol V2d-4a)
+
+`mika` / `mika chat` **ne crée plus sa session en local**.
+`chat::ouvrir_session_par_spirit` remplace les deux appels de
+`spawn_agent_worker` (`get_or_create_canonical_session` pour un singleton,
+`create_session` sinon), dont l'échec ne donnait qu'un `tracing::warn!` : la TUI
+démarrait sans session et la panne se disait au premier tour, là où elle ne se
+lit plus.
+
+**Ce que le démarrage exige.** `MIKA_INTERNAL_TOKEN`, lu avant tout appel, sur
+les **deux** chemins (avec et sans `--session-id`) — le premier tour part sur le
+fil de toute façon. Le refus nomme la variable et dit que
+`MIKA_DASHBOARD_TOKEN` **ne suffit pas** : `dashboard::auth_token()` l'accepte
+pour la sonde, les routes de session non. C'est l'angle mort que ce vol ferme —
+un shell qui ne portait que le jeton du tableau de bord passait la sonde, puis
+prenait un 401 à chaque tour. Sans jeton, ou si `ouvrir` échoue (401, 404,
+injoignable), le `?` de `run` sort en non-zéro **avant** le hook de panique et
+`enable_raw_mode` : l'écran ne s'affiche jamais. Au changement d'agent et à
+`/restart`, les chemins d'erreur existants poussent le message dans la
+conversation sans quitter la TUI.
+
+**D'où vient `is_singleton_session`.** Du **fil**, et non de l'identité locale :
+la route rend la session canonique de l'agent au lieu d'en créer une, donc le
+serveur est la seule autorité sur ce fait. `resolve_canonical_session_id` ne sert
+plus qu'au bras de reprise.
+
+**Ce que le démarrage refuse.** Sous `--session-id`, une session que la base
+locale ne connaît pas — la route ne prend aucun identifiant dans son corps, donc
+elle ne sait pas en créer une à identifiant choisi, et le refus nomme
+l'identifiant. Une session étrangère reste refusée au texte inchangé, et une base
+illisible ne se lit plus comme « session inconnue » (cette erreur était avalée).
+Une session connue et à l'agent est reprise **sans appeler `ouvrir`**.
+
+**Le refus structurel.**
+`mika1727_v2d4a_la_tui_ne_cree_plus_sa_session_en_local` (module `tests` en fin
+de `commands/chat.rs`) balaie la moitié production du fichier par
+`ProductionScanner` et refuse `create_session(` et
+`get_or_create_canonical_session(`. Son **allowlist est livrée vide et assertie
+vide** : quand elle rougit, le remède est de passer par `session_remote::ouvrir`,
+jamais d'y ajouter une ligne. Elle refuse aussi `end_session(` **depuis le vol
+V2d-4c** (remède : `session_remote::clore`) — c'est une garde **par fichier**, pas
+par vol, d'où un nom qui ne bouge plus et deux vols qui la citent. La garde de
+`handlers.rs` refuse le même motif pour son propre fichier depuis V2d-4b ; les
+deux ne sont pas fondues : elles balaient deux fichiers et une garde fondue
+rougirait sous un seul message.
+
+### `/clear` passe par mika-spirit (mika#1727, vol V2d-4b)
+
+`/clear` **ne clôt plus et ne crée plus sa session en local**.
+`tui/commands/handlers.rs::clear_par_spirit` traverse deux portes de
+`commands/session_remote.rs` : **`ouvrir` d'abord, `clore` ensuite — et cet ordre
+est le livrable.** L'inverse perdrait la session courante avant de savoir si une
+nouvelle peut naître, et laisserait la TUI sans session sur un spirit qui refuse.
+`handle_clear` charge le `.env` de la home, lit `dashboard::spirit_url()` et
+délègue, comme `handle_rewind_impl`.
+
+Ce que chaque issue rend, et pourquoi elle est distincte :
+
+| cas | effet sur l'état | message |
+|---|---|---|
+| singleton | rien n'est appelé, pas même la lecture du jeton ; la session est gardée | « Display cleared… » (inchangé) |
+| sans `MIKA_INTERNAL_TOKEN` | refus **avant tout appel**, état intact, aucun `NewSession` | le refus commun, qui nomme la variable |
+| `ouvrir` échoue | rien n'est clos, `session_id` ne change pas, aucun `NewSession` | `Error opening a new session: <issue>` |
+| `clore` échoue | la **nouvelle** session est gardée, le worker l'a | dit que l'ancienne n'a pas été close, et nomme la cause |
+| `ended: false`, `canonical: true` | la nouvelle session est gardée | dit que l'ancienne est la session canonique de l'agent (mika#1401) et reste ouverte |
+
+`is_singleton_session` prend le `canonical` rendu par `ouvrir` : la route rend la
+session canonique de l'agent au lieu d'en créer une, donc le serveur est la seule
+autorité sur ce fait (même raison qu'au vol V2d-4a). Et `clore` rend
+`{ended, canonical}` en **200** sur une session canonique, qui ne se clôt jamais
+— d'où la lecture des **deux** champs, et non d'`ended` seul : un `ended: false`
+canonique est le régime nominal de mika#1401, un `ended: false` non canonique est
+un refus sans raison donnée, et les confondre dirait à l'opérateur qu'un geste a
+échoué alors qu'il n'avait pas lieu d'être.
+
+**Le refus structurel.**
+`mika1727_v2d4b_la_tui_ne_clot_plus_la_base_en_local` (module `tests` de
+`handlers.rs`) balaie la moitié production du fichier par `ProductionScanner` et
+refuse `create_session(` (remède : `session_remote::ouvrir`) et `end_session(`
+(remède : `session_remote::clore`). Son **allowlist est livrée vide et assertie
+vide**. Elle porte un témoin *et* un contre-témoin : `production_of` masque les
+régions `#[cfg(test)]` sans jamais tronquer, donc le premier atteste que le
+balayage a lu la production (un chemin faux serait vert par cécité) et le second
+qu'il a masqué la moitié test — sans lui, les appels des tests de ce même fichier
+feraient rougir la garde, et on l'aurait « réparée » par une entrée d'allowlist.
+Depuis le vol V2d-4d elle refuse un **troisième** motif, `maybe_compact(`
+(remède : `session_remote::compacter`). Il n'était pas un motif de ce vol-ci :
+une garde qui refuse un geste que rien ne remplace encore ne laisse d'autre
+issue qu'une entrée d'allowlist, donc le motif est arrivé dans le commit qui a
+câblé `/compact`, et pas avant. Le nom de la garde n'a pas changé : c'est une
+garde **par fichier**, pas par vol.
+
+**Une seule lecture du jeton dans tout le crate.**
+`session_remote::jeton_interne(SourceEnv)` remplace les deux copies que portaient
+`chat.rs` (refus en français nommant l'ouverture de session) et `handlers.rs`
+(refus en anglais nommant le rembobinage) : elles avaient déjà divergé, et c'était
+l'argument de leur mise en commun. Le refus nomme `MIKA_INTERNAL_TOKEN`, dit que
+`MIKA_DASHBOARD_TOKEN` **n'est pas accepté** par les routes de session et de
+rembobinage, et **ne nomme aucun geste** — trois sites l'appellent, et aucun n'a
+autorité sur les deux autres. Il rend un `Err(String)` et non un
+`SessionRemoteIssue` : une variable absente n'a ni statut ni URL, et un
+`Unexpected { status: None }` se lirait « spirit injoignable » (motif mika#2331).
+`grep -rn "fn jeton_interne" crates/mika-cli/src` rend **une** ligne.
+
+### Les sorties de la TUI passent par mika-spirit (mika#1727, vol V2d-4c)
+
+Les **trois** sorties de `commands/chat.rs` — changement d'agent, `/restart`, fin
+de session — **ne closent plus la base en local**. Chacune appelle
+`chat::clore_session_de_sortie`, qui prend l'URL de base et la source
+d'environnement **par argument** (la forme d'`ouvrir_session_par_spirit` et de
+`clear_par_spirit`) et passe par `session_remote::clore`.
+
+**L'ordre du corps est le contrat**, et il se mesure : singleton → jeton →
+appel.
+
+| cas | ce qui part sur le fil | ce qui est rendu |
+|---|---|---|
+| singleton | rien, pas même la lecture du jeton | `Ok(())` |
+| sans `MIKA_INTERNAL_TOKEN`, non singleton | rien | `Err` qui nomme la variable |
+| 401, 404, injoignable | l'appel a eu lieu | `Err` qui porte le `Display` de `SessionRemoteIssue` |
+| `ended: false`, `canonical: true` en 200 | l'appel a eu lieu | `Ok(())` + un `warn!` qui dit le régime nominal de mika#1401 |
+| `ended: false`, `canonical: false` en 200 | l'appel a eu lieu | `Ok(())` + un `warn!` qui dit « sans raison donnée » |
+
+Un agent singleton ne clôt rien **et ne lit pas le jeton** : la canonique ne se
+clôt jamais (mika#1401), donc il n'y a rien à demander au fil et aucune raison
+d'exiger une variable d'environnement pour ne rien faire. Le test l'atteste avec
+une source d'environnement **vide** — le seul montage qui distingue « on n'a pas
+lu » de « on a lu puis renoncé ». Le `!app.is_singleton_session` a disparu des
+trois sites : la décision vit **dans** la fonction, et la laisser aussi chez
+l'appelant en ferait un second juge du même fait.
+
+**Une clôture en échec ne retient jamais la sortie.** Les trois sites
+journalisent un `tracing::warn!` qui nomme **leur** geste, et continuent : la
+TUI ne doit pas dépendre de spirit pour quitter, changer d'agent ou redémarrer.
+C'est la raison pour laquelle l'erreur monte à l'appelant au lieu d'être
+journalisée dans la fonction — trois lignes identiques diraient « la clôture a
+échoué » sans dire **laquelle des trois sorties** l'a demandée. Au dernier site,
+le terminal est déjà rendu et le lecteur d'événements arrêté : il n'y a plus
+d'écran où porter autre chose qu'un journal.
+
+**L'agent quitté est capturé, pas relu.** Au changement d'agent,
+`let agent_quitte = app.agent_name.clone();` précède immédiatement l'appel :
+`app.agent_name` est réaffecté une soixantaine de lignes plus bas, et une clôture
+au nom du **nouvel** agent clôrait une session qui n'est pas la sienne — le corps
+porte l'agent, et le contrôle d'appartenance du serveur ne rattraperait pas ce
+défaut puisque `resolve_agent` aurait réussi. La capture **supprime** le mode de
+panne, là où une garde qui aurait comparé deux numéros de ligne n'aurait fait que
+le surveiller, et aurait rougi sur tout déplacement innocent.
+
+**Le miroir est lu dans la fonction**, qui rend `()`. Aucun des trois sites n'a
+d'écran où porter la disjonction de mika#1401 ; le leur rendre les obligerait à
+rejouer trois fois la même lecture sans destinataire. `/clear` la rend à l'écran
+parce que `/clear` **a** un écran.
+
+Ce vol ne câble pas `compacter` ; le suivant le fait, et il ne reste alors plus
+aucune attente `dead_code` dans `session_remote.rs`.
+
+### `/compact` passe par mika-spirit (mika#1727, vol V2d-4d)
+
+`/compact` **ne compacte plus la conversation en local**. `handle_compact` n'est
+plus qu'une enveloppe — le `.env` de la home et `spirit_url()`, la forme de
+`handle_clear` — et délègue à `compact_par_spirit`, qui prend l'URL de base et la
+source d'environnement **par argument** et passe par `session_remote::compacter`.
+
+La fonction prend **`&App` et non `&mut App`**, seule différence de forme avec
+`clear_par_spirit` : `/compact` ne modifie aucun champ, la conversation étant
+recomposée côté serveur et relue au prochain poll comme n'importe quelle autre
+écriture de la base. Un `&mut` que le corps n'utilise pas annoncerait une
+mutation dans la signature et laisserait un appelant futur en glisser une sans
+que la revue la voie.
+
+**L'ordre du corps est le contrat**, et il se mesure : pas-au-repos → jeton →
+appel.
+
+| cas | ce qui part sur le fil | ce qui est rendu |
+|---|---|---|
+| `app.status != Idle` | rien, pas même la lecture du jeton | « Cannot compact while agent is busy. » |
+| sans `MIKA_INTERNAL_TOKEN`, au repos | rien | le refus de `jeton_interne`, qui nomme la variable |
+| `{compacted: false, messages: n}` en 200 | l'appel a eu lieu | « Nothing to compact (*n* messages). » |
+| `{compacted: true, messages: n}` en 200 | l'appel a eu lieu | « Compaction requested (*n* messages before)… » |
+| 409 | l'appel a eu lieu | un message qui dit l'occupation **par un autre client**, et le nouvel essai |
+| 401, 404, 500, injoignable | l'appel a eu lieu | le `Display` de `SessionRemoteIssue` |
+
+**Pourquoi le seuil n'est plus côté client.** Avant ce vol, `handlers.rs`
+comparait `count_messages()` à `50` écrit en dur, et affichait `50` comme
+dénominateur, tandis que le serveur **lit** `compaction::COMPACTION_THRESHOLD`.
+Deux vérités sur le même seuil, dont l'une était déjà une copie figée : le jour
+où la constante bouge, le client refuse ou accepte au mauvais rang et affiche un
+dénominateur faux, en silence. Le client ne compare donc plus rien et ne connaît
+plus de seuil ; le serveur rend le fait **et** le compte. Le message de
+`compacted: false` porte le compte rendu et **aucun dénominateur** — en afficher
+un redemanderait au client de connaître le seuil qu'il vient de cesser de
+connaître. `count_messages()` reste appelé par `/status`, ce qui est pourquoi il
+ne peut pas devenir un motif de garde.
+
+**Pourquoi `compacted: true` veut dire « demandée ».** La porte déclare que le
+booléen signifie « la compaction a été **demandée et n'a pas échoué** », jamais
+« une ligne `summary` a été écrite » : les deux booléens sont des 200, et `true`
+dit que `maybe_compact` a rendu `Ok` — mais elle relit le seuil elle-même et peut
+légitimement n'avoir rien fait. Un message qui dirait « Compacted conversation »
+— ce que disait le code d'avant — affirmerait un état du système que le serveur
+s'est gardé d'attester : c'est la grounding rule du dépôt, et un test l'atteste
+par un `assert!` négatif sur « compacted » et « compactée », pas par relecture.
+
+**Pourquoi le refus « pas au repos » reste local.** On pourrait croire qu'il
+double le 409, que mika-spirit sait rendre. Tant que V1 n'est pas livré, le tour
+de la TUI tourne **dans le processus de la TUI** (`chat.rs` appelle
+`agent::run_agent`), donc il ne détient pas le verrou d'agent que
+`/api/v1/compact` tente de prendre : un `/compact` lancé pendant ce tour
+obtiendrait un **200**, et la compaction remplacerait par un résumé les messages
+que le tour local est en train de relire. De ce fait-là, le refus local est le
+**seul** juge, et il le restera jusqu'à V1. Les deux refus disent donc deux
+choses différentes et gardent deux messages distincts : le local dit « ton propre
+tour tourne », le 409 dit « un autre client tient le verrou de cet agent ». Les
+fondre enverrait l'opérateur attendre la fin de son propre tour alors qu'un autre
+client est en cause, ou l'inverse.
+
+**V2d-4 est fini.** Le démarrage (V2d-4a), `/clear` (V2d-4b), les trois sorties
+(V2d-4c) et `/compact` (V2d-4d) passent tous par mika-spirit ; les trois portes
+de `session_remote.rs` sont câblées et il n'y reste **aucune** attente
+`dead_code`, ce que `cargo clippy -p mika-cli --all-targets` mesure. `App.llm`
+est parti avec le dernier lecteur local. La suite du ticket est V3 puis V4.
+
+- **Slash commands:** `/clear`, `/compact`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
+- `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session
+- `/compact` asks mika-spirit to compact the conversation through `session_remote::compacter` (mika#1727, vol V2d-4d; see above for the body order and what each arm returns). It refuses locally — **before reading the token and before any call** — while the agent is not idle, because the TUI's own turn runs in-process and does not hold the server-side agent lock. No threshold is written client-side: the server reads `COMPACTION_THRESHOLD` and returns both the fact and the count. `compacted: true` means the compaction was **requested** and did not fail, never that a summary was written
 - `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
 - `/provider` and `/model` pre-validate via `Settings::make_llm_provider()` before updating the UI. `/provider` switch persists default `{provider}_model` when none exists, warns about stale fields and max_tokens limits, and spawns a background `get_models()` to pre-warm the model list cache. `/model` lists available models from cache/API, supports aliases and direct `provider/model` format with cross-provider switching
 - **Footer badges:** `[N tasks]` (Cyan) for pending reminders, `[N running]` (Yellow) for active background callback tasks (polled every ~5s), `[N hidden]` (DarkGray) for suppressed internal messages in inbox mode, and dashboard status indicator with clickable `[start]`/`[stop]` and `[open]` buttons

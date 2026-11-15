@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod ci_failure_handler;
 pub mod ci_success_handler;
 pub(crate) mod comment_triage;
+pub mod compact;
 pub mod dashboard;
 pub mod dashboard_dev_runs;
 pub mod deadline_verdict;
@@ -27,6 +28,7 @@ pub mod openapi;
 pub mod permissions_stream;
 pub mod ready_label_handler;
 pub mod rewind;
+pub mod sessions;
 pub mod state;
 pub mod sync_debounce;
 pub mod tasks_stream;
@@ -375,6 +377,32 @@ fn build_router(state: AppState) -> Router {
             auth::require_internal_token,
         ));
 
+    // Ouverture de session (mika#1727, vol V2d-1a) — jeton interne seul.
+    //
+    // Groupe à part plutôt qu'une ligne de plus dans `rewind_routes` : ouvrir
+    // une session n'est pas un rembobinage, et les deux surfaces n'évolueront
+    // pas ensemble.
+    //
+    // Jeton interne seul, alors que le `GET /sessions` voisin accepte aussi le
+    // jeton du tableau de bord : ouvrir une session écrit une ligne. C'est le
+    // raisonnement d'`operator_v1_routes` ci-dessous — une mutation n'est pas
+    // une lecture d'observabilité, même quand son chemin jouxte celui d'une
+    // lecture. Deux déclarations pour un même chemin ne se marchent pas dessus :
+    // `route_layer` ne s'applique qu'aux méthodes déjà posées sur le groupe.
+    // Clore tombe du même côté qu'ouvrir : poser un `ended_at` écrit une ligne.
+    // Compacter aussi, et son chemin est `/compact` et non
+    // `/sessions/{id}/compact` : la compaction porte sur l'agent, pas sur une
+    // session — `count_messages` et `replace_with_summary` sont restreints à
+    // l'agent et ignorent les sessions (mika#1727, vol V2d-2).
+    let session_routes = Router::new()
+        .route("/sessions", post(sessions::handle_create_session))
+        .route("/sessions/{id}/end", post(sessions::handle_end_session))
+        .route("/compact", post(compact::handle_compact))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
+        ));
+
     // Operator mutation routes under /api/v1 — internal token ONLY, never the
     // dashboard token. mika#2506: `iterate` spawns a pilot that writes on a
     // reviewed PR's branch; that is not an observability read, so it does not
@@ -426,6 +454,7 @@ fn build_router(state: AppState) -> Router {
             "/api/v1",
             dashboard_routes
                 .merge(rewind_routes)
+                .merge(session_routes)
                 .merge(operator_v1_routes)
                 .layer(cors),
         )
@@ -5630,6 +5659,711 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ===== Routes de session (mika#1727 V2d-1a) =====
+
+    #[tokio::test]
+    async fn mika1727_sans_jeton_la_porte_de_session_rend_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 401 et non 404 : la route existe bien, c'est la porte qui refuse.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_jeton_du_tableau_de_bord_est_refuse() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Le `GET /sessions` voisin accepte ce jeton ; le POST non : ouvrir une
+        // session écrit une ligne.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_non_singleton_recoit_une_session_neuve() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["canonical"], serde_json::Value::Bool(false));
+        let session_id = json["session_id"].as_str().unwrap().to_string();
+        assert!(!session_id.is_empty());
+
+        // La lecture en base EST le test : un identifiant rendu sans sa ligne
+        // est exactement le défaut que la route ferme.
+        let session = db
+            .get_session(&session_id)
+            .await
+            .unwrap()
+            .expect("la ligne de session doit exister en base");
+        assert_eq!(session.agent_id, "mika");
+        assert_eq!(session.channel_type, "cli");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_inconnu_rend_404_sans_ecrire() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // Un couple avant/après, et non `== 0` : ce qui est mesuré est qu'un
+        // 404 n'écrit rien, pas que la base était vide au départ.
+        let avant = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"agent-inexistant-1727"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["error"].as_str().unwrap().is_empty());
+
+        let apres = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(avant, apres);
+    }
+
+    /// Un état dont l'agent `mika` est singleton (mika#1401). Même geste que
+    /// `mika2671_b2_state` : la `DashMap` détient seule l'`Arc`, donc
+    /// `Arc::get_mut` réussit tant qu'aucun clone n'en est sorti.
+    fn mika1727_state_singleton(canonical: &str) -> AppState {
+        let state = test_state();
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .canonical_session_id = Some(canonical.to_string());
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_singleton_recoit_toujours_sa_session_canonique() {
+        let state = mika1727_state_singleton("canonical-mika-1727");
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        async fn ouvrir(app: &Router) -> serde_json::Value {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/sessions")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer test-token-secret")
+                        .body(Body::from(r#"{"agent":"mika"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        // Un couple avant/après, comme pour le 404 : la base du harnais porte
+        // déjà des sessions pour `mika`, donc ce qui se mesure est le nombre de
+        // lignes que les deux appels créent, pas le total.
+        let avant = db
+            .count_sessions(Some("mika".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let premier = ouvrir(&app).await;
+        let second = ouvrir(&app).await;
+
+        assert_eq!(premier["canonical"], serde_json::Value::Bool(true));
+        assert_eq!(second["canonical"], serde_json::Value::Bool(true));
+        assert_eq!(premier["session_id"], second["session_id"]);
+
+        // Une seule ligne née des deux appels : le second n'a rien fabriqué de
+        // plus, parce qu'une session canonique ne se remplace pas.
+        let apres = db
+            .count_sessions(Some("mika".to_string()), None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(apres, avant + 1);
+    }
+
+    // ===== Clôture de session (mika#1727 V2d-1b) =====
+
+    #[tokio::test]
+    async fn mika1727_sans_jeton_la_cloture_de_session_rend_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-401/end")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 401 et non 404 : la route existe bien, c'est la porte qui refuse.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_jeton_du_tableau_de_bord_est_refuse_a_la_cloture() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Le `GET /sessions/{id}` voisin accepte ce jeton ; la clôture non :
+        // poser un `ended_at` écrit une ligne.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-dash/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_session_de_lagent_se_clot() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        db.create_session("sess-1727-a", "mika", "cli")
+            .await
+            .unwrap();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-a/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ended"], serde_json::Value::Bool(true));
+        assert_eq!(json["canonical"], serde_json::Value::Bool(false));
+
+        // La lecture de la ligne EST le test : un 200 qui n'aurait rien écrit
+        // laisserait la TUI croire la session close alors qu'elle reste ouverte.
+        let session = db
+            .get_session("sess-1727-a")
+            .await
+            .unwrap()
+            .expect("la ligne de session doit exister en base");
+        assert!(session.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_session_inconnue_rend_404() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // Un couple avant/après, et non `== 0` : la base du harnais porte déjà
+        // des sessions, donc une assertion à zéro mesurerait la vacuité du banc
+        // plutôt que l'absence d'écriture.
+        let avant = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-jamais-ecrite/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["error"].as_str().unwrap().is_empty());
+
+        let apres = db
+            .count_sessions(None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(avant, apres);
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_session_dun_autre_agent_rend_404_et_reste_ouverte() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        // `create_session` prend l'`agent_id` en paramètre : une session d'un
+        // autre agent s'écrit depuis la poignée de `mika`, sans provisionner un
+        // second agent — ce qui est exactement la raison d'être du contrôle
+        // d'appartenance, la base étant unique par conteneur. La ligne `agents`
+        // est due à la clé étrangère de `sessions.agent_id` ; elle n'entre pas
+        // dans l'`AppState`, donc cet agent reste inconnu de `resolve_agent` —
+        // ce qui est exactement le banc voulu.
+        db.register_agent("autre-agent-1727", "Autre 1727", "")
+            .await
+            .unwrap();
+        db.create_session("sess-1727-b", "autre-agent-1727", "cli")
+            .await
+            .unwrap();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions/sess-1727-b/end")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Le couple des deux assertions EST la propriété : le 404 seul
+        // laisserait passer une clôture silencieuse, et l'`ended_at` seul
+        // laisserait passer un 403 bavard qui dirait à l'appelant que la session
+        // existe chez quelqu'un d'autre.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let session = db
+            .get_session("sess-1727-b")
+            .await
+            .unwrap()
+            .expect("la session de l'autre agent doit rester en base");
+        assert!(session.ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn mika1727_la_session_canonique_ne_se_clot_jamais() {
+        let state = mika1727_state_singleton("canonical-mika-1727");
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+        let app = test_app(state);
+
+        // La session naît **par la route de V2d-1a** plutôt que par
+        // `get_or_create_canonical_session` : c'est le chemin que le client
+        // suivra en V2d-4, et le faire ainsi atteste au passage que les deux
+        // routes du vol V2d parlent du même identifiant.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/sessions")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let canonical_id = json["session_id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/sessions/{canonical_id}/end"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 200 et non une erreur : le client lit `ended: false` comme un fait sur
+        // la nature de la session, pas comme un refus.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ended"], serde_json::Value::Bool(false));
+        assert_eq!(json["canonical"], serde_json::Value::Bool(true));
+
+        let session = db
+            .get_session(&canonical_id)
+            .await
+            .unwrap()
+            .expect("la session canonique doit exister en base");
+        assert!(session.ended_at.is_none(), "mika#1401 : elle reste ouverte");
+    }
+
+    // ===== Compaction (mika#1727 V2d-2) =====
+
+    use mika_common::llm::mock::{MockLlmProvider, text_response};
+
+    /// Un `AppState` dont l'agent `mika` fait tourner le mock fourni. Le mock est
+    /// posé sur l'`AgentState` et non sur `AppState.llm` : la route lit
+    /// `agent_state.llm`, et c'est exactement la distinction que ce vol existe
+    /// pour tenir — un mock posé à côté laisserait passer le défaut corrigé.
+    fn mika1727_state_compact(mock: Arc<MockLlmProvider>) -> AppState {
+        let state = test_state();
+        {
+            let mut entry = state.agents.get_mut("mika").unwrap();
+            Arc::get_mut(entry.value_mut())
+                .expect("AgentState détenu par la seule table")
+                .llm = mock;
+        }
+        state
+    }
+
+    /// `n` messages pour l'agent. La session est créée d'abord : `messages`
+    /// porte `session_id TEXT NOT NULL REFERENCES sessions(id)`, et sans elle
+    /// l'insertion rend `FOREIGN KEY constraint failed` (787). Ce que la route
+    /// compte reste pourtant l'agent et non la session — `count_messages` est
+    /// restreint à `agent_id` et ne joint aucune table de session.
+    async fn mika1727_seed_messages(db: &AsyncDatabase, n: usize) {
+        db.create_session("sess-compact-1727", db.agent_id(), "cli")
+            .await
+            .unwrap();
+        for i in 0..n {
+            db.save_message("sess-compact-1727", "user", &format!("message {i}"), None)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mika1727_sans_jeton_la_compaction_rend_401() {
+        let state = test_state();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 401 et non 404 : la route existe bien, c'est la porte qui refuse.
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_le_jeton_du_tableau_de_bord_est_refuse_a_la_compaction() {
+        let state = test_state_with_dashboard_token();
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        // Compacter remplace des lignes de messages par une ligne de résumé :
+        // c'est une mutation, et le jeton d'observabilité n'y donne pas droit.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer dashboard-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_inconnu_rend_404_sans_appeler_le_llm() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("résumé")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"agent-inexistant-1727"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(!json["error"].as_str().unwrap().is_empty());
+
+        // Le mock est celui de `mika`, pas celui de l'agent demandé — qui n'a pas
+        // d'existence. Ce qu'il mesure est qu'un 404 se décide avant tout appel.
+        assert_eq!(mock.calls_made(), 0);
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_agent_occupe_rend_409_sans_appeler_le_llm() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("résumé")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+
+        // L'`Arc` du verrou est cloné **avant** que `test_app` consomme l'état.
+        let agent_lock = state.agents.get("mika").unwrap().agent_lock.clone();
+        let app = test_app(state);
+
+        // Variable nommée : un `let _ =` relâcherait le verrou sur place et le
+        // test passerait en mesurant le contraire de ce qu'il annonce.
+        let _occupe = agent_lock
+            .try_lock_owned()
+            .expect("le verrou est libre au départ");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(mock.calls_made(), 0);
+    }
+
+    #[tokio::test]
+    async fn mika1727_sous_le_seuil_la_route_ne_compacte_pas() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response("résumé")])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        // Le rang **exact** du seuil, parce que la comparaison est un `<=` : la
+        // route et `compaction.rs` doivent répondre pareil sur ce rang-là, et
+        // c'est le seul que ni l'un ni l'autre ne traite comme un intérieur.
+        let seuil = crate::compaction::COMPACTION_THRESHOLD;
+        mika1727_seed_messages(&db, seuil).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["compacted"], serde_json::Value::Bool(false));
+        assert_eq!(json["messages"], serde_json::json!(avant));
+
+        assert_eq!(mock.calls_made(), 0, "aucun appel au LLM sous le seuil");
+
+        // Un couple avant/après, et non un `== 50` : ce qui est mesuré est que
+        // la route n'a rien touché, pas que la base contenait un nombre connu.
+        assert_eq!(db.count_messages().await.unwrap(), avant);
+    }
+
+    #[tokio::test]
+    async fn mika1727_au_dela_du_seuil_la_route_compacte_avec_le_llm_de_lagent() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .responses(vec![text_response(
+                    "Fact: la conversation a été condensée.",
+                )])
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        mika1727_seed_messages(&db, crate::compaction::COMPACTION_THRESHOLD + 1).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["compacted"], serde_json::Value::Bool(true));
+        assert_eq!(json["messages"], serde_json::json!(avant));
+
+        // Le compte **d'avant** dans l'issue, et le mock de l'`AgentState` appelé
+        // une fois : c'est tout l'objet du vol. Un appel par le LLM de la TUI
+        // laisserait ce compteur à zéro tout en condensant quand même.
+        assert_eq!(mock.calls_made(), 1, "le LLM de l'agent, une fois");
+
+        let resume = db.load_conversation_summary().await.unwrap();
+        assert!(resume.is_some(), "une ligne summary existe en base");
+        assert!(
+            db.count_messages().await.unwrap() < avant,
+            "le compte a baissé"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_une_erreur_du_llm_rend_500_sans_toucher_au_compte() {
+        let mock = Arc::new(
+            MockLlmProvider::builder()
+                .error(mika_common::llm::LlmError::ProviderError(
+                    "fournisseur à bout".to_string(),
+                ))
+                .build(),
+        );
+        let state = mika1727_state_compact(mock.clone());
+        state.ready.store(true, Ordering::Release);
+        let db = state.agents.get("mika").unwrap().db.clone();
+
+        mika1727_seed_messages(&db, crate::compaction::COMPACTION_THRESHOLD + 1).await;
+        let avant = db.count_messages().await.unwrap();
+
+        let app = test_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/compact")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::from(r#"{"agent":"mika"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Rien n'a été écrit, et ce n'est pas une garde de la route : l'appel au
+        // LLM arrive **avant** `replace_with_summary` dans `maybe_compact`, donc
+        // l'échec laisse l'historique entier. Le test l'atteste plutôt que de le
+        // supposer — si cet ordre changeait, un 500 pourrait perdre des messages.
+        assert_eq!(db.count_messages().await.unwrap(), avant);
     }
 
     // ---- mika#2671 phase B2 — tête périmée au tour de revue ----------------
