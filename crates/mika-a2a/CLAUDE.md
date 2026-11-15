@@ -101,6 +101,14 @@ A2A tasks use `trigger_type='a2a'` in the `tasks` table with orthogonal persiste
 - `a2a_artifacts` stores A2A-specific artifact data
 - `a2a_push_notification_configs` stores push notification configurations
 
+## Request metadata keys (`mika.*`)
+
+`MessageSendParams.metadata` carries the `mika.*` family. Each spelling is the wire contract between `mika-cli` and `mika-agent`, which share no dependency edge of their own, so every constant lives in `src/params.rs` and neither side can rename one alone. The five request keys: `mika.caller_session_id` (mika#2070), `mika.only_skills` (mika#2363), `mika.model_override` (mika#2304), `mika.session_isolated` (mika#1951), `mika.callback_turn` (mika#1727). Response keys are `mika.effective_model`, `mika.session_isolated_applied`, `mika.run_usage` and `mika.turn_failure_class`. Each constant's doc-comment carries its semantics and — the part that is never guessable — whether its reader is fail-soft or fail-closed, and why.
+
+**`mika.callback_turn` (mika#1727).** A bool, and only a bool: `true` ⇒ the turn runs as a callback turn. Never the task id, the result text or the trigger name, because `/a2a/{agent}` is reachable by any authenticated caller and a payload-bearing key would let one **fabricate a callback framing** — a plausible "job X returned Y" the agent cannot check, on the one turn whose guard is armed precisely because its content is supposed to come from the agent's own background work. Absent, `null` or `false` ⇒ the turn is the one before the key existed, bit for bit; a value that is present but not a boolean **fails the request** and is never read as `false`.
+
+**Nothing posts this key today.** The A2A gate reads it as of V3a-1 (see `crates/mika-agent/CLAUDE.md`); V3a-2 is what makes the TUI post it. A reader looking for the caller will not find one — that is the current state, not a missing wire.
+
 ## Server Integration
 
 - **mika-spirit** exposes `/a2a/{agent_name}` (JSON-RPC POST, 2MB limit) and `/a2a/{agent_name}/agent.json` (Agent Card GET), both internal-token auth. See `crates/mika-agent/CLAUDE.md` for server endpoint details.
