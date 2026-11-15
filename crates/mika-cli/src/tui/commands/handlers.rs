@@ -259,20 +259,88 @@ async fn clear_par_spirit(app: &mut App<'_>, base_url: &str, lire_env: SourceEnv
     }
 }
 
-async fn handle_compact(app: &mut App<'_>) -> String {
+async fn handle_compact(app: &App<'_>) -> String {
+    // L'enveloppe de `handle_clear`, pour sa raison : le `.env` et l'URL de base
+    // sont chargés ici, et la fonction déléguée les reçoit en argument — un
+    // chargement caché derrière ce paramètre ferait mentir sa signature.
+    if let Ok(home) = mika_common::home::resolve_home_dir() {
+        mika_common::dotenv::load_dotenv(&home);
+    }
+    let base_url = crate::commands::dashboard::spirit_url();
+    compact_par_spirit(app, &base_url, &|nom| std::env::var(nom).ok()).await
+}
+
+/// `/compact` tel que mika-spirit l'applique : la conversation est recomposée par
+/// la porte `compacter` (mika#1727, vol V2d-4d). Plus rien ne compacte dans le
+/// processus de la TUI, ce que la garde structurelle de ce fichier tient.
+///
+/// **`&App` et non `&mut App`**, à la différence de [`clear_par_spirit`] : cette
+/// commande ne modifie aucun champ. La conversation est réécrite côté serveur, et
+/// la TUI la relira au prochain poll comme n'importe quelle autre écriture de la
+/// base. Un `&mut` que le corps n'utilise pas annoncerait une mutation dans la
+/// signature et laisserait un appelant futur en glisser une sans que la revue la
+/// voie.
+///
+/// **Aucun seuil n'est écrit ici.** Le serveur lit `COMPACTION_THRESHOLD`
+/// (`server/compact.rs:93`) et rend le fait **et** le compte ; le client qui en
+/// gardait une copie figée (le `50` écrit deux fois avant ce vol) refusait ou
+/// acceptait au mauvais rang dès que la constante bougeait, et affichait un
+/// dénominateur faux, en silence. Le message de `compacted: false` porte donc le
+/// compte rendu et **aucun dénominateur** : en afficher un redemanderait au
+/// client de connaître le seuil qu'il vient de cesser de connaître.
+async fn compact_par_spirit(app: &App<'_>, base_url: &str, lire_env: SourceEnv<'_>) -> String {
+    use crate::commands::session_remote;
+
+    // Le refus **local**, et il n'est pas un doublon du 409 du serveur. Tant que
+    // V1 n'est pas livré, le tour de la TUI tourne dans le processus de la TUI
+    // (`chat.rs:341` et `chat.rs:468` appellent `agent::run_agent`), donc il ne
+    // détient **pas** le verrou d'agent que `/api/v1/compact` tente de prendre :
+    // un `/compact` lancé pendant ce tour obtiendrait un 200, et la compaction
+    // remplacerait par un résumé les messages que le tour local est en train de
+    // relire. De ce fait-là, ce refus est le seul juge, et il le restera jusqu'à
+    // V1.
     if app.status != AgentStatus::Idle {
         return "Cannot compact while agent is busy.".to_string();
     }
-    let count = match app.db.count_messages().await {
-        Ok(c) => c,
-        Err(e) => return format!("Failed to check message count: {e}"),
+
+    // Le jeton, **avant tout appel**, pour la raison de `clear_par_spirit` : un
+    // refus qui attendrait l'appel nommerait le transport là où la cause est la
+    // configuration du shell. La lecture reste unique dans le crate.
+    let jeton = match jeton_interne(lire_env) {
+        Ok(jeton) => jeton,
+        Err(refus) => return refus,
     };
-    if count <= 50 {
-        return format!("Nothing to compact ({count}/50 messages).");
-    }
-    match mika_agent::compaction::maybe_compact(&app.db, app.llm.as_ref()).await {
-        Ok(()) => format!("Compacted conversation ({count} messages)."),
-        Err(e) => format!("Compaction failed: {e}"),
+
+    match session_remote::compacter(base_url, &jeton, &app.agent_name).await {
+        // Les deux booléens sont des 200, et `messages` est le compte **d'avant**
+        // dans les deux cas.
+        Ok(miroir) if !miroir.compacted => {
+            format!("Nothing to compact ({} messages).", miroir.messages)
+        }
+        // « demandée », jamais « faite » : la porte déclare que `compacted` veut
+        // dire « la compaction a été demandée et n'a pas échoué », et le serveur
+        // ne dit nulle part qu'une ligne `summary` a été écrite — `maybe_compact`
+        // relit le seuil elle-même et peut légitimement n'avoir rien fait.
+        // Affirmer « Compacted conversation », ce que disait le code d'avant,
+        // attesterait un état du système que rien n'a confirmé.
+        Ok(miroir) => format!(
+            "Compaction requested ({} messages before). mika-spirit does not report \
+             whether a summary was written.",
+            miroir.messages
+        ),
+        // Le `Display` de `Busy` dit la cause (« another turn holds its lock ») et
+        // non le remède. Devant une TUI c'est le remède qui décide de la seconde
+        // qui suit, et dire que l'occupant n'est pas son propre tour évite
+        // d'envoyer l'opérateur attendre la fin d'un tour qui n'existe pas — le
+        // refus local ci-dessus aurait déjà intercepté ce cas-là.
+        Err(session_remote::SessionRemoteIssue::Busy) => {
+            "mika-spirit is busy with this agent — another client holds its turn lock. \
+             Try /compact again when it is idle."
+                .to_string()
+        }
+        // Tout le reste porte le `Display` de la porte, déjà écrit pour nommer sa
+        // cause sans en inventer une (motif mika#2331).
+        Err(probleme) => format!("Compaction failed: {probleme}"),
     }
 }
 
@@ -1469,39 +1537,8 @@ mod tests {
     use mika_agent::async_db::AsyncDatabase;
     use mika_agent::db::Database;
     use mika_agent::skills::SkillRegistry;
-    use mika_common::llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, ProviderKind};
+    use mika_common::llm::ProviderKind;
     use tokio::sync::mpsc;
-
-    /// Minimal no-op LLM provider for TUI handler tests.
-    /// We never call send_message in handler tests — this just satisfies the type.
-    struct NoopLlmProvider;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for NoopLlmProvider {
-        async fn send_message(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            Err(LlmError::ProviderError("noop provider".to_string()))
-        }
-
-        fn model_name(&self) -> &str {
-            "noop"
-        }
-
-        fn provider_name(&self) -> &str {
-            "noop"
-        }
-
-        fn max_tokens(&self) -> u32 {
-            4096
-        }
-
-        fn supports_tool_calling(&self) -> bool {
-            false
-        }
-
-        async fn check_health(&self) -> Result<(), LlmError> {
-            Ok(())
-        }
-    }
 
     /// Test helper: construct a minimal App with captured agent_tx receiver.
     /// Returns (App, agent_rx, temp_dir) — temp_dir must be kept alive for the test duration.
@@ -1527,7 +1564,6 @@ mod tests {
         let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         let (_response_tx, response_rx) = mpsc::unbounded_channel();
 
-        let llm: Arc<dyn LlmProvider> = Arc::new(NoopLlmProvider);
         let skills = Arc::new(SkillRegistry::empty());
 
         let app = App::new(
@@ -1537,7 +1573,6 @@ mod tests {
             "claude-sonnet-4-6".to_string(),
             "Mika".to_string(),
             async_db,
-            llm,
             home_dir,
             skills,
             "mika".to_string(),
@@ -3010,18 +3045,25 @@ mod tests {
     }
 
     /// T-E — la garde structurelle : la TUI ne touche plus la table `sessions`
-    /// en local.
+    /// en local, et depuis V2d-4d elle ne compacte plus la conversation en
+    /// local.
     ///
     /// Elle n'est **pas fondue** avec celle de V2c-1b. Les deux refusent des
     /// gestes différents pour des raisons différentes, et une garde fondue
     /// rougirait sous un seul message : celui qui la lirait au prochain vol ne
     /// saurait plus laquelle des deux portes lui est demandée.
     ///
-    /// `maybe_compact(` n'est pas un motif de ce vol : il appartient à V2d-4c,
-    /// avec la porte `compacter` et sa propre garde. Une garde qui refuserait
-    /// aujourd'hui un geste que rien ne remplace encore ne laisserait d'autre
+    /// `maybe_compact(` est devenu un motif à V2d-4d, et pas avant : la porte
+    /// `compacter` existait depuis V2d-3b mais rien ne l'atteignait, et une
+    /// garde qui refuse un geste que rien ne remplace encore ne laisse d'autre
     /// issue qu'une entrée d'allowlist — exactement ce qu'elle existe pour
-    /// éviter.
+    /// éviter. Le motif arrive donc dans le commit qui câble
+    /// `compact_par_spirit`, et son rouge-avant nommait la seule ligne de
+    /// production qui appelait `maybe_compact`.
+    ///
+    /// Le nom de la garde reste `mika1727_v2d4b_…` : c'est une garde **par
+    /// fichier**, pas par vol, et la renommer casserait la trace des trois vols
+    /// qui la citent pour un gain nul.
     #[test]
     fn mika1727_v2d4b_la_tui_ne_clot_plus_la_base_en_local() {
         // Livrée vide, et vide par construction : quand la garde rougit, le
@@ -3031,6 +3073,7 @@ mod tests {
         const MOTIFS: &[(&str, &str)] = &[
             ("create_session(", "session_remote::ouvrir"),
             ("end_session(", "session_remote::clore"),
+            ("maybe_compact(", "session_remote::compacter"),
         ];
 
         let scanner =
@@ -3062,13 +3105,218 @@ mod tests {
                 .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
                 .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
                 .collect();
+            // Le message dit « ce que mika-spirit décide » et non « la table
+            // `sessions` » : depuis V2d-4d les trois motifs ne visent plus la
+            // même table, et un rouge qui nommerait `sessions` sur
+            // `maybe_compact(` enverrait son lecteur chercher la panne au
+            // mauvais endroit.
             assert!(
                 violations.is_empty(),
-                "mika#1727 V2d-4b — `{motif}` touche la table `sessions` dans le \
-                 processus de la TUI. Le remède est de passer par `{porte}`, jamais \
-                 une entrée d'allowlist :\n{}",
+                "mika#1727 V2d-4b/V2d-4d — `{motif}` fait dans le processus de la TUI \
+                 ce que mika-spirit décide. Le remède est de passer par `{porte}`, \
+                 jamais une entrée d'allowlist :\n{}",
                 violations.join("\n")
             );
         }
+    }
+
+    // --- `/compact` par mika-spirit (mika#1727, vol V2d-4d) ---
+
+    /// La route telle que le banc doit la voir : `fake_spirit` associe par le
+    /// chemin **brut**, et son `fallback` à 501 n'est traduit par aucun bras de
+    /// `post`.
+    const ROUTE_COMPACT: &str = "/api/v1/compact";
+
+    /// Monte le banc sur `reponses` et fait passer un `/compact` dessus — le
+    /// modèle de `par_le_banc` (l. 1635), pour `compact_par_spirit`. `app` est
+    /// pris par référence partagée : c'est ce que la fonction mesurée demande.
+    async fn par_le_banc_compact(
+        app: &App<'_>,
+        reponses: &[(&str, axum::http::StatusCode, String)],
+        lire_env: SourceEnv<'_>,
+    ) -> (String, Arc<Mutex<Vec<RequeteRecue>>>) {
+        let empruntes = reponses
+            .iter()
+            .map(|(chemin, statut, corps)| (*chemin, *statut, corps.as_str()))
+            .collect::<Vec<_>>();
+        let (base, vues) = fake_spirit(&empruntes).await;
+        let sortie = compact_par_spirit(app, &base, lire_env).await;
+        (sortie, vues)
+    }
+
+    /// Le banc armé sur la seule route de compaction, en 200.
+    fn compaction_servie(corps: &str) -> [(&'static str, axum::http::StatusCode, String); 1] {
+        [(ROUTE_COMPACT, axum::http::StatusCode::OK, corps.to_string())]
+    }
+
+    /// Les deux comptes sont choisis pour ne pouvoir venir d'aucun comptage
+    /// local : la base de `test_app()` ne porte ni sept ni soixante-quatre
+    /// messages, donc un comptage résiduel côté client rendrait un autre nombre.
+    const RIEN_A_COMPACTER: &str = r#"{"compacted":false,"messages":7}"#;
+    const COMPACTION_DEMANDEE: &str = r#"{"compacted":true,"messages":64}"#;
+
+    /// T-A — critère 1 : un agent qui n'est pas au repos refuse **sans aucun
+    /// appel**. Le banc est monté *et* le jeton posé : sans les deux, « aucun
+    /// appel » ne se distinguerait ni de « aucun serveur » ni de « aucun
+    /// jeton ».
+    #[tokio::test]
+    async fn mika1727_v2d4d_un_agent_occupe_refuse_sans_aucun_appel() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Thinking;
+
+        let (sortie, vues) =
+            par_le_banc_compact(&app, &compaction_servie(COMPACTION_DEMANDEE), &avec_jeton).await;
+
+        assert!(
+            sortie.contains("busy"),
+            "le refus local dit l'occupation : {sortie}"
+        );
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    /// T-B — critère 1 : sans jeton, le refus tombe **avant tout appel** et
+    /// nomme la variable à poser.
+    ///
+    /// Le contrôle positif est obligatoire : sans lui, un refus tombé pour
+    /// toute autre raison — un agent qui ne serait pas au repos, un banc muet —
+    /// rendrait ce test vert en mesurant autre chose que l'absence de jeton.
+    #[tokio::test]
+    async fn mika1727_v2d4d_sans_jeton_compact_refuse_avant_tout_appel_en_nommant_la_variable() {
+        let (app, _rx, _tmp) = test_app().await;
+        let reponses = compaction_servie(COMPACTION_DEMANDEE);
+
+        let (sortie, vues) = par_le_banc_compact(&app, &reponses, &|_| None).await;
+        assert!(sortie.contains("MIKA_INTERNAL_TOKEN"), "{sortie}");
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+
+        // Contrôle positif : le même montage, le jeton posé, atteint la socket.
+        let (_, vues) = par_le_banc_compact(&app, &reponses, &avec_jeton).await;
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            1,
+            "le même montage avec jeton doit atteindre la socket"
+        );
+    }
+
+    /// T-C — critère 2 : la route, la méthode, le jeton et l'agent, lus sur la
+    /// socket.
+    #[tokio::test]
+    async fn mika1727_v2d4d_compact_poste_sur_la_route_de_compaction_avec_son_jeton_et_son_agent() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let (_, vues) =
+            par_le_banc_compact(&app, &compaction_servie(COMPACTION_DEMANDEE), &avec_jeton).await;
+
+        let vues = vues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel, et sur la seule route");
+        assert_eq!(vues[0].chemin, ROUTE_COMPACT);
+        assert_eq!(vues[0].methode, "POST");
+        assert_eq!(
+            vues[0].autorisation.as_deref(),
+            Some("Bearer jeton-interne")
+        );
+        // Le corps est **désérialisé** plutôt que cherché par sous-chaîne : le
+        // serveur lit un champ, pas un ordre de clés, et un `contains` serait
+        // vert sur un `agent` enfoui dans une autre valeur.
+        let corps: serde_json::Value =
+            serde_json::from_str(&vues[0].corps).expect("le corps posté est du JSON");
+        assert_eq!(corps["agent"], serde_json::json!(app.agent_name));
+    }
+
+    /// T-D — critères 2 et 3 : « rien à compacter » porte le compte **rendu** et
+    /// aucun seuil.
+    #[tokio::test]
+    async fn mika1727_v2d4d_rien_a_compacter_porte_le_compte_rendu_et_aucun_seuil() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let (sortie, _) =
+            par_le_banc_compact(&app, &compaction_servie(RIEN_A_COMPACTER), &avec_jeton).await;
+
+        assert!(sortie.contains("Nothing to compact"), "{sortie}");
+        assert!(sortie.contains('7'), "le compte servi est rendu : {sortie}");
+        // La moitié exécutable du critère 3 : plus aucun dénominateur, donc plus
+        // aucun seuil reconnu côté client.
+        assert!(
+            !sortie.contains("50"),
+            "aucun seuil n'est écrit côté client : {sortie}"
+        );
+    }
+
+    /// T-E — critère 2 : la compaction est dite **demandée**, jamais affirmée
+    /// faite. La grounding rule attestée par assertion, et non par relecture :
+    /// une rédaction future qui reviendrait au passé rougira ici.
+    #[tokio::test]
+    async fn mika1727_v2d4d_une_compaction_est_demandee_jamais_affirmee_faite() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let (sortie, _) =
+            par_le_banc_compact(&app, &compaction_servie(COMPACTION_DEMANDEE), &avec_jeton).await;
+
+        assert!(sortie.contains("requested"), "{sortie}");
+        assert!(
+            sortie.contains("64"),
+            "le compte d'avant est rendu : {sortie}"
+        );
+        let minuscule = sortie.to_lowercase();
+        assert!(!minuscule.contains("compacted"), "{sortie}");
+        assert!(!minuscule.contains("compactée"), "{sortie}");
+    }
+
+    /// T-F — critère 2 : le 409 dit l'occupation **et** le nouvel essai. Le
+    /// `Display` de `Busy` dit la cause ; devant une TUI, c'est le remède qui
+    /// décide de la seconde qui suit.
+    #[tokio::test]
+    async fn mika1727_v2d4d_un_409_dit_loccupation_et_le_nouvel_essai() {
+        let (app, _rx, _tmp) = test_app().await;
+        let reponses = [(
+            ROUTE_COMPACT,
+            axum::http::StatusCode::CONFLICT,
+            String::new(),
+        )];
+
+        let (sortie, vues) = par_le_banc_compact(&app, &reponses, &avec_jeton).await;
+
+        assert!(sortie.contains("busy"), "{sortie}");
+        assert!(
+            sortie.contains("again"),
+            "le remède est dit, pas seulement la cause : {sortie}"
+        );
+        // La socket a bien été touchée : sans cette assertion, un refus local
+        // rendrait ce test vert sans qu'aucun 409 soit jamais reçu.
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            1,
+            "le 409 vient du serveur"
+        );
+    }
+
+    /// T-G — critère 2 : toute autre erreur porte le `Display` du problème.
+    ///
+    /// Un 500 du banc plutôt qu'un point injoignable : c'est le montage déjà
+    /// employé l. 3047-3068, aucun critère n'exige ici un `DeadEndpoint`, et il
+    /// ne coûte aucun import.
+    #[tokio::test]
+    async fn mika1727_v2d4d_une_autre_erreur_porte_le_display_du_probleme() {
+        let (app, _rx, _tmp) = test_app().await;
+        let reponses = [(
+            ROUTE_COMPACT,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "disk full".to_string(),
+        )];
+
+        let (sortie, _) = par_le_banc_compact(&app, &reponses, &avec_jeton).await;
+
+        assert!(sortie.contains("Compaction failed"), "{sortie}");
+        // La cause vient du `Display` de `SessionRemoteIssue`, et non d'une
+        // paraphrase écrite ici.
+        assert!(sortie.contains("500"), "{sortie}");
     }
 }

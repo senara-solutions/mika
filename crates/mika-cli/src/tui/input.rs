@@ -1118,40 +1118,10 @@ mod tests {
     use mika_agent::async_db::AsyncDatabase;
     use mika_agent::db::Database;
     use mika_agent::skills::SkillRegistry;
-    use mika_common::llm::{LlmError, LlmProvider, LlmRequest, LlmResponse, ProviderKind};
+    use mika_common::llm::ProviderKind;
     use tokio::sync::mpsc;
 
     use crate::tui::app::AgentRequest;
-
-    /// Minimal no-op LLM provider for input handler tests.
-    struct NoopLlmProvider;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for NoopLlmProvider {
-        async fn send_message(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-            Err(LlmError::ProviderError("noop provider".to_string()))
-        }
-
-        fn model_name(&self) -> &str {
-            "noop"
-        }
-
-        fn provider_name(&self) -> &str {
-            "noop"
-        }
-
-        fn max_tokens(&self) -> u32 {
-            4096
-        }
-
-        fn supports_tool_calling(&self) -> bool {
-            false
-        }
-
-        async fn check_health(&self) -> Result<(), LlmError> {
-            Ok(())
-        }
-    }
 
     /// Test helper: construct a minimal App for input handler tests.
     async fn test_app() -> (
@@ -1175,7 +1145,6 @@ mod tests {
         let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         let (_response_tx, response_rx) = mpsc::unbounded_channel();
 
-        let llm: Arc<dyn LlmProvider> = Arc::new(NoopLlmProvider);
         let skills = Arc::new(SkillRegistry::empty());
 
         let app = App::new(
@@ -1185,7 +1154,6 @@ mod tests {
             "claude-sonnet-4-6".to_string(),
             "Mika".to_string(),
             async_db,
-            llm,
             home_dir,
             skills,
             "mika".to_string(),
