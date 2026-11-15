@@ -146,6 +146,55 @@ pub const SESSION_ISOLATED_KEY: &str = "mika.session_isolated";
 /// every path outside synchronous `message/send` all land there.
 pub const SESSION_ISOLATED_APPLIED_KEY: &str = "mika.session_isolated_applied";
 
+/// Request-metadata key declaring that this turn **is a callback turn**
+/// (mika#1727, vol V3a-1).
+///
+/// Fifth request key of the family. `true` ⇒ the agent loop runs the turn with
+/// `AgentParams.is_callback_turn` set, which has four effects and no others:
+///
+/// - it **arms guard #716** on unverified state claims — a callback turn reports
+///   what a background job did, so a claim it cannot ground is the failure mode
+///   that guard exists for;
+/// - it counts the turn as an **automatic trigger** for the `send_message`
+///   frontier, like a message opening with `[callback:`;
+/// - it **skips recording the user message**, because the caller has already
+///   recorded the raw result as a `tool_result` — recording it again would put
+///   the same text in the conversation twice;
+/// - it **skips the webhook dispatch context**, which belongs to a turn a
+///   webhook started, not to one a callback resumed.
+///
+/// Absent, `null` or `false` ⇒ the turn is the one before this key existed, bit
+/// for bit.
+///
+/// # A bool, never the callback payload — and that is a safety constraint
+///
+/// `/a2a/{agent}` is reachable by any authenticated caller. A key carrying a
+/// task id, a result text or a trigger name would let a caller **fabricate a
+/// callback framing** — hand the agent a plausible "job X returned Y" it has no
+/// way to check, on a turn whose guard is armed precisely because its content is
+/// supposed to come from the agent's own background work. A bool says *this turn
+/// is a callback turn*, nothing more; the framing stays built by the caller from
+/// state the caller already holds. Same construction as
+/// [`SESSION_ISOLATED_KEY`]: what must not be expressible is made inexpressible,
+/// not refused by a predicate a later editor could relax.
+///
+/// # Reading is fail-soft on absence, fail-closed on a malformed value
+///
+/// Absent and `null` mean "ordinary turn", so a caller that predates this key
+/// produces the turn it always did. But a key *present with a non-boolean value*
+/// **fails the request**; it is never read as `false`. A string `"true"` — the
+/// shape a hand-written client is most likely to send — read as `false` would
+/// record the raw callback result **a second time** and **disarm guard #716** on
+/// the one turn whose claims are least verifiable. Neither failure is visible in
+/// the answer the caller gets back: it is the asymmetry
+/// [`MODEL_OVERRIDE_KEY`] and [`SESSION_ISOLATED_KEY`] already carry, for the
+/// same reason — a silent no-op here *is* the defect.
+///
+/// **Nothing sets this key yet.** The A2A gate reads it as of this flight; V3a-2
+/// is what makes the TUI's `CallbackResult` arm travel over the wire instead of
+/// running the loop in its own process.
+pub const CALLBACK_TURN_KEY: &str = "mika.callback_turn";
+
 /// Response-metadata key carrying the token usage of the **whole turn**
 /// (mika#1883).
 ///
@@ -410,6 +459,14 @@ mod tests {
     }
 
     #[test]
+    fn callback_turn_key_is_the_wire_spelling() {
+        // mika#1727. Fifth request key of the family, same contract: the CLI will
+        // write it (V3a-2) and the agent reads it, with no dependency edge
+        // between them for a rename to travel along.
+        assert_eq!(CALLBACK_TURN_KEY, "mika.callback_turn");
+    }
+
+    #[test]
     fn run_usage_key_is_the_wire_spelling() {
         // mika#1883. Third response key of the family, same contract: the CLI
         // reads it and the agent writes it, with no dependency edge between
@@ -440,6 +497,7 @@ mod tests {
             EFFECTIVE_MODEL_KEY,
             SESSION_ISOLATED_KEY,
             SESSION_ISOLATED_APPLIED_KEY,
+            CALLBACK_TURN_KEY,
             RUN_USAGE_KEY,
             TURN_FAILURE_CLASS_KEY,
         ];
