@@ -3152,4 +3152,204 @@ mod tests {
             );
         }
     }
+
+    // --- `/compact` par mika-spirit (mika#1727, vol V2d-4d) ---
+
+    /// La route telle que le banc doit la voir : `fake_spirit` associe par le
+    /// chemin **brut**, et son `fallback` à 501 n'est traduit par aucun bras de
+    /// `post`.
+    const ROUTE_COMPACT: &str = "/api/v1/compact";
+
+    /// Monte le banc sur `reponses` et fait passer un `/compact` dessus — le
+    /// modèle de `par_le_banc` (l. 1635), pour `compact_par_spirit`. `app` est
+    /// pris par référence partagée : c'est ce que la fonction mesurée demande.
+    async fn par_le_banc_compact(
+        app: &App<'_>,
+        reponses: &[(&str, axum::http::StatusCode, String)],
+        lire_env: SourceEnv<'_>,
+    ) -> (String, Arc<Mutex<Vec<RequeteRecue>>>) {
+        let empruntes = reponses
+            .iter()
+            .map(|(chemin, statut, corps)| (*chemin, *statut, corps.as_str()))
+            .collect::<Vec<_>>();
+        let (base, vues) = fake_spirit(&empruntes).await;
+        let sortie = compact_par_spirit(app, &base, lire_env).await;
+        (sortie, vues)
+    }
+
+    /// Le banc armé sur la seule route de compaction, en 200.
+    fn compaction_servie(corps: &str) -> [(&'static str, axum::http::StatusCode, String); 1] {
+        [(ROUTE_COMPACT, axum::http::StatusCode::OK, corps.to_string())]
+    }
+
+    /// Les deux comptes sont choisis pour ne pouvoir venir d'aucun comptage
+    /// local : la base de `test_app()` ne porte ni sept ni soixante-quatre
+    /// messages, donc un comptage résiduel côté client rendrait un autre nombre.
+    const RIEN_A_COMPACTER: &str = r#"{"compacted":false,"messages":7}"#;
+    const COMPACTION_DEMANDEE: &str = r#"{"compacted":true,"messages":64}"#;
+
+    /// T-A — critère 1 : un agent qui n'est pas au repos refuse **sans aucun
+    /// appel**. Le banc est monté *et* le jeton posé : sans les deux, « aucun
+    /// appel » ne se distinguerait ni de « aucun serveur » ni de « aucun
+    /// jeton ».
+    #[tokio::test]
+    async fn mika1727_v2d4d_un_agent_occupe_refuse_sans_aucun_appel() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.status = AgentStatus::Thinking;
+
+        let (sortie, vues) =
+            par_le_banc_compact(&app, &compaction_servie(COMPACTION_DEMANDEE), &avec_jeton).await;
+
+        assert!(
+            sortie.contains("busy"),
+            "le refus local dit l'occupation : {sortie}"
+        );
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    /// T-B — critère 1 : sans jeton, le refus tombe **avant tout appel** et
+    /// nomme la variable à poser.
+    ///
+    /// Le contrôle positif est obligatoire : sans lui, un refus tombé pour
+    /// toute autre raison — un agent qui ne serait pas au repos, un banc muet —
+    /// rendrait ce test vert en mesurant autre chose que l'absence de jeton.
+    #[tokio::test]
+    async fn mika1727_v2d4d_sans_jeton_compact_refuse_avant_tout_appel_en_nommant_la_variable() {
+        let (app, _rx, _tmp) = test_app().await;
+        let reponses = compaction_servie(COMPACTION_DEMANDEE);
+
+        let (sortie, vues) = par_le_banc_compact(&app, &reponses, &|_| None).await;
+        assert!(sortie.contains("MIKA_INTERNAL_TOKEN"), "{sortie}");
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+
+        // Contrôle positif : le même montage, le jeton posé, atteint la socket.
+        let (_, vues) = par_le_banc_compact(&app, &reponses, &avec_jeton).await;
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            1,
+            "le même montage avec jeton doit atteindre la socket"
+        );
+    }
+
+    /// T-C — critère 2 : la route, la méthode, le jeton et l'agent, lus sur la
+    /// socket.
+    #[tokio::test]
+    async fn mika1727_v2d4d_compact_poste_sur_la_route_de_compaction_avec_son_jeton_et_son_agent() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let (_, vues) =
+            par_le_banc_compact(&app, &compaction_servie(COMPACTION_DEMANDEE), &avec_jeton).await;
+
+        let vues = vues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel, et sur la seule route");
+        assert_eq!(vues[0].chemin, ROUTE_COMPACT);
+        assert_eq!(vues[0].methode, "POST");
+        assert_eq!(
+            vues[0].autorisation.as_deref(),
+            Some("Bearer jeton-interne")
+        );
+        // Le corps est **désérialisé** plutôt que cherché par sous-chaîne : le
+        // serveur lit un champ, pas un ordre de clés, et un `contains` serait
+        // vert sur un `agent` enfoui dans une autre valeur.
+        let corps: serde_json::Value =
+            serde_json::from_str(&vues[0].corps).expect("le corps posté est du JSON");
+        assert_eq!(corps["agent"], serde_json::json!(app.agent_name));
+    }
+
+    /// T-D — critères 2 et 3 : « rien à compacter » porte le compte **rendu** et
+    /// aucun seuil.
+    #[tokio::test]
+    async fn mika1727_v2d4d_rien_a_compacter_porte_le_compte_rendu_et_aucun_seuil() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let (sortie, _) =
+            par_le_banc_compact(&app, &compaction_servie(RIEN_A_COMPACTER), &avec_jeton).await;
+
+        assert!(sortie.contains("Nothing to compact"), "{sortie}");
+        assert!(sortie.contains('7'), "le compte servi est rendu : {sortie}");
+        // La moitié exécutable du critère 3 : plus aucun dénominateur, donc plus
+        // aucun seuil reconnu côté client.
+        assert!(
+            !sortie.contains("50"),
+            "aucun seuil n'est écrit côté client : {sortie}"
+        );
+    }
+
+    /// T-E — critère 2 : la compaction est dite **demandée**, jamais affirmée
+    /// faite. La grounding rule attestée par assertion, et non par relecture :
+    /// une rédaction future qui reviendrait au passé rougira ici.
+    #[tokio::test]
+    async fn mika1727_v2d4d_une_compaction_est_demandee_jamais_affirmee_faite() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let (sortie, _) =
+            par_le_banc_compact(&app, &compaction_servie(COMPACTION_DEMANDEE), &avec_jeton).await;
+
+        assert!(sortie.contains("requested"), "{sortie}");
+        assert!(
+            sortie.contains("64"),
+            "le compte d'avant est rendu : {sortie}"
+        );
+        let minuscule = sortie.to_lowercase();
+        assert!(!minuscule.contains("compacted"), "{sortie}");
+        assert!(!minuscule.contains("compactée"), "{sortie}");
+    }
+
+    /// T-F — critère 2 : le 409 dit l'occupation **et** le nouvel essai. Le
+    /// `Display` de `Busy` dit la cause ; devant une TUI, c'est le remède qui
+    /// décide de la seconde qui suit.
+    #[tokio::test]
+    async fn mika1727_v2d4d_un_409_dit_loccupation_et_le_nouvel_essai() {
+        let (app, _rx, _tmp) = test_app().await;
+        let reponses = [(
+            ROUTE_COMPACT,
+            axum::http::StatusCode::CONFLICT,
+            String::new(),
+        )];
+
+        let (sortie, vues) = par_le_banc_compact(&app, &reponses, &avec_jeton).await;
+
+        assert!(sortie.contains("busy"), "{sortie}");
+        assert!(
+            sortie.contains("again"),
+            "le remède est dit, pas seulement la cause : {sortie}"
+        );
+        // La socket a bien été touchée : sans cette assertion, un refus local
+        // rendrait ce test vert sans qu'aucun 409 soit jamais reçu.
+        assert_eq!(
+            vues.lock().expect("le témoin du banc").len(),
+            1,
+            "le 409 vient du serveur"
+        );
+    }
+
+    /// T-G — critère 2 : toute autre erreur porte le `Display` du problème.
+    ///
+    /// Un 500 du banc plutôt qu'un point injoignable : c'est le montage déjà
+    /// employé l. 3047-3068, aucun critère n'exige ici un `DeadEndpoint`, et il
+    /// ne coûte aucun import.
+    #[tokio::test]
+    async fn mika1727_v2d4d_une_autre_erreur_porte_le_display_du_probleme() {
+        let (app, _rx, _tmp) = test_app().await;
+        let reponses = [(
+            ROUTE_COMPACT,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "disk full".to_string(),
+        )];
+
+        let (sortie, _) = par_le_banc_compact(&app, &reponses, &avec_jeton).await;
+
+        assert!(sortie.contains("Compaction failed"), "{sortie}");
+        // La cause vient du `Display` de `SessionRemoteIssue`, et non d'une
+        // paraphrase écrite ici.
+        assert!(sortie.contains("500"), "{sortie}");
+    }
 }
