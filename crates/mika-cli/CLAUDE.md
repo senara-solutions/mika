@@ -525,10 +525,11 @@ de `commands/chat.rs`) balaie la moitié production du fichier par
 `ProductionScanner` et refuse `create_session(` et
 `get_or_create_canonical_session(`. Son **allowlist est livrée vide et assertie
 vide** : quand elle rougit, le remède est de passer par `session_remote::ouvrir`,
-jamais d'y ajouter une ligne. `end_session(` n'est **pas** un motif de *cette*
-garde — il est refusé depuis le vol V2d-4b par celle de `handlers.rs`, avec la
-porte `clore` (voir juste en dessous). Les deux ne sont pas fondues : elles
-balaient deux fichiers et nomment deux portes différentes, et une garde fondue
+jamais d'y ajouter une ligne. Elle refuse aussi `end_session(` **depuis le vol
+V2d-4c** (remède : `session_remote::clore`) — c'est une garde **par fichier**, pas
+par vol, d'où un nom qui ne bouge plus et deux vols qui la citent. La garde de
+`handlers.rs` refuse le même motif pour son propre fichier depuis V2d-4b ; les
+deux ne sont pas fondues : elles balaient deux fichiers et une garde fondue
 rougirait sous un seul message.
 
 ### `/clear` passe par mika-spirit (mika#1727, vol V2d-4b)
@@ -570,8 +571,10 @@ régions `#[cfg(test)]` sans jamais tronquer, donc le premier atteste que le
 balayage a lu la production (un chemin faux serait vert par cécité) et le second
 qu'il a masqué la moitié test — sans lui, les appels des tests de ce même fichier
 feraient rougir la garde, et on l'aurait « réparée » par une entrée d'allowlist.
-`maybe_compact(` n'est pas un motif : il part au vol V2d-4c, avec la porte
-`compacter`.
+`maybe_compact(` n'est pas un motif : il part au vol suivant, avec la porte
+`compacter` — `/compact` compacte encore en local, et une garde qui refuserait
+un geste que rien ne remplace ne laisserait d'autre issue qu'une entrée
+d'allowlist.
 
 **Une seule lecture du jeton dans tout le crate.**
 `session_remote::jeton_interne(SourceEnv)` remplace les deux copies que portaient
@@ -584,6 +587,59 @@ autorité sur les deux autres. Il rend un `Err(String)` et non un
 `SessionRemoteIssue` : une variable absente n'a ni statut ni URL, et un
 `Unexpected { status: None }` se lirait « spirit injoignable » (motif mika#2331).
 `grep -rn "fn jeton_interne" crates/mika-cli/src` rend **une** ligne.
+
+### Les sorties de la TUI passent par mika-spirit (mika#1727, vol V2d-4c)
+
+Les **trois** sorties de `commands/chat.rs` — changement d'agent, `/restart`, fin
+de session — **ne closent plus la base en local**. Chacune appelle
+`chat::clore_session_de_sortie`, qui prend l'URL de base et la source
+d'environnement **par argument** (la forme d'`ouvrir_session_par_spirit` et de
+`clear_par_spirit`) et passe par `session_remote::clore`.
+
+**L'ordre du corps est le contrat**, et il se mesure : singleton → jeton →
+appel.
+
+| cas | ce qui part sur le fil | ce qui est rendu |
+|---|---|---|
+| singleton | rien, pas même la lecture du jeton | `Ok(())` |
+| sans `MIKA_INTERNAL_TOKEN`, non singleton | rien | `Err` qui nomme la variable |
+| 401, 404, injoignable | l'appel a eu lieu | `Err` qui porte le `Display` de `SessionRemoteIssue` |
+| `ended: false`, `canonical: true` en 200 | l'appel a eu lieu | `Ok(())` + un `warn!` qui dit le régime nominal de mika#1401 |
+| `ended: false`, `canonical: false` en 200 | l'appel a eu lieu | `Ok(())` + un `warn!` qui dit « sans raison donnée » |
+
+Un agent singleton ne clôt rien **et ne lit pas le jeton** : la canonique ne se
+clôt jamais (mika#1401), donc il n'y a rien à demander au fil et aucune raison
+d'exiger une variable d'environnement pour ne rien faire. Le test l'atteste avec
+une source d'environnement **vide** — le seul montage qui distingue « on n'a pas
+lu » de « on a lu puis renoncé ». Le `!app.is_singleton_session` a disparu des
+trois sites : la décision vit **dans** la fonction, et la laisser aussi chez
+l'appelant en ferait un second juge du même fait.
+
+**Une clôture en échec ne retient jamais la sortie.** Les trois sites
+journalisent un `tracing::warn!` qui nomme **leur** geste, et continuent : la
+TUI ne doit pas dépendre de spirit pour quitter, changer d'agent ou redémarrer.
+C'est la raison pour laquelle l'erreur monte à l'appelant au lieu d'être
+journalisée dans la fonction — trois lignes identiques diraient « la clôture a
+échoué » sans dire **laquelle des trois sorties** l'a demandée. Au dernier site,
+le terminal est déjà rendu et le lecteur d'événements arrêté : il n'y a plus
+d'écran où porter autre chose qu'un journal.
+
+**L'agent quitté est capturé, pas relu.** Au changement d'agent,
+`let agent_quitte = app.agent_name.clone();` précède immédiatement l'appel :
+`app.agent_name` est réaffecté une soixantaine de lignes plus bas, et une clôture
+au nom du **nouvel** agent clôrait une session qui n'est pas la sienne — le corps
+porte l'agent, et le contrôle d'appartenance du serveur ne rattraperait pas ce
+défaut puisque `resolve_agent` aurait réussi. La capture **supprime** le mode de
+panne, là où une garde qui aurait comparé deux numéros de ligne n'aurait fait que
+le surveiller, et aurait rougi sur tout déplacement innocent.
+
+**Le miroir est lu dans la fonction**, qui rend `()`. Aucun des trois sites n'a
+d'écran où porter la disjonction de mika#1401 ; le leur rendre les obligerait à
+rejouer trois fois la même lecture sans destinataire. `/clear` la rend à l'écran
+parce que `/clear` **a** un écran.
+
+Ce vol ne câble pas `compacter` : `/compact` compacte encore en local, et les
+deux `expect(dead_code)` de `session_remote.rs` restent **deux**.
 
 - **Slash commands:** `/clear`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session

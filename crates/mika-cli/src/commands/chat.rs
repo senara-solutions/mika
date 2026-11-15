@@ -122,6 +122,71 @@ async fn ouvrir_session_par_spirit(
     }
 }
 
+/// Clôt la session du fil sur mika-spirit, au nom de l'agent qu'on quitte
+/// (mika#1727, vol V2d-4c).
+///
+/// Même forme que `ouvrir_session_par_spirit` ci-dessus : l'URL de base et la
+/// source d'environnement arrivent **par argument**, pour qu'un test les
+/// pilote. Un client qui résout ses propres accès ne se pilote pas depuis un
+/// test, et un chargement caché derrière le paramètre ferait mentir la
+/// signature.
+///
+/// Le retour est `anyhow::Result<()>` et non `Result<_, SessionRemoteIssue>` :
+/// les trois appelants sont dans [`run`], qui est en `anyhow`, et un type
+/// d'erreur qui mélangerait « variable absente » et « spirit a répondu 401 »
+/// n'est pas `SessionRemoteIssue` — une variable absente n'a ni statut ni URL,
+/// et `Unexpected { status: None, .. }` se lirait « spirit injoignable » là où
+/// rien n'a été tenté (motif mika#2331).
+///
+/// Le miroir est lu **ici** plutôt que rendu aux appelants : aucun des trois
+/// sites n'a d'écran où porter la disjonction de mika#1401 — le dernier a déjà
+/// rendu le terminal, les deux autres détruisent leur worker —, et la leur
+/// rendre les obligerait à rejouer trois fois la même lecture sans
+/// destinataire. `/clear` la rend à l'écran parce que `/clear` **a** un écran
+/// (`tui/commands/handlers.rs::clear_par_spirit`).
+async fn clore_session_de_sortie(
+    base_url: &str,
+    lire_env: SourceEnv<'_>,
+    agent: &str,
+    session_id: &str,
+    is_singleton_session: bool,
+) -> Result<()> {
+    // Avant toute lecture du jeton : la session canonique d'un agent singleton
+    // ne se clôt jamais (mika#1401), donc il n'y a rien à demander au fil et
+    // aucune raison d'exiger une variable d'environnement pour ne rien faire.
+    if is_singleton_session {
+        return Ok(());
+    }
+
+    // `map_err` et non un `?` direct : la lecture commune rend un `String`,
+    // pour la raison écrite sur `jeton_interne`. Le refus nomme
+    // `MIKA_INTERNAL_TOKEN` parce que c'est elle qui le nomme.
+    let jeton = jeton_interne(lire_env).map_err(anyhow::Error::msg)?;
+
+    let miroir = session_remote::clore(base_url, &jeton, agent, session_id)
+        .await
+        .map_err(|probleme| anyhow::anyhow!("La session n'a pas pu être close : {probleme}"))?;
+
+    // Les deux `ended: false` sont des 200, et aucun n'est un échec : rendre
+    // l'un des deux en `Err` ferait dire au `warn!` de l'appelant qu'un geste a
+    // échoué alors qu'il n'avait pas lieu d'être.
+    if !miroir.ended {
+        if miroir.canonical {
+            tracing::warn!(
+                session_id = %session_id,
+                "mika-spirit n'a pas clos la session canonique de l'agent, ce qui est son \
+                 régime nominal (mika#1401) : elle ne se clôt jamais"
+            );
+        } else {
+            tracing::warn!(
+                session_id = %session_id,
+                "mika-spirit n'a clos aucune session et n'a pas dit pourquoi"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
 async fn spawn_agent_worker(
     ctx: AppContext,
@@ -792,12 +857,28 @@ pub async fn run(
 
         // Handle agent switch
         if let Some(target_name) = app.pending_switch.take() {
-            // End the old session before switching agents. No-op for singleton
-            // agents — the canonical session is never ended (mika#1401).
-            if !app.is_singleton_session
-                && let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await
+            // La session du fil se clôt sur mika-spirit avant le changement
+            // d'agent (mika#1727, vol V2d-4c). Le cas singleton est tranché
+            // **dans** la clôture : le laisser aussi ici en ferait un second
+            // juge du même fait.
+            //
+            // L'agent qu'on quitte est lu ici et non dans la clôture :
+            // `app.agent_name` est réaffecté une soixantaine de lignes plus
+            // bas, et une clôture au nom du nouvel agent clôrait une session
+            // qui n'est pas la sienne. La capture ramène à deux lignes une
+            // distance qu'aucun test de `run()` ne peut surveiller.
+            let agent_quitte = app.agent_name.clone();
+            if let Err(e) = clore_session_de_sortie(
+                &crate::commands::dashboard::spirit_url(),
+                &|nom| std::env::var(nom).ok(),
+                &agent_quitte,
+                &app.session_id,
+                app.is_singleton_session,
+            )
+            .await
             {
-                tracing::warn!(error = %e, "failed to end session on agent switch");
+                tracing::warn!(error = %e, agent = %agent_quitte,
+                    "la session n'a pas été close sur spirit au changement d'agent");
             }
 
             // Silence the supervisor before tearing down the old worker — dropping
@@ -908,13 +989,20 @@ pub async fn run(
         if app.pending_restart {
             app.pending_restart = false;
 
-            // End the old session before restarting so the dashboard shows it as
-            // completed rather than ongoing. No-op for singleton agents — the
-            // canonical session is never ended (mika#1401).
-            if !app.is_singleton_session
-                && let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await
+            // La session se clôt sur mika-spirit avant le redémarrage, pour que
+            // le dashboard la montre terminée plutôt qu'en cours (mika#1727,
+            // vol V2d-4c). Un échec ne retient pas le `/restart` : il se
+            // journalise, et le geste continue.
+            if let Err(e) = clore_session_de_sortie(
+                &crate::commands::dashboard::spirit_url(),
+                &|nom| std::env::var(nom).ok(),
+                &app.agent_name,
+                &app.session_id,
+                app.is_singleton_session,
+            )
+            .await
             {
-                tracing::warn!(error = %e, "failed to end session on /restart");
+                tracing::warn!(error = %e, "la session n'a pas été close sur spirit au /restart");
             }
 
             worker.shutdown_initiated.store(true, Ordering::Release);
@@ -1008,12 +1096,20 @@ pub async fn run(
     // Shut down event reader thread
     events.shutdown();
 
-    // End the session so the dashboard shows duration instead of "ongoing".
-    // No-op for singleton agents — the canonical session is never ended (mika#1401).
-    if !app.is_singleton_session
-        && let Err(e) = worker._ctx.async_db.end_session(&app.session_id).await
+    // La session se clôt sur mika-spirit, pour que le dashboard montre une
+    // durée plutôt qu'« en cours » (mika#1727, vol V2d-4c). La sortie ne
+    // dépend jamais de spirit : le terminal est déjà rendu et le lecteur
+    // d'événements arrêté, donc un échec ne peut que se journaliser.
+    if let Err(e) = clore_session_de_sortie(
+        &crate::commands::dashboard::spirit_url(),
+        &|nom| std::env::var(nom).ok(),
+        &app.agent_name,
+        &app.session_id,
+        app.is_singleton_session,
+    )
+    .await
     {
-        tracing::warn!(error = %e, "failed to end session");
+        tracing::warn!(error = %e, "la session n'a pas été close sur spirit à la sortie");
     }
 
     // Wait for the supervisor (which owns the worker JoinHandle). It exits
@@ -1326,6 +1422,14 @@ mod tests {
     const ROUTE_SESSIONS: &str = "/api/v1/sessions";
     const CORPS_OUVERT: &str = r#"{"session_id":"s-du-fil","canonical":false}"#;
 
+    /// Le chemin de fin, écrit **en entier** et non composé depuis
+    /// `ROUTE_SESSIONS` : le composer ici rejouerait le `format!` de la porte,
+    /// et une faute dans celui-ci passerait inaperçue des deux côtés. Le banc
+    /// associe par le chemin brut, donc un chemin faux tombe sur son `fallback`
+    /// à 501 — qu'aucun bras de `post` ne traduit.
+    const ROUTE_FIN: &str = "/api/v1/sessions/s-du-fil/end";
+    const CORPS_CLOS: &str = r#"{"ended":true,"canonical":false}"#;
+
     /// La base de la TUI, en mémoire, comme `handlers.rs::test_app()` :
     /// `ouvrir_session_par_spirit` prend `&AsyncDatabase` et non `&AppContext`,
     /// donc la fixture n'a ni home, ni `Settings`, ni registre de skills.
@@ -1577,13 +1681,170 @@ mod tests {
         );
     }
 
-    /// mika#1727 V2d-4a — la création de session de la TUI est passée à
-    /// `session_remote::ouvrir`. Cette garde refuse son retour en local dans la
-    /// moitié *production* de ce fichier.
+    #[tokio::test]
+    async fn mika1727_v2d4c_la_cloture_de_sortie_poste_sur_la_route_de_fin_avec_son_jeton() {
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::OK, CORPS_CLOS)]).await;
+
+        clore_session_de_sortie(
+            &base,
+            &jeton_pose("jeton-secret"),
+            "agent-quitte",
+            "s-du-fil",
+            false,
+        )
+        .await
+        .expect("un 200 au corps lisible clôt la session");
+
+        // Les faits se lisent sur la socket et non sur l'appel : c'est ce que le
+        // serveur reçoit qui tient le contrat, pas ce qu'on croit poster.
+        let vues = recues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel attendu");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "POST");
+        assert_eq!(vue.chemin, ROUTE_FIN);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        let envoye: serde_json::Value = serde_json::from_str(&vue.corps).expect("un corps JSON");
+        // L'agent **passé**, et c'est tout l'enjeu du critère 3 : au changement
+        // d'agent, celui qui part sur le fil est l'agent quitté. Un corps qui
+        // porterait l'autre clôrait une session qui n'est pas la sienne, et le
+        // contrôle d'appartenance du serveur ne le rattraperait pas.
+        assert_eq!(envoye["agent"], "agent-quitte");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_un_singleton_ne_clot_rien_et_ne_lit_pas_le_jeton() {
+        // Le banc est **armé** et ne verra rien.
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::OK, CORPS_CLOS)]).await;
+
+        // La source d'environnement est **vide**, et c'est le montage : avec un
+        // jeton posé, ce test ne saurait pas distinguer « on n'a pas lu » de
+        // « on a lu puis renoncé ». Vide, il atteste l'ordre du corps — le
+        // singleton tranche avant toute lecture.
+        clore_session_de_sortie(&base, &|_| None, "mika-dev", "s-du-fil", true)
+            .await
+            .expect("la canonique ne se clôt jamais, et ce n'est pas un échec");
+
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_sans_jeton_la_cloture_refuse_avant_tout_appel_en_nommant_la_variable() {
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::OK, CORPS_CLOS)]).await;
+
+        let refus = clore_session_de_sortie(&base, &|_| None, "mika-dev", "s-du-fil", false)
+            .await
+            .expect_err("sans jeton, la clôture refuse");
+
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+
+        // Contrôle positif, et pas une décoration : sans lui, un refus tombé
+        // pour toute autre raison — un chemin mal composé, un banc non armé —
+        // rendrait ce test vert en mesurant autre chose que la lecture du jeton.
+        clore_session_de_sortie(&base, &jeton_pose("jeton"), "mika-dev", "s-du-fil", false)
+            .await
+            .expect("le même montage, plus le jeton, atteint la socket");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une requête attendue"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_un_401_est_rendu_en_erreur() {
+        let (base, recues) = fake_spirit(&[(ROUTE_FIN, StatusCode::UNAUTHORIZED, "")]).await;
+
+        let refus = clore_session_de_sortie(
+            &base,
+            &jeton_pose("mauvais-jeton"),
+            "mika-dev",
+            "s-du-fil",
+            false,
+        )
+        .await
+        .expect_err("un 401 est rendu à l'appelant");
+
+        // Le message nomme la variable à poser parce que `Denied` la nomme : un
+        // jeton posé mais faux est la panne la plus coûteuse à diagnostiquer.
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
+        // La socket **a** été touchée, et c'est ce qui sépare ce refus de celui
+        // du test précédent : les deux rendent une erreur, un seul a appelé.
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une requête attendue"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_un_point_injoignable_est_rendu_en_erreur() {
+        // mika#2569 : le port est **tenu** pour toute la durée de l'appel. Le
+        // motif qui liait puis libérait a vu un factice voisin du même binaire
+        // servir l'appel censé échouer.
+        let dead = DeadEndpoint::reserve();
+        let base = format!("http://{}", dead.addr());
+
+        let refus =
+            clore_session_de_sortie(&base, &jeton_pose("jeton"), "mika-dev", "s-du-fil", false)
+                .await
+                .expect_err("rien n'écoute : la clôture est rendue en erreur");
+
+        let message = refus.to_string();
+        assert!(message.contains("unreachable"), "{message}");
+        assert!(message.contains(&format!("{base}{ROUTE_FIN}")), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_v2d4c_une_session_canonique_refusee_nest_pas_un_echec() {
+        let (base, recues) = fake_spirit(&[(
+            ROUTE_FIN,
+            StatusCode::OK,
+            r#"{"ended":false,"canonical":true}"#,
+        )])
+        .await;
+
+        // `is_singleton_session` est **faux** ici : le serveur est la seule
+        // autorité sur la canonicité, et le client peut l'ignorer — c'est le cas
+        // d'une session reprise par `--session-id`. Un `ended: false` canonique
+        // en 200 est le régime nominal de mika#1401 : la session ne se clôt
+        // jamais, et le geste n'a pas échoué. Le rendre en `Err` ferait dire au
+        // `warn!` de l'appelant qu'une sortie a mal tourné.
+        clore_session_de_sortie(&base, &jeton_pose("jeton"), "mika-dev", "s-du-fil", false)
+            .await
+            .expect("un refus sur la canonique n'est pas un échec");
+
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "l'appel a bien eu lieu"
+        );
+    }
+
+    /// mika#1727 — la session de la TUI s'ouvre et se clôt sur mika-spirit.
+    /// Cette garde refuse le retour en local des trois gestes correspondants
+    /// dans la moitié *production* de ce fichier : la création est passée à
+    /// `session_remote::ouvrir` au vol V2d-4a, la clôture à
+    /// `session_remote::clore` au vol V2d-4c.
     ///
-    /// Le scan porte sur les deux gestes qui *créent une session en base dans
-    /// le processus de la TUI*, et sur rien d'autre : `end_session(` y reste
-    /// jusqu'à V2d-4b, qui porte la porte `clore` et sa propre garde.
+    /// Le nom de la garde n'a pas changé avec le second vol : c'est une garde
+    /// **par fichier**, pas par vol, et la renommer casserait la trace des deux
+    /// vols qui la citent.
+    ///
+    /// Le scan porte sur ces trois gestes et sur rien d'autre. `maybe_compact(`
+    /// n'en est pas : `/compact` compacte encore en local, et une garde qui
+    /// refuserait un geste que rien ne remplace ne laisserait d'autre issue
+    /// qu'une entrée d'allowlist — exactement ce qu'elle existe pour éviter.
     #[test]
     fn mika1727_v2d4a_la_tui_ne_cree_plus_sa_session_en_local() {
         // Livrée vide, et vide par construction : quand la garde rougit, le
@@ -1593,6 +1854,7 @@ mod tests {
         const MOTIFS: &[(&str, &str)] = &[
             ("create_session(", "session_remote::ouvrir"),
             ("get_or_create_canonical_session(", "session_remote::ouvrir"),
+            ("end_session(", "session_remote::clore"),
         ];
 
         let scanner =
@@ -1610,10 +1872,23 @@ mod tests {
             production.contains("async fn spawn_agent_worker("),
             "la garde n'a pas lu la moitié production de chat.rs"
         );
+        // Contre-témoin : `production_of` **masque** les régions `#[cfg(test)]`
+        // sans jamais tronquer, donc la moitié test doit être absente alors que
+        // tout ce qui la suit reste visible. Jusqu'à V2d-4c, aucun motif de
+        // cette garde n'apparaissait dans la moitié test et un masquage perdu
+        // y serait resté invisible ; les tests de la clôture de sortie
+        // l'exercent désormais. Sans cette assertion, un masquage perdu ferait
+        // rougir un *motif*, et on aurait « réparé » la garde par une entrée
+        // d'allowlist. La cible est un nom de test antérieur à ce vol.
+        assert!(
+            !production.contains("fn mika1727_v2d4a_un_point_injoignable_nomme_lurl"),
+            "la garde n'a pas masqué la moitié test de chat.rs"
+        );
 
-        // Les deux motifs sont balayés avant le refus, et non refusés l'un après
-        // l'autre : un `assert!` par motif n'aurait montré que le premier site,
-        // et le rouge doit nommer tout ce qu'il y a à déplacer, pas une moitié.
+        // Les trois motifs sont balayés avant le refus, et non refusés l'un
+        // après l'autre : un `assert!` par motif n'aurait montré que le premier
+        // site, et le rouge doit nommer tout ce qu'il y a à déplacer, pas une
+        // moitié.
         let violations: Vec<String> = MOTIFS
             .iter()
             .flat_map(|(motif, porte)| {
@@ -1626,9 +1901,9 @@ mod tests {
             .collect();
         assert!(
             violations.is_empty(),
-            "mika#1727 V2d-4a — la TUI crée sa session dans son propre processus. \
-             Le remède est de passer par la porte que chaque ligne nomme, jamais \
-             une entrée d'allowlist :\n{}",
+            "mika#1727 — la TUI touche la table `sessions` dans son propre \
+             processus. Le remède est de passer par la porte que chaque ligne \
+             nomme, jamais une entrée d'allowlist :\n{}",
             violations.join("\n")
         );
     }
