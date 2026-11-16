@@ -250,6 +250,15 @@ voudrait dire garder un compte `== 1` qui doit valoir `0` — un faux rouge au
 premier passage. Sa disparition n'ouvre aucun angle mort : la garde principale,
 allowlist vide, couvre désormais `commands/chat.rs` comme tout le reste.
 
+**Écart É8 (pilote, 2026-11-16) — ce retrait part en C1, pas en C2.** Le « faux
+rouge au premier passage » n'est pas une hypothèse : il est **mesuré** dès que
+C1 bascule le bras (`assertion left == right failed … left: 0, right: 1`).
+Laisser le retrait en C2 ferait donc de C1 un commit **rouge**, ce que la règle
+« chaque garde arrive avec ses tests, dans le même commit » interdit. Le retrait
+suit la bascule qui le rend nécessaire. `V1_ALLOWED` et son pin restent en C2 :
+tant que l'allowlist tolère `commands/chat.rs`, la garde principale est verte en
+C1 — elle ne trouve plus aucune violation nulle part.
+
 `mika1727_v1_le_scan_nest_pas_vide` (l. 662 à 684) reste **tel quel**, sans un
 caractère de différence : c'est l'anti-vacuité (mika#2103, mika#2205) qui
 empêche les deux gardes d'être vertes par cécité, et elle vise déjà nommément
@@ -273,6 +282,17 @@ décrivent déjà un état qui n'existe plus (É1, É2) :
 4. **`crates/mika-cli/CLAUDE.md` l. 384 à 393** — « L'unique appel local restant
    est le bras `CallbackResult` » devient « il n'en reste aucun », et la phrase
    sur le poll est corrigée : **le poll de `tui/app.rs` reste** (É2).
+
+**Écart É9 (pilote, 2026-11-16) — un cinquième texte, et il part en C1.**
+`init.rs` l. 95-96, doc d'`override_model` : « This method is now the
+**in-process** consumer only: `mika chat`, whose turn really does run against
+`self.llm`. » Cette phrase devient fausse **dans le commit qui la rend fausse**,
+puisque le bras `CallbackResult` était ce dernier tour en processus. Elle est
+donc corrigée en C1, avec le code qui l'invalide, et non en C3 : D7 ne la
+listait pas parce qu'elle vit dans un fichier que D7 ne couvrait pas. La doc
+corrigée dit ce qui reste — la **validation** par `make_llm_provider`, dont le
+`?` remonte au démarrage de `mika chat` — et renvoie `--model` à
+`mika.model_override` (mika#2304).
 
 `cargo test -p mika-common --test claude_md_size` garde le plafond : le
 paragraphe est réécrit, pas allongé.
@@ -364,11 +384,27 @@ retrait des variables vont dans le même commit ».
 5. **`chat.rs`** — `SetModel` : `worker_llm = new_llm;` part, la validation
    devient `if updated_settings.make_llm_provider().is_ok()` (É3).
 6. **`init.rs`** — `make_message_sender` (l. 209 à 247) et la ligne d'import
-   l. 4 partent (É6). `AppContext.llm` (l. 17) et `DbContext.github_app` (l. 38)
-   prennent `#[expect(dead_code, reason = "mika#1727 V3 : dernier lecteur parti
-   au vol V3a-2b ; V3 retire le champ")]` — `expect` et non `allow`, pour que
+   l. 4 partent (É6). `DbContext.github_app` (l. 38) prend
+   `#[expect(dead_code, reason = "mika#1727 V3 : dernier lecteur parti au vol
+   V3a-2b ; V3 retire le champ")]` — `expect` et non `allow`, pour que
    l'attribut rougisse de lui-même le jour où un lecteur revient ou où le champ
    part.
+
+   **Écart É10 (pilote, 2026-11-16) — `AppContext.llm` (l. 17) ne prend
+   PAS cet attribut.** Mesuré : rustc rend
+   `warning: this lint expectation is unfulfilled` sur l'attente elle-même.
+   `override_model` **écrit** `self.llm` (l. 103), et une écriture de champ
+   compte comme un usage pour `dead_code` — le champ n'est donc pas mort au
+   sens du lint, seulement sans lecteur. Mettre l'attribut échangerait un champ
+   silencieux contre un `warn` permanent, c'est-à-dire exactement ce qu'il
+   devait éviter. Le champ porte à la place un commentaire doc qui dit l'état —
+   plus aucun lecteur depuis V3a-2b, un écrivain restant, V3 retire les deux —
+   et É9 corrige la doc d'`override_model` juste au-dessus.
+7. **`init.rs`** — la doc d'`override_model` (l. 95-96) est corrigée (É9).
+
+8. **`chat_turn.rs`** — `mika1727_v1_le_site_tolere_na_quun_seul_appel_local`
+   part ici et non en C2 (É8) : la bascule du bras la rend rouge dans ce même
+   commit.
 
 **Tests livrés dans ce commit** (ils ne se reportent jamais) :
 
@@ -403,7 +439,8 @@ Fichier : `commands/chat_turn.rs` (module `tests` uniquement).
    qui dit pourquoi elle est au niveau module (D6).
 2. `mika1727_v3a2b_lallowlist_du_tour_est_livree_vide` l'asserte vide, sur la
    forme de `mika1727_v2a_lallowlist_est_livree_vide` — **critère 4**.
-3. `mika1727_v1_le_site_tolere_na_quun_seul_appel_local` (l. 633 à 654) part.
+3. `mika1727_v1_le_site_tolere_na_quun_seul_appel_local` est déjà partie en C1
+   (É8) : elle rougissait dès la bascule du bras.
 4. La doc de `mika1727_v1_le_tour_de_la_tui_ne_fait_plus_tourner_la_boucle`
    (l. 578 à 586) est réécrite : aucun site n'est plus toléré (D7.2, É1).
 5. `mika1727_v1_le_scan_nest_pas_vide` est **inchangée**.
