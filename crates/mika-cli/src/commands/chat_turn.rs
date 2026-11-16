@@ -56,11 +56,18 @@ fn spirit_turn_endpoint(agent_name: &str) -> String {
 /// tour atterrissent donc sur la session que la TUI affiche, et non sur une
 /// session parallèle.
 ///
-/// Deux des paramètres de `send_message_to_agent` restent posés vides à
-/// dessein : pas de restriction de skills, pas d'override de modèle (`/model`
-/// reste appliqué en processus en V1, voir `chat.rs`). L'isolation de session
-/// reste `false` pour une raison propre — un tour de TUI veut précisément voir
-/// ses tours précédents.
+/// Un seul paramètre de `send_message_to_agent` reste posé vide à dessein : la
+/// restriction de skills. L'isolation de session reste `false` pour une raison
+/// propre — un tour de TUI veut précisément voir ses tours précédents.
+///
+/// `model_override` **voyage depuis le vol V3b-1**, et il part **brut** : la
+/// valeur telle que l'opérateur l'a tapée, alias et préfixe `provider/`
+/// compris, sans qu'aucune résolution ait lieu ici. C'est mika#2304 : seul le
+/// côté qui exécute détient les clés d'API et la table d'alias, donc c'est lui
+/// qui résout — et qui **refuse fermement** le tour sur un modèle qu'il ne sait
+/// pas servir, plutôt que de le dégrader en « pas d'override ». Un override
+/// silencieusement abandonné rendrait une réponse plausible sous un modèle que
+/// l'opérateur n'a pas choisi.
 ///
 /// `callback_turn` est en revanche **un paramètre de cette fonction** depuis le
 /// vol V3a-2a : la TUI est le seul appelant qui a un tour de callback à envoyer,
@@ -74,9 +81,10 @@ pub(crate) async fn send_turn_to_spirit(
     agent_name: &str,
     session_id: &str,
     callback_turn: bool,
+    model_override: Option<&str>,
 ) -> Result<TurnReply> {
     let endpoint = spirit_turn_endpoint(agent_name);
-    send_turn_to_endpoint(text, &endpoint, session_id, callback_turn).await
+    send_turn_to_endpoint(text, &endpoint, session_id, callback_turn, model_override).await
 }
 
 /// Le corps de [`send_turn_to_spirit`], l'endpoint déjà résolu.
@@ -84,18 +92,22 @@ pub(crate) async fn send_turn_to_spirit(
 /// Séparé pour une seule raison : les tests visent un serveur factice, et
 /// l'alternative serait de muter `MIKA_SPIRIT_URL` — un état global de
 /// processus que les tests `cargo` parallèles se disputent.
+///
+/// `model_override` part brut, sans résolution locale : voir
+/// [`send_turn_to_spirit`] pour le pourquoi (mika#2304).
 async fn send_turn_to_endpoint(
     text: &str,
     endpoint: &str,
     session_id: &str,
     callback_turn: bool,
+    model_override: Option<&str>,
 ) -> Result<TurnReply> {
     let task = mika_cli::remote_ask::send_message_to_agent(
         text,
         endpoint,
         Some(session_id),
         &[],
-        None,
+        model_override,
         false,
         callback_turn,
     )
@@ -163,6 +175,11 @@ async fn send_turn_to_endpoint(
 /// L'échec de cette remise est journalisé et **non propagé** : l'opérateur doit
 /// recevoir le message d'erreur du tour, pas le remplacer par celui de la
 /// remise.
+///
+/// `model_override` part brut, sans résolution locale : voir
+/// [`send_turn_to_spirit`] pour le pourquoi (mika#2304). Un tour de callback le
+/// porte comme les autres — le modèle que l'opérateur a choisi vaut pour la
+/// reprise d'une tâche autant que pour ce qu'il tape.
 pub(crate) async fn livrer_tour_de_callback(
     db: &AsyncDatabase,
     agent_name: &str,
@@ -170,6 +187,7 @@ pub(crate) async fn livrer_tour_de_callback(
     cadrage: &str,
     task_id: &str,
     statut_dorigine: &str,
+    model_override: Option<&str>,
 ) -> AgentResponse {
     let endpoint = spirit_turn_endpoint(agent_name);
     livrer_tour_de_callback_sur_endpoint(
@@ -179,6 +197,7 @@ pub(crate) async fn livrer_tour_de_callback(
         cadrage,
         task_id,
         statut_dorigine,
+        model_override,
     )
     .await
 }
@@ -188,6 +207,9 @@ pub(crate) async fn livrer_tour_de_callback(
 /// Séparé pour la même raison que [`send_turn_to_endpoint`] : les tests visent
 /// un serveur factice, et l'alternative serait de muter `MIKA_SPIRIT_URL` — un
 /// état global de processus que les tests `cargo` parallèles se disputent.
+///
+/// `model_override` part brut, sans résolution locale : voir
+/// [`send_turn_to_spirit`] pour le pourquoi (mika#2304).
 async fn livrer_tour_de_callback_sur_endpoint(
     db: &AsyncDatabase,
     endpoint: &str,
@@ -195,8 +217,9 @@ async fn livrer_tour_de_callback_sur_endpoint(
     cadrage: &str,
     task_id: &str,
     statut_dorigine: &str,
+    model_override: Option<&str>,
 ) -> AgentResponse {
-    match send_turn_to_endpoint(cadrage, endpoint, session_id, true).await {
+    match send_turn_to_endpoint(cadrage, endpoint, session_id, true, model_override).await {
         Ok(reply) => AgentResponse::Reply {
             content: reply.content,
             is_error: false,
@@ -409,7 +432,7 @@ mod tests {
         .await;
 
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let reply = send_turn_to_endpoint("quoi de neuf", &endpoint, "sess-t1", false)
+        let reply = send_turn_to_endpoint("quoi de neuf", &endpoint, "sess-t1", false, None)
             .await
             .expect("un spirit qui répond un Task complété rend son texte");
         assert_eq!(reply.content, "bonjour");
@@ -436,7 +459,7 @@ mod tests {
         .await;
 
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        send_turn_to_endpoint("salut", &endpoint, "sess-t2-abc", false)
+        send_turn_to_endpoint("salut", &endpoint, "sess-t2-abc", false, None)
             .await
             .expect("envoi");
 
@@ -460,7 +483,7 @@ mod tests {
         let dead = DeadEndpoint::reserve();
         let endpoint = format!("http://{}/a2a/mika-prime", dead.addr());
 
-        let err = send_turn_to_endpoint("salut", &endpoint, "sess-t3", false)
+        let err = send_turn_to_endpoint("salut", &endpoint, "sess-t3", false, None)
             .await
             .expect_err("rien n'écoute : l'appel doit échouer");
         let chain = format!("{err:#}");
@@ -502,7 +525,7 @@ mod tests {
         .await;
 
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let outcome = send_turn_to_endpoint("salut", &endpoint, "sess-t4", false).await;
+        let outcome = send_turn_to_endpoint("salut", &endpoint, "sess-t4", false, None).await;
         let err = match outcome {
             Ok(reply) => panic!(
                 "un Task sans texte lisible doit échouer, pas rendre {:?}",
@@ -526,7 +549,7 @@ mod tests {
         let (addr, _) =
             spawn_mock(|_cap, _body| (StatusCode::OK, Json(ok_task_with_text("ok")))).await;
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5a", false)
+        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5a", false, None)
             .await
             .expect("envoi");
         assert_eq!(
@@ -542,7 +565,7 @@ mod tests {
         })
         .await;
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5b", false)
+        let reply = send_turn_to_endpoint("salut", &endpoint, "sess-t5b", false, None)
             .await
             .expect("envoi");
         assert_eq!(reply.input_tokens, Some(41_000));
@@ -567,7 +590,7 @@ mod tests {
         })
         .await;
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        send_turn_to_endpoint("salut", &endpoint, "sess-cb-oui", true)
+        send_turn_to_endpoint("salut", &endpoint, "sess-cb-oui", true, None)
             .await
             .expect("envoi");
 
@@ -595,7 +618,7 @@ mod tests {
         })
         .await;
         let endpoint = format!("http://{addr}/a2a/mika-prime");
-        send_turn_to_endpoint("salut", &endpoint, "sess-cb-non", false)
+        send_turn_to_endpoint("salut", &endpoint, "sess-cb-non", false, None)
             .await
             .expect("envoi");
 
@@ -611,6 +634,85 @@ mod tests {
         assert_eq!(
             metadata[mika_cli::remote_ask::CALLER_SESSION_ID_KEY],
             "sess-cb-non",
+            "anti-vacuité de la moitié négative : le corps capturé est bien \
+             celui de ce second envoi, et non un corps resté vide ; \
+             corps : {body}"
+        );
+    }
+
+    /// **Critère 1 de V3b-1 — le modèle choisi voyage, et son absence aussi.**
+    ///
+    /// Les deux moitiés vivent dans la **même** fonction, pour la raison du test
+    /// de callback ci-dessus : séparée, la moitié négative serait verte devant un
+    /// `spawn_mock` qui capture mal, et rien ne le dirait.
+    ///
+    /// La valeur donnée porte un préfixe de provider **exprès** : elle doit
+    /// arriver telle quelle sur le fil. Une valeur que ce site aurait raccourcie,
+    /// résolue ou normalisée serait un second résolveur de modèle à côté de celui
+    /// de spirit (mika#2304) — et le jour où les deux divergeraient, l'opérateur
+    /// recevrait une réponse d'un modèle qu'il n'a pas demandé.
+    #[tokio::test]
+    async fn mika1727_v3b1_le_modele_choisi_voyage_et_son_absence_aussi() {
+        // Moitié positive : la valeur part brute, et À CÔTÉ de la session.
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("ok")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+        send_turn_to_endpoint(
+            "salut",
+            &endpoint,
+            "sess-modele-oui",
+            false,
+            Some("anthropic/claude-sonnet-4-6"),
+        )
+        .await
+        .expect("envoi");
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        let metadata = &body["params"]["metadata"];
+        assert_eq!(
+            metadata[mika_cli::remote_ask::MODEL_OVERRIDE_KEY],
+            "anthropic/claude-sonnet-4-6",
+            "le modèle choisi doit partir tel que tapé : c'est spirit qui \
+             résout l'alias et le préfixe, et qui détient les clés \
+             (mika#2304) ; corps : {body}"
+        );
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLER_SESSION_ID_KEY],
+            "sess-modele-oui",
+            "la clé du modèle ne doit pas chasser celle de la session : le \
+             tour doit atterrir sur l'historique que la TUI affiche ; \
+             corps : {body}"
+        );
+
+        // Moitié négative : le MÊME envoi sans override ne porte pas la clé.
+        // Sans elle, un `insert` rendu inconditionnel passerait la première — et
+        // une clé posée à `null` est refusée fermement par spirit, donc elle
+        // couperait tous les tours de qui n'a jamais tapé `/model`.
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("ok")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+        send_turn_to_endpoint("salut", &endpoint, "sess-modele-non", false, None)
+            .await
+            .expect("envoi");
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        let metadata = &body["params"]["metadata"];
+        assert!(
+            metadata
+                .get(mika_cli::remote_ask::MODEL_OVERRIDE_KEY)
+                .is_none(),
+            "aucun override veut dire aucune clé, pas une clé vide ni nulle \
+             (mika#2331) ; corps : {body}"
+        );
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLER_SESSION_ID_KEY],
+            "sess-modele-non",
             "anti-vacuité de la moitié négative : le corps capturé est bien \
              celui de ce second envoi, et non un corps resté vide ; \
              corps : {body}"
@@ -696,6 +798,7 @@ mod tests {
             "[callback: run_claude_pilot] terminé",
             &task_id,
             "completed",
+            None,
         )
         .await;
 
@@ -770,6 +873,7 @@ mod tests {
                 "[callback: run_claude_pilot] terminé",
                 &task_id,
                 statut_dorigine,
+                None,
             )
             .await;
 
@@ -796,6 +900,61 @@ mod tests {
                  reprend : le résultat du pilote est perdu en silence"
             );
         }
+    }
+
+    /// **Critère 2 de V3b-1** — le tour de callback porte le modèle choisi, et
+    /// la clé de callback reste à `true`.
+    ///
+    /// Les deux clés sont mesurées dans le même envoi : le callback passe par le
+    /// site d'envoi commun, donc le risque réel n'est pas qu'une des deux
+    /// manque, c'est qu'un argument supplémentaire **déplace** l'autre dans la
+    /// liste. Un test qui ne regarderait que l'override resterait vert avec un
+    /// `callback_turn` parti à `false` — et spirit ferait alors un tour
+    /// ordinaire, laissant la garde #716 désarmée.
+    #[tokio::test]
+    async fn mika1727_v3b1_le_tour_de_callback_porte_le_modele_choisi() {
+        let db = base_de_callback();
+        let task_id = tache_de_callback_livree(&db).await;
+
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("le pilote a fini")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+
+        let reponse = livrer_tour_de_callback_sur_endpoint(
+            &db,
+            &endpoint,
+            "sess-cb-modele",
+            "[callback: run_claude_pilot] terminé",
+            &task_id,
+            "completed",
+            Some("groq/kimi-k2"),
+        )
+        .await;
+
+        let AgentResponse::Reply { is_error, .. } = &reponse else {
+            panic!("le bras convertit les deux issues en Reply, et rien d'autre")
+        };
+        assert!(!is_error, "un tour qui aboutit n'est pas une erreur");
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        let metadata = &body["params"]["metadata"];
+        assert_eq!(
+            metadata[mika_cli::remote_ask::MODEL_OVERRIDE_KEY],
+            "groq/kimi-k2",
+            "un tour de callback porte le modèle choisi comme les autres : la \
+             reprise d'une tâche tourne sous le modèle que l'opérateur a \
+             posé ; corps : {body}"
+        );
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLBACK_TURN_KEY],
+            Value::Bool(true),
+            "l'argument de l'override ne doit pas avoir déplacé celui du \
+             callback : sans cette clé spirit fait un tour ordinaire ; \
+             corps : {body}"
+        );
     }
 
     /// Une image abandonnée, pour les assertions de l'avis d'inertie.

@@ -339,6 +339,7 @@ async fn spawn_agent_worker(
                         &worker_agent_name,
                         &worker_session,
                         false,
+                        None,
                     )
                     .await;
 
@@ -437,6 +438,7 @@ async fn spawn_agent_worker(
                         &framing,
                         &task_id,
                         &original_status,
+                        None,
                     )
                     .await;
                     if agent_tx.send(response).is_err() {
