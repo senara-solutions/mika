@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
-use mika_agent::messaging::{GatewayMessageSender, MessageSender};
 use mika_agent::startup;
 use mika_common::config::Settings;
 use mika_common::github_app::GitHubApp;
@@ -14,6 +13,12 @@ use std::sync::Arc;
 /// Dropping this shuts down the async database automatically.
 pub struct AppContext {
     pub db_ctx: DbContext,
+    /// mika#1727 V3 : **plus aucun lecteur depuis le vol V3a-2b** — le bras
+    /// `CallbackResult` était le dernier. Le champ n'en porte pas
+    /// `#[expect(dead_code)]` pour autant : `override_model` l'**écrit**, et
+    /// rustc compte une écriture de champ comme un usage, donc l'attente
+    /// serait non remplie et le `warn` tomberait sur l'attente elle-même. V3
+    /// retire le champ et l'écriture ensemble.
     pub llm: Arc<dyn LlmProvider>,
 }
 
@@ -35,6 +40,10 @@ pub struct DbContext {
     /// In multi-agent mode this differs from `home_dir` (which is the agent's dir).
     pub global_home: PathBuf,
     /// GitHub App authentication manager (optional).
+    #[expect(
+        dead_code,
+        reason = "mika#1727 V3 : dernier lecteur parti au vol V3a-2b ; V3 retire le champ"
+    )]
     pub github_app: Option<Arc<GitHubApp>>,
 }
 
@@ -91,9 +100,15 @@ impl AppContext {
     /// Since mika#2304 the resolution itself lives in
     /// [`mika_common::llm::model_override`], reachable by `mika-agent` too —
     /// `mika ask` no longer executes the turn (mika#1727), so the server must be
-    /// able to resolve the same string the same way. This method is now the
-    /// **in-process** consumer only: `mika chat`, whose turn really does run
-    /// against `self.llm`.
+    /// able to resolve the same string the same way.
+    ///
+    /// **Depuis le vol V3a-2b, plus aucun tour ne tourne contre `self.llm`** :
+    /// le bras `CallbackResult` était son dernier lecteur. Ce que la méthode
+    /// garde, c'est la **validation** — `make_llm_provider` refuse un modèle
+    /// que la configuration ne saurait pas servir, et le `?` remonte au
+    /// démarrage de `mika chat`. Le provider bâti est posé dans un champ que
+    /// V3 retire ; le `--model` qui compte voyage sous `mika.model_override`
+    /// (mika#2304).
     pub fn override_model(&mut self, model: &str) -> Result<()> {
         let (provider, model_id) =
             mika_common::llm::model_override::resolve_model_override(&self.db_ctx.settings, model)?;
@@ -204,46 +219,6 @@ pub async fn connect_mcp(agent_home: &Path) -> Option<mika_agent::mcp::McpManage
     } else {
         None
     }
-}
-
-/// Build a `GatewayMessageSender` if both `routing_url` and `internal_token` are configured.
-/// Returns `None` otherwise, preserving CLI-only behavior.
-pub fn make_message_sender(
-    settings: &Settings,
-    db: &AsyncDatabase,
-    http_client: &reqwest::Client,
-    agent_name: &str,
-) -> Option<Arc<dyn MessageSender>> {
-    let url = settings.routing_url.as_deref()?;
-    let token = settings.internal_token.clone()?;
-
-    let parsed = match reqwest::Url::parse(url) {
-        Ok(parsed) => parsed,
-        Err(e) => {
-            tracing::warn!(error = %e, "invalid routing_url, skipping gateway message sender");
-            return None;
-        }
-    };
-
-    if !matches!(parsed.scheme(), "http" | "https") {
-        tracing::warn!(
-            scheme = parsed.scheme(),
-            "routing_url must use http or https scheme"
-        );
-        return None;
-    }
-
-    let sender = GatewayMessageSender::new(
-        url.to_string(),
-        token,
-        db.clone(),
-        http_client.clone(),
-        None,
-        Some(agent_name.to_string()),
-        None,
-        settings.customer_id.clone(),
-    );
-    Some(Arc::new(sender))
 }
 
 #[cfg(test)]

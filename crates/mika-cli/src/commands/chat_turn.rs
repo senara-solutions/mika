@@ -18,7 +18,9 @@
 //! `mika ask` partagent déjà (mika#1883). Une seconde lecture de la même clé est
 //! comment deux surfaces finissent par répondre différemment à la même question.
 
+use crate::tui::app::AgentResponse;
 use anyhow::Result;
+use mika_agent::async_db::AsyncDatabase;
 
 /// Ce qu'un tour rendu par mika-spirit rapporte à la TUI.
 ///
@@ -123,6 +125,107 @@ async fn send_turn_to_endpoint(
     })
 }
 
+/// Le tour de callback de la TUI, livré sur le fil (mika#1727, vol V3a-2b).
+///
+/// C'était le **dernier** appel local de la boucle dans `mika-cli` : le bras
+/// `AgentRequest::CallbackResult` de `chat.rs` faisait tourner
+/// `agent::run_agent` dans le processus de la TUI. Il passe désormais par le
+/// seul site d'envoi du crate, avec `callback_turn: true` — l'unique appelant à
+/// `true` de [`send_turn_to_endpoint`].
+///
+/// Elle rend un [`AgentResponse`] et non un `Result` parce que le bras
+/// d'aujourd'hui convertit **les deux** issues en `Reply` : lui rendre un
+/// `Result` ferait rejouer cette conversion chez l'appelant, qui n'a aucune
+/// décision à prendre dessus.
+///
+/// # Ce que la réponse porte, et ce qu'elle ne porte plus
+///
+/// Sur un succès : le texte rendu par le serveur et `input_tokens` tel que le
+/// serveur l'atteste. `thinking` est **`None`**, et c'est une perte réelle — un
+/// `Task` A2A ne porte pas de part de pensée, donc le bloc que le tour local
+/// rendait n'existe plus. Aucun avis d'inertie n'est émis pour autant :
+/// personne ne *tape* un tour de callback, et un avis sans opérateur pour le
+/// lire est un avis qu'on apprend à ignorer (mika#1883). `updated_skills` reste
+/// `None` comme aujourd'hui : le rechargement à chaud est un geste du bras
+/// `Message`.
+///
+/// # Pourquoi la remise du statut survit à l'envoi distant
+///
+/// Sur **toute** erreur, la tâche revient à son statut d'origine pour que le
+/// poll suivant la reprenne — la règle d'aujourd'hui, gardée telle quelle.
+/// Elle coûte désormais quelque chose de visible : une erreur peut arriver
+/// **après** que spirit a fait le tour, si la relecture par `context_id`
+/// échoue elle aussi (mika#2036). La livraison suivante rejoue alors un tour
+/// déjà exécuté. La règle préfère ce doublon à un résultat perdu, et c'est le
+/// même arbitrage que `mika ask` pose sur son canal de retour : une réponse
+/// générée puis abandonnée est la panne qu'on ne voit pas.
+///
+/// L'échec de cette remise est journalisé et **non propagé** : l'opérateur doit
+/// recevoir le message d'erreur du tour, pas le remplacer par celui de la
+/// remise.
+pub(crate) async fn livrer_tour_de_callback(
+    db: &AsyncDatabase,
+    agent_name: &str,
+    session_id: &str,
+    cadrage: &str,
+    task_id: &str,
+    statut_dorigine: &str,
+) -> AgentResponse {
+    let endpoint = spirit_turn_endpoint(agent_name);
+    livrer_tour_de_callback_sur_endpoint(
+        db,
+        &endpoint,
+        session_id,
+        cadrage,
+        task_id,
+        statut_dorigine,
+    )
+    .await
+}
+
+/// Le corps de [`livrer_tour_de_callback`], l'endpoint déjà résolu.
+///
+/// Séparé pour la même raison que [`send_turn_to_endpoint`] : les tests visent
+/// un serveur factice, et l'alternative serait de muter `MIKA_SPIRIT_URL` — un
+/// état global de processus que les tests `cargo` parallèles se disputent.
+async fn livrer_tour_de_callback_sur_endpoint(
+    db: &AsyncDatabase,
+    endpoint: &str,
+    session_id: &str,
+    cadrage: &str,
+    task_id: &str,
+    statut_dorigine: &str,
+) -> AgentResponse {
+    match send_turn_to_endpoint(cadrage, endpoint, session_id, true).await {
+        Ok(reply) => AgentResponse::Reply {
+            content: reply.content,
+            is_error: false,
+            thinking: None,
+            input_tokens: reply.input_tokens,
+            updated_skills: None,
+        },
+        Err(e) => {
+            // `mark_task_delivered` a posé `delivered` ; la remise au statut
+            // d'origine est ce qui rend la tâche à
+            // `get_undelivered_callback_tasks`.
+            if let Err(reset_err) = db.update_task_status(task_id, statut_dorigine).await {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %reset_err,
+                    "failed to unclaim callback task after agent error"
+                );
+            }
+            AgentResponse::Reply {
+                content: format!("Failed to process callback result: {e}"),
+                is_error: true,
+                thinking: None,
+                input_tokens: None,
+                updated_skills: None,
+            }
+        }
+    }
+}
+
 /// Aplatir l'échec d'un tour à la façon de `commands::ask::wrap_send_error`.
 ///
 /// `{err:#}` et pas `{err}` : la chaîne porte le statut HTTP, l'échec de
@@ -221,6 +324,7 @@ pub(crate) fn inertia_notice(
 mod tests {
     use super::*;
     use axum::{Json, Router, http::StatusCode, routing::post};
+    use mika_agent::db::{Database, NewTask};
     use mika_common::dead_endpoint::DeadEndpoint;
     use serde_json::Value;
     use std::net::SocketAddr;
@@ -513,6 +617,187 @@ mod tests {
         );
     }
 
+    /// Une base en mémoire portant une tâche de callback **déjà réclamée**.
+    ///
+    /// Le gabarit `NewTask` vient de `tui/app.rs::couture_dun_callback_livrable`
+    /// — une `long_running` en `callback`, action `resume_agent` — et la ligne
+    /// est passée à `delivered`, qui est l'état où `mark_task_delivered` l'a
+    /// laissée quand le bras tourne. Le statut d'**origine** n'est pas posé ici :
+    /// c'est un argument du bras, et le figer dans l'assistant rendrait invisible
+    /// la seule chose que le test de l'erreur mesure.
+    ///
+    /// Un seul assistant pour tous les tests du vol : deux copies d'un gabarit de
+    /// vingt-deux champs divergent en silence, et les deux tests cesseraient de
+    /// parler de la même tâche (mika#2205).
+    async fn tache_de_callback_livree(db: &AsyncDatabase) -> String {
+        let id = db
+            .create_task(NewTask {
+                agent_id: db.agent_id().to_string(),
+                team_run_id: None,
+                parent_task_id: None,
+                depth: 1,
+                label: "long_running:run_claude_pilot".to_string(),
+                trigger_type: "callback".to_string(),
+                cron_expr: None,
+                event_source: None,
+                event_offset_secs: None,
+                condition_expr: None,
+                next_fire_at: None,
+                timeout_at: None,
+                action_type: "resume_agent".to_string(),
+                action_config: "{}".to_string(),
+                input_context: None,
+                created_by_session: Some("sess-du-pilote".to_string()),
+                created_trace_id: None,
+                reference_url: None,
+                source: Some("self_dev".to_string()),
+                metadata: None,
+                r#type: None,
+                dispatch_class: Some("implement".to_string()),
+            })
+            .await
+            .expect("une ligne de callback");
+        db.update_task_status(&id, "delivered")
+            .await
+            .expect("la réclamation de la livraison");
+        id
+    }
+
+    fn base_de_callback() -> AsyncDatabase {
+        AsyncDatabase::new(Database::open_in_memory().expect("une base en mémoire"))
+    }
+
+    /// **Critères 1 et 2 de V3a-2b** — le tour de callback part sur le fil avec
+    /// la clé, et un succès ne touche pas à la tâche.
+    ///
+    /// Les deux critères tiennent dans un test parce qu'ils décrivent le **même**
+    /// envoi : séparés, le second rouvrirait un serveur factice pour re-mesurer
+    /// ce que le premier vient de mesurer, et les deux pourraient diverger sur ce
+    /// qui a réellement été envoyé.
+    ///
+    /// Le critère 2 est le contrôle négatif du vol : sans lui, une remise de
+    /// statut rendue inconditionnelle passerait le test de l'erreur.
+    #[tokio::test]
+    async fn mika1727_v3a2b_le_tour_de_callback_part_sur_le_fil_avec_la_cle() {
+        let db = base_de_callback();
+        let task_id = tache_de_callback_livree(&db).await;
+
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("le pilote a fini")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+
+        let reponse = livrer_tour_de_callback_sur_endpoint(
+            &db,
+            &endpoint,
+            "sess-cb-v3a2b",
+            "[callback: run_claude_pilot] terminé",
+            &task_id,
+            "completed",
+        )
+        .await;
+
+        let AgentResponse::Reply {
+            content, is_error, ..
+        } = &reponse
+        else {
+            panic!("le bras convertit les deux issues en Reply, et rien d'autre")
+        };
+        assert!(!is_error, "un tour qui aboutit n'est pas une erreur");
+        assert_eq!(
+            content, "le pilote a fini",
+            "la réponse porte le texte rendu par le serveur, et non un texte \
+             composé ici"
+        );
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        let metadata = &body["params"]["metadata"];
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLBACK_TURN_KEY],
+            Value::Bool(true),
+            "sans cette clé spirit fait un tour ordinaire : la garde #716 reste \
+             désarmée et le cadrage est enregistré comme un message de \
+             l'utilisateur ; corps : {body}"
+        );
+        assert_eq!(
+            metadata[mika_cli::remote_ask::CALLER_SESSION_ID_KEY],
+            "sess-cb-v3a2b",
+            "le tour doit atterrir sur l'historique que la TUI affiche ; \
+             corps : {body}"
+        );
+        assert_eq!(
+            body["params"]["message"]["parts"][0]["text"], "[callback: run_claude_pilot] terminé",
+            "c'est le cadrage bâti par le bras qui part, pas le résultat brut ; \
+             corps : {body}"
+        );
+
+        let tache = db
+            .get_task(&task_id)
+            .await
+            .expect("relecture")
+            .expect("la tâche existe");
+        assert_eq!(
+            tache.status, "delivered",
+            "un succès ne rend pas la tâche : la rendre la ferait rejouer au \
+             poll suivant, et le tour aurait lieu deux fois"
+        );
+    }
+
+    /// **Critère 3 de V3a-2b** — sur une erreur, la tâche revient à son statut
+    /// d'origine, quel qu'il soit.
+    ///
+    /// Les deux statuts que `mark_task_delivered` accepte sont parcourus dans la
+    /// même mesure : la remise lit un argument, et un test sur un seul statut
+    /// resterait vert devant un littéral codé en dur.
+    #[tokio::test]
+    async fn mika1727_v3a2b_un_endpoint_mort_rend_la_tache_a_son_statut_dorigine() {
+        for statut_dorigine in ["completed", "failed"] {
+            let db = base_de_callback();
+            let task_id = tache_de_callback_livree(&db).await;
+
+            // mika#2569 : le port est TENU pour toute la durée de l'appel, sans
+            // quoi un serveur factice voisin du même binaire sert l'appel censé
+            // échouer.
+            let dead = DeadEndpoint::reserve();
+            let endpoint = format!("http://{}/a2a/mika-prime", dead.addr());
+
+            let reponse = livrer_tour_de_callback_sur_endpoint(
+                &db,
+                &endpoint,
+                "sess-cb-mort",
+                "[callback: run_claude_pilot] terminé",
+                &task_id,
+                statut_dorigine,
+            )
+            .await;
+
+            let AgentResponse::Reply {
+                content, is_error, ..
+            } = &reponse
+            else {
+                panic!("le bras convertit les deux issues en Reply, et rien d'autre")
+            };
+            assert!(is_error, "un spirit injoignable est une erreur");
+            assert!(
+                content.starts_with("Failed to process callback result:"),
+                "le texte d'aujourd'hui est gardé mot pour mot ; obtenu : {content}"
+            );
+
+            let tache = db
+                .get_task(&task_id)
+                .await
+                .expect("relecture")
+                .expect("la tâche existe");
+            assert_eq!(
+                tache.status, statut_dorigine,
+                "sans la remise, la tâche reste `delivered` et aucun poll ne la \
+                 reprend : le résultat du pilote est perdu en silence"
+            );
+        }
+    }
+
     /// Une image abandonnée, pour les assertions de l'avis d'inertie.
     fn dropped(media_type: &str, payload_bytes: usize) -> DroppedImage {
         DroppedImage {
@@ -622,36 +907,14 @@ mod tests {
         );
     }
 
-    /// **AC1, seconde moitié** — le site toléré n'a qu'un seul appel local.
-    ///
-    /// L'allowlist seule serait un faux vert : les deux bras vivent dans le
-    /// *même fichier*, donc une exception au niveau du fichier ne verrait pas le
-    /// tour utilisateur régresser à côté du bras toléré. Deux
-    /// `agent::run_agent(` dans `commands/chat.rs` = le tour utilisateur est
-    /// revenu en processus. Le remède est de le router par
-    /// `chat_turn::send_turn_to_spirit`, JAMAIS d'incrémenter ce compte.
-    #[test]
-    fn mika1727_v1_le_site_tolere_na_quun_seul_appel_local() {
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let site = scanner.src_root().join("commands").join("chat.rs");
-        let production = scanner.production_of(&site);
-
-        let locals: Vec<&str> = production
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .filter(|line| line.contains("agent::run_agent("))
-            .collect();
-
-        assert_eq!(
-            locals.len(),
-            1,
-            "mika#1727 V1 — `commands/chat.rs` ne tolère qu'un appel local, celui \
-             du bras `CallbackResult` (§ D2). Trouvé {} :\n{}",
-            locals.len(),
-            locals.join("\n")
-        );
-    }
+    // mika#1727 vol V3a-2b — `mika1727_v1_le_site_tolere_na_quun_seul_appel_local`
+    // vivait ici. Elle comptait les `agent::run_agent(` de `commands/chat.rs` et
+    // en exigeait exactement **un**, le bras `CallbackResult` : l'exception
+    // portait sur le fichier, donc elle n'aurait pas vu le tour utilisateur
+    // régresser à côté du bras toléré. Ce vol envoie ce dernier appel sur le
+    // fil ; le compte doit valoir zéro, ce que la garde principale mesure déjà
+    // sur tout le crate, allowlist vide. La garder voudrait dire garder un
+    // `== 1` qui est devenu un faux rouge.
 
     /// Anti-vacuité (mika#2103) — le balayage a réellement vu les deux fichiers
     /// du vol.
