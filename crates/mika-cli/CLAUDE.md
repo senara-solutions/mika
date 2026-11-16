@@ -250,10 +250,10 @@ mika#2304, a remote agent on another version, `message/stream` and
 local value would be a lie. Reading the CLI alone is not the probe — cross-check
 `turn_usage` in `$MIKA_SPIRIT_LOG_FILE`.
 
-*Unchanged:* `mika chat --model`, which runs in process and really does execute
-against the provider it builds. The resolution itself moved to
-`mika_common::llm::model_override` so both sides call one implementation; a second
-copy in this crate is refused by
+*`mika chat --model` reached the same shape at vol V3b-1 and builds no provider
+either since V3b-2* (see "Le worker de la TUI ne porte plus de provider" below).
+The resolution itself moved to `mika_common::llm::model_override` so both sides
+call one implementation; a second copy in this crate is refused by
 `init::tests::mika2304_the_cli_keeps_no_second_resolver`.
 
 **`--isolated` — one turn, one session, and the CLI does not answer for the
@@ -719,11 +719,48 @@ de `session_remote.rs` sont câblées et il n'y reste **aucune** attente
 `dead_code`, ce que `cargo clippy -p mika-cli --all-targets` mesure. `App.llm`
 est parti avec le dernier lecteur local. La suite du ticket est V3 puis V4.
 
+### Le worker de la TUI ne porte plus de provider (mika#1727, vol V3b-2)
+
+Depuis V3b-1 le modèle choisi voyage sur le fil sous `mika.model_override`
+(`mika_a2a::params::MODEL_OVERRIDE_KEY`), posé par `AgentRequest::SetModel` et
+lu par `chat_turn`. Ce vol retire ce qui restait derrière : **`spawn_agent_worker`
+prend un `DbContext`** — le worker n'a jamais eu besoin que de la base — et
+`init.rs` perd `AppContext`, son `Deref`, `override_model`, `init_for_agent` et
+`connect_mcp`. `init_db_only_for_agent` est désormais la **seule** porte d'entrée
+des commandes interactives, `mika ask` comprise.
+
+**MCP quitte la TUI en entier.** Aucun outil de ce processus n'y touchait depuis
+V1 : le tour tourne chez spirit, qui monte son propre `McpManager`. Les deux
+rechargements de skills à chaud partent avec `skills_dirty`, un drapeau que rien
+ne posait ; l'assemblage de démarrage reste, une fois.
+
+**Ce qui reste local est la seule part indépendante du provider.**
+`mika chat --model ""` est refusé au lancement, avec le message d'`ask.rs` —
+porté par `commands::ask::MODEL_MUST_NOT_BE_EMPTY`, une constante partagée et non
+deux littéraux. Un `--model` non vide part au worker **tel que tapé** et c'est
+lui qui s'affiche au démarrage : afficher le modèle configuré pendant qu'un
+override le remplace serait une fausse provenance (mika#2331). Bâtir un provider
+ici pour valider davantage ne pourrait plus que **refuser** un tour que spirit
+sait servir, sur une clé absente de ce shell (mika#2293).
+
+**`/provider` devient honnête**, et c'est le second livrable du vol : voir la
+puce `/provider` plus bas pour ce qu'il fait, et `handlers.rs` pour le pourquoi
+mika#1591 — un override préfixé d'un provider que le spirit **en cours** n'a pas
+configuré est refusé fermement et couperait tous les tours suivants.
+
+**Le refus structurel.** La garde de V3b-1
+(`mika1727_v3b1_le_tour_de_la_tui_ne_construit_plus_son_provider`, module `tests`
+de `commands/chat.rs`) **garde son nom** — elle est par fichier, pas par vol — et
+passe à deux sites (`chat.rs`, `ask.rs`) et huit motifs, dont `connect_mcp`,
+`McpManager`, `init_for_agent`, `AppContext` et `skills_dirty`. Allowlist livrée
+vide et assertie vide, un témoin par site, le contre-témoin sur `chat.rs` : quand
+elle rougit, le remède est de router l'appelant, jamais d'ajouter une ligne.
+
 - **Slash commands:** `/clear`, `/compact`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session
 - `/compact` asks mika-spirit to compact the conversation through `session_remote::compacter` (mika#1727, vol V2d-4d; see above for the body order and what each arm returns). It refuses locally — **before reading the token and before any call** — while the agent is not idle, because the TUI's own turn runs in-process and does not hold the server-side agent lock. No threshold is written client-side: the server reads `COMPACTION_THRESHOLD` and returns both the fact and the count. `compacted: true` means the compaction was **requested** and did not fail, never that a summary was written
 - `/restart` tears down a crashed agent-worker tokio task and spawns a fresh worker for the same agent (mika#1149). Refuses on a healthy worker — `/clear` is the right tool for starting a new session. The lost in-flight prompt is NOT replayed; the operator must re-type. Background callback tasks survive the restart and continue delivering to the new worker
-- `/provider` and `/model` pre-validate via `Settings::make_llm_provider()` before updating the UI. `/provider` switch persists default `{provider}_model` when none exists, warns about stale fields and max_tokens limits, and spawns a background `get_models()` to pre-warm the model list cache. `/model` lists available models from cache/API, supports aliases and direct `provider/model` format with cross-provider switching
+- `/provider` **writes, and nothing more** (mika#1727, vol V3b-2 — see below): it persists `llm_provider` plus the default `{provider}_model` when none exists, warns about stale fields and max_tokens limits, spawns a background `get_models()` to pre-warm the model list cache, and names mika-spirit's next restart in its answer. It sends no `SetModel` and changes neither `app.provider` nor `app.model`. `/model` lists available models from cache/API, supports aliases and direct `provider/model` format; a cross-provider `/model` persists the provider and sends the target provider's prefixed model as an override, but leaves `app.provider` alone for the same reason. `/provider set model <x>` still sends its `SetModel`, prefixed with `app.provider` — that arm changes no provider. Both still pre-validate the target provider through `commands::provider::validate_provider_switch`, which builds a `make_llm_provider()` locally to throw it away — the last local provider build on this path, left out of scope by V3b-2 and carrying the mika#2293 caveat (this shell's keys are not the daemon's)
 - **Footer badges:** `[N tasks]` (Cyan) for pending reminders, `[N running]` (Yellow) for active background callback tasks (polled every ~5s), `[N hidden]` (DarkGray) for suppressed internal messages in inbox mode, and dashboard status indicator with clickable `[start]`/`[stop]` and `[open]` buttons
 - **Inbox mode:** Default on — hides internal (agent-to-agent) messages from the chat view. `/inbox` toggles between inbox mode (filtered) and audit mode (all messages visible). Reloads message history from DB on toggle. `--inbox` flag on `mika chat` launches directly in audit mode (equivalent to typing `/inbox` after launch). `hidden_internal_count` tracks internal messages: seeded at startup with the count of internals filtered from the initial message load (mika#593), then incremented as new internal messages arrive during the session
 - **Input:** Shell-like Tab completion with context-aware argument completers. Multi-line input via Alt+Enter (primary) or Shift+Enter. Image paste (Ctrl+V), persistent per-agent input history, mouse scroll, click-drag text selection with clipboard copy, bracketed paste (100KB limit)
