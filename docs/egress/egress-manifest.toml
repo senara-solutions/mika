@@ -425,14 +425,13 @@ client_site        = "crates/mika-cli/src/commands/notify.rs"
 call_site          = "crates/mika-cli/src/commands/notify.rs"
 owner              = "@samidarko"
 
-[[sink]]
-id                 = "cli-chat-worker"
-destination        = "MIKA_ROUTING_URL (le gateway)"
-destination_source = "config"
-class              = "internal"
-data               = "messages sortants des tours en mode silencieux et des sessions TUI, qui tournent encore en process dans le CLI"
-logged             = false
-client_site        = "crates/mika-cli/src/commands/chat.rs"
-call_site          = "crates/mika-cli/src/commands/chat.rs"
-owner              = "@samidarko"
-notes              = "La population restante du CLI depuis mika#1727 : heartbeat, réflexion, rappels et `mika chat` appellent encore agent::run_agent en process, donc leur livraison part d'ici et non de mika-spirit."
+# `cli-chat-worker` a été retiré au vol V3a-2b de mika#1727. Son client
+# `reqwest` ne servait qu'au `GatewayMessageSender` que `commands/chat.rs`
+# bâtissait pour le tour en process ; le bras `CallbackResult` était son
+# dernier appelant, et il part désormais chez mika-spirit
+# (`chat_turn::livrer_tour_de_callback`). `init::make_message_sender` est
+# supprimée avec lui, donc plus aucun message sortant de la TUI ne quitte le
+# CLI par cette porte — la livraison est celle de mika-spirit, déjà déclarée
+# de son côté. L'entrée est retirée plutôt que repointée : la règle D3 du
+# lint dit qu'un manifeste décrivant un sink disparu est un manifeste qui
+# ment.

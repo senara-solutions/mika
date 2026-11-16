@@ -376,21 +376,28 @@ l'endpoint, jamais en rendant une réponse vide (mika#2270).
 
 `chat_turn.rs` est l'**unique** site d'envoi, et c'est structurel :
 `mika1727_v1_le_tour_de_la_tui_ne_fait_plus_tourner_la_boucle` balaie la moitié
-production du crate et refuse `agent::run_agent(` comme `AgentParams` partout
-sauf dans `commands/chat.rs`, où `mika1727_v1_le_site_tolere_na_quun_seul_appel_local`
-n'en tolère **qu'un**. Quand l'une rougit, le remède est de router le nouvel
-appelant par l'envoi existant, jamais d'élargir l'allowlist.
+production du crate et refuse `agent::run_agent(` comme `AgentParams`
+**partout**, allowlist (`V1_ALLOWED`) livrée vide et assertie vide depuis le vol
+V3a-2b. Quand elle rougit, le remède est de router le nouvel appelant par
+l'envoi existant, jamais d'y ajouter une ligne.
 
-**L'unique appel local restant est le bras `CallbackResult`, et il est borné.**
-Le fil sait désormais exprimer un tour de callback des deux côtés : la porte A2A
-lit `mika.callback_turn` en booléen strict depuis le vol V3a-1, et depuis V3a-2a
-**le client sait poser la clé**, par le seul site où se bâtissent les métadonnées
-de requête — `remote_ask::build_send_params`, que `callback_turn: bool` traverse
-jusqu'à la chaîne `send_turn_to_spirit`. **Aucun appelant ne la pose avant le vol
-V3a-2b** : tous passent `false`, et le bras tourne donc encore en processus. Il
-part avec le poll des callbacks au vol V3a-2b, et l'entrée d'allowlist avec lui ;
-le `TaskEngine`, lui, est déjà parti (vol V2a, voir plus bas). Le périmètre des
-vols est dans le corps de mika#1727.
+**Il ne reste aucun appel local de la boucle dans ce crate (vol V3a-2b).** Le
+bras `CallbackResult` était le dernier ; il passe désormais par
+`chat_turn::livrer_tour_de_callback`, qui est le seul site à poser
+`mika.callback_turn` à `true` — la porte A2A le lit en booléen strict depuis le
+vol V3a-1, et le client sait le poser depuis V3a-2a, par
+`remote_ask::build_send_params`. **Le poll des callbacks de `tui/app.rs`, lui,
+reste** : c'est ce qui livre le résultat au bras, et il part plus tard. Le
+`TaskEngine` est déjà parti (vol V2a, voir plus bas), et l'exception
+d'allowlist avec le bras. Le périmètre des vols est dans le corps de mika#1727.
+
+Ce que le tour de callback **perd** en passant sur le fil est dit sur
+`livrer_tour_de_callback` : pas de bloc `thinking:` (un `Task` A2A n'en porte
+pas de part), et aucun avis d'inertie — personne ne *tape* un tour de callback.
+Ce qu'il **garde** : sur toute erreur la tâche revient à son statut d'origine,
+pour que le poll suivant la reprenne. Une erreur peut arriver **après** que
+spirit a fait le tour, donc la livraison suivante le rejoue : la règle préfère
+un tour en double à un résultat perdu.
 
 **Trois entrées de la TUI n'atteignent plus le tour, et se disent à voix haute.**
 `chat_turn::inertia_notice` rend un avis **à chaque tour qui les exerce** — pas
