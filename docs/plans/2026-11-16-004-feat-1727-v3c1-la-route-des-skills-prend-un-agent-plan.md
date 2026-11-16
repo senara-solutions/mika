@@ -399,6 +399,14 @@ duplication assumée de D2, la provenance des treize champs, la raison du
 la borne, le pilote s'arrête selon la halte ci-dessus ; il ne retire pas après
 coup les commentaires qui portent un pourquoi.
 
+### Amendement : borne relevée à 475
+
+Le pilote a fait halte après C2, à **455** lignes pour une borne de **450**, sans
+avoir écrit C3. Vincent relève la borne de ce vol à **475** le 2026-11-16. La
+finition ne porte que le paragraphe de `crates/mika-agent/CLAUDE.md` (C3) et les
+vérifications de fin de pipeline ; aucun code de production n'y est touché et
+aucun commentaire n'est raboté.
+
 ### Si le code s'écarte de ce plan
 
 La QA juge contre **ce plan**, pas contre le corps du ticket. Si le pilote doit
