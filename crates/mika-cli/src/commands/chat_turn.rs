@@ -63,12 +63,12 @@ fn spirit_turn_endpoint(agent_name: &str) -> String {
 /// ses tours précédents.
 ///
 /// `callback_turn` est en revanche **un paramètre de cette fonction** depuis le
-/// vol V3a-2a : la TUI est le seul appelant qui aura un jour un tour de callback
-/// à envoyer, et le paramètre existe pour qu'il n'ait pas à rouvrir ce site. Son
-/// unique appelant d'aujourd'hui, le bras `Message` de `chat.rs`, le pose
-/// `false` : un message tapé par l'opérateur n'est pas un callback. **Le premier
-/// appelant à `true` est le vol V3a-2b**, qui fait partir le bras
-/// `CallbackResult` sur le fil au lieu de le faire tourner en processus.
+/// vol V3a-2a : la TUI est le seul appelant qui a un tour de callback à envoyer,
+/// et le paramètre existe pour qu'il n'ait pas à rouvrir ce site. Le bras
+/// `Message` de `chat.rs` le pose `false` — un message tapé par l'opérateur
+/// n'est pas un callback. **Le bras `CallbackResult` le pose `true`**, depuis
+/// le vol V3a-2b, par [`livrer_tour_de_callback`] : c'est le seul site du crate
+/// à le faire.
 pub(crate) async fn send_turn_to_spirit(
     text: &str,
     agent_name: &str,
