@@ -535,10 +535,17 @@ pub async fn run(
 ) -> Result<()> {
     let mut ctx = init::init_for_agent(agent_name)?;
 
+    // mika#1727 vol V3b-1 — `ctx.override_model` RESTE, et ce n'est pas un
+    // oubli : il valide la valeur avant le premier tour, ce qui donne à
+    // `mika chat --model x` un refus immédiat plutôt qu'au premier message, et
+    // `ctx.settings` a d'autres lecteurs ici (l'affichage du modèle au
+    // démarrage). Son retrait est porté par V3b-2, avec celui de `AppContext`.
     if let Some(model) = model_override {
         ctx.override_model(model)?;
     }
 
+    // L'override de départ part au worker tel que l'opérateur l'a tapé, et non
+    // tel que `ctx` l'a résolu : c'est spirit qui résout (mika#2304).
     let (
         mut worker,
         user_tx,
@@ -548,7 +555,7 @@ pub async fn run(
         identity_name,
         skill_registry,
         is_singleton_session,
-    ) = spawn_agent_worker(ctx, agent_name, session, None).await?;
+    ) = spawn_agent_worker(ctx, agent_name, session, model_override.map(String::from)).await?;
 
     // Build app with shared resources
     let mut app = App::new(
