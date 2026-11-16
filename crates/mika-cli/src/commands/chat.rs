@@ -6,7 +6,6 @@ use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use secrecy::ExposeSecret;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +31,6 @@ use mika_agent::prompt;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::assembly::assemble_agent_registry;
 use mika_agent::teams::types::TeamEvent;
-use mika_agent::tools;
 use mika_common::config::Settings;
 use mika_common::team;
 use std::path::Path;
@@ -191,7 +189,6 @@ async fn clore_session_de_sortie(
 async fn spawn_agent_worker(
     ctx: AppContext,
     agent_name: &str,
-    http_client: &reqwest::Client,
     session_id: Option<&str>,
 ) -> Result<(
     AgentWorker,
@@ -229,16 +226,6 @@ async fn spawn_agent_worker(
         canonical_session_id.as_deref(),
     )
     .await?;
-    let mut tool_registry = tools::default_tools();
-    for tool in tools::management_tools_if_needed(
-        &ctx.global_home,
-        &ctx.settings,
-        reqwest::Client::new(),
-        ctx.github_app.clone(),
-    ) {
-        tool_registry.register(tool);
-    }
-    let tool_registry = Arc::new(tool_registry);
     let skills_dir = ctx.home_dir.join("skills");
     // Migrate legacy .disabled marker files to DB (one-shot, idempotent).
     if let Err(e) = mika_agent::skills::migrate_disabled_markers_async(
@@ -264,31 +251,9 @@ async fn spawn_agent_worker(
         ctx.async_db.agent_id(),
     ));
     let skills_dirty = Arc::new(AtomicBool::new(false));
-    let embedding_client = ctx.settings.make_embedding_client();
-    let message_sender = crate::init::make_message_sender(
-        &ctx.settings,
-        &ctx.async_db,
-        http_client,
-        ctx.async_db.agent_id(),
-    );
-
-    let brave_api_key = ctx
-        .settings
-        .brave_api_key
-        .as_ref()
-        .map(|s| s.expose_secret().to_string());
-    let github_token = ctx.settings.agent_github_token().map(String::from);
 
     // Connect to MCP servers
     let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
-
-    // mika#1962 — CLI has no `AgentState`, so the CLI process start IS the
-    // init boundary for the tier. Resolve once here and thread the copy; do
-    // not re-read the env per turn.
-    let cli_tier = mika_common::home::AgentTier::from_env();
-    // mika#2290 — same boundary, same reason: the CLI process start is where
-    // the posed hosting fact is read, once.
-    let cli_deployment = mika_common::home::Deployment::from_env();
 
     // mika#1727 vol V2a — la TUI ne construit plus de moteur de tâches. Le
     // `TaskDispatcher`, le `TaskEngine`, la boucle de tick, `startup_recovery`,
@@ -307,26 +272,12 @@ async fn spawn_agent_worker(
     let supervisor_agent_tx = agent_tx.clone();
 
     let worker_db = ctx.async_db.clone();
-    let mut worker_llm = ctx.llm.clone();
     let mut worker_settings = ctx.settings.clone();
-    let worker_tools = tool_registry.clone();
     let mut worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let mut worker_session = session_id.clone();
-    let worker_embedding = embedding_client;
-    let worker_brave_key = brave_api_key;
-    let worker_github_token = github_token;
-    let worker_gateway_url = ctx.settings.routing_url.clone();
-    let worker_internal_token = ctx
-        .settings
-        .internal_token
-        .as_ref()
-        .map(|s| s.expose_secret().to_string());
-    let worker_github_app = ctx.github_app.clone();
-    let worker_sender = message_sender;
     let worker_dirty = skills_dirty.clone();
     let mut worker_mcp = mcp_manager;
-    let worker_global_home = ctx.global_home.clone();
     // mika#1727 V1 — l'agent visé par l'endpoint A2A du tour. C'est le nom tel
     // que l'opérateur l'a lancé, le même que `commands::ask` met dans son URL.
     let worker_agent_name = agent_name.to_string();
@@ -474,85 +425,20 @@ async fn spawn_agent_worker(
                         is_failed,
                     );
 
-                    // mika#1727 V1 — chemin par le module, et non par un import de
-                    // tête : le bras `Message` n'appelle plus rien de `agent`, et
-                    // un import nu de ces deux noms survivrait au vol V2 qui
-                    // emporte ce bras. Le corps du bras est inchangé par ailleurs.
-                    let is_onboarding = agent::check_onboarding(&worker_db).await;
-                    let callback_result = agent::run_agent(&agent::AgentParams {
-                        db: &worker_db,
-                        tier: cli_tier,
-                        deployment: cli_deployment,
-                        llm: worker_llm.as_ref(),
-                        tools: &worker_tools,
-                        skills: &worker_skills,
-                        user_message: &framing,
-                        channel_type: "cli",
-                        session_id: &worker_session,
-                        home_dir: &worker_home,
-                        is_onboarding,
-                        message_sender: worker_sender.clone(),
-                        skip_compaction: false,
-                        embedding_client: worker_embedding.as_ref(),
-                        thinking: None,
-                        user_images: &[],
-                        brave_api_key: worker_brave_key.as_deref(),
-                        github_token: worker_github_token.as_deref(),
-                        gateway_url: worker_gateway_url.as_deref(),
-                        internal_token: worker_internal_token.as_deref(),
-                        github_app: worker_github_app.as_deref(),
-                        skills_dirty: &worker_dirty,
-                        skill_nudge: None, // mika#1583: nudges apply in server mode only
-                        mcp_manager: worker_mcp.as_ref(),
-                        global_home_dir: Some(&worker_global_home),
-                        is_callback_turn: true,
-                        settings: Some(&worker_settings),
-                        // mika#2304: see the sibling construction above — the
-                        // chat worker's provider already carries any `--model`.
-                        caller_model_override: false,
-                        session_isolated: false,
-                        trace_id: trace_id.clone(),
-                        correlated_task_id: None,
-                        internal: false,
-                        pr_reviews_posted: None, // CLI mode: no session-scoped dedup needed
-                        // mika#3004: see the sibling construction above — a callback
-                        // turn on the CLI path has no pre-handler webhook text either.
-                        webhook_event_text: None,
-                        stream_ctx: None, // A2A-only injection point (mika#1731 wire, mika#1757 emission)
-                    })
+                    // mika#1727 vol V3a-2b — le tour part sur le fil, avec
+                    // `mika.callback_turn` à `true`. C'était le dernier appel
+                    // local de la boucle dans ce crate ; ce qu'il perd en
+                    // chemin et pourquoi la remise de statut lui survit se lit
+                    // sur `chat_turn::livrer_tour_de_callback`.
+                    let response = chat_turn::livrer_tour_de_callback(
+                        &worker_db,
+                        &worker_agent_name,
+                        &worker_session,
+                        &framing,
+                        &task_id,
+                        &original_status,
+                    )
                     .await;
-
-                    let response = match callback_result {
-                        Ok(output) => AgentResponse::Reply {
-                            content: output.text.unwrap_or_default(),
-                            is_error: false,
-                            thinking: output.thinking,
-                            input_tokens: output.usage.as_ref().map(|u| u.input_tokens as u32),
-                            updated_skills: None,
-                        },
-                        Err(e) => {
-                            // Unclaim the task so the next poll cycle can retry it.
-                            // mark_task_delivered set status to 'delivered'; reset to original
-                            // status so get_undelivered_callback_tasks will pick it up again.
-                            if let Err(reset_err) = worker_db
-                                .update_task_status(&task_id, &original_status)
-                                .await
-                            {
-                                tracing::warn!(
-                                    task_id = %task_id,
-                                    error = %reset_err,
-                                    "failed to unclaim callback task after agent error"
-                                );
-                            }
-                            AgentResponse::Reply {
-                                content: format!("Failed to process callback result: {e}"),
-                                is_error: true,
-                                thinking: None,
-                                input_tokens: None,
-                                updated_skills: None,
-                            }
-                        }
-                    };
                     if agent_tx.send(response).is_err() {
                         break;
                     }
@@ -575,8 +461,12 @@ async fn spawn_agent_worker(
                         let provider = updated_settings.llm_provider;
                         updated_settings.set_provider_model(provider, Some(model.clone()));
                     }
-                    if let Ok(new_llm) = updated_settings.make_llm_provider() {
-                        worker_llm = new_llm;
+                    // mika#1727 vol V3a-2b — le worker ne porte plus de
+                    // provider : le tour s'exécute chez mika-spirit. La
+                    // validation reste, elle, parce qu'elle est ce qui refuse
+                    // d'enregistrer un modèle que rien ne saurait servir ; seul
+                    // son produit est jeté.
+                    if updated_settings.make_llm_provider().is_ok() {
                         worker_settings = updated_settings;
                     }
                 }
@@ -651,7 +541,6 @@ pub async fn run(
         ctx.override_model(model)?;
     }
 
-    let http_client = reqwest::Client::new();
     let (
         mut worker,
         user_tx,
@@ -661,7 +550,7 @@ pub async fn run(
         identity_name,
         skill_registry,
         is_singleton_session,
-    ) = spawn_agent_worker(ctx, agent_name, &http_client, session).await?;
+    ) = spawn_agent_worker(ctx, agent_name, session).await?;
 
     // Build app with shared resources
     let mut app = App::new(
@@ -914,7 +803,7 @@ pub async fn run(
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
                 Ok(new_ctx) => {
-                    match spawn_agent_worker(new_ctx, &target_name, &http_client, None).await {
+                    match spawn_agent_worker(new_ctx, &target_name, None).await {
                         Ok((
                             new_worker,
                             new_tx,
@@ -1024,7 +913,7 @@ pub async fn run(
 
             match init::init_for_agent(agent_name) {
                 Ok(new_ctx) => {
-                    match spawn_agent_worker(new_ctx, agent_name, &http_client, None).await {
+                    match spawn_agent_worker(new_ctx, agent_name, None).await {
                         Ok((
                             new_worker,
                             new_tx,
