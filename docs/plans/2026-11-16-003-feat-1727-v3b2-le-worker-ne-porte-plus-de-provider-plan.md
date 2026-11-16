@@ -340,6 +340,19 @@ dans le même commit (É2). Dans `docs/slash-commands.md` : le paragraphe
 « Cross-provider switch » de `/model` (l. 240-250) et le bloc de bascule de
 `/provider` (l. 273-302).
 
+**Amendement du pilote (2026-11-16) — un huitième fichier change :
+`crates/mika-agent/docs/slash-commands.md`.** `slash-commands.md` est dans la
+liste de `scripts/sync-agent-docs.sh` (l. 21), et le job `docs-sync` de `ci.yml`
+(l. 349-367) relance ce script puis échoue sur tout `git diff` de
+`crates/mika-agent/docs/`. Toucher `docs/slash-commands.md` — ce que D12 exige —
+rend donc la copie locale du crate désynchronisée, et la PR rouge. Le fichier
+n'est pas du plan de contrôle, c'est une copie mécanique produite par le script
+et jamais éditée à la main. Ni le corps du ticket ni ce plan ne l'avaient prévu,
+d'où cet amendement. **Conséquence sur la borne** : les 27 lignes de
+`docs/slash-commands.md` sont comptées **deux fois**, le miroir compris, soit 27
+lignes de plus que le « Total estimé » de ce plan. Mesure après C3 : 367 pour
+400.
+
 ---
 
 ## Fire-Disposition
@@ -477,11 +490,15 @@ Vérifications de périmètre, à la main, avant la PR :
 - `git diff --stat origin/main...HEAD` ne nomme que `commands/chat.rs`,
   `init.rs`, `commands/ask.rs`, `commands/chat_turn.rs`,
   `tui/commands/handlers.rs`, `crates/mika-cli/CLAUDE.md`,
-  `docs/slash-commands.md` et ce plan.
+  `docs/slash-commands.md`, `crates/mika-agent/docs/slash-commands.md`
+  (amendement de D12 ci-dessus) et ce plan.
 - `git diff origin/main...HEAD -- crates/mika-cli/src/tui/app.rs` est **vide**
   (critère 6, à l'octet) ; de même pour `commands/model.rs`,
   `commands/provider.rs`, `remote_ask.rs`, `crates/mika-a2a/`,
-  `crates/mika-agent/`, `crates/mika-common/` et `crates/mika-gateway/`.
+  `crates/mika-agent/src/`, `crates/mika-common/` et `crates/mika-gateway/`. La
+  racine `crates/mika-agent/` est remplacée par son `src/` : seule la copie
+  mécanique `crates/mika-agent/docs/slash-commands.md` y change, et elle n'est
+  produite que par `scripts/sync-agent-docs.sh`.
 - Aucun `#[allow(` ni `#[expect(` neuf dans le diff (critère 4) — un `expect`
   disparaît (É4).
 - **Aucun fichier du plan de contrôle** : ni `.github/workflows/`, ni `.claude/`,
@@ -574,8 +591,10 @@ en nommant le point et la raison.
 - [ ] `crates/mika-cli/CLAUDE.md` et `docs/slash-commands.md` disent ce qui est
       vrai de `/model`, de `/provider` et du worker ; le paragraphe
       « *Unchanged:* `mika chat --model` » a disparu.
-- [ ] Seuls les sept fichiers listés changent ; `tui/app.rs` est inchangé à
-      l'octet ; aucun fichier du plan de contrôle n'est touché.
+- [ ] Seuls les sept fichiers listés changent, plus la copie mécanique
+      `crates/mika-agent/docs/slash-commands.md` (amendement de D12) ;
+      `tui/app.rs` est inchangé à l'octet ; aucun fichier du plan de contrôle
+      n'est touché.
 - [ ] Au plus 400 lignes ajoutées, plan exclu.
 - [ ] La PR porte `Refs mika#1727`, et aucun `Closes`, `Fixes` ni `Resolves` —
       corps et commits. Si le gabarit de reprise l'ouvre avec un `Closes`, il est
