@@ -1265,6 +1265,10 @@ pub async fn handle_session_tool_calls(
 pub struct SkillsListQuery {
     pub source: Option<String>,
     pub always_on: Option<String>,
+    /// Agent whose registry is served. Absent or empty means the server's
+    /// default agent — and never the head of the `DashMap`, whose iteration
+    /// order is undefined (mika#1727 V3c-1).
+    pub agent: Option<String>,
 }
 
 pub async fn handle_skills_list(
@@ -1274,15 +1278,31 @@ pub async fn handle_skills_list(
     use crate::bundled_skills::is_bundled_skill;
     use crate::skills::{SkillListFilter, SkillSource, apply_filter};
 
-    // Extract the first agent state out of the DashMap iter scrutinee so the
-    // shard-lock guard is released before we branch (clippy::sig_drop, #1724).
-    let first_agent_state = state.agents.iter().next().map(|r| r.value().clone());
-    let agent_state = match first_agent_state {
+    let requested = q.agent.as_deref().unwrap_or("");
+    // `resolve_agent` hands back an `Arc<AgentState>` that does not carry its
+    // own name, so the root `agent` field has to replay its default rule here.
+    // This duplication is the **trace of a scope constraint** — mika#1727 V3c-1
+    // keeps `server/state.rs` intact — not a design choice: the day that file
+    // opens, make `resolve_agent` return the resolved name and delete these
+    // five lines. `resolve_agent` stays the sole resolver: it receives
+    // `requested` raw and nothing here decides which agent is served.
+    let resolved_name = if requested.is_empty() {
+        state.default_agent.clone()
+    } else {
+        mika_common::agent::normalize_agent_name(requested)
+    };
+
+    let agent_state = match state.resolve_agent(requested).await {
         Some(a) => a,
         None => {
+            // Same wording as `handle_agent_detail` above: two routes of this
+            // file that refuse the same object must refuse it alike. No
+            // `skills` key — an empty list would read as "this agent has no
+            // skills" when in fact it has no existence. The name reported is
+            // the one **asked for**, because that is what the caller has to fix.
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "no agents configured"})),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("agent '{}' not found", requested)})),
             )
                 .into_response();
         }
@@ -1302,6 +1322,26 @@ pub async fn handle_skills_list(
             } else {
                 "marketplace"
             };
+            // `variants` is an object rather than two flat fields because the
+            // TUI's `/skill <name>` renders total and breakdown together
+            // ("N total (p1 (k models), p2)"); splitting them would make the
+            // reader glue them back. A provider with no model appears with `0`
+            // — the distinction behind "p2" without parentheses.
+            let providers: serde_json::Map<String, serde_json::Value> = entry
+                .variant_providers()
+                .into_iter()
+                .map(|p| (p.to_string(), entry.variant_models(p).len().into()))
+                .collect();
+            let tool_names: Vec<&str> = entry
+                .skill_tools
+                .iter()
+                .map(|t| t.definition.name.as_str())
+                .collect();
+            // The six original fields keep their names — `tools` stays the
+            // COUNT, and the names arrive beside it under `tool_names`.
+            // Renaming it would buy nothing and break the only contract this
+            // route has already published. The seven added are exactly what
+            // V3c-2 reads off this route, not a speculative widening.
             serde_json::json!({
                 "name": name,
                 "description": entry.manifest.skill.description,
@@ -1309,11 +1349,38 @@ pub async fn handle_skills_list(
                 "enabled": entry.enabled,
                 "always_on": entry.manifest.skill.always_on,
                 "tools": entry.skill_tools.len(),
+                "has_override": entry.has_override,
+                "version": entry.manifest.skill.version,
+                // The ROOT timeout, not `effective_timeout(provider, model)`:
+                // that pair is unknown here — the provider serving the calling
+                // session is not this route's business — and inventing one
+                // would serve a wrong number with authority. It is also what
+                // the TUI displays today.
+                "timeout_secs": entry.manifest.skill.timeout_secs,
+                "keywords": entry.manifest.triggers.keywords,
+                "tool_names": tool_names,
+                "path": entry.dir.display().to_string(),
+                "variants": {"total": entry.variant_count(), "providers": providers},
             })
         })
         .collect();
 
-    Json(serde_json::json!({ "skills": skills })).into_response()
+    // `skipped` is a property of the REGISTRY, not of a skill: it names what
+    // could not be loaded. It is deliberately NOT filtered by `source` /
+    // `always_on` — a skipped skill has no readable manifest for a property
+    // filter to bear on.
+    let skipped: Vec<serde_json::Value> = registry
+        .skipped()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "reason": s.reason}))
+        .collect();
+
+    Json(serde_json::json!({
+        "agent": resolved_name,
+        "skills": skills,
+        "skipped": skipped,
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/sessions/:id/skills — loaded skills from session metadata.

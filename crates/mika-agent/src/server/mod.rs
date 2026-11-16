@@ -2501,14 +2501,75 @@ mod tests {
     ) -> AppState {
         let db = test_async_db();
         let dashboard_db = db.clone();
-        let llm = mika_common::llm::dummy_provider();
         let tools_reg = Arc::new(tools::default_tools());
-        let skills_reg = Arc::new(SkillRegistry::empty());
+
+        let agent_state = test_agent_state(
+            db,
+            agent_settings,
+            tier,
+            home_dir,
+            model_drift,
+            SkillRegistry::empty(),
+        );
+
+        let agents = dashmap::DashMap::new();
+        agents.insert("mika".to_string(), Arc::new(agent_state));
+
+        AppState {
+            agents: Arc::new(agents),
+            default_agent: "mika".to_string(),
+            tools: tools_reg,
+            ready: Arc::new(AtomicBool::new(false)),
+            internal_token: SecretString::from("test-token-secret"),
+            dashboard_token: None,
+            gateway_url: "http://localhost:9999".to_string(),
+            startup_time: std::time::Instant::now(),
+            http_client: reqwest::Client::new(),
+            brave_api_key: None,
+            github_token: None,
+            github_app: None,
+            global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
+            settings: test_settings(),
+            dashboard_db,
+            investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
+            dashboard_enabled: Arc::new(AtomicBool::new(false)),
+            a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
+            pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
+            rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
+            webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
+            a2a_queue_audit_last: Arc::new(dashmap::DashMap::new()),
+            webhook_queue_shutdown: CancellationToken::new(),
+            permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
+            task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
+        }
+    }
+
+    /// The `AgentState` of a test state, in one place (mika#1727 V3c-1 D6).
+    ///
+    /// Extracted from [`test_state_full`] so a multi-agent state can carry more
+    /// than one agent without recopying twenty-five fields — a second copy is a
+    /// second thing to forget to update.
+    ///
+    /// The agent's **name is not a parameter**: `budget_record` stays resolved
+    /// for `"mika"` the way it always was. The skills route does not read that
+    /// field, and parameterizing it would add a seventh argument with no reader.
+    /// A future multi-agent budget test is what opens it.
+    fn test_agent_state(
+        db: AsyncDatabase,
+        agent_settings: Settings,
+        tier: mika_common::home::AgentTier,
+        home_dir: std::path::PathBuf,
+        model_drift: mika_common::llm::ModelDriftCheck,
+        skills: SkillRegistry,
+    ) -> AgentState {
+        let llm = mika_common::llm::dummy_provider();
+        let skills_reg = Arc::new(skills);
         let skills_dirty = Arc::new(AtomicBool::new(false));
         let agent_lock = Arc::new(tokio::sync::Mutex::new(()));
         let (task_engine, dispatcher) = test_task_engine(db.clone());
 
-        let agent_state = AgentState {
+        AgentState {
             tier,
             deployment: mika_common::home::Deployment::Unknown,
             db,
@@ -2544,43 +2605,329 @@ mod tests {
             )),
             model_drift: Arc::new(model_drift),
             home_dir,
-        };
-
-        let agents = dashmap::DashMap::new();
-        agents.insert("mika".to_string(), Arc::new(agent_state));
-
-        AppState {
-            agents: Arc::new(agents),
-            default_agent: "mika".to_string(),
-            tools: tools_reg,
-            ready: Arc::new(AtomicBool::new(false)),
-            internal_token: SecretString::from("test-token-secret"),
-            dashboard_token: None,
-            gateway_url: "http://localhost:9999".to_string(),
-            startup_time: std::time::Instant::now(),
-            http_client: reqwest::Client::new(),
-            brave_api_key: None,
-            github_token: None,
-            github_app: None,
-            global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
-            settings: test_settings(),
-            dashboard_db,
-            investigation_lock: Arc::new(tokio::sync::Mutex::new(())),
-            investigation_tools: Arc::new(tokio::sync::OnceCell::new()),
-            dashboard_enabled: Arc::new(AtomicBool::new(false)),
-            a2a_broadcasters: Arc::new(dashmap::DashMap::new()),
-            pr_reviews_posted: Arc::new(dashmap::DashMap::new()),
-            rate_limit_audit_last: Arc::new(dashmap::DashMap::new()),
-            webhook_queue_audit_last: Arc::new(dashmap::DashMap::new()),
-            a2a_queue_audit_last: Arc::new(dashmap::DashMap::new()),
-            webhook_queue_shutdown: CancellationToken::new(),
-            permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
-            task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
         }
     }
 
     fn test_app(state: AppState) -> Router {
         build_router(state)
+    }
+
+    // --- mika#1727 V3c-1: `GET /api/v1/skills` serves a NAMED agent ------------
+    //
+    // On main the route served `state.agents.iter().next()` — the head of a
+    // `DashMap`, whose iteration order is undefined — so "which agent's skills
+    // am I reading?" had no answer. V3c-2 makes the TUI read this route, so the
+    // answer has to be the one the caller asked for.
+
+    /// The only skill-entry factory of this module (mika#1727 V3c-1 D6).
+    ///
+    /// The two override maps are populated **for every entry**, deliberately:
+    /// `variants` is read back by the critère-4 test, and a `provider_overrides`
+    /// left empty would make `variants.total` vacuous. `"openai"` carries a
+    /// provider override and no model, so the response has a provider whose
+    /// model count is `0` — the distinction the TUI already renders.
+    fn test_skill_entry(
+        name: &str,
+        always_on: bool,
+        keywords: &[&str],
+        tool_names: &[&str],
+    ) -> crate::skills::index::SkillEntry {
+        use crate::skills::index::{ResolvedSkillTool, SkillEntry};
+        use crate::skills::manifest::{
+            Constraints, ProviderSkillFields, SkillInfo, SkillManifest, ToolHandler, Triggers,
+        };
+        use mika_common::claude::ToolDefinition;
+
+        let variant_fields = ProviderSkillFields {
+            timeout_secs: Some(99),
+            max_prompt_size: None,
+        };
+        SkillEntry {
+            manifest: SkillManifest {
+                skill: SkillInfo {
+                    name: name.to_string(),
+                    description: format!("{name} description"),
+                    version: "1.2.3".to_string(),
+                    always_on,
+                    timeout_secs: 45,
+                    dependencies: vec![],
+                    max_prompt_size: None,
+                    data_grade: Default::default(),
+                },
+                triggers: Triggers {
+                    keywords: keywords.iter().map(|k| k.to_string()).collect(),
+                },
+                llm: Default::default(),
+                constraints: Constraints::default(),
+                output: Default::default(),
+                context: std::collections::HashMap::new(),
+                variants: Default::default(),
+            },
+            dir: std::path::PathBuf::from(format!("/tmp/mika-test/skills/{name}")),
+            keywords_lower: keywords.iter().map(|k| k.to_lowercase()).collect(),
+            prompt_snippet: String::new(),
+            skill_tools: tool_names
+                .iter()
+                .map(|tn| ResolvedSkillTool {
+                    definition: ToolDefinition {
+                        name: tn.to_string(),
+                        description: format!("{tn} tool"),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    handler: ToolHandler::Builtin {
+                        function: tn.to_string(),
+                    },
+                    skill_dir: std::path::PathBuf::from(format!("/tmp/mika-test/skills/{name}")),
+                })
+                .collect(),
+            enabled: true,
+            has_override: true,
+            provider_overrides: std::collections::HashMap::from([
+                ("anthropic".to_string(), variant_fields.clone()),
+                ("openai".to_string(), variant_fields.clone()),
+            ]),
+            prompt_sources: SkillEntry::empty_prompt_sources(),
+            model_overrides: std::collections::HashMap::from([(
+                "anthropic/sonnet".to_string(),
+                variant_fields,
+            )]),
+        }
+    }
+
+    /// A state with three agents carrying **distinct** registries, built on top
+    /// of [`test_state`] rather than recopying the `AppState` literal (D6).
+    ///
+    /// The `"mika"` agent of `test_state` survives with an **empty** registry,
+    /// and that is a benefit: it keeps the critère-1 test non-vacuous even if
+    /// the `DashMap` happened to put `"mika"` at its head.
+    ///
+    /// `skills-skipped` exists because no public constructor combines entries
+    /// and skipped skills (écart É1), and `skipped` has to be served non-empty
+    /// somewhere.
+    fn test_state_skills_multi() -> AppState {
+        use crate::skills::index::SkippedSkill;
+
+        let mut state = test_state();
+        let home = std::path::PathBuf::from("/tmp/mika-test");
+        let tier = mika_common::home::AgentTier::Default;
+
+        let agents: [(&str, SkillRegistry); 3] = [
+            (
+                "skills-a",
+                SkillRegistry::from_test_entries(vec![
+                    test_skill_entry("alpha-always", true, &["alpha"], &["alpha_tool"]),
+                    test_skill_entry("alpha-on-demand", false, &["alpha", "second"], &[]),
+                ]),
+            ),
+            (
+                "skills-b",
+                SkillRegistry::from_test_entries(vec![test_skill_entry(
+                    "beta-only",
+                    false,
+                    &["beta"],
+                    &[],
+                )]),
+            ),
+            (
+                "skills-skipped",
+                SkillRegistry::with_skipped(vec![SkippedSkill {
+                    name: "broken-skill".to_string(),
+                    reason: "manifest parse error".to_string(),
+                }]),
+            ),
+        ];
+
+        for (name, registry) in agents {
+            let agent_state = test_agent_state(
+                test_async_db(),
+                test_settings(),
+                tier,
+                home.clone(),
+                mika_common::llm::ModelDriftCheck::NotApplicable,
+                registry,
+            );
+            state.agents.insert(name.to_string(), Arc::new(agent_state));
+        }
+
+        state.default_agent = "skills-a".to_string();
+        state
+    }
+
+    /// `GET /api/v1/skills<query>` with the internal token, body deserialized.
+    /// Four tests share it rather than each recopying a `Request::builder`.
+    async fn skills_get(app: Router, query: &str) -> (StatusCode, serde_json::Value) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/skills{query}"))
+                    .header("authorization", "Bearer test-token-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn skill_names(body: &serde_json::Value) -> Vec<String> {
+        body["skills"]
+            .as_array()
+            .expect("the response must carry a `skills` array")
+            .iter()
+            .map(|s| {
+                s["name"]
+                    .as_str()
+                    .expect("each skill has a name")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Critère 1 — the route serves the agent it was ASKED for, and the property
+    /// filters apply to that agent.
+    ///
+    /// This is the flight's negative test: on main the route ignores `agent`, so
+    /// one of the two halves fails whichever agent the `DashMap` happens to serve
+    /// first — the two assertions cannot both hold under head-of-map semantics.
+    #[tokio::test]
+    async fn mika1727_the_skills_route_serves_the_agent_it_was_asked_for() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        let (status, a) = skills_get(test_app(state.clone()), "?agent=skills-a").await;
+        assert_eq!(status, StatusCode::OK);
+        let mut names = skill_names(&a);
+        names.sort();
+        assert_eq!(names, vec!["alpha-always", "alpha-on-demand"]);
+        assert!(
+            !names.contains(&"beta-only".to_string()),
+            "skills-a must not be served another agent's registry"
+        );
+
+        let (status, b) = skills_get(test_app(state.clone()), "?agent=skills-b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(skill_names(&b), vec!["beta-only"]);
+
+        // The mika#606 filters apply to the RESOLVED agent, not to a registry
+        // picked by iteration order.
+        let (status, filtered) =
+            skills_get(test_app(state), "?agent=skills-a&always_on=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(skill_names(&filtered), vec!["alpha-always"]);
+    }
+
+    /// Critère 2 — an unknown agent is a 404 carrying the name that was asked
+    /// for, and NO `skills` key: an empty list would read as "this agent has no
+    /// skills" when it has no existence.
+    #[tokio::test]
+    async fn mika1727_an_unknown_agent_is_a_404_without_a_skills_key() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        // The name is implausible ON DISK on purpose: `resolve_agent`'s slow path
+        // reads `<global_home_dir>/agents/<name>/identity.toml` (= /tmp/mika-test
+        // here), so a banal name could exist on a dev machine and turn this test
+        // green for the wrong reason.
+        let name = "agent-absent-v3c1";
+        assert!(
+            !std::path::Path::new("/tmp/mika-test/agents")
+                .join(name)
+                .join("identity.toml")
+                .exists(),
+            "the test name must not exist on disk, or the 404 proves nothing"
+        );
+
+        let (status, body) = skills_get(test_app(state), &format!("?agent={name}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], format!("agent '{name}' not found"));
+        assert!(
+            body.get("skills").is_none(),
+            "a refused agent must not carry a skills field"
+        );
+    }
+
+    /// Critère 3 — no `agent` param, and an empty one, both mean the server's
+    /// DEFAULT agent; the root `agent` field names whoever was resolved.
+    #[tokio::test]
+    async fn mika1727_the_default_agent_answers_an_absent_or_empty_param() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        for query in ["", "?agent="] {
+            let (status, body) = skills_get(test_app(state.clone()), query).await;
+            assert_eq!(status, StatusCode::OK, "query {query:?}");
+            assert_eq!(body["agent"], "skills-a", "query {query:?}");
+            let mut names = skill_names(&body);
+            names.sort();
+            assert_eq!(names, vec!["alpha-always", "alpha-on-demand"]);
+        }
+
+        // The field names the RESOLVED agent, not the default one — without this
+        // third request a hardcoded `state.default_agent` would pass.
+        let (status, body) = skills_get(test_app(state), "?agent=skills-b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["agent"], "skills-b");
+    }
+
+    /// Critère 4 — the thirteen per-skill fields and the root `skipped`.
+    ///
+    /// Two requests, because no public constructor combines entries and skipped
+    /// skills (écart É1). That pins the registry → response coupling on BOTH
+    /// sides: were the handler reading another agent's `skipped`, the first half
+    /// would redden too.
+    #[tokio::test]
+    async fn mika1727_each_served_skill_carries_the_thirteen_fields() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        let (status, body) = skills_get(test_app(state.clone()), "?agent=skills-b").await;
+        assert_eq!(status, StatusCode::OK);
+        let skill = &body["skills"][0];
+        assert_eq!(skill["name"], "beta-only");
+        assert_eq!(skill["description"], "beta-only description");
+        assert_eq!(skill["origin"], "marketplace");
+        assert_eq!(skill["enabled"], true);
+        assert_eq!(skill["always_on"], false);
+        assert_eq!(skill["tools"], 0);
+        assert_eq!(skill["has_override"], true);
+        assert_eq!(skill["version"], "1.2.3");
+        // The root timeout of the manifest, not an `effective_timeout` for a
+        // provider the route does not know (the fixture's overrides carry 99).
+        assert_eq!(skill["timeout_secs"], 45);
+        assert_eq!(skill["keywords"], serde_json::json!(["beta"]));
+        assert_eq!(skill["tool_names"], serde_json::json!([]));
+        assert_eq!(skill["path"], "/tmp/mika-test/skills/beta-only");
+        assert_eq!(
+            skill["variants"],
+            serde_json::json!({"total": 3, "providers": {"anthropic": 1, "openai": 0}}),
+            "a provider with no model must appear with 0"
+        );
+        assert_eq!(
+            body["skipped"],
+            serde_json::json!([]),
+            "an agent whose registry skipped nothing serves an empty list"
+        );
+
+        // An entry with a tool and a second keyword, so `tools`/`tool_names`
+        // are not vacuously empty on every served skill.
+        let (_, a) = skills_get(test_app(state.clone()), "?agent=skills-a&always_on=true").await;
+        assert_eq!(a["skills"][0]["tools"], 1);
+        assert_eq!(
+            a["skills"][0]["tool_names"],
+            serde_json::json!(["alpha_tool"])
+        );
+
+        let (status, skipped) = skills_get(test_app(state), "?agent=skills-skipped").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(skill_names(&skipped), Vec::<String>::new());
+        assert_eq!(
+            skipped["skipped"],
+            serde_json::json!([{"name": "broken-skill", "reason": "manifest parse error"}])
+        );
     }
 
     // --- mika#2070: the caller's session id survives the whole server hop ------
