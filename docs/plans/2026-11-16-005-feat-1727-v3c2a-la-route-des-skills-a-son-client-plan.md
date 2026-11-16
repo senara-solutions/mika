@@ -66,6 +66,30 @@ précisément le chemin qui met la décision sous les yeux de l'opérateur. Les 
 coupes du § 4 sont le matériau de cette décision, chacune repassant sous la
 borne.
 
+### Réponse à la passe 1 de l'architecte — F1
+
+**Could not address: F1.** Le constat du finding est exact — c'est celui de ce
+§ 0, aux mêmes chiffres — et son *changement requis* est hors de portée du groom.
+F1 demande que Vincent choisisse **(a)** la coupe A, **(b)** la coupe B, ou
+**(c)** relève la borne avec sa justification : les trois sont des mots
+d'opérateur. En prendre un à sa place enfreindrait la consigne même qui a produit
+la halte — « Il ne recoupe pas lui-même : une coupe demande le mot de Vincent »
+(tête du ticket, citée *supra*) — et serait l'élargissement que mika#2693 et
+cette consigne interdisent de concert.
+
+Ce que la révision fait, à défaut de trancher : elle rend le mot **suffisant**.
+Le § 4 gagne ce que chacune des trois réponses déclenche, et le seul point du
+plan qu'un dispatch sous borne relevée aurait trouvé faux — la halte du pilote du
+§ 3, calée sur 475. Rien d'autre n'a bougé : § 1 (la mesure) et § 2 (les
+décisions) valent inchangés sous les trois réponses.
+
+**Ce que la seconde passe automatique ne peut pas faire.** Le
+`mika-arch-second-review` qui relit ce document relira la même halte, au même
+dépassement chiffré, et c'est l'état nominal plutôt qu'une révision manquée : la
+boucle automatique n'a aucun coup à jouer sur un plan dont le seul blocage est
+une décision d'opérateur. La sortie attendue de ce vol est un **ESCALATE vers
+Vincent**, pas un GROOMED.
+
 ---
 
 ## 1. Ce qui est mesuré sur main (@ `210f8dd8`)
@@ -506,6 +530,17 @@ les trois autres et les teste. Aucun test ne se reporte. Les trois vols passent
 largement sous 429. Le prix est un `Refus` qui gagne trois variants en deux
 temps — un type qui s'élargit, jamais un type qui mentait.
 
+### Ce que chaque mot déclenche (passe 2, matériau de F1)
+
+| réponse | suite immédiate | ce qu'il faut recaler avant de dispatcher |
+|---|---|---|
+| **(a) coupe A** | deux vols, A-i puis A-ii, groomés depuis ce document sans nouvelle passe de mesure | la borne d'A-ii : ses 441 tiennent sous **452** (tête du ticket) mais pas sous **429** (mika#2693). (a) emporte donc, implicitement, le choix de la borne de la tête — à dire explicitement, sinon le groom d'A-ii rouvrira cette même halte à 3 lignes près |
+| **(b) coupe B** | trois vols, B-i → B-ii → B-iii, même matériau | **rien** : les trois passent largement sous 429. C'est la seule des trois réponses qui ne demande aucun ajustement de règle |
+| **(c) borne relevée** | ce vol part tel quel, en un seul dispatch | la tête du ticket **et** la halte du pilote du § 3, qui lit « > 475 ⇒ arrêt » et « > 425 après le premier commit ⇒ arrêt ». Sous (c) ces deux nombres doivent devenir ceux de la borne relevée (≥ **534** dans l'unité du vol, ≥ **517** dans celle de l'architecte), sans quoi le pilote s'arrête au milieu de C2 sur une borne que Vincent vient de lever — un vol mort sur une garde devenue fausse |
+
+Ce tableau est le coût de chaque mot, jamais son choix : le plan ne porte aucune
+des trois variantes.
+
 ### Ce que le groom ne fait pas
 
 Il ne choisit pas entre A et B, il ne relève aucune borne, et il n'écrit le plan
@@ -657,3 +692,23 @@ aval d'un périmètre plus petit.
 
 Un poste tomberait-il de 10 % que le total resterait au-dessus des trois bornes.
 C'est pourquoi le § 0 conclut à la halte plutôt qu'à une marge à surveiller.
+
+---
+
+## Revision history
+
+- **rev 2 (2026-11-16)** — **could not address F1.** Le changement requis par F1
+  est un mot d'opérateur (trancher entre la coupe A, la coupe B, ou relever la
+  borne), et la tête du ticket l'interdit explicitement au groom : « Il ne
+  recoupe pas lui-même : une coupe demande le mot de Vincent ». Le prendre à sa
+  place serait l'élargissement que cette consigne et mika#2693 interdisent de
+  concert. À défaut de trancher, la révision rend ce mot suffisant : le § 0 porte
+  la réponse nommée à F1 et déclare la sortie attendue (**ESCALATE vers
+  Vincent**, pas GROOMED, la boucle automatique n'ayant aucun coup à jouer sur un
+  blocage d'opérateur), et le § 4 nomme ce que chacune des trois réponses
+  déclenche — dont le recalage de la halte du pilote du § 3 sous (c), seul point
+  du plan qu'un dispatch à borne relevée aurait trouvé faux, et le fait que (a)
+  emporte implicitement le choix de la borne 452 contre 429. Aucune autre section
+  n'a changé : la mesure (§ 1), les décisions (§ 2), l'ordre de commit (§ 3), la
+  DoD (§ 5), les AC (§ 6) et le chiffrage valent inchangés de rev 1, et sous les
+  trois réponses. Aucun AC n'a été affaibli ni retiré.
