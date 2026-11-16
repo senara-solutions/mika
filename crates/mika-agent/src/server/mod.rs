@@ -2873,6 +2873,63 @@ mod tests {
         assert_eq!(body["agent"], "skills-b");
     }
 
+    /// Critère 4 — the thirteen per-skill fields and the root `skipped`.
+    ///
+    /// Two requests, because no public constructor combines entries and skipped
+    /// skills (écart É1). That pins the registry → response coupling on BOTH
+    /// sides: were the handler reading another agent's `skipped`, the first half
+    /// would redden too.
+    #[tokio::test]
+    async fn mika1727_each_served_skill_carries_the_thirteen_fields() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        let (status, body) = skills_get(test_app(state.clone()), "?agent=skills-b").await;
+        assert_eq!(status, StatusCode::OK);
+        let skill = &body["skills"][0];
+        assert_eq!(skill["name"], "beta-only");
+        assert_eq!(skill["description"], "beta-only description");
+        assert_eq!(skill["origin"], "marketplace");
+        assert_eq!(skill["enabled"], true);
+        assert_eq!(skill["always_on"], false);
+        assert_eq!(skill["tools"], 0);
+        assert_eq!(skill["has_override"], true);
+        assert_eq!(skill["version"], "1.2.3");
+        // The root timeout of the manifest, not an `effective_timeout` for a
+        // provider the route does not know (the fixture's overrides carry 99).
+        assert_eq!(skill["timeout_secs"], 45);
+        assert_eq!(skill["keywords"], serde_json::json!(["beta"]));
+        assert_eq!(skill["tool_names"], serde_json::json!([]));
+        assert_eq!(skill["path"], "/tmp/mika-test/skills/beta-only");
+        assert_eq!(
+            skill["variants"],
+            serde_json::json!({"total": 3, "providers": {"anthropic": 1, "openai": 0}}),
+            "a provider with no model must appear with 0"
+        );
+        assert_eq!(
+            body["skipped"],
+            serde_json::json!([]),
+            "an agent whose registry skipped nothing serves an empty list"
+        );
+
+        // An entry with a tool and a second keyword, so `tools`/`tool_names`
+        // are not vacuously empty on every served skill.
+        let (_, a) = skills_get(test_app(state.clone()), "?agent=skills-a&always_on=true").await;
+        assert_eq!(a["skills"][0]["tools"], 1);
+        assert_eq!(
+            a["skills"][0]["tool_names"],
+            serde_json::json!(["alpha_tool"])
+        );
+
+        let (status, skipped) = skills_get(test_app(state), "?agent=skills-skipped").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(skill_names(&skipped), Vec::<String>::new());
+        assert_eq!(
+            skipped["skipped"],
+            serde_json::json!([{"name": "broken-skill", "reason": "manifest parse error"}])
+        );
+    }
+
     // --- mika#2070: the caller's session id survives the whole server hop ------
     //
     // The unit tests on either side of this — metadata extraction in

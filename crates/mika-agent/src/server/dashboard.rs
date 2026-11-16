@@ -1322,6 +1322,26 @@ pub async fn handle_skills_list(
             } else {
                 "marketplace"
             };
+            // `variants` is an object rather than two flat fields because the
+            // TUI's `/skill <name>` renders total and breakdown together
+            // ("N total (p1 (k models), p2)"); splitting them would make the
+            // reader glue them back. A provider with no model appears with `0`
+            // — the distinction behind "p2" without parentheses.
+            let providers: serde_json::Map<String, serde_json::Value> = entry
+                .variant_providers()
+                .into_iter()
+                .map(|p| (p.to_string(), entry.variant_models(p).len().into()))
+                .collect();
+            let tool_names: Vec<&str> = entry
+                .skill_tools
+                .iter()
+                .map(|t| t.definition.name.as_str())
+                .collect();
+            // The six original fields keep their names — `tools` stays the
+            // COUNT, and the names arrive beside it under `tool_names`.
+            // Renaming it would buy nothing and break the only contract this
+            // route has already published. The seven added are exactly what
+            // V3c-2 reads off this route, not a speculative widening.
             serde_json::json!({
                 "name": name,
                 "description": entry.manifest.skill.description,
@@ -1329,11 +1349,38 @@ pub async fn handle_skills_list(
                 "enabled": entry.enabled,
                 "always_on": entry.manifest.skill.always_on,
                 "tools": entry.skill_tools.len(),
+                "has_override": entry.has_override,
+                "version": entry.manifest.skill.version,
+                // The ROOT timeout, not `effective_timeout(provider, model)`:
+                // that pair is unknown here — the provider serving the calling
+                // session is not this route's business — and inventing one
+                // would serve a wrong number with authority. It is also what
+                // the TUI displays today.
+                "timeout_secs": entry.manifest.skill.timeout_secs,
+                "keywords": entry.manifest.triggers.keywords,
+                "tool_names": tool_names,
+                "path": entry.dir.display().to_string(),
+                "variants": {"total": entry.variant_count(), "providers": providers},
             })
         })
         .collect();
 
-    Json(serde_json::json!({ "agent": resolved_name, "skills": skills })).into_response()
+    // `skipped` is a property of the REGISTRY, not of a skill: it names what
+    // could not be loaded. It is deliberately NOT filtered by `source` /
+    // `always_on` — a skipped skill has no readable manifest for a property
+    // filter to bear on.
+    let skipped: Vec<serde_json::Value> = registry
+        .skipped()
+        .iter()
+        .map(|s| serde_json::json!({"name": s.name, "reason": s.reason}))
+        .collect();
+
+    Json(serde_json::json!({
+        "agent": resolved_name,
+        "skills": skills,
+        "skipped": skipped,
+    }))
+    .into_response()
 }
 
 /// GET /api/v1/sessions/:id/skills — loaded skills from session metadata.
