@@ -704,8 +704,10 @@ pub async fn dispatch_remote(
     // It is also strictly restrictive by the shape of its wire value, so
     // sending it to a remote agent cannot widen anything there.
     // `callback_turn` ne voyage pas : un tour `mika ask --remote` n'est jamais
-    // un tour de callback. C'est l'opérateur qui tape le message, et le bras
-    // qui en poserait un (`CallbackResult` de la TUI) ne passe pas par ici.
+    // un tour de callback — c'est l'opérateur qui tape le message. Le seul
+    // appelant qui pose la clé est le bras `CallbackResult` de la TUI, et il
+    // emprunte l'autre porte : `chat_turn::livrer_tour_de_callback`, donc
+    // `send_turn_to_spirit`, vers le spirit local de son agent.
     let task = send_message_to_agent(
         message,
         remote_url,
