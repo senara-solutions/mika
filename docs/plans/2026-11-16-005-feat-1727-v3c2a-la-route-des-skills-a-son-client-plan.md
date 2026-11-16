@@ -49,10 +49,13 @@ postes que la tête du ticket exige tous les deux, et qu'elle chiffre à un vol 
    avec ses tests, dans le même commit. »
 
 Le précédent mesuré le confirme plutôt qu'il ne l'atténue : le vol V2d-3a
-(mika#3086, `0b44a562`) a coûté **357 lignes** dans `session_remote.rs` pour un
-client de **la même nature** mais à **trois** champs de miroir et six tests. Le
-client de ce vol-ci porte 23 champs de miroir et sept tests, **et** le vol porte
-en plus son côté serveur. 517 est l'estimation serrée, pas l'estimation prudente.
+(mika#3086, `0b44a562`) a coûté **369 lignes** dans l'unité de la borne — **78 %
+de 475** — pour un client de **la même nature** mais à **trois** champs de miroir
+et six tests, **sans** côté serveur et sans `CLAUDE.md`. Le client de ce vol-ci
+porte 23 champs de miroir et sept tests, **et** le vol porte en plus son côté
+serveur. 517 est l'estimation serrée, pas l'estimation prudente : un vol qui livre
+plus sur chaque axe qu'un vol déjà à 78 % de la borne ne repasse pas dessous. Le
+détail de cette relecture est au § *Taille estimée*.
 
 **Pour mika-arch.** Ce dépassement est délibéré et déclaré, pas un oubli de
 découpage. La règle mika#2693 demande de découper en vols au-dessus de la borne ;
@@ -639,6 +642,18 @@ sur un précédent **mesuré** dans ce dépôt, pas deviné :
   **357** lignes dans `session_remote.rs` pour un client de la même nature, à
   **trois** champs de miroir et six tests. Celui-ci en a 23 et sept, et le vol
   porte en plus son côté serveur.
+
+**Le précédent, relu dans l'unité de la borne** (vérification de la seconde passe
+de groom, `git show --stat 0b44a562`). Les 357 ci-dessus sont le seul
+`session_remote.rs`. Le vol V2d-3a **entier** a coûté **369** lignes dans l'unité
+où la borne se compte — 357 + 11 d'egress + 1 de `commands/mod.rs`, plan exclu.
+C'est le nombre à mettre en face des 475, et il le charge déjà à **78 %**. Or ce
+vol-là livrait **strictement moins** que celui-ci : trois champs de miroir contre
+23, six tests contre sept, **aucun** côté serveur, **aucun** `CLAUDE.md`, et pas
+de témoin de requête à ajouter au factice. Un vol qui livre plus sur chaque axe
+que celui qui a consommé 78 % de la borne ne tient pas sous la borne ; la halte du
+§ 0 ne repose donc pas sur l'addition du tableau seule, mais sur un coût mesuré en
+aval d'un périmètre plus petit.
 
 Un poste tomberait-il de 10 % que le total resterait au-dessus des trois bornes.
 C'est pourquoi le § 0 conclut à la halte plutôt qu'à une marge à surveiller.
