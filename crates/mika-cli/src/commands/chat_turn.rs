@@ -860,18 +860,31 @@ mod tests {
         );
     }
 
-    /// **AC1** — aucun tour utilisateur de la TUI ne fait tourner la boucle ici.
+    /// Allowlist du scan structurel du vol V1 — **livrée vide depuis le vol
+    /// V3a-2b**, et c'est la propriété (doctrine mika#2201, #2323, #2425,
+    /// #2457, #2759).
     ///
-    /// Le bras `CallbackResult` de `chat.rs` est le dernier appel local du
-    /// crate. Il part au vol V2 avec le `TaskEngine` et le poll des callbacks :
-    /// la porte A2A écrit `is_callback_turn: false` en dur
-    /// (`server/a2a.rs:343`), et le réparer demanderait une clé de fil dans
-    /// `crates/mika-a2a/` et sa lecture dans `crates/mika-agent/` — deux crates
-    /// hors du périmètre de ce vol.
-    /// Tracked in: senara-solutions/mika#1727
+    /// Elle est au niveau du module, comme [`V2A_ALLOWED`] et pour la même
+    /// raison : la garde de vacuité
+    /// [`mika1727_v3a2b_lallowlist_du_tour_est_livree_vide`] doit observer la
+    /// constante que le scan lit réellement, et non une copie qui pourrait
+    /// diverger d'elle.
+    const V1_ALLOWED: &[&str] = &[];
+
+    /// **AC1** — aucun tour de la TUI ne fait tourner la boucle ici.
+    ///
+    /// **Aucun site n'est plus toléré depuis le vol V3a-2b.** Le bras
+    /// `CallbackResult` de `chat.rs` était le dernier appel local du crate ; il
+    /// passe désormais par `chat_turn::livrer_tour_de_callback`, qui pose
+    /// `mika.callback_turn` sur le fil. L'exception de fichier qui le couvrait
+    /// est partie avec lui, et le compte qui la doublait aussi.
+    ///
+    /// Quand cette garde rougit, le remède est de router le nouvel appelant par
+    /// l'envoi qui existe — `send_turn_to_spirit` pour un tour tapé,
+    /// `livrer_tour_de_callback` pour un tour de callback —, **jamais**
+    /// d'ajouter une ligne à [`V1_ALLOWED`].
     #[test]
     fn mika1727_v1_le_tour_de_la_tui_ne_fait_plus_tourner_la_boucle() {
-        const ALLOWED: &[&str] = &["commands/chat.rs"];
         const NEEDLES: &[&str] = &["agent::run_agent(", "AgentParams"];
 
         let scanner =
@@ -885,7 +898,7 @@ mod tests {
                 .unwrap_or(path)
                 .display()
                 .to_string();
-            if ALLOWED.contains(&rel.as_str()) {
+            if V1_ALLOWED.contains(&rel.as_str()) {
                 return;
             }
             for (idx, line) in production.lines().enumerate() {
@@ -902,8 +915,27 @@ mod tests {
             violations.is_empty(),
             "mika#1727 V1 — la boucle d'agent tourne de nouveau dans le processus \
              de la TUI. Le remède est de router le tour par \
-             `chat_turn::send_turn_to_spirit`, jamais d'élargir ALLOWED :\n{}",
+             `chat_turn::send_turn_to_spirit` (tour tapé) ou par \
+             `livrer_tour_de_callback` (tour de callback), jamais d'élargir \
+             V1_ALLOWED :\n{}",
             violations.join("\n")
+        );
+    }
+
+    /// **Critère 4 de V3a-2b** — [`V1_ALLOWED`] est livrée vide, et le reste.
+    ///
+    /// Sans cette assertion, le jour où un appel local revient, l'issue la plus
+    /// courte serait d'y réinscrire `commands/chat.rs` : la garde redeviendrait
+    /// verte et le scan deviendrait ce que mika#2323 refuse — un détecteur qui
+    /// ne détecte plus que ce qu'on veut bien lui montrer. Le remède d'un rouge
+    /// est de router le nouvel appelant par l'envoi qui existe.
+    #[test]
+    fn mika1727_v3a2b_lallowlist_du_tour_est_livree_vide() {
+        assert!(
+            V1_ALLOWED.is_empty(),
+            "mika#1727 V3a-2b — V1_ALLOWED est livrée vide et doit le rester : \
+             un scan structurel s'applique à tout le crate, il ne s'exempte \
+             pas. Trouvé : {V1_ALLOWED:?}"
         );
     }
 
