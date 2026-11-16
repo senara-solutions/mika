@@ -249,6 +249,30 @@ async fn livrer_tour_de_callback_sur_endpoint(
     }
 }
 
+/// Ce qu'un `SetModel { model }` laisse comme override pour les tours suivants.
+///
+/// Une fonction, et non trois lignes dans le bras, parce que c'est la seule
+/// décision que ce bras prend encore depuis le vol V3b-1 : tout le reste —
+/// l'alias, le préfixe de provider, la clé d'API — est résolu par spirit
+/// (mika#2304). Isolée, elle se mesure sans bâtir un `AppContext` complet.
+///
+/// Une valeur blanche rend **`None`** plutôt que `Some("")` : spirit refuserait
+/// fermement une clé vide, donc la poser couperait tous les tours suivants au
+/// lieu de rendre son modèle par défaut. `/model` sans argument n'atteint pas ce
+/// bras aujourd'hui, mais la ligne de défense se tient ici, là où la clé est
+/// décidée, et non chez chaque appelant.
+///
+/// La valeur non vide est `trim`ée et pas autrement touchée : la normaliser
+/// serait commencer à résoudre.
+pub(crate) fn override_de_set_model(model: &str) -> Option<String> {
+    let taille = model.trim();
+    if taille.is_empty() {
+        None
+    } else {
+        Some(taille.to_string())
+    }
+}
+
 /// Aplatir l'échec d'un tour à la façon de `commands::ask::wrap_send_error`.
 ///
 /// `{err:#}` et pas `{err}` : la chaîne porte le statut HTTP, l'échec de
@@ -953,6 +977,74 @@ mod tests {
             Value::Bool(true),
             "l'argument de l'override ne doit pas avoir déplacé celui du \
              callback : sans cette clé spirit fait un tour ordinaire ; \
+             corps : {body}"
+        );
+    }
+
+    /// **Critère 3 de V3b-1** — l'override de `SetModel` se lit, et se tait sur
+    /// une valeur blanche.
+    ///
+    /// La table parcourt les trois formes que `format_worker_model` peut rendre
+    /// — nom nu, nom préfixé d'un provider, et la valeur blanche — plus la
+    /// chaîne vide. Les deux premières attestent que **rien n'est résolu ici** :
+    /// le préfixe survit, l'alias survit. Les deux dernières sont le négatif, et
+    /// c'est la moitié qui compte : un `Some(String::new())` poserait une clé
+    /// vide que spirit refuse fermement, donc il couperait tous les tours
+    /// suivants au lieu de rendre le modèle par défaut.
+    ///
+    /// La sortie est ensuite **donnée au site d'envoi** : la fonction pure et le
+    /// fil se mesurent dans la même fonction, sinon la paire resterait verte
+    /// avec un bras qui lit la fonction et n'en fait rien.
+    #[tokio::test]
+    async fn mika1727_v3b1_loverride_de_set_model_se_lit_et_se_tait() {
+        assert_eq!(
+            override_de_set_model("claude-sonnet-4-6"),
+            Some("claude-sonnet-4-6".to_string()),
+            "un nom nu part tel quel : c'est spirit qui résout l'alias"
+        );
+        assert_eq!(
+            override_de_set_model("  groq/kimi-k2  "),
+            Some("groq/kimi-k2".to_string()),
+            "le préfixe de provider SURVIT, et seuls les blancs de bord \
+             tombent : normaliser ici serait commencer à résoudre (mika#2304)"
+        );
+        assert_eq!(
+            override_de_set_model("   "),
+            None,
+            "une valeur blanche doit rendre l'absence : une clé vide est \
+             refusée fermement par spirit, donc elle couperait les tours \
+             suivants au lieu de rendre le modèle par défaut"
+        );
+        assert_eq!(
+            override_de_set_model(""),
+            None,
+            "même raison que ci-dessus pour la chaîne vide"
+        );
+
+        // La sortie de la fonction pure est bien ce qui atteint le fil : c'est
+        // le maillon que la table seule ne mesure pas.
+        let (addr, capture) = spawn_mock(|cap, Json(body)| {
+            cap.lock().unwrap().last_body = Some(body);
+            (StatusCode::OK, Json(ok_task_with_text("ok")))
+        })
+        .await;
+        let endpoint = format!("http://{addr}/a2a/mika-prime");
+        let pose = override_de_set_model("groq/kimi-k2");
+        send_turn_to_endpoint(
+            "salut",
+            &endpoint,
+            "sess-apres-setmodel",
+            false,
+            pose.as_deref(),
+        )
+        .await
+        .expect("envoi");
+
+        let body = capture.lock().unwrap().last_body.clone().unwrap();
+        assert_eq!(
+            body["params"]["metadata"][mika_cli::remote_ask::MODEL_OVERRIDE_KEY],
+            "groq/kimi-k2",
+            "ce que la fonction pure rend est ce que le tour suivant porte ; \
              corps : {body}"
         );
     }

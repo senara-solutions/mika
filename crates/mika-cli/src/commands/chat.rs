@@ -186,10 +186,16 @@ async fn clore_session_de_sortie(
 }
 
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
+///
+/// `model_override` est l'override de départ du worker (mika#1727, vol V3b-1) :
+/// la valeur de `--model` telle que l'opérateur l'a tapée, ou `None`. Il n'est
+/// pas lu dans `ctx` parce qu'un respawn — bascule d'agent ou `/restart` — doit
+/// pouvoir repartir sans override alors que `ctx` en porte encore un.
 async fn spawn_agent_worker(
     ctx: AppContext,
     agent_name: &str,
     session_id: Option<&str>,
+    model_override: Option<String>,
 ) -> Result<(
     AgentWorker,
     mpsc::UnboundedSender<AgentRequest>,
@@ -272,7 +278,12 @@ async fn spawn_agent_worker(
     let supervisor_agent_tx = agent_tx.clone();
 
     let worker_db = ctx.async_db.clone();
-    let mut worker_settings = ctx.settings.clone();
+    // mika#1727 vol V3b-1 — le modèle choisi vit ICI, dans le worker, et nulle
+    // part ailleurs : c'est lui qui tient le fil des tours. La copie des
+    // réglages qui occupait cette ligne ne servait qu'au bras `SetModel`, qui
+    // validait un provider local et jetait le résultat ; plus aucun tour ne se
+    // construit dans ce processus.
+    let mut worker_override = model_override;
     let mut worker_skills = skill_registry.clone();
     let worker_home = ctx.home_dir.clone();
     let mut worker_session = session_id.clone();
@@ -339,7 +350,7 @@ async fn spawn_agent_worker(
                         &worker_agent_name,
                         &worker_session,
                         false,
-                        None,
+                        worker_override.as_deref(),
                     )
                     .await;
 
@@ -438,7 +449,7 @@ async fn spawn_agent_worker(
                         &framing,
                         &task_id,
                         &original_status,
-                        None,
+                        worker_override.as_deref(),
                     )
                     .await;
                     if agent_tx.send(response).is_err() {
@@ -446,31 +457,16 @@ async fn spawn_agent_worker(
                     }
                 }
                 AgentRequest::SetModel { model } => {
-                    // Recreate the LLM provider with the new model.
-                    // Parse provider/model format if present, otherwise set on active provider.
-                    let mut updated_settings = worker_settings.clone();
-                    if let Some(slash_pos) = model.find('/') {
-                        let prefix = &model[..slash_pos];
-                        if let Ok(provider) = prefix.parse::<mika_common::llm::ProviderKind>() {
-                            let model_name = model[slash_pos + 1..].to_string();
-                            updated_settings.llm_provider = provider;
-                            updated_settings.set_provider_model(provider, Some(model_name));
-                        } else {
-                            let provider = updated_settings.llm_provider;
-                            updated_settings.set_provider_model(provider, Some(model.clone()));
-                        }
-                    } else {
-                        let provider = updated_settings.llm_provider;
-                        updated_settings.set_provider_model(provider, Some(model.clone()));
-                    }
-                    // mika#1727 vol V3a-2b — le worker ne porte plus de
-                    // provider : le tour s'exécute chez mika-spirit. La
-                    // validation reste, elle, parce qu'elle est ce qui refuse
-                    // d'enregistrer un modèle que rien ne saurait servir ; seul
-                    // son produit est jeté.
-                    if updated_settings.make_llm_provider().is_ok() {
-                        worker_settings = updated_settings;
-                    }
+                    // mika#1727 vol V3b-1 — le bras pose l'override pour les
+                    // tours suivants, et ne valide plus rien. La validation qui
+                    // vivait ici construisait un provider local pour jeter son
+                    // produit : elle ne pouvait prononcer que sur les clés et
+                    // les alias de CE processus, et la TUI n'exécute plus aucun
+                    // tour. C'est spirit qui tranche, qui a les clés, et qui
+                    // refuse fermement un modèle qu'il ne sait pas servir
+                    // (mika#2304) — le refus arrive donc au tour suivant, et il
+                    // est visible, là où un abandon local était muet.
+                    worker_override = chat_turn::override_de_set_model(&model);
                 }
                 AgentRequest::NewSession { session_id } => {
                     worker_session = session_id;
@@ -552,7 +548,7 @@ pub async fn run(
         identity_name,
         skill_registry,
         is_singleton_session,
-    ) = spawn_agent_worker(ctx, agent_name, session).await?;
+    ) = spawn_agent_worker(ctx, agent_name, session, None).await?;
 
     // Build app with shared resources
     let mut app = App::new(
@@ -805,7 +801,12 @@ pub async fn run(
             // Initialize the new agent
             match init::init_for_agent(&target_name) {
                 Ok(new_ctx) => {
-                    match spawn_agent_worker(new_ctx, &target_name, None).await {
+                    // mika#1727 vol V3b-1 — une bascule d'agent repart sans
+                    // override : le modèle choisi l'avait été pour l'agent
+                    // qu'on quitte, et le nouveau n'a pas forcément de quoi le
+                    // servir. La survie de l'override à la bascule est portée
+                    // par V3b-2, si elle est voulue.
+                    match spawn_agent_worker(new_ctx, &target_name, None, None).await {
                         Ok((
                             new_worker,
                             new_tx,
@@ -915,7 +916,10 @@ pub async fn run(
 
             match init::init_for_agent(agent_name) {
                 Ok(new_ctx) => {
-                    match spawn_agent_worker(new_ctx, agent_name, None).await {
+                    // mika#1727 vol V3b-1 — un `/restart` repart sans
+                    // override, comme un démarrage sans `--model`. La survie de
+                    // l'override à `/restart` est portée par V3b-2.
+                    match spawn_agent_worker(new_ctx, agent_name, None, None).await {
                         Ok((
                             new_worker,
                             new_tx,
@@ -1796,6 +1800,71 @@ mod tests {
             "mika#1727 — la TUI touche la table `sessions` dans son propre \
              processus. Le remède est de passer par la porte que chaque ligne \
              nomme, jamais une entrée d'allowlist :\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// **Critère 4 de V3b-1** — le tour de la TUI ne construit plus son
+    /// provider, et n'en garde plus de copie des réglages.
+    ///
+    /// La garde est **par fichier**, et non par crate, parce que
+    /// `make_llm_provider` a quatre lecteurs légitimes ailleurs dans
+    /// `mika-cli` — `init.rs`, `commands/provider.rs`, `commands/doctor.rs`,
+    /// `commands/agents.rs` — qui construisent un provider pour autre chose
+    /// qu'un tour de chat. Une garde par crate aurait demandé une allowlist de
+    /// quatre entrées, et une allowlist peuplée est exactement ce qui ne refuse
+    /// plus rien (mika#2309) : le cinquième lecteur s'y serait ajouté sans
+    /// qu'un œil s'y arrête.
+    #[test]
+    fn mika1727_v3b1_le_tour_de_la_tui_ne_construit_plus_son_provider() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le
+        // remède est la porte que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+        const MOTIFS: &[(&str, &str)] = &[
+            (
+                "worker_settings",
+                "l'override vit dans le worker, pas dans une copie des réglages",
+            ),
+            (
+                "make_llm_provider(",
+                "le provider est construit par spirit, qui détient les clés",
+            ),
+        ];
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let site = scanner.src_root().join("commands/chat.rs");
+        let production = scanner.production_of(&site);
+
+        // Même témoin et même contre-témoin que la garde ci-dessus, et pour la
+        // même raison : une garde qui balaie un chemin faux, ou dont le
+        // masquage des régions de test aurait dérapé, serait verte par cécité
+        // (mika#2398).
+        assert!(
+            production.contains("async fn spawn_agent_worker("),
+            "la garde n'a pas lu la moitié production de chat.rs"
+        );
+        assert!(
+            !production.contains("fn mika1727_v2d4a_un_point_injoignable_nomme_lurl"),
+            "la garde n'a pas masqué la moitié test de chat.rs"
+        );
+
+        let violations: Vec<String> = MOTIFS
+            .iter()
+            .flat_map(|(motif, porte)| {
+                production
+                    .lines()
+                    .enumerate()
+                    .filter(move |(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
+                    .map(move |(i, l)| format!("{}: {} (remède : {porte})", i + 1, l.trim()))
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "mika#1727 vol V3b-1 — le tour de la TUI se remet à décider du \
+             modèle dans son propre processus. Le remède est la porte que \
+             chaque ligne nomme, jamais une entrée d'allowlist :\n{}",
             violations.join("\n")
         );
     }
