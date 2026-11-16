@@ -240,12 +240,18 @@ is unreachable, stale cache or aliases are used as fallback.
 **Cross-provider switch (alias or provider/model format):**
 ```
 /model deepseek
-→ Switched to DeepSeek Chat (deepseek/deepseek-chat). (switched provider to deepseek)
+→ Switched to deepseek/deepseek-chat. (switched provider to deepseek in config.toml
+  — mika-spirit takes it at its next restart, for every turn of the agent)
 ```
 
-When a model alias or `provider/model` format targets a different provider, the
-active provider is also switched and both `llm_provider` and `{provider}_model`
-are persisted to `config.toml`.
+When a model alias or `provider/model` format targets a different provider, both
+`llm_provider` and `{provider}_model` are persisted to `config.toml`. The **model**
+reaches the turns that follow right away: it travels to mika-spirit as an override
+(`mika.model_override`), prefixed with the target provider. The **provider** does
+not — an override never re-dispatches to another provider (mika#1591), so the
+turns of this session keep running on the provider mika-spirit loaded at startup.
+That is why the persistence is described as covering the whole agent *at the next
+restart*, and why the TUI's own provider display does not move.
 
 Recognized aliases: `sonnet`, `opus`, `haiku`, `gpt4o`, `deepseek`, `gemini`.
 
@@ -270,12 +276,23 @@ Available providers:
   ...
 ```
 
-**Switch provider:**
+**Switch provider — this writes `config.toml`, and nothing else:**
 ```
 /provider deepseek
-→ Switched to deepseek (model: deepseek-reasoner).
+→ Wrote llm_provider = "deepseek" (model: deepseek-reasoner) to config.toml.
+  mika-spirit takes it at its next restart, for every turn of the agent.
+  This session keeps running on anthropic.
 Note: anthropic_model is still set (kept for switching back)
 ```
+
+Since mika#1727 (vol V3b-2) the turn runs on mika-spirit, which reads
+`llm_provider` from `config.toml` at startup. A provider switch therefore reaches
+the turns at the daemon's **next restart** — and nowhere else: the command sends
+no model override to the worker and does not move the TUI's provider or model
+display. The reason it cannot is mika#1591 — an override prefixed with a provider
+the **running** spirit has not configured is firmly refused, which would break
+every turn that follows. To change the model of the turns that follow *now*, use
+`/model <x>` or `/provider set model <x>`.
 
 The switch reads the user's configured `{provider}_model` from `config.toml` if
 set, falling back to the provider's default model otherwise. When no model was
@@ -298,8 +315,10 @@ missing, the switch is blocked with a clear error message:
 /provider set base_url https://...  → Set openai_base_url = "https://..."
 ```
 
-Provider switches are persisted to `config.toml`. If persistence fails, the switch
-still takes effect for the current session with a warning.
+`set model` changes no provider, so it is free of the mika#1591 constraint above:
+it persists the key **and** sends the model to the worker as an override, prefixed
+with the provider currently in force. If persistence fails, the switch is reported
+with a warning — and since nothing else happens, nothing takes effect.
 
 ---
 

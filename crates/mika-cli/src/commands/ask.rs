@@ -4,6 +4,13 @@ use uuid::Uuid;
 use crate::cli::OutputFormat;
 use crate::init;
 
+/// Le refus d'un `--model` blanc, partagé avec `commands::chat::run`
+/// (mika#1727, vol V3b-2). Une constante et non deux littéraux : le critère
+/// demande que `mika chat --model ""` soit refusé **avec le message d'`ask.rs`**,
+/// et deux copies identiques dans deux fichiers dérivent à la première
+/// reformulation.
+pub(crate) const MODEL_MUST_NOT_BE_EMPTY: &str = "--model value must not be empty";
+
 #[derive(serde::Serialize)]
 struct AskJsonResponse {
     role: &'static str,
@@ -164,14 +171,17 @@ pub async fn run(
     session_isolated: bool,
     verbose: bool,
 ) -> Result<()> {
-    let ctx = init::init_for_agent(agent_name)?;
+    let ctx = init::init_db_only_for_agent(agent_name)?;
 
     // mika#2304: `--model` is no longer spent on `ctx.override_model`. That
     // rebuilt a *local* provider nobody calls on this path any more (mika#1727),
     // while also writing the requested model into `ctx.settings` — which the
     // verbose envelope then read back and printed as if it had served. The flag
     // now travels to the executing surface; the envelope reads the server's
-    // attestation.
+    // attestation. Depuis le vol V3b-2 ce chemin ne demande donc plus que la
+    // base : construire un provider ici le faisait aussi **refuser** un tour sur
+    // l'absence d'une clé dans CE shell, alors que spirit, qui l'exécute, a son
+    // propre environnement (mika#2293) et sait peut-être le servir.
     //
     // **Arg-level validation stays local and early, but only the part that is
     // provider-independent.** A blank `--model` is refused here, before any round
@@ -185,7 +195,7 @@ pub async fn run(
     if let Some(model) = model_override
         && model.trim().is_empty()
     {
-        anyhow::bail!("--model value must not be empty");
+        anyhow::bail!(MODEL_MUST_NOT_BE_EMPTY);
     }
 
     // Validate task_id format — reject empty or excessively long values

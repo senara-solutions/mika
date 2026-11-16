@@ -17,7 +17,7 @@ use crate::commands::chat_turn;
 use crate::commands::session_remote;
 use crate::commands::tasks::CallbackFeed;
 use crate::commands::team_outcome::TeamOutcome;
-use crate::init::{self, AppContext};
+use crate::init::{self, DbContext};
 use crate::tui::app::{
     AgentRequest, AgentResponse, AgentStatus, App, ChatMessage, ChatRole, TeamRequest,
     session_message_to_chat_message,
@@ -35,7 +35,7 @@ use mika_common::config::Settings;
 use mika_common::team;
 use std::path::Path;
 
-/// Holds the agent worker supervisor handle, the AppContext (for DB shutdown),
+/// Holds the agent worker supervisor handle, the DbContext (for DB shutdown),
 /// and the shutdown-initiated flag the supervisor reads to distinguish operator-driven
 /// shutdown from worker death (mika#1149).
 struct AgentWorker {
@@ -45,7 +45,7 @@ struct AgentWorker {
     /// Set to `true` before tearing down the worker (Quit, agent switch, /restart)
     /// so the supervisor exits silently on the resulting `Ok(())` from the worker loop.
     shutdown_initiated: Arc<AtomicBool>,
-    _ctx: AppContext,
+    _ctx: DbContext,
 }
 
 // La lecture stricte du jeton et sa source vivent chez les portes depuis
@@ -58,9 +58,9 @@ use crate::commands::session_remote::{SourceEnv, jeton_interne};
 /// Ouvre — ou reprend — la session de la TUI (mika#1727, vol V2d-4a).
 ///
 /// Tout ce qui touche le monde arrive par argument, donc un test pilote la
-/// source d'environnement, la base et l'URL du banc sans construire
-/// d'`AppContext` : c'est la forme de `rewind_par_spirit`. Elle prend
-/// `&AsyncDatabase` et non `&AppContext` pour la même raison.
+/// source d'environnement, la base et l'URL du banc sans construire le
+/// contexte du démarrage : c'est la forme de `rewind_par_spirit`. Elle prend
+/// `&AsyncDatabase` et non `&DbContext` pour la même raison.
 ///
 /// Le booléen rendu est `is_singleton_session`. Sur le chemin nominal il vient
 /// **du fil** et non de `resolve_canonical_session_id` : la route rend la
@@ -192,7 +192,7 @@ async fn clore_session_de_sortie(
 /// pas lu dans `ctx` parce qu'un respawn — bascule d'agent ou `/restart` — doit
 /// pouvoir repartir sans override alors que `ctx` en porte encore un.
 async fn spawn_agent_worker(
-    ctx: AppContext,
+    ctx: DbContext,
     agent_name: &str,
     session_id: Option<&str>,
     model_override: Option<String>,
@@ -243,8 +243,10 @@ async fn spawn_agent_worker(
     {
         tracing::warn!(error = %e, "failed to migrate .disabled markers");
     }
-    // Same assembler as the server init and as the two hot reloads below
-    // (mika#2889) — the TUI no longer carries its own copy of the sequence.
+    // Same assembler as the server init (mika#2889) — the TUI no longer carries
+    // its own copy of the sequence. Assembled once, at startup: les deux
+    // rechargements à chaud qui suivaient vivaient sous un drapeau que personne
+    // ne posait, et ils partent au vol V3b-2.
     let overrides = ctx
         .async_db
         .get_skill_overrides(&ctx.async_db.agent_id)
@@ -256,10 +258,10 @@ async fn spawn_agent_worker(
         &overrides,
         ctx.async_db.agent_id(),
     ));
-    let skills_dirty = Arc::new(AtomicBool::new(false));
-
-    // Connect to MCP servers
-    let mcp_manager = crate::init::connect_mcp(&ctx.home_dir).await;
+    // mika#1727 vol V3b-2 — la TUI ne connecte plus de serveur MCP. Elle en
+    // montait un jeu au démarrage et le fermait en sortie, alors qu'aucun outil
+    // de ce processus n'y touchait depuis V1 : le tour tourne chez spirit, qui
+    // monte son propre `McpManager`.
 
     // mika#1727 vol V2a — la TUI ne construit plus de moteur de tâches. Le
     // `TaskDispatcher`, le `TaskEngine`, la boucle de tick, `startup_recovery`,
@@ -283,12 +285,16 @@ async fn spawn_agent_worker(
     // réglages qui occupait cette ligne ne servait qu'au bras `SetModel`, qui
     // validait un provider local et jetait le résultat ; plus aucun tour ne se
     // construit dans ce processus.
+    // mika#1727 vol V3b-2 — ce qui s'affiche est ce qui part sur le fil :
+    // afficher le modèle configuré alors qu'un `--model` le remplace pour tous
+    // les tours serait une provenance fausse (mika#2331). La décision vit ici et
+    // non dans `run` parce que les deux respawns passent par cette porte sans
+    // override, et retombent donc sur le modèle configuré.
+    let model = model_override
+        .clone()
+        .unwrap_or_else(|| ctx.settings.active_model_display());
     let mut worker_override = model_override;
-    let mut worker_skills = skill_registry.clone();
-    let worker_home = ctx.home_dir.clone();
     let mut worker_session = session_id.clone();
-    let worker_dirty = skills_dirty.clone();
-    let mut worker_mcp = mcp_manager;
     // mika#1727 V1 — l'agent visé par l'endpoint A2A du tour. C'est le nom tel
     // que l'opérateur l'a lancé, le même que `commands::ask` met dans son URL.
     let worker_agent_name = agent_name.to_string();
@@ -300,26 +306,6 @@ async fn spawn_agent_worker(
                     images,
                     thinking_budget,
                 } => {
-                    // Hot-reload skills if the dirty flag was set by a previous
-                    // turn. A reload is an assembly, so it goes through the single
-                    // assembler (mika#2889).
-                    let mut skills_reloaded = false;
-                    if worker_dirty.load(Ordering::Acquire) {
-                        worker_dirty.store(false, Ordering::Release);
-                        let reload_identity = mika_agent::prompt::load_identity(&worker_home);
-                        let overrides = worker_db
-                            .get_skill_overrides(&worker_db.agent_id)
-                            .await
-                            .unwrap_or_default();
-                        worker_skills = Arc::new(assemble_agent_registry(
-                            &worker_home.join("skills"),
-                            &reload_identity,
-                            &overrides,
-                            &worker_db.agent_id,
-                        ));
-                        skills_reloaded = true;
-                    }
-
                     // mika#1727 V1 § D3 — les entrées qui cessent d'atteindre le
                     // tour se disent à voix haute, une fois par tour, chacune
                     // nommant le geste qui l'éteint (mika#1883). L'avis est émis
@@ -354,30 +340,14 @@ async fn spawn_agent_worker(
                     )
                     .await;
 
-                    // If the dirty flag is set after this turn, rebuild now so we
-                    // can send the updated registry to the TUI for autocomplete.
-                    if worker_dirty.load(Ordering::Acquire) {
-                        worker_dirty.store(false, Ordering::Release);
-                        let reload_identity2 = mika_agent::prompt::load_identity(&worker_home);
-                        let overrides = worker_db
-                            .get_skill_overrides(&worker_db.agent_id)
-                            .await
-                            .unwrap_or_default();
-                        worker_skills = Arc::new(assemble_agent_registry(
-                            &worker_home.join("skills"),
-                            &reload_identity2,
-                            &overrides,
-                            &worker_db.agent_id,
-                        ));
-                        skills_reloaded = true;
-                    }
-
-                    let updated_skills = if skills_reloaded {
-                        Some(worker_skills.clone())
-                    } else {
-                        None
-                    };
-
+                    // mika#1727 vol V3b-2 — `updated_skills` vaut désormais
+                    // toujours `None` : les deux rechargements à chaud qui le
+                    // remplissaient tournaient sous `skills_dirty`, un drapeau
+                    // que rien ne posait à `true`. Le champ reste dans
+                    // `AgentResponse::Reply` parce que `tui/app.rs` le lit et
+                    // doit rester inchangé à l'octet ; il est passé en clair à
+                    // ses deux sites pour qu'on lise sur place qu'aucune
+                    // branche ne le remplit.
                     let response = match result {
                         Ok(reply) => AgentResponse::Reply {
                             content: reply.content,
@@ -387,14 +357,14 @@ async fn spawn_agent_worker(
                             // fil. L'avis d'inertie ci-dessus l'a déjà dit.
                             thinking: None,
                             input_tokens: reply.input_tokens,
-                            updated_skills,
+                            updated_skills: None,
                         },
                         Err(e) => AgentResponse::Reply {
                             content: format!("{e}"),
                             is_error: true,
                             thinking: None,
                             input_tokens: None,
-                            updated_skills,
+                            updated_skills: None,
                         },
                     };
                     if agent_tx.send(response).is_err() {
@@ -474,13 +444,8 @@ async fn spawn_agent_worker(
                 AgentRequest::Quit => break,
             }
         }
-        // Gracefully shut down MCP server connections
-        if let Some(mcp) = worker_mcp.take() {
-            mcp.shutdown().await;
-        }
     });
 
-    let model = ctx.settings.active_model_display();
     let identity_name = identity.name.clone();
 
     // Supervise the worker task (mika#1149). The supervisor awaits `handle` and
@@ -533,15 +498,18 @@ pub async fn run(
     model_override: Option<&str>,
     start_in_audit_mode: bool,
 ) -> Result<()> {
-    let mut ctx = init::init_for_agent(agent_name)?;
+    let ctx = init::init_db_only_for_agent(agent_name)?;
 
-    // mika#1727 vol V3b-1 — `ctx.override_model` RESTE, et ce n'est pas un
-    // oubli : il valide la valeur avant le premier tour, ce qui donne à
-    // `mika chat --model x` un refus immédiat plutôt qu'au premier message, et
-    // `ctx.settings` a d'autres lecteurs ici (l'affichage du modèle au
-    // démarrage). Son retrait est porté par V3b-2, avec celui de `AppContext`.
-    if let Some(model) = model_override {
-        ctx.override_model(model)?;
+    // mika#1727 vol V3b-2 — la validation de `--model` qui vivait ici bâtissait
+    // un provider local pour le jeter, et n'avait d'avis que sur les clés et les
+    // alias de CE processus (le pourquoi se lit sur `commands::ask::run`). Ce
+    // qui reste local est la seule part indépendante du provider — une valeur
+    // blanche — et son refus prend la forme et le message d'`ask.rs` : une
+    // faute de frappe se lit au lancement, pas au premier message.
+    if let Some(model) = model_override
+        && model.trim().is_empty()
+    {
+        anyhow::bail!(crate::commands::ask::MODEL_MUST_NOT_BE_EMPTY);
     }
 
     // L'override de départ part au worker tel que l'opérateur l'a tapé, et non
@@ -783,11 +751,12 @@ pub async fn run(
             // `Ok(())` and trip the WorkerCrashed path (mika#1149).
             worker.shutdown_initiated.store(true, Ordering::Release);
 
-            // mika#1150 cohort: send Quit BEFORE aborting so the worker's
-            // post-loop `mcp.shutdown().await` runs on the common case
-            // (worker is healthy, just switching agents). Abort is the
-            // fallback if the worker is mid-LLM-call and the 2s drain
-            // window expires.
+            // mika#1150 cohort: send Quit BEFORE aborting so the worker's loop
+            // ends by itself on the common case (worker is healthy, just
+            // switching agents). Abort is the fallback if the worker is
+            // mid-turn and the 2s drain window expires. The post-loop
+            // `mcp.shutdown().await` this ordering also served left with MCP at
+            // V3b-2; draining a turn in flight is reason enough on its own.
             let _ = app.agent_tx.send(AgentRequest::Quit);
 
             let old_supervisor = std::mem::replace(
@@ -801,18 +770,18 @@ pub async fn run(
                 tracing::warn!(
                     target_agent = %target_name,
                     "old agent worker did not shut down within 2s during agent switch; \
-                     supervisor task abandoned (mcp.shutdown handshake may have been skipped)"
+                     supervisor task abandoned"
                 );
             }
 
             // Initialize the new agent
-            match init::init_for_agent(&target_name) {
+            match init::init_db_only_for_agent(&target_name) {
                 Ok(new_ctx) => {
-                    // mika#1727 vol V3b-1 — une bascule d'agent repart sans
-                    // override : le modèle choisi l'avait été pour l'agent
-                    // qu'on quitte, et le nouveau n'a pas forcément de quoi le
-                    // servir. La survie de l'override à la bascule est portée
-                    // par V3b-2, si elle est voulue.
+                    // mika#1727 — une bascule d'agent repart sans override : le
+                    // modèle choisi l'avait été pour l'agent qu'on quitte, et le
+                    // nouveau n'a pas forcément de quoi le servir. Le vol V3b-2
+                    // ne porte pas sa survie : elle est hors périmètre, et ce
+                    // bras retombe donc sur le modèle que `config.toml` déclare.
                     match spawn_agent_worker(new_ctx, &target_name, None, None).await {
                         Ok((
                             new_worker,
@@ -921,11 +890,11 @@ pub async fn run(
                 );
             }
 
-            match init::init_for_agent(agent_name) {
+            match init::init_db_only_for_agent(agent_name) {
                 Ok(new_ctx) => {
-                    // mika#1727 vol V3b-1 — un `/restart` repart sans
-                    // override, comme un démarrage sans `--model`. La survie de
-                    // l'override à `/restart` est portée par V3b-2.
+                    // mika#1727 — un `/restart` repart sans override, comme un
+                    // démarrage sans `--model`. Le vol V3b-2 ne porte pas sa
+                    // survie : elle est hors périmètre, nommément.
                     match spawn_agent_worker(new_ctx, agent_name, None, None).await {
                         Ok((
                             new_worker,
@@ -1334,7 +1303,7 @@ mod tests {
     const CORPS_CLOS: &str = r#"{"ended":true,"canonical":false}"#;
 
     /// La base de la TUI, en mémoire, comme `handlers.rs::test_app()` :
-    /// `ouvrir_session_par_spirit` prend `&AsyncDatabase` et non `&AppContext`,
+    /// `ouvrir_session_par_spirit` prend `&AsyncDatabase` et non le contexte,
     /// donc la fixture n'a ni home, ni `Settings`, ni registre de skills.
     fn base_en_memoire() -> AsyncDatabase {
         AsyncDatabase::new(Database::open_in_memory().expect("une base en mémoire"))
@@ -1811,8 +1780,17 @@ mod tests {
         );
     }
 
-    /// **Critère 4 de V3b-1** — le tour de la TUI ne construit plus son
-    /// provider, et n'en garde plus de copie des réglages.
+    /// **Critère 4 de V3b-1, étendu au critère 4 de V3b-2** — le tour de la TUI
+    /// ne construit plus son provider, n'en garde plus de copie des réglages, et
+    /// depuis V3b-2 ne porte plus ni contexte complet, ni MCP, ni rechargement
+    /// de skills à chaud.
+    ///
+    /// **Son nom ne change pas avec le second vol** : c'est une garde par
+    /// *fichier*, pas par vol — l'argument de la garde voisine ci-dessus — et la
+    /// renommer casserait la trace des deux vols qui la citent. Le nom couvre
+    /// moins bien `connect_mcp`, `McpManager` et `skills_dirty` que les trois
+    /// autres motifs neufs, et cette tension est dite ici plutôt que réparée
+    /// par un renommage qui coûterait la trace.
     ///
     /// La garde est **par fichier**, et non par crate, parce que
     /// `make_llm_provider` a quatre lecteurs légitimes ailleurs dans
@@ -1837,36 +1815,67 @@ mod tests {
                 "make_llm_provider(",
                 "le provider est construit par spirit, qui détient les clés",
             ),
+            (
+                "init_for_agent",
+                "`init_db_only_for_agent` : aucun tour ici",
+            ),
+            ("AppContext", "`DbContext` : le worker ne lit que la base"),
+            ("connect_mcp", "spirit monte son propre `McpManager`"),
+            ("McpManager", "spirit monte son propre `McpManager`"),
+            (
+                "override_model(",
+                "l'override voyage sous `mika.model_override`",
+            ),
+            (
+                "skills_dirty",
+                "le registre s'assemble une fois, au démarrage",
+            ),
+        ];
+        // Deux sites depuis V3b-2, chacun avec SON témoin : un témoin générique
+        // comme `pub async fn run(` passerait sur le mauvais fichier, et une
+        // garde qui balaie un chemin faux — ou dont le masquage des régions de
+        // test a dérapé — est verte par cécité (mika#2398). Celui d'`ask.rs` est
+        // hors du périmètre de ce vol, donc sa disparition dit bien « la garde ne
+        // vise plus le bon fichier » et non « le vol a bougé ».
+        const SITES: &[(&str, &str)] = &[
+            ("commands/chat.rs", "async fn spawn_agent_worker("),
+            ("commands/ask.rs", "--task-id value must not be empty"),
         ];
 
         let scanner =
             mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let site = scanner.src_root().join("commands/chat.rs");
-        let production = scanner.production_of(&site);
-
-        // Même témoin et même contre-témoin que la garde ci-dessus, et pour la
-        // même raison : une garde qui balaie un chemin faux, ou dont le
-        // masquage des régions de test aurait dérapé, serait verte par cécité
-        // (mika#2398).
-        assert!(
-            production.contains("async fn spawn_agent_worker("),
-            "la garde n'a pas lu la moitié production de chat.rs"
-        );
-        assert!(
-            !production.contains("fn mika1727_v2d4a_un_point_injoignable_nomme_lurl"),
-            "la garde n'a pas masqué la moitié test de chat.rs"
-        );
-
-        let violations: Vec<String> = MOTIFS
-            .iter()
-            .flat_map(|(motif, porte)| {
+        let mut violations: Vec<String> = Vec::new();
+        for (fichier, temoin) in SITES {
+            let production = scanner.production_of(&scanner.src_root().join(fichier));
+            assert!(
+                production.contains(temoin),
+                "la garde n'a pas lu la moitié production de {fichier}"
+            );
+            violations.extend(MOTIFS.iter().flat_map(|(motif, porte)| {
                 production
                     .lines()
                     .enumerate()
                     .filter(move |(_, l)| !l.trim_start().starts_with("//") && l.contains(motif))
-                    .map(move |(i, l)| format!("{}: {} (remède : {porte})", i + 1, l.trim()))
-            })
-            .collect();
+                    .map(move |(i, l)| {
+                        format!("{fichier}:{}: {} (remède : {porte})", i + 1, l.trim())
+                    })
+            }));
+        }
+
+        // Contre-témoin sur `chat.rs` **seulement**. Il y est indispensable : la
+        // table de motifs ci-dessus vit dans la moitié test de ce fichier et les
+        // contient en clair, donc un masquage perdu la ferait se dénoncer
+        // elle-même, et le réflexe serait de « réparer » par une entrée
+        // d'allowlist — précisément le piège. Sur `ask.rs` il n'y a rien à
+        // contre-témoigner : sa moitié test ne contient aucun des huit motifs,
+        // un masquage perdu n'y produirait aucun rouge, et l'assertion y serait
+        // du théâtre.
+        let chat = scanner.production_of(&scanner.src_root().join("commands/chat.rs"));
+        assert!(
+            !chat.contains("fn mika1727_v2d4a_un_point_injoignable_nomme_lurl"),
+            "la garde n'a pas masqué la moitié test de chat.rs"
+        );
+
         assert!(
             violations.is_empty(),
             "mika#1727 vol V3b-1 — le tour de la TUI se remet à décider du \

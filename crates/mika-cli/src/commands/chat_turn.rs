@@ -2,8 +2,8 @@
 //!
 //! # Pourquoi un module, et pas une fonction dans `chat.rs`
 //!
-//! Le worker de la TUI vit dans `chat::spawn_agent_worker`, qui exige un
-//! `AppContext` complet — base de données, provider LLM, MCP, `TaskEngine`.
+//! Le worker de la TUI vit dans `chat::spawn_agent_worker`, qui exige une base
+//! ouverte, une identité sur disque et une session ouverte sur spirit.
 //! Rien de ce bras n'est atteignable depuis un test. L'envoi est donc extrait
 //! ici, au périmètre, avec ses tests en ligne : c'est la seule forme où
 //! « le tour part bien sur le fil, avec la session du tour » est une propriété
@@ -254,7 +254,7 @@ async fn livrer_tour_de_callback_sur_endpoint(
 /// Une fonction, et non trois lignes dans le bras, parce que c'est la seule
 /// décision que ce bras prend encore depuis le vol V3b-1 : tout le reste —
 /// l'alias, le préfixe de provider, la clé d'API — est résolu par spirit
-/// (mika#2304). Isolée, elle se mesure sans bâtir un `AppContext` complet.
+/// (mika#2304). Isolée, elle se mesure sans ouvrir ni base ni session.
 ///
 /// Une valeur blanche rend **`None`** plutôt que `Some("")` : spirit refuserait
 /// fermement une clé vide, donc la poser couperait tous les tours suivants au

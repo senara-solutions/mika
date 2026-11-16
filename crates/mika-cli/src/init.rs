@@ -3,32 +3,8 @@ use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::Database;
 use mika_agent::startup;
 use mika_common::config::Settings;
-use mika_common::github_app::GitHubApp;
 use mika_common::home;
-use mika_common::llm::LlmProvider;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-/// Full application context for commands that need an LLM provider.
-/// Dropping this shuts down the async database automatically.
-pub struct AppContext {
-    pub db_ctx: DbContext,
-    /// mika#1727 V3 : **plus aucun lecteur depuis le vol V3a-2b** — le bras
-    /// `CallbackResult` était le dernier. Le champ n'en porte pas
-    /// `#[expect(dead_code)]` pour autant : `override_model` l'**écrit**, et
-    /// rustc compte une écriture de champ comme un usage, donc l'attente
-    /// serait non remplie et le `warn` tomberait sur l'attente elle-même. V3
-    /// retire le champ et l'écriture ensemble.
-    pub llm: Arc<dyn LlmProvider>,
-}
-
-// Deref so callers can still use ctx.settings, ctx.async_db, ctx.home_dir.
-impl std::ops::Deref for AppContext {
-    type Target = DbContext;
-    fn deref(&self) -> &DbContext {
-        &self.db_ctx
-    }
-}
 
 /// Lightweight context for commands that only need the database.
 /// Dropping this shuts down the async database automatically.
@@ -39,12 +15,6 @@ pub struct DbContext {
     /// The global Mika home directory (e.g. ~/.mika/).
     /// In multi-agent mode this differs from `home_dir` (which is the agent's dir).
     pub global_home: PathBuf,
-    /// GitHub App authentication manager (optional).
-    #[expect(
-        dead_code,
-        reason = "mika#1727 V3 : dernier lecteur parti au vol V3a-2b ; V3 retire le champ"
-    )]
-    pub github_app: Option<Arc<GitHubApp>>,
 }
 
 impl Drop for DbContext {
@@ -83,60 +53,20 @@ fn init_base_for_agent(agent_name: &str) -> Result<(Settings, AsyncDatabase, Pat
     Ok((settings, async_db, agent_home, global_home))
 }
 
-impl AppContext {
-    /// Apply a one-shot model override (not persisted to config).
-    ///
-    /// The `--model` flag is a **model-id-only** override: the provider is always
-    /// inherited from the agent's configured `llm_provider`. The model id is never
-    /// used to re-dispatch to a different (native) provider based on its name prefix
-    /// (mika#1591) — that prefix-routing produced spurious HTTP 401 "no API key"
-    /// failures when the inferred native provider had no key. A `prefix/` is stripped
-    /// only when it names the configured provider itself (e.g. `qwen/qwen3.7-max`
-    /// under `llm_provider = "qwen"`); under any other provider (e.g. OpenRouter,
-    /// whose ids are vendor-prefixed) the full id is preserved.
-    ///
-    /// Aliases (e.g. "sonnet") are resolved before routing.
-    ///
-    /// Since mika#2304 the resolution itself lives in
-    /// [`mika_common::llm::model_override`], reachable by `mika-agent` too —
-    /// `mika ask` no longer executes the turn (mika#1727), so the server must be
-    /// able to resolve the same string the same way.
-    ///
-    /// **Depuis le vol V3a-2b, plus aucun tour ne tourne contre `self.llm`** :
-    /// le bras `CallbackResult` était son dernier lecteur. Ce que la méthode
-    /// garde, c'est la **validation** — `make_llm_provider` refuse un modèle
-    /// que la configuration ne saurait pas servir, et le `?` remonte au
-    /// démarrage de `mika chat`. Le provider bâti est posé dans un champ que
-    /// V3 retire ; le `--model` qui compte voyage sous `mika.model_override`
-    /// (mika#2304).
-    pub fn override_model(&mut self, model: &str) -> Result<()> {
-        let (provider, model_id) =
-            mika_common::llm::model_override::resolve_model_override(&self.db_ctx.settings, model)?;
-        self.db_ctx
-            .settings
-            .set_provider_model(provider, Some(model_id));
-        self.llm = self.db_ctx.settings.make_llm_provider()?;
-        Ok(())
-    }
-}
-
-/// Initialize full context for a named agent (for chat).
-pub fn init_for_agent(agent_name: &str) -> Result<AppContext> {
-    let db_ctx = init_db_only_for_agent(agent_name)?;
-    let llm = db_ctx.settings.make_llm_provider()?;
-    Ok(AppContext { db_ctx, llm })
-}
-
 /// Initialize database-only context for a named agent.
+///
+/// mika#1727 vol V3b-2 — c'est désormais la **seule** porte d'entrée des
+/// commandes interactives. `init_for_agent` et `AppContext::override_model`
+/// sont partis avec le provider qu'ils bâtissaient : plus aucun tour ne tourne
+/// dans ce processus, et pourquoi ce provider local ne pouvait plus que
+/// **refuser** se lit sur `commands::ask::run`.
 pub fn init_db_only_for_agent(agent_name: &str) -> Result<DbContext> {
     let (settings, async_db, home_dir, global_home) = init_base_for_agent(agent_name)?;
-    let github_app = GitHubApp::from_settings(&settings);
     Ok(DbContext {
         settings,
         async_db,
         home_dir,
         global_home,
-        github_app,
     })
 }
 
@@ -189,37 +119,12 @@ fn open_db(settings: &Settings) -> Result<Database> {
     Database::open(db_path).context("failed to open database")
 }
 
-/// Load MCP config and connect to all enabled servers.
-/// Returns `None` if no servers are configured or all connections fail.
-///
-/// Reads from the operator-shell scoped MCP config path (mika#1737 AC3).
-/// Runs the AC5 one-shot migration from `{agent_home}/mcp.json` if the
-/// operator-shell path does not yet exist. `agent_home` is retained only
-/// as the migration source; runtime MCP connections themselves are
-/// operator-shell scoped.
-pub async fn connect_mcp(agent_home: &Path) -> Option<mika_agent::mcp::McpManager> {
-    if let Err(e) =
-        mika_agent::mcp::config::McpConfig::migrate_from_agent_home_if_needed(agent_home)
-    {
-        tracing::warn!(error = %e, "mika#1737 AC5 MCP migration failed on connect_mcp");
-    }
-    let config = match mika_agent::mcp::config::McpConfig::load_operator_shell() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load operator-shell MCP config, skipping");
-            return None;
-        }
-    };
-    if config.mcp_servers.is_empty() {
-        return None;
-    }
-    let manager = mika_agent::mcp::McpManager::connect_all(&config).await;
-    if manager.has_connections() {
-        Some(manager)
-    } else {
-        None
-    }
-}
+// mika#1727 vol V3b-2 — `connect_mcp` est parti d'ici avec son seul appelant,
+// `mika chat`, dont aucun outil ne touchait ces connexions depuis V1. La
+// migration mika#1737 AC5 de `{agent_home}/mcp.json` qu'elle déclenchait au
+// passage garde quatre autres déclencheurs vivants — `commands/mcp.rs`,
+// `mika-agent/src/validate.rs`, le démarrage du daemon et leurs tests —
+// mesurés avant le retrait, non supposés (mika#2331).
 
 #[cfg(test)]
 mod tests {

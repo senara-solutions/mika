@@ -657,9 +657,12 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             Ok(result) => {
                 let target_provider: mika_common::llm::ProviderKind =
                     result.provider.parse().unwrap_or(app.provider);
-                if result.provider_changed {
-                    app.provider = target_provider;
-                }
+                // mika#1727 vol V3b-2 — `app.provider` ne bouge pas, même quand
+                // `switch_model` a changé de provider dans `config.toml` : un
+                // override ne re-dispatche jamais vers un autre provider
+                // (mika#1591), donc les tours de cette TUI restent servis par
+                // celui que mika-spirit a chargé. Le modèle, lui, part bien :
+                // `format_worker_model` rend la valeur que le fil porte.
                 let display_id =
                     crate::commands::provider::format_display_model(target_provider, &result.model);
                 let worker_model =
@@ -678,7 +681,11 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
 
                 let mut out = format!("Switched to {display_id}.");
                 if result.provider_changed {
-                    out.push_str(&format!(" (switched provider to {})", result.provider));
+                    out.push_str(&format!(
+                        " (switched provider to {} in config.toml \u{2014} mika-spirit takes it \
+                         at its next restart, for every turn of the agent)",
+                        result.provider
+                    ));
                 }
                 for w in &result.warnings {
                     out.push_str(&format!(" (warning: {w})"));
@@ -771,23 +778,16 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
         .await
         {
             Ok(result) => {
+                // mika#1727 vol V3b-2 — cette commande écrit, et rien de plus :
+                // aucun `SetModel` ne part, ni `app.provider` ni `app.model` ne
+                // bouge. Un override préfixé d'un provider que le spirit **en
+                // cours** n'a pas configuré est refusé fermement et couperait
+                // tous les tours suivants (mika#1591), et des champs qui
+                // annonceraient un provider que le fil n'atteint pas seraient
+                // une fausse provenance (motif mika#2331). La bascule atteint
+                // les tours au prochain démarrage de mika-spirit, qui relit
+                // `config.toml` — d'où une réponse qui nomme ce redémarrage.
                 let new_provider: ProviderKind = result.provider.parse().unwrap_or(app.provider);
-                let display_id =
-                    crate::commands::provider::format_display_model(new_provider, &result.model);
-                let worker_model =
-                    crate::commands::provider::format_worker_model(new_provider, &result.model);
-                app.model = display_id;
-                app.provider = new_provider;
-                if app
-                    .agent_tx
-                    .send(AgentRequest::SetModel {
-                        model: worker_model,
-                    })
-                    .is_err()
-                {
-                    return WORKER_NOT_RESPONDING.to_string();
-                }
-                app.needs_redraw = true;
 
                 // Fire-and-forget model cache warm (TUI keeps running, unlike CLI)
                 let home = app.home_dir.clone();
@@ -797,7 +797,12 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                         crate::commands::provider::fetch_models(&global, &home, new_provider).await;
                 });
 
-                let mut out = format!("Switched to {new_provider} (model: {}).", result.model);
+                let mut out = format!(
+                    "Wrote llm_provider = \"{new_provider}\" (model: {}) to config.toml. \
+                     mika-spirit takes it at its next restart, for every turn of the agent. \
+                     This session keeps running on {}.",
+                    result.model, app.provider
+                );
                 for w in &result.warnings {
                     let _ = write!(out, "\n{w}");
                 }
@@ -1892,7 +1897,9 @@ mod tests {
         let env_path = tmp.path().join(".env");
         std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
         let _ = handle_provider(&mut app, "deepseek").await;
-        drain_requests(&mut rx); // clear SetModel from provider switch
+        // Le canal est déjà vide depuis V3b-2 — la bascule n'envoie rien ; le
+        // drain garde la mesure ci-dessous close sur le seul `/model`.
+        drain_requests(&mut rx);
 
         // Use a direct model name (not an alias)
         let output = handle_model(&mut app, "deepseek-reasoner").await;
@@ -2195,7 +2202,10 @@ mod tests {
             output.contains("deepseek-reasoner"),
             "should show configured model, got: {output}"
         );
-        assert_eq!(app.provider, ProviderKind::DeepSeek);
+        // mika#1727 vol V3b-2 — ce test tient la lecture du modèle configuré, et
+        // l'`App` ne bascule plus ; le fait à part entière est tenu par
+        // `test_provider_switch_writes_config_and_sends_no_setmodel`.
+        assert_eq!(app.provider, ProviderKind::Anthropic);
     }
 
     #[tokio::test]
@@ -2259,23 +2269,31 @@ mod tests {
         assert_eq!(app.provider, ProviderKind::Anthropic);
         let output = handle_model(&mut app, "deepseek").await;
 
-        // Should switch provider to DeepSeek
+        // mika#1727 vol V3b-2 (critère 3) — la bascule est persistée et le
+        // modèle part sur le fil, mais `app.provider` ne bouge pas : un override
+        // ne re-dispatche jamais vers un autre provider (mika#1591).
         assert_eq!(
             app.provider,
-            ProviderKind::DeepSeek,
-            "should switch provider for cross-provider alias"
+            ProviderKind::Anthropic,
+            "le provider de l'App ne suit pas la persistance"
         );
         assert!(
             output.contains("switched provider to deepseek"),
             "should note provider switch, got: {output}"
         );
+        assert!(
+            output.contains("next restart"),
+            "la réponse nomme ce que la persistance couvre, got: {output}"
+        );
 
-        // Verify SetModel was sent
+        // Le `SetModel` porte exactement ce que `format_worker_model` rend pour
+        // le provider cible — l'alias `deepseek` résout `deepseek/deepseek-chat`.
         let requests = drain_requests(&mut rx);
         assert!(
-            requests
-                .iter()
-                .any(|r| matches!(r, AgentRequest::SetModel { .. }))
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model == "deepseek/deepseek-chat")
+            ),
+            "SetModel should carry the target provider's prefixed model"
         );
     }
 
@@ -2288,7 +2306,9 @@ mod tests {
 
         let output = handle_model(&mut app, "deepseek/deepseek-reasoner").await;
 
-        assert_eq!(app.provider, ProviderKind::DeepSeek);
+        // Le provider cible se lit dans le modèle préfixé, pas sur l'`App`
+        // (mika#1727 vol V3b-2).
+        assert_eq!(app.provider, ProviderKind::Anthropic);
         assert!(
             output.contains("deepseek/deepseek-reasoner"),
             "should set full model id, got: {output}"
@@ -2326,28 +2346,80 @@ mod tests {
 
     // --- #451: provider switch worker propagation ---
 
+    /// **Le test négatif du vol V3b-2 (critère 2, mika#1727).**
+    ///
+    /// C'est l'ancien `test_provider_switch_worker_gets_provider_prefix`
+    /// retourné, et non un test neuf à côté : le fait qu'il tenait — un
+    /// `SetModel` préfixé `deepseek/` part au worker — est précisément celui
+    /// que le vol retire. Un override vers un provider que le spirit **en
+    /// cours** n'a pas configuré est refusé fermement (mika#1591) et couperait
+    /// tous les tours suivants. Le préfixe reste tenu, pour les gestes qui le
+    /// portent encore, par `test_provider_set_model_still_sends_setmodel` et
+    /// `test_model_switch_worker_gets_provider_prefix`.
     #[tokio::test]
-    async fn test_provider_switch_worker_gets_provider_prefix() {
+    async fn test_provider_switch_writes_config_and_sends_no_setmodel() {
         let (mut app, mut rx, tmp) = test_app().await;
 
         // Setup: start on Anthropic, switch to DeepSeek
         let env_path = tmp.path().join(".env");
         std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
 
-        let _output = handle_provider(&mut app, "deepseek").await;
+        let output = handle_provider(&mut app, "deepseek").await;
 
-        // Worker message must contain "deepseek/" prefix so worker can switch provider
+        assert!(
+            drain_requests(&mut rx).is_empty(),
+            "rien ne part au worker : ni SetModel, ni autre chose"
+        );
+        assert_eq!(app.provider, ProviderKind::Anthropic);
+        assert_eq!(app.model, "claude-sonnet-4-6");
+
+        let config = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            config.contains("llm_provider = \"deepseek\""),
+            "la bascule est écrite dans config.toml, got: {config}"
+        );
+        assert!(
+            output.contains("next restart"),
+            "la réponse nomme le redémarrage de mika-spirit, got: {output}"
+        );
+    }
+
+    /// **É9 — `/provider set model <x>` pose toujours l'override (mika#1727).**
+    ///
+    /// Ce bras-là ne change pas de provider, donc mika#1591 ne le concerne pas :
+    /// le préfixe qu'il envoie est celui d'`app.provider`, c'est-à-dire du
+    /// provider que le spirit en cours a chargé. Sans ce test, le retrait du
+    /// `SetModel` de la bascule serait indiscernable d'un retrait des deux.
+    #[tokio::test]
+    async fn test_provider_set_model_still_sends_setmodel() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // test_app uses global_home == agent_home, so .env isn't read
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "llm_provider = \"anthropic\"\nanthropic_api_key = \"sk-ant-fake-key\"\n",
+        )
+        .unwrap();
+
+        let output = handle_provider(&mut app, "set model claude-opus-4-6").await;
+
         let requests = drain_requests(&mut rx);
         assert!(
-            requests.iter().any(
-                |r| matches!(r, AgentRequest::SetModel { model } if model.starts_with("deepseek/"))
-            ),
-            "SetModel should contain provider prefix"
+            requests.iter().any(|r| matches!(
+                r,
+                AgentRequest::SetModel { model } if model == "anthropic/claude-opus-4-6"
+            )),
+            "SetModel carries app.provider's prefix"
+        );
+        assert_eq!(app.model, "claude-opus-4-6");
+        assert!(
+            output.contains("anthropic_model"),
+            "should name the key written, got: {output}"
         );
     }
 
     #[tokio::test]
-    async fn test_provider_switch_to_anthropic_worker_gets_prefix() {
+    async fn test_provider_switch_back_to_anthropic_writes_config_only() {
         let (mut app, mut rx, tmp) = test_app().await;
 
         // Set API keys via process env (test_app uses global_home == agent_home,
@@ -2368,16 +2440,14 @@ mod tests {
         .unwrap();
         let _output = handle_provider(&mut app, "anthropic").await;
 
-        // Worker message must contain "anthropic/" prefix even for Anthropic
-        let requests = drain_requests(&mut rx);
+        // mika#1727 vol V3b-2 — la bascule de retour écrit, et n'envoie rien non
+        // plus : la règle ne dépend pas du provider visé.
+        assert!(drain_requests(&mut rx).is_empty());
+        let config = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            requests.iter().any(
-                |r| matches!(r, AgentRequest::SetModel { model } if model.starts_with("anthropic/"))
-            ),
-            "SetModel for Anthropic should contain provider prefix"
+            config.contains("llm_provider = \"anthropic\""),
+            "la bascule de retour est écrite, got: {config}"
         );
-        // Display value should NOT have the prefix
-        assert_eq!(app.model, "claude-sonnet-4-6");
     }
 
     #[tokio::test]
