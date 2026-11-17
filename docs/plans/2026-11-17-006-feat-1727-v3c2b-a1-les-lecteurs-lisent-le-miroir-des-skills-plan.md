@@ -421,6 +421,15 @@ Transcrits du corps de mika#1727, § *Critères de V3c-2b-A1* :
 | 11 | les quatre commandes dans cet ordre, puis `bash scripts/verify-pipeline.sh origin/main` |
 | 12 | `gh pr view <N> --json closingIssuesReferences` rend `[]` |
 
+> **Amendement de la finition (2026-11-17, écart sur la mesure du critère 6).**
+> Après le commit 2, `grep -rn 'updated_skills' crates/mika-cli/` rend bien zéro
+> ligne. Après le commit 3, il en rend **une** : le littéral `"updated_skills"` de
+> la table `MOTIFS` de `mika1727_v3b1_…`, dans la moitié test de `chat.rs`, que ce
+> même plan exige (critère 8). La mesure du critère 6 se lit donc : **aucune
+> ligne hors de cette entrée de la garde**, et le contre-témoin de la garde
+> atteste que la moitié test, qui la contient, est masquée du balayage. Le champ,
+> lui, n'existe plus ; le compilateur le confirme. Rien d'autre ne change.
+
 ---
 
 ## Fire-Disposition
