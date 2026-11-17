@@ -5,20 +5,20 @@
 //! déjà écrite sur [`super::rewind_remote`] : un client qui résout ses propres
 //! accès ne se pilote pas depuis un test. Le jeton ne se lit donc pas ici —
 //! `session_remote::jeton_interne` reste la seule lecture du crate, et c'est
-//! l'appelant de V3c-2b qui l'y prendra.
+//! `chat::lire_les_skills` qui l'y prend depuis V3c-2b-A1.
 //!
 //! **Rien n'est mis en commun avec les deux transports voisins.** Une entrée
 //! d'egress déclare **un** site de construction de client, et sa ligne `data`
 //! décrit ce qui part de ce site ; la moitié de ce raisonnement est écrite sur
 //! l'en-tête de [`super::session_remote`], l'autre sur `rewind_remote::post`.
 //!
-//! **État du vol.** La porte est posée et elle n'a **aucun appelant de
-//! production** : les items sans lecteur portent une attente `dead_code` que
-//! V3c-2b retire en câblant la TUI sur cette route — `app.skills` cesse alors
-//! d'être assemblé localement. Les deux refus métier de cette route, 404 agent
-//! inconnu et 401 jeton refusé, ont depuis leur variant : ce qui sort encore
-//! par [`SkillsRemoteIssue::Statut`] est un statut dont ce client ne sait rien
-//! dire de plus que ce que le serveur en a dit.
+//! **État du vol.** Depuis V3c-2b-A1 la porte a son appelant de production :
+//! `spawn_agent_worker` la lit au démarrage et à chaque respawn, `app.skills`
+//! porte le résultat sous [`EtatSkills`], et les six attentes `dead_code` que
+//! les items sans lecteur portaient sont tombées avec lui. Les deux refus
+//! métier de cette route, 404 agent inconnu et 401 jeton refusé, ont leur
+//! variant : ce qui sort encore par [`SkillsRemoteIssue::Statut`] est un statut
+//! dont ce client ne sait rien dire de plus que ce que le serveur en a dit.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -30,22 +30,41 @@ use std::collections::BTreeMap;
 // **compte** des outils d'une skill, `tool_names` leurs noms — parce qu'un
 // miroir qui renomme oblige chacun de ses lecteurs à tenir la correspondance.
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
-)]
-#[derive(Debug, Deserialize)]
+/// `Default` pour le mode équipe de la TUI (`App::new_team_mode`), qui n'a pas
+/// d'agent dont lire le registre : il pose un miroir **lu et vide**, ce qui
+/// n'est pas la même chose qu'une lecture en échec — c'est toute la raison
+/// d'être d'[`EtatSkills`].
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct SkillsMirror {
+    /// Le nom d'agent que la route confirme. Au miroir parce que la route le
+    /// sert ; sans lecteur dans la TUI parce qu'aucune des quatre surfaces ne
+    /// l'affiche — `spawn_agent_worker` connaît déjà le nom qu'il a demandé, et
+    /// le rendre ici en ferait un second juge du même fait. Le retirer serait
+    /// pire : un champ absent du miroir se lit comme un champ absent de la route
+    /// (motif mika#2331).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "servi par la route, affiché par aucune des quatre surfaces"
+        )
+    )]
     pub(crate) agent: String,
     pub(crate) skills: Vec<SkillMirror>,
     pub(crate) skipped: Vec<SkippedMirror>,
     pub(crate) warnings: Vec<WarningMirror>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
-)]
+/// Ce que la TUI porte des skills de son agent : le miroir que la route a servi,
+/// ou la cause de son refus **en une ligne**.
+///
+/// Un `String` et non [`SkillsRemoteIssue`] : la cause est figée à l'instant de
+/// la lecture, et ce que les quatre surfaces de lecture ont à dire est cette
+/// ligne, pas un vocabulaire de refus à rejouer chacune de son côté. Une
+/// lecture en échec **n'est pas fatale** — la TUI démarre, et chaque surface dit
+/// la cause au lieu de prétendre un registre vide.
+pub(crate) type EtatSkills = Result<SkillsMirror, String>;
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct SkillMirror {
     pub(crate) name: String,
@@ -54,6 +73,17 @@ pub(crate) struct SkillMirror {
     /// de deux valeurs et non un enum : la route ne publie pas ce vocabulaire
     /// comme fermé, et un variant de plus côté serveur ferait ici un
     /// `CorpsIllisible` là où la TUI n'a qu'une étiquette à afficher.
+    ///
+    /// Sans lecteur dans la TUI : ni `/skills` ni `/skill <nom>` n'affichait
+    /// l'origine avant ce vol, et le critère de rendu identique au caractère
+    /// près interdit de la leur ajouter ici. Même raison de rester qu'[`SkillsMirror::agent`].
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "servi par la route, affiché par aucune des quatre surfaces"
+        )
+    )]
     pub(crate) origin: String,
     pub(crate) enabled: bool,
     pub(crate) always_on: bool,
@@ -70,10 +100,6 @@ pub(crate) struct SkillMirror {
     pub(crate) variants: VariantsMirror,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
-)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct VariantsMirror {
     pub(crate) total: usize,
@@ -83,10 +109,6 @@ pub(crate) struct VariantsMirror {
     pub(crate) providers: BTreeMap<String, usize>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
-)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct SkippedMirror {
     pub(crate) name: String,
@@ -97,10 +119,6 @@ pub(crate) struct SkippedMirror {
 /// oubli : la route n'en sert pas, parce que tout ce qui atteint cette liste est
 /// un avertissement par construction — un diagnostic n'est enregistré que sur
 /// une skill restée chargée.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
-)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct WarningMirror {
     pub(crate) name: String,
@@ -216,10 +234,6 @@ impl std::fmt::Display for SkillsRemoteIssue {
 /// `rewind_remote::rewind_url` : il n'y a qu'**une** route ici, donc le
 /// `trim_end_matches('/')` qui absorbe un `base_url` à barre finale n'a pas deux
 /// lecteurs à tenir d'accord.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
-)]
 pub(crate) async fn lire(
     base_url: &str,
     token: &str,
@@ -276,8 +290,13 @@ pub(crate) async fn lire(
 // sortirait — le lint d'egress ne le verrait plus. `rewind_remote.rs` porte la
 // même note, répétée ici plutôt que pointée : un lecteur qui déplace un item ne
 // lit pas le fichier d'à côté.
+//
+// Module `pub(crate)` depuis V3c-2b-A1, la forme de `rewind_remote::tests` :
+// [`tests::miroir_de_test`] est le **seul** constructeur de miroir des tests du
+// crate, et une `pub(crate) fn` dans un module privé resterait inatteignable
+// depuis `tui/`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Banc **emprunté** au voisin, et non recopié : un second témoin de socket
     // ouvrirait une seconde vérité sur ce que le serveur reçoit, libre d'en
@@ -295,7 +314,13 @@ mod tests {
     /// seconde à l'autre valeur de chaque booléen —, une ignorée et un
     /// avertissement. Recopiée par test, elle divergerait là où le contrat de
     /// fil est un.
-    const CORPS: &str = r#"{
+    ///
+    /// `pub(crate)` depuis V3c-2b-A1 : les tests de `chat::lire_les_skills`
+    /// arment le banc avec **ce** corps, et non avec un corps réduit écrit chez
+    /// eux — un second corps de fil divergerait du premier sans qu'aucun test ne
+    /// le voie, pour la raison même qui fait de [`miroir_de_test`] le seul
+    /// constructeur.
+    pub(crate) const CORPS: &str = r#"{
       "agent": "mika-dev",
       "skills": [
         {"name": "self-dev", "description": "orchestration", "origin": "built-in",
@@ -311,6 +336,23 @@ mod tests {
       "skipped": [{"name": "broken", "reason": "manifest parse error"}],
       "warnings": [{"name": "self-dev", "messages": ["two handlers share a keyword"]}]
     }"#;
+
+    /// Le miroir que tous les tests des lecteurs du crate construisent — ceux de
+    /// ce fichier comme ceux de `tui/` (mika#1727 vol V3c-2b-A1).
+    ///
+    /// Il **désérialise [`CORPS`]** au lieu de recopier la forme du miroir : un
+    /// seul lieu dit le contrat de fil, et le constructeur prouve au passage que
+    /// ce corps se relit. Un second constructeur, fût-il plus commode à écrire,
+    /// ouvrirait une seconde vérité sur ce que la route sert, libre d'en
+    /// diverger sans qu'aucun test ne le voie.
+    ///
+    /// Ce que [`CORPS`] couvre, et dont les lecteurs vivent : une skill avec
+    /// outils, override et variantes sur deux providers dont un sans modèle
+    /// (`self-dev`), une skill désactivée sans outil ni variante (`weather`),
+    /// une skill ignorée (`broken`) et un avertissement.
+    pub(crate) fn miroir_de_test() -> SkillsMirror {
+        serde_json::from_str(CORPS).expect("le corps de référence de la route se relit")
+    }
 
     /// Un factice qui ne sert qu'un couple sur la route des skills, et l'appel
     /// que [`lire`] y fait. L'URL de base revient avec, parce que les messages

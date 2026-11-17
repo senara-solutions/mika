@@ -11,6 +11,7 @@ use mika_agent::db::TeamRunSummary;
 use mika_agent::skills::SkillRegistry;
 use mika_agent::teams::types::{TeamEvent, TeamPhase};
 
+use crate::commands::skills_remote::EtatSkills;
 use crate::commands::tasks::CallbackFeed;
 use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands;
@@ -575,7 +576,11 @@ pub struct App<'a> {
     // Shared resources for slash commands
     pub db: AsyncDatabase,
     pub home_dir: PathBuf,
-    pub skills: Arc<SkillRegistry>,
+    /// Le registre de skills de l'agent **tel que mika-spirit l'a servi**, ou la
+    /// cause de son refus en une ligne (mika#1727, vol V3c-2b-A1). Relu à chaque
+    /// respawn par `spawn_agent_worker`, donc une bascule d'agent porte le
+    /// miroir de l'agent visé.
+    pub skills: Arc<EtatSkills>,
 
     // Slash command state
     pub autocomplete: AutocompleteState,
@@ -687,7 +692,7 @@ impl<'a> App<'a> {
         identity_name: String,
         db: AsyncDatabase,
         home_dir: PathBuf,
-        skills: Arc<SkillRegistry>,
+        skills: Arc<EtatSkills>,
         agent_name: String,
         global_home: PathBuf,
         provider: mika_common::llm::ProviderKind,
@@ -819,7 +824,11 @@ impl<'a> App<'a> {
             // accessing them.
             db,
             home_dir: team_dir.clone(),
-            skills: Arc::new(SkillRegistry::empty()),
+            // Un miroir **lu et vide**, et non une lecture en échec : le mode
+            // équipe n'a pas d'agent dont lire le registre, ce qui n'est pas la
+            // même chose qu'un spirit qui a refusé de le dire (mika#1727, vol
+            // V3c-2b-A1).
+            skills: Arc::new(Ok(crate::commands::skills_remote::SkillsMirror::default())),
             autocomplete: AutocompleteState::new(),
             pending_command: None,
             agent_name: String::new(),
@@ -1341,13 +1350,12 @@ impl<'a> App<'a> {
                 is_error,
                 thinking,
                 input_tokens,
-                updated_skills,
+                // Plus de rechargement à chaud depuis le vol V3c-2b-A1 : le
+                // miroir des skills est relu sur la route à chaque respawn, et
+                // ce champ — `None` à ses quatre sites depuis V3b-2 — part au
+                // commit suivant.
+                updated_skills: _,
             }) => {
-                // Update skills if hot-reloaded during this turn
-                if let Some(new_skills) = updated_skills {
-                    self.skills = new_skills;
-                }
-
                 // Update context token tracking
                 if let Some(tokens) = input_tokens {
                     self.context_tokens = Some(tokens);
@@ -2330,7 +2338,8 @@ mod tests {
     ) {
         use mika_agent::async_db::AsyncDatabase;
         use mika_agent::db::Database;
-        use mika_agent::skills::SkillRegistry;
+
+        use crate::commands::skills_remote::tests::miroir_de_test;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().to_path_buf();
@@ -2354,7 +2363,7 @@ mod tests {
             "Mika".to_string(),
             async_db,
             home_dir,
-            Arc::new(SkillRegistry::empty()),
+            Arc::new(Ok(miroir_de_test())),
             "mika".to_string(),
             global_home,
             mika_common::llm::ProviderKind::Anthropic,

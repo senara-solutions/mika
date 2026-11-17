@@ -5,6 +5,7 @@ use mika_common::agent;
 use mika_common::home;
 use mika_common::team;
 
+use crate::commands::skills_remote::SkillMirror;
 use crate::tui::app::{
     AgentRequest, AgentStatus, App, ChatMessage, ChatRole, MessagesLayout, SelectionState,
     session_message_to_chat_message,
@@ -904,8 +905,16 @@ async fn handle_export(app: &mut App<'_>) -> String {
 }
 
 fn handle_skills(app: &App<'_>) -> String {
-    let skills = app.skills.skills();
-    let skipped = app.skills.skipped();
+    // mika#1727 vol V3c-2b-A1 — la cause, et **jamais** « No skills loaded. » :
+    // cette phrase dirait d'un spirit muet qu'il a servi un registre vide, et
+    // elle enverrait l'opérateur chercher la panne du côté de ses skills. Elle
+    // est réservée au miroir lu dont les deux listes sont vides.
+    let miroir = match app.skills.as_ref() {
+        Ok(miroir) => miroir,
+        Err(cause) => return cause.clone(),
+    };
+    let skills = &miroir.skills;
+    let skipped = &miroir.skipped;
 
     if skills.is_empty() && skipped.is_empty() {
         return "No skills loaded.".to_string();
@@ -913,19 +922,13 @@ fn handle_skills(app: &App<'_>) -> String {
 
     let max_name_width = skills
         .iter()
-        .map(|e| e.manifest.skill.name.len())
+        .map(|e| e.name.len())
         .chain(skipped.iter().map(|s| s.name.len()))
         .max()
         .unwrap_or(0);
 
-    let mut always_on: Vec<&_> = skills
-        .iter()
-        .filter(|e| e.manifest.skill.always_on)
-        .collect();
-    let mut on_demand: Vec<&_> = skills
-        .iter()
-        .filter(|e| !e.manifest.skill.always_on)
-        .collect();
+    let mut always_on: Vec<&_> = skills.iter().filter(|e| e.always_on).collect();
+    let mut on_demand: Vec<&_> = skills.iter().filter(|e| !e.always_on).collect();
 
     // Within each group: enabled first, disabled last
     always_on.sort_by_key(|e| !e.enabled);
@@ -941,8 +944,8 @@ fn handle_skills(app: &App<'_>) -> String {
         )
     };
 
-    let format_entry = |out: &mut String, entry: &mika_agent::skills::index::SkillEntry| {
-        let tool_count = entry.skill_tools.len();
+    let format_entry = |out: &mut String, entry: &SkillMirror| {
+        let tool_count = entry.tools;
         let tool_info = if tool_count == 0 {
             "\u{2014}".to_string()
         } else if tool_count == 1 {
@@ -957,7 +960,7 @@ fn handle_skills(app: &App<'_>) -> String {
             ""
         };
         let variants = {
-            let count = entry.variant_count();
+            let count = entry.variants.total;
             if count > 0 {
                 format!(" [variants: {count}]")
             } else {
@@ -967,9 +970,9 @@ fn handle_skills(app: &App<'_>) -> String {
         let _ = writeln!(
             out,
             "  \u{25cf} {:<width$}  {:<9}  {}{}{}{}",
-            entry.manifest.skill.name,
+            entry.name,
             tool_info,
-            entry.manifest.skill.description,
+            entry.description,
             disabled,
             overridden,
             variants,
@@ -1063,57 +1066,65 @@ fn handle_skill(app: &App<'_>, args: &str) -> String {
         return "Usage: /skill <name>".to_string();
     }
 
-    let skills = app.skills.skills();
-    let found = skills
+    // La cause avant la recherche (mika#1727 vol V3c-2b-A1) : sans ce bras,
+    // « No skill found with name '…' » répondrait d'un registre que personne n'a
+    // lu, et le nom tapé se lirait comme la faute.
+    let miroir = match app.skills.as_ref() {
+        Ok(miroir) => miroir,
+        Err(cause) => return cause.clone(),
+    };
+    let found = miroir
+        .skills
         .iter()
-        .find(|s| s.manifest.skill.name.eq_ignore_ascii_case(name));
+        .find(|s| s.name.eq_ignore_ascii_case(name));
 
     match found {
         Some(entry) => {
-            let m = &entry.manifest;
-            let keywords = if m.triggers.keywords.is_empty() {
+            let keywords = if entry.keywords.is_empty() {
                 "none".to_string()
             } else {
-                m.triggers.keywords.join(", ")
+                entry.keywords.join(", ")
             };
             let mut out = String::new();
-            let _ = writeln!(out, "Skill: {}", m.skill.name);
-            let _ = writeln!(out, "  Description: {}", m.skill.description);
+            let _ = writeln!(out, "Skill: {}", entry.name);
+            let _ = writeln!(out, "  Description: {}", entry.description);
             let _ = writeln!(
                 out,
                 "  Version: {}",
-                if m.skill.version.is_empty() {
+                if entry.version.is_empty() {
                     "unset"
                 } else {
-                    &m.skill.version
+                    &entry.version
                 }
             );
-            let _ = writeln!(out, "  Always on: {}", m.skill.always_on);
+            let _ = writeln!(out, "  Always on: {}", entry.always_on);
             let _ = writeln!(out, "  Enabled: {}", entry.enabled);
-            let _ = writeln!(out, "  Timeout: {}s", m.skill.timeout_secs);
+            let _ = writeln!(out, "  Timeout: {}s", entry.timeout_secs);
             let _ = writeln!(out, "  Keywords: {keywords}");
-            if !entry.skill_tools.is_empty() {
-                let tool_names: Vec<&str> = entry
-                    .skill_tools
-                    .iter()
-                    .map(|t| t.definition.name.as_str())
-                    .collect();
-                let _ = writeln!(out, "  Tools: {}", tool_names.join(", "));
+            if !entry.tool_names.is_empty() {
+                let _ = writeln!(out, "  Tools: {}", entry.tool_names.join(", "));
             }
-            let _ = writeln!(out, "  Path: {}", entry.dir.display());
-            let variant_total = entry.variant_count();
+            let _ = writeln!(out, "  Path: {}", entry.path);
+            let variant_total = entry.variants.total;
             if variant_total > 0 {
-                let providers = entry.variant_providers();
-                let provider_list: Vec<_> = providers.iter().copied().collect();
-                let mut variant_details = Vec::new();
-                for p in &provider_list {
-                    let model_count = entry.variant_models(p).len();
-                    if model_count > 0 {
-                        variant_details.push(format!("{p} ({model_count} models)"));
-                    } else {
-                        variant_details.push(p.to_string());
-                    }
-                }
+                // L'ordre vient du `BTreeMap` du miroir, et c'est la raison
+                // écrite sur son type : un détail par provider qui changerait
+                // d'ordre d'un affichage à l'autre se lirait comme un
+                // changement du registre. Un provider à zéro modèle se rend
+                // sans parenthèse, comme hier — il existe, il n'a pas de
+                // variante de modèle.
+                let variant_details: Vec<String> = entry
+                    .variants
+                    .providers
+                    .iter()
+                    .map(|(p, model_count)| {
+                        if *model_count > 0 {
+                            format!("{p} ({model_count} models)")
+                        } else {
+                            p.to_string()
+                        }
+                    })
+                    .collect();
                 let _ = writeln!(
                     out,
                     "  Variants: {} total ({})",
@@ -1541,9 +1552,11 @@ mod tests {
 
     use mika_agent::async_db::AsyncDatabase;
     use mika_agent::db::Database;
-    use mika_agent::skills::SkillRegistry;
     use mika_common::llm::ProviderKind;
     use tokio::sync::mpsc;
+
+    use crate::commands::skills_remote::SkillsMirror;
+    use crate::commands::skills_remote::tests::miroir_de_test;
 
     /// Test helper: construct a minimal App with captured agent_tx receiver.
     /// Returns (App, agent_rx, temp_dir) — temp_dir must be kept alive for the test duration.
@@ -1569,7 +1582,7 @@ mod tests {
         let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         let (_response_tx, response_rx) = mpsc::unbounded_channel();
 
-        let skills = Arc::new(SkillRegistry::empty());
+        let skills = Arc::new(Ok(miroir_de_test()));
 
         let app = App::new(
             agent_tx,
@@ -2105,60 +2118,136 @@ mod tests {
         );
     }
 
-    // --- /skills skipped section tests ---
+    // --- mika#1727 vol V3c-2b-A1 : les deux lecteurs lisent le miroir ---
 
+    /// La cause d'un refus de lecture, telle que `lire_les_skills` la fige :
+    /// une ligne, déjà formée par le `Display` de `SkillsRemoteIssue`.
+    const CAUSE: &str =
+        "mika-spirit is unreachable at http://127.0.0.1:9/api/v1/skills: connection refused";
+
+    /// **Critère 1** — `/skills` rend sur le miroir ce qu'il rendait sur le
+    /// registre local, au caractère près.
+    ///
+    /// Comparaison **littérale** et non une suite de `contains` : ce qui a
+    /// changé est la source de chaque champ, accès par accès, et seule une
+    /// égalité de chaîne voit un alignement perdu, une section déplacée ou une
+    /// colonne passée du compte d'outils aux noms d'outils. Les trois sections
+    /// y sont ensemble, dans leur ordre, avec la largeur de colonne que le plus
+    /// long des trois noms impose.
     #[tokio::test]
-    async fn test_skills_shows_skipped_section() {
-        use mika_agent::skills::index::SkippedSkill;
+    async fn mika1727_v3c2b_skills_rend_le_miroir_au_caractere_pres() {
+        let (app, _rx, _tmp) = test_app().await;
 
-        let (mut app, _rx, _tmp) = test_app().await;
-        app.skills = Arc::new(SkillRegistry::with_skipped(vec![
-            SkippedSkill {
-                name: "broken-skill".to_string(),
-                reason: "broken symlink".to_string(),
-            },
-            SkippedSkill {
-                name: "bad-manifest".to_string(),
-                reason: "invalid TOML: unexpected key".to_string(),
-            },
-        ]));
+        let sortie = handle_skills(&app);
 
-        let output = handle_skills(&app);
-
-        assert!(output.contains("SKIPPED"), "should have SKIPPED section");
-        assert!(
-            output.contains("broken-skill"),
-            "should show broken skill name"
-        );
-        assert!(
-            output.contains("broken symlink"),
-            "should show broken skill reason"
-        );
-        assert!(
-            output.contains("bad-manifest"),
-            "should show bad manifest name"
-        );
-        assert!(
-            output.contains("invalid TOML"),
-            "should show parse error reason"
-        );
-        assert!(
-            output.contains("2 skipped"),
-            "header should show skipped count"
+        assert_eq!(
+            sortie,
+            "Loaded skills (2, 1 skipped):\n\
+             \n  ALWAYS ON\n\
+             \u{20}\u{20}\u{25cf} weather   \u{2014}           [disabled]\n\
+             \n  ON DEMAND\n\
+             \u{20}\u{20}\u{25cf} self-dev  2 tools    orchestration [override] [variants: 3]\n\
+             \n  SKIPPED\n\
+             \u{20}\u{20}\u{2717} broken    manifest parse error\n"
         );
     }
 
+    /// **Critère 1** — `/skill <nom>` rend sur le miroir ce qu'il rendait sur le
+    /// registre local, au caractère près.
+    ///
+    /// La skill visée porte tout ce que ce lecteur sait afficher : des outils
+    /// nommés, un override, des mots-clés, et des variantes sur deux providers
+    /// dont un **sans modèle** — celui-là se rend sans parenthèse, et c'est
+    /// l'écart qu'un miroir à `providers` vide ne montrerait pas.
     #[tokio::test]
-    async fn test_skills_hides_skipped_when_none() {
+    async fn mika1727_v3c2b_skill_rend_le_detail_au_caractere_pres() {
         let (app, _rx, _tmp) = test_app().await;
 
-        let output = handle_skills(&app);
+        let sortie = handle_skill(&app, "self-dev");
 
-        // Empty registry — no skills, no skipped
-        assert!(
-            !output.contains("SKIPPED"),
-            "should not have SKIPPED section"
+        assert_eq!(
+            sortie,
+            "Skill: self-dev\n\
+             \u{20} Description: orchestration\n\
+             \u{20} Version: 0.3.1\n\
+             \u{20} Always on: false\n\
+             \u{20} Enabled: true\n\
+             \u{20} Timeout: 600s\n\
+             \u{20} Keywords: dev, loop\n\
+             \u{20} Tools: run_claude_pilot, deploy_mika\n\
+             \u{20} Path: /skills/self-dev\n\
+             \u{20} Variants: 3 total (anthropic (2 models), groq)\n"
         );
+    }
+
+    /// **Critère 1** — les trois lignes qu'une skill sans outil, sans mot-clé et
+    /// sans variante **n'affiche pas**, et le `none` qu'elle affiche à leur
+    /// place. Trois absences, qu'un littéral sur la skill d'à côté ne pourrait
+    /// pas montrer.
+    #[tokio::test]
+    async fn mika1727_v3c2b_skill_sans_outil_ni_variante_nen_affiche_aucun() {
+        let (app, _rx, _tmp) = test_app().await;
+
+        let sortie = handle_skill(&app, "weather");
+
+        assert!(sortie.contains("  Keywords: none\n"), "{sortie}");
+        assert!(!sortie.contains("  Tools:"), "{sortie}");
+        assert!(!sortie.contains("  Variants:"), "{sortie}");
+        // Le nom se cherche sans égard à la casse, comme hier.
+        assert_eq!(handle_skill(&app, "WEATHER"), sortie);
+    }
+
+    /// **Critère 2** — sur une lecture en échec, les deux lecteurs disent la
+    /// cause, et **jamais** « No skills loaded. ».
+    ///
+    /// L'assertion négative est le cœur du test : la phrase interdite est
+    /// atteignable depuis l'early-return de `handle_skills`, et elle dirait d'un
+    /// spirit muet qu'il a servi un registre vide — une provenance fausse, celle
+    /// que mika#2331 refuse. `/skill <nom>` a la sienne : « No skill found with
+    /// name » répondrait d'un registre que personne n'a lu.
+    #[tokio::test]
+    async fn mika1727_v3c2b_les_deux_lecteurs_disent_la_cause_sur_echec() {
+        let (mut app, _rx, _tmp) = test_app().await;
+        app.skills = Arc::new(Err(CAUSE.to_string()));
+
+        let skills = handle_skills(&app);
+        assert_eq!(skills, CAUSE);
+        assert!(!skills.contains("No skills loaded."), "{skills}");
+
+        let skill = handle_skill(&app, "self-dev");
+        assert_eq!(skill, CAUSE);
+        assert!(!skill.contains("No skill found with name"), "{skill}");
+    }
+
+    /// **Critère 3** — « No skills loaded. » n'appartient qu'au miroir **lu** dont
+    /// les deux listes sont vides.
+    ///
+    /// Les trois états dans un seul test : séparés, le lecteur de la revue
+    /// aurait à tenir lui-même que les trois sont exhaustifs, et c'est
+    /// l'exhaustivité qui est la propriété.
+    #[tokio::test]
+    async fn mika1727_v3c2b_no_skills_loaded_est_reserve_au_miroir_lu_et_vide() {
+        let (mut app, _rx, _tmp) = test_app().await;
+
+        // Lu et vide : la phrase, et elle seule.
+        app.skills = Arc::new(Ok(SkillsMirror::default()));
+        assert_eq!(handle_skills(&app), "No skills loaded.");
+
+        // Lu, sans skill chargée mais avec une ignorée : la section `SKIPPED`,
+        // et **pas** la phrase. C'est l'état qu'un `skipped` lu derrière une
+        // projection vers un registre perdait.
+        let mut sans_skill = miroir_de_test();
+        sans_skill.skills.clear();
+        sans_skill.warnings.clear();
+        app.skills = Arc::new(Ok(sans_skill));
+        let sortie = handle_skills(&app);
+        assert!(sortie.contains("  SKIPPED\n"), "{sortie}");
+        assert!(sortie.contains("broken"), "{sortie}");
+        assert!(!sortie.contains("No skills loaded."), "{sortie}");
+
+        // Pas lu : la cause.
+        app.skills = Arc::new(Err(CAUSE.to_string()));
+        assert_eq!(handle_skills(&app), CAUSE);
     }
 
     // --- Channel send failure tests ---
