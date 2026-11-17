@@ -1968,7 +1968,9 @@ mod tests {
     /// **Critère 4 de V3b-1, étendu au critère 4 de V3b-2** — le tour de la TUI
     /// ne construit plus son provider, n'en garde plus de copie des réglages, et
     /// depuis V3b-2 ne porte plus ni contexte complet, ni MCP, ni rechargement
-    /// de skills à chaud.
+    /// de skills à chaud. **Critère 8 de V3c-2b-A1** : la TUI n'assemble plus
+    /// ses skills sur le disque — ni registre, ni migration des marqueurs, ni
+    /// lecture des overrides — et la réponse du worker ne porte plus de registre.
     ///
     /// **Son nom ne change pas avec le second vol** : c'est une garde par
     /// *fichier*, pas par vol — l'argument de la garde voisine ci-dessus — et la
@@ -2015,6 +2017,22 @@ mod tests {
                 "skills_dirty",
                 "le registre s'assemble une fois, au démarrage",
             ),
+            (
+                "assemble_agent_registry",
+                "le registre arrive par la route, pas par le disque",
+            ),
+            (
+                "migrate_disabled_markers_async",
+                "spirit migre les marqueurs à l'`init_agent`",
+            ),
+            (
+                "get_skill_overrides",
+                "les overrides sont déjà appliqués dans le miroir",
+            ),
+            (
+                "updated_skills",
+                "plus de rechargement à chaud : la route est relue au respawn",
+            ),
         ];
         // Deux sites depuis V3b-2, chacun avec SON témoin : un témoin générique
         // comme `pub async fn run(` passerait sur le mauvais fichier, et une
@@ -2052,7 +2070,7 @@ mod tests {
         // contient en clair, donc un masquage perdu la ferait se dénoncer
         // elle-même, et le réflexe serait de « réparer » par une entrée
         // d'allowlist — précisément le piège. Sur `ask.rs` il n'y a rien à
-        // contre-témoigner : sa moitié test ne contient aucun des huit motifs,
+        // contre-témoigner : sa moitié test ne contient aucun des douze motifs,
         // un masquage perdu n'y produirait aucun rouge, et l'assertion y serait
         // du théâtre.
         let chat = scanner.production_of(&scanner.src_root().join("commands/chat.rs"));
