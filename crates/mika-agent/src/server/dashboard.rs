@@ -1375,10 +1375,26 @@ pub async fn handle_skills_list(
         .map(|s| serde_json::json!({"name": s.name, "reason": s.reason}))
         .collect();
 
+    // Same reason as `skipped` just above, and deliberately not restated: a
+    // validation warning is a property of the REGISTRY too, so it is not
+    // filtered either. What is specific here is the DROPPED `level`:
+    // `apply_load_safety_check` only records a diagnostic on a skill it KEPT
+    // loaded, so everything reaching this list is a warning by construction —
+    // and the message alone is what the TUI already shows at startup.
+    let warnings: Vec<serde_json::Value> = registry
+        .validated_warnings()
+        .iter()
+        .map(|w| {
+            let messages: Vec<&str> = w.diagnostics.iter().map(|d| d.message.as_str()).collect();
+            serde_json::json!({"name": w.skill_name, "messages": messages})
+        })
+        .collect();
+
     Json(serde_json::json!({
         "agent": resolved_name,
         "skills": skills,
         "skipped": skipped,
+        "warnings": warnings,
     }))
     .into_response()
 }
