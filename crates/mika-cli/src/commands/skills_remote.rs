@@ -131,6 +131,9 @@ pub(crate) enum SkillsRemoteIssue {
         agent: String,
         url: String,
     },
+    JetonRefuse {
+        url: String,
+    },
     Statut {
         status: u16,
         url: String,
@@ -168,6 +171,21 @@ impl std::fmt::Display for SkillsRemoteIssue {
                     "mika-spirit does not serve an agent named '{agent}' at {url}"
                 )
             }
+            // La seconde moitié est la phrase du `Denied` de
+            // `session_remote::SessionRemoteIssue`, reprise telle quelle : le
+            // geste de remédiation est le même, et deux formulations d'un même
+            // geste dérivent. Elles ne sont pas mises en commun pour autant —
+            // partager un littéral entre deux `Display` de deux modules créerait
+            // une dépendance de texte là où il n'y a aucune dépendance de
+            // domaine. La première moitié, elle, nomme l'URL que le voisin ne
+            // nomme pas : `base_url` est un argument, donc « quel serveur a
+            // refusé » est la moitié de la question quand deux daemons tournent.
+            // Ni corps ni statut sur ce variant : un 401 d'ici a un corps vide
+            // ou générique, et le 401 est déjà dans le nom.
+            Self::JetonRefuse { url } => write!(
+                f,
+                "mika-spirit denied the request for {url}: set MIKA_INTERNAL_TOKEN to the server's token"
+            ),
             Self::Statut { status, url, body } => {
                 write!(f, "mika-spirit returned {status} for {url}: {body}")
             }
@@ -234,6 +252,7 @@ pub(crate) async fn lire(
                 agent: agent.to_string(),
                 url,
             },
+            401 => SkillsRemoteIssue::JetonRefuse { url },
             _ => SkillsRemoteIssue::Statut {
                 status: statut,
                 url,
@@ -433,6 +452,25 @@ mod tests {
             !message.contains("session"),
             "un 404 d'ici ne peut vouloir dire qu'agent inconnu : {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_401_nomme_la_variable_de_jeton() {
+        // Corps vide : c'est ce que `require_dashboard_or_internal_token` rend
+        // sur un jeton refusé. Le test en vit, puisque c'est justement l'absence
+        // de corps qui rendait le `Statut` d'avant muet sur la cause.
+        let (base, _, rendu) = appel(StatusCode::UNAUTHORIZED, "", "mika-dev").await;
+        let probleme = rendu.expect_err("un 401 est une erreur");
+        assert!(
+            matches!(probleme, SkillsRemoteIssue::JetonRefuse { .. }),
+            "{probleme:?}"
+        );
+        let message = probleme.to_string();
+        assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+        // Le nom exact de la variable, et pas une périphrase : c'est le seul
+        // geste que l'opérateur ait à faire, et le message n'a de valeur que
+        // s'il le nomme assez précisément pour être exporté tel quel.
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
     }
 
     #[tokio::test]
