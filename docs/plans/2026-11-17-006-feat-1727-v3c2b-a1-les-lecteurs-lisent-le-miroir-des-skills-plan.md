@@ -268,9 +268,18 @@ visé), les trois messages de démarrage en littéral, les deux lecteurs en succ
 en échec, l'autocomplétion vide, les trois états de « No skills loaded. ».
 
 **Commit 2 — `refactor(1727): updated_skills quitte la réponse du worker`.** Le champ
-`app.rs:332`, son lecteur `app.rs:1344-1349`, les quatre sites de production, le site
-de test `app.rs:2417`, le commentaire `chat.rs:343` et le passage de doc
-`chat_turn.rs:160`.
+`app.rs:332`, les quatre sites de production, le site de test `app.rs:2417`, le
+commentaire `chat.rs:343` et le passage de doc `chat_turn.rs:160`.
+
+> **Amendement du pilote (2026-11-17, écart sur l'affectation d'une ligne).** Le
+> **lecteur** `app.rs:1344-1349` passe au **commit 1**, et non au commit 2 comme
+> écrit ci-dessus. Son corps est `self.skills = new_skills;` : il pose un
+> `Arc<SkillRegistry>` dans un champ qui devient `Arc<EtatSkills>` au commit 1, donc
+> l'affecter au commit 2 rend le commit 1 non compilable — ce que la première phrase
+> de cette section interdit (« Chacun compile et passe ses tests »). Au commit 1 le
+> champ reste donc déclaré et ignoré au motif (`updated_skills: _`) ; le commit 2
+> retire la déclaration, le motif et les cinq sites. Rien d'autre ne change : le
+> contenu livré, le nombre de commits et les critères sont ceux du plan.
 
 **Commit 3 — `test(1727): la garde de chat.rs refuse l'assemblage local des skills`.**
 Quatre motifs ajoutés à `MOTIFS` — **après** les commits 1 et 2 seulement, sinon elle
