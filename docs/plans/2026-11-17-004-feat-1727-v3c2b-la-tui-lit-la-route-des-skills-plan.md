@@ -53,9 +53,14 @@ Le registre se pose dans `app.skills` à trois endroits : au démarrage
 (l. 822).
 
 `AgentResponse::Reply` porte `updated_skills: Option<Arc<SkillRegistry>>`
-(l. 332), lu l. 1344-1349, et vaut `None` à ses quatre sites d'écriture depuis
-V3b-2 (deux dans le bras `Message` de `chat.rs`, un dans `chat_turn.rs`, un dans
-un test d'`app.rs` l. 2417).
+(l. 332), lu l. 1344-1349, et vaut `None` à tous ses sites d'écriture depuis
+V3b-2. **Ils sont cinq, pas quatre** — `chat.rs:360` et `chat.rs:367` (bras
+`Message`), `chat_turn.rs:228` et `chat_turn.rs:246` (tour de callback : succès
+*et* erreur), plus `app.rs:2417` dans un test. Le corps du ticket dit « quatre » :
+le compte juste est **quatre sites de production** plus un site de test, et
+`chat_turn.rs` en porte deux, pas un. Le plan le note ici pour que le pilote ne
+laisse pas le second derrière lui — le critère 5 exige zéro occurrence dans tout
+`crates/mika-cli/`, et un `grep` final tranche.
 
 ### Les lecteurs — recensement fermé
 
@@ -151,8 +156,15 @@ message de chaque skill et le fallback `"unknown issue"`.
 
 ### `updated_skills`
 
-Quitte `AgentResponse::Reply`, son lecteur (`app.rs:1344-1349`) et ses quatre
-sites d'écriture (`chat.rs` ×2, `chat_turn.rs`, `app.rs:2417`).
+Quitte `AgentResponse::Reply`, son lecteur (`app.rs:1344-1349`) et ses cinq sites
+d'écriture (`chat.rs` ×2, `chat_turn.rs` ×2, `app.rs:2417`) — voir le
+recensement ci-dessus pour le second site de `chat_turn.rs`, que le corps du
+ticket ne compte pas.
+
+**Le volume ne bouge pas pour autant** : les cinq sites sont des lignes
+`updated_skills: None,` **retirées**, et le tableau de § *Taille estimée* compte
+les lignes **ajoutées**. La seule ligne ajoutée de `chat_turn.rs` est la
+réécriture du passage de doc (l. 160) qui décrit aujourd'hui le champ.
 
 ### Les attentes
 
@@ -165,7 +177,14 @@ appelant. **Aucune attente ni aucun `allow` neuf** ;
 **Décision du plan : `skills_remote::tests::miroir_de_test() -> SkillsMirror`,
 `pub(crate)`.** Précédent dans le crate : `rewind_remote::tests::{RequeteRecue, fake_spirit}`,
 `pub(crate)` depuis V2c-1b, consommés par le module `tests` de `skills_remote.rs`
-lui-même. Il rend deux skills (une `always_on`, une à la demande), une ignorée et
+lui-même.
+
+**Le module porte la visibilité, pas seulement la fonction.** Le `mod tests` de
+`skills_remote.rs` (l. 280) est privé aujourd'hui ; `rewind_remote.rs` l. 525
+l'écrit `pub(crate) mod tests`. Une `pub(crate) fn` dans un module privé reste
+inatteignable depuis `tui/`, et le pilote le découvrirait à la compilation du
+commit 2. Le commit 1 pose donc `#[cfg(test)] pub(crate) mod tests`, sur la forme
+exacte de `rewind_remote`. Il rend deux skills (une `always_on`, une à la demande), une ignorée et
 un avertissement — la forme exacte dont les lecteurs ont besoin pour mesurer « à
 donnée égale ». Les cinq sites qui construisaient un `SkillRegistry` passent par
 lui. **Aucun test ne recopie la forme du miroir.**
