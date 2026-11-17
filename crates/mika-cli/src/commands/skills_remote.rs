@@ -30,11 +30,16 @@ use std::collections::BTreeMap;
 // **compte** des outils d'une skill, `tool_names` leurs noms — parce qu'un
 // miroir qui renomme oblige chacun de ses lecteurs à tenir la correspondance.
 
+/// `Default` sert le seul site qui n'a aucun agent à interroger : le mode
+/// équipe de `tui/app.rs`, qui n'ouvre pas de worker et donc ne lit pas la
+/// route. Un miroir vide y est la vérité — « cet écran ne porte pas de
+/// registre » —, là où un `Err` inventerait une panne qui n'a pas eu lieu
+/// (mika#2331).
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "câblé au vol V3c-2b de mika#1727")
 )]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct SkillsMirror {
     pub(crate) agent: String,
     pub(crate) skills: Vec<SkillMirror>,
@@ -276,8 +281,15 @@ pub(crate) async fn lire(
 // sortirait — le lint d'egress ne le verrait plus. `rewind_remote.rs` porte la
 // même note, répétée ici plutôt que pointée : un lecteur qui déplace un item ne
 // lit pas le fichier d'à côté.
+//
+// `pub(crate)` sur le module **et** sur [`tests::miroir_de_test`] : la
+// visibilité de la fonction seule ne suffit pas, un `pub(crate) fn` d'un module
+// privé restant inatteignable depuis `tui/`. Même forme que `rewind_remote`
+// l. 525, et pour le même motif : les lecteurs du miroir mesurent « à donnée
+// égale » contre la forme que ce fichier tient, plutôt que contre une copie
+// libre d'en diverger.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Banc **emprunté** au voisin, et non recopié : un second témoin de socket
     // ouvrirait une seconde vérité sur ce que le serveur reçoit, libre d'en
@@ -311,6 +323,19 @@ mod tests {
       "skipped": [{"name": "broken", "reason": "manifest parse error"}],
       "warnings": [{"name": "self-dev", "messages": ["two handlers share a keyword"]}]
     }"#;
+
+    /// Le constructeur de miroir **unique** du crate : les tests des cinq
+    /// lecteurs de la TUI passent par lui plutôt que de recopier la forme du
+    /// miroir chacun pour soi (mika#1727, vol V3c-2b).
+    ///
+    /// Il désérialise [`CORPS`] au lieu de rebâtir les structs champ par champ,
+    /// et c'est le point : ce que les lecteurs mesurent est alors la forme que
+    /// **la route sert**, pas une forme écrite à la main qui pourrait rester
+    /// verte après que le contrat de fil a bougé. L'`expect` est le seul endroit
+    /// où une faute de frappe dans `CORPS` se dit, et elle s'y dit fort.
+    pub(crate) fn miroir_de_test() -> SkillsMirror {
+        serde_json::from_str(CORPS).expect("CORPS est la forme que la route sert")
+    }
 
     /// Un factice qui ne sert qu'un couple sur la route des skills, et l'appel
     /// que [`lire`] y fait. L'URL de base revient avec, parce que les messages
