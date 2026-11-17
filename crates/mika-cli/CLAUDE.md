@@ -752,26 +752,52 @@ configuré est refusé fermement et couperait tous les tours suivants.
 **Le refus structurel.** La garde de V3b-1
 (`mika1727_v3b1_le_tour_de_la_tui_ne_construit_plus_son_provider`, module `tests`
 de `commands/chat.rs`) **garde son nom** — elle est par fichier, pas par vol — et
-passe à deux sites (`chat.rs`, `ask.rs`) et huit motifs, dont `connect_mcp`,
+passe à deux sites (`chat.rs`, `ask.rs`) et douze motifs, dont `connect_mcp`,
 `McpManager`, `init_for_agent`, `AppContext` et `skills_dirty`. Allowlist livrée
 vide et assertie vide, un témoin par site, le contre-témoin sur `chat.rs` : quand
 elle rougit, le remède est de router l'appelant, jamais d'ajouter une ligne.
 
-### La route des skills a son client, pas encore son appelant (mika#1727, vols V3c-2a-ii et V3c-2a-iii)
+### La route des skills est la source de la TUI (mika#1727, vols V3c-2a-ii à V3c-2b)
 
 `commands/skills_remote.rs::lire(base_url, token, agent)` fait le GET de
 `/api/v1/skills` — nom d'agent en paramètre de requête **encodé par reqwest**,
-jeton interne en `Authorization` — et rend un miroir des quatre clés de la route,
-treize champs par skill. **Depuis V3c-2b-A1, `spawn_agent_worker` l'appelle**,
-par `lire_les_skills` : `app.skills` porte le miroir lu, ou la cause du refus en
-une ligne, et seuls les champs `agent` et `origin`, sans lecteur dans la TUI,
-gardent leur attente `dead_code`. Cinq refus distincts, et pas le
-vocabulaire de `session_remote` : `Injoignable` (aucun statut, par construction
-du variant), `AgentInconnu` (404 — ici un 404 ne peut vouloir dire qu'agent
-inconnu, et le message nomme l'agent **demandé**, jamais une session),
-`JetonRefuse` (401 — le message nomme `MIKA_INTERNAL_TOKEN`), `Statut` (tout
-autre statut que 200, rendu avec son corps), `CorpsIllisible` (un 200 au corps
-illisible est un refus, jamais un miroir à champs vides).
+jeton interne pris par `chat::lire_les_skills` sur `session_remote::jeton_interne`
+et posé en `Authorization` — et rend un miroir des quatre clés de la route,
+treize champs par skill. **Son appelant est `spawn_agent_worker`** : au
+démarrage, à la bascule d'agent et au `/restart`. Pas de rechargement à chaud —
+la route est **relue au respawn**.
+
+`app.skills` porte un `Arc<EtatSkills>`, soit `Result<SkillsMirror, String>` : le
+miroir lu, ou la cause du refus **en une ligne**, figée à l'instant de la
+lecture. Une lecture en échec **n'est pas fatale** — la TUI démarre. Cinq refus
+distincts, et pas le vocabulaire de `session_remote` : `Injoignable` (aucun
+statut, par construction du variant), `AgentInconnu` (404 — ici un 404 ne peut
+vouloir dire qu'agent inconnu, et le message nomme l'agent **demandé**, jamais
+une session), `JetonRefuse` (401 — le message nomme `MIKA_INTERNAL_TOKEN`),
+`Statut` (tout autre statut que 200, rendu avec son corps), `CorpsIllisible` (un
+200 au corps illisible est un refus, jamais un miroir à champs vides).
+
+**Ce que disent les quatre surfaces sur échec.** Le démarrage rend la ligne de
+cause telle quelle (`chat::message_de_cause`), sans cadre qui la dirait deux
+fois. `/skills` et `/skill <nom>` (`handlers.rs`) rendent la cause et **jamais**
+« No skills loaded. » ni « No skill found with name '…' » — ces deux phrases
+enverraient chercher la panne du côté des skills, la provenance fausse que
+mika#2331 refuse ; « No skills loaded. » n'appartient qu'au miroir **lu** dont
+les deux listes sont vides. L'autocomplétion de `/skill` (`completers.rs`) ne
+propose **rien** : une liste vide s'y lirait « cet agent n'a pas de skill », et
+la cause est déjà dite par les trois autres surfaces. Seuls `SkillsMirror::agent`
+et `SkillMirror::origin` gardent une attente `dead_code`, faute de surface qui
+les affiche.
+
+**Le refus structurel (V3c-2b-A2).**
+`mika1727_v3c2b_a2_la_tui_ne_nomme_plus_le_registre_des_skills`, module `tests`
+de `tui/app.rs`, interdit `SkillRegistry` dans la moitié production de **chaque**
+fichier de `tui/`, balayé en entier — par dossier et non par fichier, pour qu'un
+fichier neuf soit couvert sans qu'on y pense ; par dossier et non par crate,
+parce que `commands/skills.rs` construit légitimement le registre sur le disque.
+Allowlist livrée vide et assertie vide, un témoin sur `app.skills`, un
+contre-témoin de masquage et un contre-témoin de détection. Quand elle rougit, le
+remède est `skills_remote::lire` par `app.skills`, jamais une ligne d'allowlist.
 
 - **Slash commands:** `/clear`, `/compact`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session
