@@ -127,6 +127,10 @@ pub(crate) enum SkillsRemoteIssue {
         url: String,
         cause: String,
     },
+    AgentInconnu {
+        agent: String,
+        url: String,
+    },
     Statut {
         status: u16,
         url: String,
@@ -145,6 +149,24 @@ impl std::fmt::Display for SkillsRemoteIssue {
         match self {
             Self::Injoignable { url, cause } => {
                 write!(f, "mika-spirit is unreachable at {url}: {cause}")
+            }
+            // Le nom vient de l'argument de `lire`, jamais du corps du 404 : le
+            // serveur y renvoie une reformulation du nom qu'on vient d'envoyer,
+            // et la relire coûterait une désérialisation qui peut échouer — un
+            // spirit d'une autre version, un proxy — pour retrouver une chaîne
+            // que l'appelant détient déjà. Et cet échec-là rendrait un message
+            // sans nom d'agent, là où le nom est le seul fait utile.
+            //
+            // La limite, dite ici plutôt que gardée : un 404 ne vaut « agent
+            // inconnu » que servi par un spirit qui monte bien cette route. Un
+            // spirit qui ne la monterait pas du tout rendrait aussi un 404, et
+            // ce message nommerait l'agent à tort — distinction que le serveur
+            // lui-même ne fait pas, donc que le client ne peut pas faire.
+            Self::AgentInconnu { agent, url } => {
+                write!(
+                    f,
+                    "mika-spirit does not serve an agent named '{agent}' at {url}"
+                )
             }
             Self::Statut { status, url, body } => {
                 write!(f, "mika-spirit returned {status} for {url}: {body}")
@@ -202,10 +224,21 @@ pub(crate) async fn lire(
     let statut = reponse.status().as_u16();
     let corps = reponse.text().await.unwrap_or_default();
     if statut != 200 {
-        return Err(SkillsRemoteIssue::Statut {
-            status: statut,
-            url,
-            body: corps,
+        // Le `if` est gardé et le `match` niché dedans : à plat, un
+        // `match statut { 200 => {}, … }` réécrirait le chemin de succès pour
+        // deux cas d'erreur, et la revue aurait à relire un diff là où rien
+        // n'a changé. Le bras `_` reste `Statut` et reste le dernier, donc il
+        // est le seul à consommer `corps` et aucun `clone` n'est nécessaire.
+        return Err(match statut {
+            404 => SkillsRemoteIssue::AgentInconnu {
+                agent: agent.to_string(),
+                url,
+            },
+            _ => SkillsRemoteIssue::Statut {
+                status: statut,
+                url,
+                body: corps,
+            },
         });
     }
     serde_json::from_str(&corps).map_err(|cause| SkillsRemoteIssue::CorpsIllisible {
@@ -371,6 +404,35 @@ mod tests {
         let message = probleme.to_string();
         assert!(message.contains("unreachable"), "{message}");
         assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_404_nomme_lagent_demande_et_jamais_une_session() {
+        // Le corps est celui que la route sert réellement pour ce statut, et
+        // non une chaîne arbitraire : c'est ce qui rend le test capable de voir
+        // qu'un futur éditeur a remis ce corps dans le message.
+        let (base, _, rendu) = appel(
+            StatusCode::NOT_FOUND,
+            r#"{"error": "agent 'fantome' not found"}"#,
+            "fantome",
+        )
+        .await;
+        let probleme = rendu.expect_err("un 404 est une erreur");
+        assert!(
+            matches!(probleme, SkillsRemoteIssue::AgentInconnu { .. }),
+            "{probleme:?}"
+        );
+        let message = probleme.to_string();
+        assert!(message.contains("fantome"), "{message}");
+        assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+        // L'assertion sans laquelle ce variant ne prouve rien : il n'existe que
+        // pour ne pas dire ce que dit le `NotFound` du voisin — « unknown
+        // agent, or unknown session » — qui enverrait l'opérateur chercher la
+        // panne du côté des sessions, où elle n'est pas.
+        assert!(
+            !message.contains("session"),
+            "un 404 d'ici ne peut vouloir dire qu'agent inconnu : {message}"
+        );
     }
 
     #[tokio::test]
