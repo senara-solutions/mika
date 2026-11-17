@@ -537,6 +537,10 @@ pub(crate) mod tests {
         pub(crate) chemin: String,
         pub(crate) autorisation: Option<String>,
         pub(crate) corps: String,
+        /// La chaîne de requête, sans le `?`. `Option` et non `String` : une
+        /// requête absente et une requête vide ne sont pas le même fait, et un
+        /// client qui oublie son paramètre produit la première.
+        pub(crate) requete: Option<String>,
     }
 
     #[derive(Clone)]
@@ -548,6 +552,7 @@ pub(crate) mod tests {
     async fn servir(State(etat): State<Factice>, requete: Request) -> (StatusCode, String) {
         let methode = requete.method().to_string();
         let chemin = requete.uri().path().to_string();
+        let chaine_requete = requete.uri().query().map(str::to_string);
         let autorisation = requete
             .headers()
             .get("authorization")
@@ -562,6 +567,7 @@ pub(crate) mod tests {
             chemin,
             autorisation,
             corps,
+            requete: chaine_requete,
         });
         // Un chemin non associé rend 501, qu'aucun bras de `post` ne traduit :
         // une faute de chemin ne se lit jamais comme un `NotFound`.

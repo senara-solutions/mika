@@ -371,6 +371,17 @@ call_site          = "crates/mika-cli/src/commands/rewind_remote.rs"
 owner              = "@samidarko"
 
 [[sink]]
+id                 = "cli-spirit-skills"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "un GET vers /api/v1/skills : le nom de l'agent en paramètre de requête, et le jeton interne en en-tête Authorization ; aucun corps"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/skills_remote.rs"
+call_site          = "crates/mika-cli/src/commands/skills_remote.rs"
+owner              = "@samidarko"
+
+[[sink]]
 id                 = "cli-spirit-sessions"
 destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
 destination_source = "config"
