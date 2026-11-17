@@ -157,9 +157,10 @@ async fn send_turn_to_endpoint(
 /// `Task` A2A ne porte pas de part de pensée, donc le bloc que le tour local
 /// rendait n'existe plus. Aucun avis d'inertie n'est émis pour autant :
 /// personne ne *tape* un tour de callback, et un avis sans opérateur pour le
-/// lire est un avis qu'on apprend à ignorer (mika#1883). `updated_skills` reste
-/// `None` comme aujourd'hui : le rechargement à chaud est un geste du bras
-/// `Message`.
+/// lire est un avis qu'on apprend à ignorer (mika#1883). Le champ de
+/// rechargement de skills à chaud ne voyage plus du tout : il a quitté
+/// `AgentResponse::Reply` au vol V3c-2b, où `app.skills` est devenu le miroir
+/// lu sur la route.
 ///
 /// # Pourquoi la remise du statut survit à l'envoi distant
 ///
@@ -225,7 +226,6 @@ async fn livrer_tour_de_callback_sur_endpoint(
             is_error: false,
             thinking: None,
             input_tokens: reply.input_tokens,
-            updated_skills: None,
         },
         Err(e) => {
             // `mark_task_delivered` a posé `delivered` ; la remise au statut
@@ -243,7 +243,6 @@ async fn livrer_tour_de_callback_sur_endpoint(
                 is_error: true,
                 thinking: None,
                 input_tokens: None,
-                updated_skills: None,
             }
         }
     }

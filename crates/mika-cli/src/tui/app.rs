@@ -328,8 +328,6 @@ pub enum AgentResponse {
         is_error: bool,
         thinking: Option<String>,
         input_tokens: Option<u32>,
-        /// If skills were hot-reloaded during this turn, contains the new registry.
-        updated_skills: Option<Arc<SkillRegistry>>,
     },
     /// Un avis du worker à destination de l'opérateur, rendu en `System` et
     /// sans rapport avec la réussite du tour (mika#1727 V1 § D3 : les entrées de
@@ -1341,13 +1339,7 @@ impl<'a> App<'a> {
                 is_error,
                 thinking,
                 input_tokens,
-                updated_skills,
             }) => {
-                // Update skills if hot-reloaded during this turn
-                if let Some(new_skills) = updated_skills {
-                    self.skills = new_skills;
-                }
-
                 // Update context token tracking
                 if let Some(tokens) = input_tokens {
                     self.context_tokens = Some(tokens);
@@ -2414,7 +2406,6 @@ mod tests {
                 is_error: false,
                 thinking: None,
                 input_tokens: None,
-                updated_skills: None,
             })
             .unwrap();
 
