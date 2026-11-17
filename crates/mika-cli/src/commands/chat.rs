@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 
 use crate::commands::chat_turn;
 use crate::commands::session_remote;
+use crate::commands::skills_remote::{self, EtatSkills};
 use crate::commands::tasks::CallbackFeed;
 use crate::commands::team_outcome::TeamOutcome;
 use crate::init::{self, DbContext};
@@ -28,8 +29,6 @@ use crate::tui::ui;
 use mika_agent::agent;
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::prompt;
-use mika_agent::skills::SkillRegistry;
-use mika_agent::skills::assembly::assemble_agent_registry;
 use mika_agent::teams::types::TeamEvent;
 use mika_common::config::Settings;
 use mika_common::team;
@@ -120,6 +119,27 @@ async fn ouvrir_session_par_spirit(
     }
 }
 
+/// Lit le registre de skills de l'agent sur mika-spirit (mika#1727, vol
+/// V3c-2b-A1), là où la TUI l'assemblait sur le disque.
+///
+/// La forme d'[`ouvrir_session_par_spirit`] : tout ce qui touche le monde arrive
+/// par argument, donc le test se joue contre un factice sans variable
+/// d'environnement.
+///
+/// **Rien n'est fatal ici**, et c'est la différence avec l'ouverture de session
+/// juste au-dessus : le retour est un [`EtatSkills`] et non un `Result` qu'un
+/// `?` remonterait. Un registre illisible n'empêche pas de tenir une
+/// conversation — les quatre surfaces de lecture disent la cause, et la TUI
+/// démarre. Un jeton absent est un refus comme un autre pour cette raison : il
+/// ne peut pas arrêter un démarrage que même un spirit à terre ne doit pas
+/// arrêter.
+async fn lire_les_skills(base_url: &str, lire_env: SourceEnv<'_>, agent: &str) -> EtatSkills {
+    let jeton = jeton_interne(lire_env)?;
+    skills_remote::lire(base_url, &jeton, agent)
+        .await
+        .map_err(|probleme| probleme.to_string())
+}
+
 /// Clôt la session du fil sur mika-spirit, au nom de l'agent qu'on quitte
 /// (mika#1727, vol V2d-4c).
 ///
@@ -203,7 +223,7 @@ async fn spawn_agent_worker(
     String, // session_id
     String, // model
     String, // identity_name
-    Arc<SkillRegistry>,
+    Arc<EtatSkills>,
     bool, // is_singleton_session (mika#1401)
 )> {
     let identity = prompt::load_identity(&ctx.home_dir);
@@ -232,32 +252,25 @@ async fn spawn_agent_worker(
         canonical_session_id.as_deref(),
     )
     .await?;
-    let skills_dir = ctx.home_dir.join("skills");
-    // Migrate legacy .disabled marker files to DB (one-shot, idempotent).
-    if let Err(e) = mika_agent::skills::migrate_disabled_markers_async(
-        &skills_dir,
-        &ctx.async_db,
-        &ctx.async_db.agent_id,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "failed to migrate .disabled markers");
-    }
-    // Same assembler as the server init (mika#2889) — the TUI no longer carries
-    // its own copy of the sequence. Assembled once, at startup: les deux
-    // rechargements à chaud qui suivaient vivaient sous un drapeau que personne
-    // ne posait, et ils partent au vol V3b-2.
-    let overrides = ctx
-        .async_db
-        .get_skill_overrides(&ctx.async_db.agent_id)
-        .await
-        .unwrap_or_default();
-    let skill_registry = Arc::new(assemble_agent_registry(
-        &skills_dir,
-        &identity,
-        &overrides,
-        ctx.async_db.agent_id(),
-    ));
+    // mika#1727 vol V3c-2b-A1 — le registre des skills arrive par la route, et
+    // non plus du disque. Les trois gestes qui vivaient ici — la migration des
+    // marqueurs `.disabled`, la lecture des overrides, l'assemblage — étaient un
+    // second exemplaire de ce que le serveur fait déjà à l'`init_agent` de
+    // chaque agent (`mika-agent/src/server/mod.rs`), et la migration en
+    // particulier n'est pas perdue : elle y est faite avant que cette route
+    // puisse répondre.
+    //
+    // La lecture a lieu ici, donc à **chaque** respawn : la bascule d'agent et
+    // `/restart` repassent par cette fonction, et le miroir qu'ils posent est
+    // celui de l'agent qu'ils visent.
+    let etat_skills = Arc::new(
+        lire_les_skills(
+            &crate::commands::dashboard::spirit_url(),
+            &|nom| std::env::var(nom).ok(),
+            agent_name,
+        )
+        .await,
+    );
     // mika#1727 vol V3b-2 — la TUI ne connecte plus de serveur MCP. Elle en
     // montait un jeu au démarrage et le fermait en sortie, alors qu'aucun outil
     // de ce processus n'y touchait depuis V1 : le tour tourne chez spirit, qui
@@ -340,14 +353,6 @@ async fn spawn_agent_worker(
                     )
                     .await;
 
-                    // mika#1727 vol V3b-2 — `updated_skills` vaut désormais
-                    // toujours `None` : les deux rechargements à chaud qui le
-                    // remplissaient tournaient sous `skills_dirty`, un drapeau
-                    // que rien ne posait à `true`. Le champ reste dans
-                    // `AgentResponse::Reply` parce que `tui/app.rs` le lit et
-                    // doit rester inchangé à l'octet ; il est passé en clair à
-                    // ses deux sites pour qu'on lise sur place qu'aucune
-                    // branche ne le remplit.
                     let response = match result {
                         Ok(reply) => AgentResponse::Reply {
                             content: reply.content,
@@ -357,14 +362,12 @@ async fn spawn_agent_worker(
                             // fil. L'avis d'inertie ci-dessus l'a déjà dit.
                             thinking: None,
                             input_tokens: reply.input_tokens,
-                            updated_skills: None,
                         },
                         Err(e) => AgentResponse::Reply {
                             content: format!("{e}"),
                             is_error: true,
                             thinking: None,
                             input_tokens: None,
-                            updated_skills: None,
                         },
                     };
                     if agent_tx.send(response).is_err() {
@@ -487,9 +490,94 @@ async fn spawn_agent_worker(
         session_id,
         model,
         identity_name,
-        skill_registry,
+        etat_skills,
         is_singleton_session,
     ))
+}
+
+/// Les skills que la route a dit ignorées, en un message de démarrage
+/// (mika#1727, vol V3c-2b-A1).
+///
+/// Fonction pure sur `&EtatSkills` — **rien du monde en argument** —, comme ses
+/// deux voisines ci-dessous. C'est cette extraction qui rend le texte mesurable
+/// : en ligne dans [`run`], il ne se comparait qu'à travers un démarrage
+/// complet, donc il ne se comparait pas. Le `format!` et les `writeln!` sont
+/// ceux d'avant la bascule, déménagés sans se réécrire : à donnée égale, le
+/// rendu est au caractère près celui d'hier.
+///
+/// `None` sur une lecture en échec : ce qu'il y a à dire alors est la cause, et
+/// c'est [`message_de_cause`] qui la dit — une seule fois, plutôt qu'une fois
+/// par surface.
+fn message_des_skills_ignorees(etat: &EtatSkills) -> Option<String> {
+    let skipped = &etat.as_ref().ok()?.skipped;
+    if skipped.is_empty() {
+        return None;
+    }
+    use std::fmt::Write;
+    let count = skipped.len();
+    let mut warning = format!("\u{26a0} {count} skill(s) skipped at startup:\n");
+    let max_display = 5;
+    for entry in skipped.iter().take(max_display) {
+        let _ = writeln!(warning, "  \u{2022} {}: {}", entry.name, entry.reason);
+    }
+    if count > max_display {
+        let _ = writeln!(
+            warning,
+            "  ... and {} more. Run `mika skills validate` for details.",
+            count - max_display
+        );
+    }
+    Some(warning.trim_end().to_string())
+}
+
+/// Les skills chargées avec un avertissement de validation, en un message de
+/// démarrage (#530, porté sur le miroir au vol V3c-2b-A1).
+///
+/// **Le premier message de chaque skill**, comme avant la bascule : le registre
+/// local portait des `diagnostics` dont on lisait `.first().message`, la route
+/// sert des `messages` dont on lit `.first()`. Le fallback `"unknown issue"`
+/// reste, et il reste atteignable — la route peut servir une liste vide, et
+/// « absent n'est pas zéro » vaut aussi pour un texte (mika#2331).
+fn message_des_avertissements(etat: &EtatSkills) -> Option<String> {
+    let warnings = &etat.as_ref().ok()?.warnings;
+    if warnings.is_empty() {
+        return None;
+    }
+    use std::fmt::Write;
+    let count = warnings.len();
+    let mut warning = format!("\u{26a0} {count} skill(s) loaded with validation warnings:\n");
+    let max_display = 5;
+    for entry in warnings.iter().take(max_display) {
+        // Show skill name + first diagnostic message for brevity
+        let first_msg = entry
+            .messages
+            .first()
+            .map(String::as_str)
+            .unwrap_or("unknown issue");
+        let _ = writeln!(warning, "  \u{2022} {}: {}", entry.name, first_msg);
+    }
+    if count > max_display {
+        let _ = writeln!(
+            warning,
+            "  ... and {} more. Run `mika skills validate` for details.",
+            count - max_display
+        );
+    }
+    Some(warning.trim_end().to_string())
+}
+
+/// Pourquoi la TUI n'a pas pu lire le registre, en un message de démarrage
+/// (mika#1727, vol V3c-2b-A1, critère 2).
+///
+/// La ligne de cause **telle qu'elle a été figée à la lecture**, sans
+/// reformulation : elle nomme déjà l'URL et le geste de remédiation, et un
+/// cadre ajouté ici dirait deux fois ce que les messages de
+/// [`skills_remote::SkillsRemoteIssue`] disent une fois.
+///
+/// Sans ce message, un spirit à terre se lirait comme un agent sans skills —
+/// la provenance fausse que mika#2331 refuse.
+fn message_de_cause(etat: &EtatSkills) -> Option<String> {
+    etat.as_ref().err().cloned()
 }
 
 pub async fn run(
@@ -521,7 +609,7 @@ pub async fn run(
         session_id,
         model,
         identity_name,
-        skill_registry,
+        etat_skills,
         is_singleton_session,
     ) = spawn_agent_worker(ctx, agent_name, session, model_override.map(String::from)).await?;
 
@@ -534,7 +622,7 @@ pub async fn run(
         identity_name,
         worker._ctx.async_db.clone(),
         worker._ctx.home_dir.clone(),
-        skill_registry,
+        etat_skills,
         agent_name.to_string(),
         worker._ctx.global_home.clone(),
         worker._ctx.settings.llm_provider,
@@ -576,57 +664,21 @@ pub async fn run(
     // Load persisted thinking level ("off" resolves to None → stays default)
     app.load_thinking_level().await;
 
-    // Surface skipped skills as a startup warning so the user knows
-    let skipped_skills = app.skills.skipped();
-    if !skipped_skills.is_empty() {
-        use std::fmt::Write;
-        let count = skipped_skills.len();
-        let mut warning = format!("\u{26a0} {count} skill(s) skipped at startup:\n");
-        let max_display = 5;
-        for entry in skipped_skills.iter().take(max_display) {
-            let _ = writeln!(warning, "  \u{2022} {}: {}", entry.name, entry.reason);
-        }
-        if count > max_display {
-            let _ = writeln!(
-                warning,
-                "  ... and {} more. Run `mika skills validate` for details.",
-                count - max_display
-            );
-        }
+    // Ce que l'état des skills a à dire au démarrage (mika#1727, vol V3c-2b-A1).
+    // La cause **en premier** : sur un échec de lecture, elle est le seul des
+    // trois messages qui ait quelque chose à dire, et elle explique l'absence
+    // des deux autres.
+    for message in [
+        message_de_cause(&app.skills),
+        message_des_skills_ignorees(&app.skills),
+        message_des_avertissements(&app.skills),
+    ]
+    .into_iter()
+    .flatten()
+    {
         app.messages.push(ChatMessage {
             role: ChatRole::System,
-            content: warning.trim_end().to_string(),
-            rendered: None,
-            channel: None,
-        });
-    }
-
-    // Surface skills with validation warnings (#530)
-    let validation_warnings = app.skills.validated_warnings();
-    if !validation_warnings.is_empty() {
-        use std::fmt::Write;
-        let count = validation_warnings.len();
-        let mut warning = format!("\u{26a0} {count} skill(s) loaded with validation warnings:\n");
-        let max_display = 5;
-        for entry in validation_warnings.iter().take(max_display) {
-            // Show skill name + first diagnostic message for brevity
-            let first_msg = entry
-                .diagnostics
-                .first()
-                .map(|d| d.message.as_str())
-                .unwrap_or("unknown issue");
-            let _ = writeln!(warning, "  \u{2022} {}: {}", entry.skill_name, first_msg);
-        }
-        if count > max_display {
-            let _ = writeln!(
-                warning,
-                "  ... and {} more. Run `mika skills validate` for details.",
-                count - max_display
-            );
-        }
-        app.messages.push(ChatMessage {
-            role: ChatRole::System,
-            content: warning.trim_end().to_string(),
+            content: message,
             rendered: None,
             channel: None,
         });
@@ -1703,6 +1755,139 @@ mod tests {
         );
     }
 
+    // --- mika#1727 vol V3c-2b-A1 : la source des skills est la route ---
+
+    /// Le chemin tel que le banc doit le voir, écrit **en entier** comme
+    /// `ROUTE_SESSIONS` : le banc associe par le chemin brut, hors chaîne de
+    /// requête, et un chemin faux tombe sur son `fallback` à 501.
+    const ROUTE_SKILLS: &str = "/api/v1/skills";
+
+    /// **Critère 4** — la lecture vise la route, avec son jeton et son agent.
+    ///
+    /// Les trois faits se mesurent sur la socket et non sur le rendu : un agent
+    /// qui n'atteindrait pas la chaîne de requête donnerait le miroir d'un autre
+    /// agent — plausible, et faux.
+    #[tokio::test]
+    async fn mika1727_v3c2b_la_lecture_des_skills_vise_la_route_avec_son_jeton() {
+        let (base, recues) = fake_spirit(&[(
+            ROUTE_SKILLS,
+            StatusCode::OK,
+            crate::commands::skills_remote::tests::CORPS,
+        )])
+        .await;
+
+        let etat = lire_les_skills(&base, &jeton_pose("jeton-secret"), "mika-dev").await;
+
+        let miroir = etat.expect("un 200 au corps lisible donne le miroir");
+        assert_eq!(miroir.skills.len(), 2);
+
+        let vues = recues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel attendu");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "GET");
+        assert_eq!(vue.chemin, ROUTE_SKILLS);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        assert_eq!(vue.requete.as_deref(), Some("agent=mika-dev"));
+    }
+
+    /// **Critère 4** — sans jeton, la lecture refuse **avant tout appel**, et
+    /// le refus est la cause que portera `app.skills`.
+    #[tokio::test]
+    async fn mika1727_v3c2b_sans_jeton_la_lecture_des_skills_refuse_avant_tout_appel() {
+        // Le banc est **armé** et ne verra rien : c'est ce qui distingue
+        // « refusé avant tout appel » de « refusé par le serveur ».
+        let (base, recues) = fake_spirit(&[(
+            ROUTE_SKILLS,
+            StatusCode::OK,
+            crate::commands::skills_remote::tests::CORPS,
+        )])
+        .await;
+
+        let cause = lire_les_skills(&base, &|_| None, "mika-dev")
+            .await
+            .expect_err("sans jeton, la lecture refuse");
+
+        assert!(cause.contains("MIKA_INTERNAL_TOKEN"), "{cause}");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir"
+        );
+    }
+
+    /// **Critère 4** — un refus de la route devient une cause **en une ligne**.
+    ///
+    /// L'assertion sur l'absence de `\n` n'est pas cosmétique : cette chaîne est
+    /// poussée telle quelle dans un message `System` et rendue par `/skills`, où
+    /// une cause multiligne déplacerait tout le rendu.
+    #[tokio::test]
+    async fn mika1727_v3c2b_un_refus_de_la_route_devient_une_cause_en_une_ligne() {
+        let (base, _) = fake_spirit(&[(ROUTE_SKILLS, StatusCode::NOT_FOUND, "")]).await;
+
+        let cause = lire_les_skills(&base, &jeton_pose("jeton"), "mika-dev")
+            .await
+            .expect_err("un 404 est un refus");
+
+        // Un 404 sur cette route ne peut vouloir dire qu'agent inconnu, et le
+        // message nomme l'agent **demandé**.
+        assert!(cause.contains("mika-dev"), "{cause}");
+        assert!(
+            !cause.contains('\n'),
+            "la cause tient sur une ligne : {cause}"
+        );
+    }
+
+    /// **Critères 1 et 3** — les trois messages de démarrage, en littéral, sur
+    /// le miroir de référence.
+    ///
+    /// Littéraux parce que ce sont des messages que l'opérateur lit au
+    /// démarrage : le compte, la puce, le `:` séparateur et la troncature à cinq
+    /// étaient ceux du registre local, et ils restent les mêmes à donnée égale.
+    #[test]
+    fn mika1727_v3c2b_les_messages_de_demarrage_rendent_le_miroir() {
+        let etat: EtatSkills = Ok(crate::commands::skills_remote::tests::miroir_de_test());
+
+        assert_eq!(
+            message_des_skills_ignorees(&etat).as_deref(),
+            Some(
+                "\u{26a0} 1 skill(s) skipped at startup:\n  \u{2022} broken: manifest parse error"
+            )
+        );
+        assert_eq!(
+            message_des_avertissements(&etat).as_deref(),
+            Some(
+                "\u{26a0} 1 skill(s) loaded with validation warnings:\n  \u{2022} self-dev: two handlers share a keyword"
+            )
+        );
+        // Un miroir lu n'a aucune cause à dire.
+        assert_eq!(message_de_cause(&etat), None);
+    }
+
+    /// **Critères 2 et 3** — sur une lecture en échec, le démarrage dit la
+    /// cause et **rien d'autre** ; sur un miroir lu et vide, il ne dit rien.
+    ///
+    /// Les deux moitiés tiennent dans un test parce que c'est leur
+    /// complémentarité qui est la propriété : chacun des trois messages se tait
+    /// exactement là où les deux autres parlent, et un message « 0 skill(s)
+    /// skipped » sur une lecture qui n'a pas eu lieu serait la fausse provenance
+    /// que mika#2331 refuse.
+    #[test]
+    fn mika1727_v3c2b_le_demarrage_dit_la_cause_et_jamais_un_compte_invente() {
+        let echec: EtatSkills = Err("spirit injoignable".to_string());
+
+        assert_eq!(
+            message_de_cause(&echec).as_deref(),
+            Some("spirit injoignable")
+        );
+        assert_eq!(message_des_skills_ignorees(&echec), None);
+        assert_eq!(message_des_avertissements(&echec), None);
+
+        let vide: EtatSkills = Ok(crate::commands::skills_remote::SkillsMirror::default());
+        assert_eq!(message_de_cause(&vide), None);
+        assert_eq!(message_des_skills_ignorees(&vide), None);
+        assert_eq!(message_des_avertissements(&vide), None);
+    }
+
     /// mika#1727 — la session de la TUI s'ouvre et se clôt sur mika-spirit.
     /// Cette garde refuse le retour en local des trois gestes correspondants
     /// dans la moitié *production* de ce fichier : la création est passée à
@@ -1783,7 +1968,9 @@ mod tests {
     /// **Critère 4 de V3b-1, étendu au critère 4 de V3b-2** — le tour de la TUI
     /// ne construit plus son provider, n'en garde plus de copie des réglages, et
     /// depuis V3b-2 ne porte plus ni contexte complet, ni MCP, ni rechargement
-    /// de skills à chaud.
+    /// de skills à chaud. **Critère 8 de V3c-2b-A1** : la TUI n'assemble plus
+    /// ses skills sur le disque — ni registre, ni migration des marqueurs, ni
+    /// lecture des overrides — et la réponse du worker ne porte plus de registre.
     ///
     /// **Son nom ne change pas avec le second vol** : c'est une garde par
     /// *fichier*, pas par vol — l'argument de la garde voisine ci-dessus — et la
@@ -1830,6 +2017,22 @@ mod tests {
                 "skills_dirty",
                 "le registre s'assemble une fois, au démarrage",
             ),
+            (
+                "assemble_agent_registry",
+                "le registre arrive par la route, pas par le disque",
+            ),
+            (
+                "migrate_disabled_markers_async",
+                "spirit migre les marqueurs à l'`init_agent`",
+            ),
+            (
+                "get_skill_overrides",
+                "les overrides sont déjà appliqués dans le miroir",
+            ),
+            (
+                "updated_skills",
+                "plus de rechargement à chaud : la route est relue au respawn",
+            ),
         ];
         // Deux sites depuis V3b-2, chacun avec SON témoin : un témoin générique
         // comme `pub async fn run(` passerait sur le mauvais fichier, et une
@@ -1867,7 +2070,7 @@ mod tests {
         // contient en clair, donc un masquage perdu la ferait se dénoncer
         // elle-même, et le réflexe serait de « réparer » par une entrée
         // d'allowlist — précisément le piège. Sur `ask.rs` il n'y a rien à
-        // contre-témoigner : sa moitié test ne contient aucun des huit motifs,
+        // contre-témoigner : sa moitié test ne contient aucun des douze motifs,
         // un masquage perdu n'y produirait aucun rouge, et l'assertion y serait
         // du théâtre.
         let chat = scanner.production_of(&scanner.src_root().join("commands/chat.rs"));

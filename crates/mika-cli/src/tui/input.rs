@@ -1117,8 +1117,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use mika_agent::async_db::AsyncDatabase;
     use mika_agent::db::Database;
-    use mika_agent::skills::SkillRegistry;
     use mika_common::llm::ProviderKind;
+
+    use crate::commands::skills_remote::tests::miroir_de_test;
     use tokio::sync::mpsc;
 
     use crate::tui::app::AgentRequest;
@@ -1145,7 +1146,7 @@ mod tests {
         let (agent_tx, agent_rx) = mpsc::unbounded_channel();
         let (_response_tx, response_rx) = mpsc::unbounded_channel();
 
-        let skills = Arc::new(SkillRegistry::empty());
+        let skills = Arc::new(Ok(miroir_de_test()));
 
         let app = App::new(
             agent_tx,

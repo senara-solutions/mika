@@ -263,13 +263,19 @@ pub fn complete_skill(
     if arg_index > 0 {
         return (vec![], " Skills ");
     }
-    let items: Vec<CompletionItem> = ctx
+    // Sur une lecture en échec, **rien** : une liste vide se lirait « cet agent
+    // n'a pas de skill », et une suggestion construite sur une provenance
+    // absente est la panne que mika#2331 refuse. La cause, elle, est dite par
+    // `/skills`, par `/skill` et par le message de démarrage.
+    let Ok(miroir) = ctx.skills else {
+        return (vec![], " Skills ");
+    };
+    let items: Vec<CompletionItem> = miroir
         .skills
-        .skills()
         .iter()
         .map(|entry| CompletionItem {
-            value: entry.manifest.skill.name.clone(),
-            description: Some(entry.manifest.skill.description.clone()),
+            value: entry.name.clone(),
+            description: Some(entry.description.clone()),
         })
         .collect();
     (filter_by_prefix(items, arg_text), " Skills ")
@@ -387,16 +393,27 @@ fn split_path_for_completion(path: &str, cwd: &Path) -> (std::path::PathBuf, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mika_agent::skills::SkillRegistry;
+    use crate::commands::skills_remote::EtatSkills;
+    use crate::commands::skills_remote::tests::miroir_de_test;
 
     fn test_ctx(cwd: &Path) -> CompletionContext<'_> {
         test_ctx_with_args(cwd, "")
     }
 
     fn test_ctx_with_args<'a>(cwd: &'a Path, args_str: &'a str) -> CompletionContext<'a> {
-        let registry = SkillRegistry::empty();
+        ctx_pour_etat(cwd, args_str, Ok(miroir_de_test()))
+    }
+
+    /// Le contexte de complétion pour un état de skills donné — lu ou refusé.
+    /// Un seul constructeur, parce que les deux cas ne diffèrent que par cet
+    /// argument et qu'un second recopierait les six autres champs.
+    fn ctx_pour_etat<'a>(
+        cwd: &'a Path,
+        args_str: &'a str,
+        etat: EtatSkills,
+    ) -> CompletionContext<'a> {
         // Leak to get 'static-like lifetime for test — fine in tests
-        let skills = Box::leak(Box::new(registry));
+        let skills = Box::leak(Box::new(etat));
         CompletionContext {
             home_dir: Path::new("/tmp/mika-test"),
             global_home: Path::new("/tmp/mika-test"),
@@ -406,6 +423,41 @@ mod tests {
             args_str,
             provider: mika_common::llm::ProviderKind::Anthropic,
         }
+    }
+
+    /// **Critère 1** — l'autocomplétion de `/skill` propose les skills du
+    /// miroir, nom **et** description, et la désactivée avec les autres : le
+    /// registre local la proposait aussi, et `/skill weather` répond.
+    #[test]
+    fn mika1727_v3c2b_lautocompletion_propose_les_skills_du_miroir() {
+        let ctx = test_ctx(Path::new("/tmp"));
+
+        let (items, titre) = complete_skill("", 0, &ctx);
+
+        assert_eq!(titre, " Skills ");
+        let noms: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
+        assert_eq!(noms, vec!["self-dev", "weather"]);
+        assert_eq!(items[0].description.as_deref(), Some("orchestration"));
+    }
+
+    /// **Critère 2** — sur une lecture en échec, l'autocomplétion ne propose
+    /// **rien**.
+    ///
+    /// Une liste vide se lirait « cet agent n'a pas de skill », et c'est la
+    /// seule des quatre surfaces qui ne peut pas dire la cause : un popup de
+    /// complétion n'a pas de place pour un message. Elle se tait donc, et les
+    /// trois autres parlent.
+    #[test]
+    fn mika1727_v3c2b_lautocompletion_ne_propose_rien_sur_une_lecture_en_echec() {
+        let cwd = Path::new("/tmp");
+        let ctx = ctx_pour_etat(cwd, "", Err("spirit injoignable".to_string()));
+
+        let (items, titre) = complete_skill("", 0, &ctx);
+
+        assert!(items.is_empty());
+        // Le titre reste celui du contexte : c'est `show_arguments` qui ferme le
+        // popup sur une liste vide, et il n'a pas à le faire pour deux raisons.
+        assert_eq!(titre, " Skills ");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use mika_agent::skills::SkillRegistry;
+use crate::commands::skills_remote::EtatSkills;
 
 use super::{SlashCommand, filter_commands};
 
@@ -17,7 +17,11 @@ pub struct CompletionItem {
 pub struct CompletionContext<'a> {
     pub home_dir: &'a Path,
     pub global_home: &'a Path,
-    pub skills: &'a SkillRegistry,
+    /// Le miroir des skills lu sur la route, ou la cause de son refus
+    /// (mika#1727, vol V3c-2b-A1) : l'autocomplétion de `/skill` ne propose
+    /// alors **rien**, plutôt qu'une liste vide qui se lirait « cet agent n'a
+    /// pas de skill ».
+    pub skills: &'a EtatSkills,
     pub current_agent: &'a str,
     pub cwd: &'a Path,
     /// Full args string (everything after the command name), for multi-arg completers.
