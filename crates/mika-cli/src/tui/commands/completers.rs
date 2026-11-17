@@ -263,13 +263,20 @@ pub fn complete_skill(
     if arg_index > 0 {
         return (vec![], " Skills ");
     }
-    let items: Vec<CompletionItem> = ctx
+    // mika#1727 vol V3c-2b — sur un miroir qu'on n'a pas pu lire, la liste est
+    // **vide** et non une liste d'hier : une complétion n'a pas d'endroit où
+    // dire une cause, et proposer un nom qu'on ne sait plus servir serait une
+    // provenance fausse (mika#2331). Le démarrage, lui, a déjà dit la cause par
+    // un message `System`.
+    let Ok(miroir) = ctx.skills else {
+        return (vec![], " Skills ");
+    };
+    let items: Vec<CompletionItem> = miroir
         .skills
-        .skills()
         .iter()
         .map(|entry| CompletionItem {
-            value: entry.manifest.skill.name.clone(),
-            description: Some(entry.manifest.skill.description.clone()),
+            value: entry.name.clone(),
+            description: Some(entry.description.clone()),
         })
         .collect();
     (filter_by_prefix(items, arg_text), " Skills ")
@@ -387,16 +394,24 @@ fn split_path_for_completion(path: &str, cwd: &Path) -> (std::path::PathBuf, Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mika_agent::skills::SkillRegistry;
+    use crate::commands::skills_remote::tests::miroir_de_test;
+    use crate::tui::app::EtatSkills;
 
     fn test_ctx(cwd: &Path) -> CompletionContext<'_> {
         test_ctx_with_args(cwd, "")
     }
 
     fn test_ctx_with_args<'a>(cwd: &'a Path, args_str: &'a str) -> CompletionContext<'a> {
-        let registry = SkillRegistry::empty();
+        test_ctx_with_skills(cwd, args_str, Ok(miroir_de_test()))
+    }
+
+    fn test_ctx_with_skills<'a>(
+        cwd: &'a Path,
+        args_str: &'a str,
+        etat: EtatSkills,
+    ) -> CompletionContext<'a> {
         // Leak to get 'static-like lifetime for test — fine in tests
-        let skills = Box::leak(Box::new(registry));
+        let skills = Box::leak(Box::new(etat));
         CompletionContext {
             home_dir: Path::new("/tmp/mika-test"),
             global_home: Path::new("/tmp/mika-test"),
@@ -567,5 +582,26 @@ mod tests {
         let filtered = filter_by_prefix(items, "s");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].value, "sonnet");
+    }
+
+    #[test]
+    fn mika1727_v3c2b_la_completion_des_skills_lit_le_miroir() {
+        let cwd = Path::new("/tmp/mika-test");
+        let (items, titre) = complete_skill("", 0, &test_ctx(cwd));
+        assert_eq!(titre, " Skills ");
+        let noms: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(noms, vec!["self-dev", "weather"]);
+        assert_eq!(items[0].description.as_deref(), Some("orchestration"));
+    }
+
+    #[test]
+    fn mika1727_v3c2b_un_miroir_illisible_ne_propose_aucun_nom() {
+        // Le contre-témoin du test ci-dessus : sans lui, une complétion vide par
+        // cécité (mauvais champ lu) passerait pour une complétion vide par refus.
+        let cwd = Path::new("/tmp/mika-test");
+        let etat: EtatSkills = Err("spirit injoignable".to_string());
+        let (items, titre) = complete_skill("", 0, &test_ctx_with_skills(cwd, "", etat));
+        assert!(items.is_empty());
+        assert_eq!(titre, " Skills ");
     }
 }

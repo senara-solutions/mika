@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use mika_agent::skills::SkillRegistry;
+use crate::tui::app::EtatSkills;
 
 use super::{SlashCommand, filter_commands};
 
@@ -17,7 +17,7 @@ pub struct CompletionItem {
 pub struct CompletionContext<'a> {
     pub home_dir: &'a Path,
     pub global_home: &'a Path,
-    pub skills: &'a SkillRegistry,
+    pub skills: &'a EtatSkills,
     pub current_agent: &'a str,
     pub cwd: &'a Path,
     /// Full args string (everything after the command name), for multi-arg completers.

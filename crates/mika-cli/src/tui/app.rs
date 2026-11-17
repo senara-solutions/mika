@@ -8,14 +8,26 @@ use tui_textarea::TextArea;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::TeamRunSummary;
-use mika_agent::skills::SkillRegistry;
 use mika_agent::teams::types::{TeamEvent, TeamPhase};
 
+use crate::commands::skills_remote::SkillsMirror;
 use crate::commands::tasks::CallbackFeed;
 use crate::tui::attachment::ImageAttachment;
 use crate::tui::commands;
 use crate::tui::commands::autocomplete::AutocompleteState;
 use crate::tui::markdown;
+
+/// Ce que la TUI sait des skills de son agent (mika#1727, vol V3c-2b) : le
+/// miroir que `GET /api/v1/skills?agent=<nom>` a servi, ou la cause en une
+/// ligne si la lecture a échoué.
+///
+/// **Un échec de lecture n'est pas fatal** : la TUI démarre, et chaque lecteur
+/// dit la cause plutôt que « No skills loaded. » — un registre vide et un
+/// registre qu'on n'a pas pu lire sont deux faits différents, et les confondre
+/// enverrait l'opérateur chercher la panne dans ses manifestes (mika#2331).
+/// Le `String` porte le `Display` de `SkillsRemoteIssue`, qui nomme déjà l'URL
+/// et le geste.
+pub(crate) type EtatSkills = Result<SkillsMirror, String>;
 
 /// Messages flowing between the TUI and the team worker.
 pub enum TeamRequest {
@@ -573,7 +585,7 @@ pub struct App<'a> {
     // Shared resources for slash commands
     pub db: AsyncDatabase,
     pub home_dir: PathBuf,
-    pub skills: Arc<SkillRegistry>,
+    pub skills: Arc<EtatSkills>,
 
     // Slash command state
     pub autocomplete: AutocompleteState,
@@ -685,7 +697,7 @@ impl<'a> App<'a> {
         identity_name: String,
         db: AsyncDatabase,
         home_dir: PathBuf,
-        skills: Arc<SkillRegistry>,
+        skills: Arc<EtatSkills>,
         agent_name: String,
         global_home: PathBuf,
         provider: mika_common::llm::ProviderKind,
@@ -817,7 +829,11 @@ impl<'a> App<'a> {
             // accessing them.
             db,
             home_dir: team_dir.clone(),
-            skills: Arc::new(SkillRegistry::empty()),
+            // Le mode équipe n'ouvre pas de worker et n'interroge donc aucun
+            // agent : un miroir **vide** y est la vérité — « cet écran ne porte
+            // pas de registre » —, là où un `Err` inventerait une panne de
+            // lecture qui n'a pas eu lieu (mika#2331).
+            skills: Arc::new(Ok(SkillsMirror::default())),
             autocomplete: AutocompleteState::new(),
             pending_command: None,
             agent_name: String::new(),
@@ -2322,7 +2338,6 @@ mod tests {
     ) {
         use mika_agent::async_db::AsyncDatabase;
         use mika_agent::db::Database;
-        use mika_agent::skills::SkillRegistry;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let home_dir = temp_dir.path().to_path_buf();
@@ -2346,7 +2361,7 @@ mod tests {
             "Mika".to_string(),
             async_db,
             home_dir,
-            Arc::new(SkillRegistry::empty()),
+            Arc::new(Ok(crate::commands::skills_remote::tests::miroir_de_test())),
             "mika".to_string(),
             global_home,
             mika_common::llm::ProviderKind::Anthropic,
