@@ -15,7 +15,11 @@
 //! **État du vol.** Depuis V3c-2b-A1 la porte a son appelant de production :
 //! `spawn_agent_worker` la lit au démarrage et à chaque respawn, `app.skills`
 //! porte le résultat sous [`EtatSkills`], et les six attentes `dead_code` que
-//! les items sans lecteur portaient sont tombées avec lui. Les deux refus
+//! les items sans lecteur portaient sont tombées avec lui ; **deux attentes de
+//! champ les ont remplacées**, sur [`SkillsMirror::agent`] et
+//! [`SkillMirror::origin`] — servis par la route, affichés par aucune des quatre
+//! surfaces, et retirés du miroir ils se liraient comme absents de la route
+//! (motif mika#2331). Les deux refus
 //! métier de cette route, 404 agent inconnu et 401 jeton refusé, ont leur
 //! variant : ce qui sort encore par [`SkillsRemoteIssue::Statut`] est un statut
 //! dont ce client ne sait rien dire de plus que ce que le serveur en a dit.
