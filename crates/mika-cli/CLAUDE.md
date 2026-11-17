@@ -756,19 +756,20 @@ passe à deux sites (`chat.rs`, `ask.rs`) et huit motifs, dont `connect_mcp`,
 vide et assertie vide, un témoin par site, le contre-témoin sur `chat.rs` : quand
 elle rougit, le remède est de router l'appelant, jamais d'ajouter une ligne.
 
-### La route des skills a son client, pas encore son appelant (mika#1727, vol V3c-2a-ii)
+### La route des skills a son client, pas encore son appelant (mika#1727, vols V3c-2a-ii et V3c-2a-iii)
 
 `commands/skills_remote.rs::lire(base_url, token, agent)` fait le GET de
 `/api/v1/skills` — nom d'agent en paramètre de requête **encodé par reqwest**,
 jeton interne en `Authorization` — et rend un miroir des quatre clés de la route,
 treize champs par skill. **Rien ne l'appelle** : `app.skills` reste assemblé
 localement, et les attentes `dead_code` que portent les items sans lecteur
-tombent à V3c-2b, qui câble la TUI sur la route. Trois refus distincts, et pas le
+tombent à V3c-2b, qui câble la TUI sur la route. Cinq refus distincts, et pas le
 vocabulaire de `session_remote` : `Injoignable` (aucun statut, par construction
-du variant), `Statut` (tout statut autre que 200, **404 et 401 compris** jusqu'à
-V3c-2a-iii qui les éclate — ici un 404 ne peut vouloir dire qu'agent inconnu),
-`CorpsIllisible` (un 200 au corps illisible est un refus, jamais un miroir à
-champs vides).
+du variant), `AgentInconnu` (404 — ici un 404 ne peut vouloir dire qu'agent
+inconnu, et le message nomme l'agent **demandé**, jamais une session),
+`JetonRefuse` (401 — le message nomme `MIKA_INTERNAL_TOKEN`), `Statut` (tout
+autre statut que 200, rendu avec son corps), `CorpsIllisible` (un 200 au corps
+illisible est un refus, jamais un miroir à champs vides).
 
 - **Slash commands:** `/clear`, `/compact`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session

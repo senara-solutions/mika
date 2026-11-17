@@ -1,6 +1,6 @@
 //! Le transport de la route des skills de mika-spirit
-//! (`GET /api/v1/skills?agent=<nom>`, mika#1727 vol V3c-2a-ii) : les cinq
-//! miroirs du fil, un vocabulaire de refus à trois variants, et la porte
+//! (`GET /api/v1/skills?agent=<nom>`, mika#1727 vol V3c-2a-iii) : les cinq
+//! miroirs du fil, un vocabulaire de refus à cinq variants, et la porte
 //! [`lire`]. L'URL de base et le jeton arrivent **par argument**, pour la raison
 //! déjà écrite sur [`super::rewind_remote`] : un client qui résout ses propres
 //! accès ne se pilote pas depuis un test. Le jeton ne se lit donc pas ici —
@@ -15,9 +15,10 @@
 //! **État du vol.** La porte est posée et elle n'a **aucun appelant de
 //! production** : les items sans lecteur portent une attente `dead_code` que
 //! V3c-2b retire en câblant la TUI sur cette route — `app.skills` cesse alors
-//! d'être assemblé localement. V3c-2a-iii éclate avant cela les deux refus
-//! métier, 404 agent inconnu et 401 jeton refusé, qui sortent d'ici par
-//! [`SkillsRemoteIssue::Statut`] en attendant.
+//! d'être assemblé localement. Les deux refus métier de cette route, 404 agent
+//! inconnu et 401 jeton refusé, ont depuis leur variant : ce qui sort encore
+//! par [`SkillsRemoteIssue::Statut`] est un statut dont ce client ne sait rien
+//! dire de plus que ce que le serveur en a dit.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -112,15 +113,18 @@ pub(crate) struct WarningMirror {
 /// vouloir dire qu'**agent inconnu**. Un message qui nomme une session
 /// enverrait l'opérateur chercher la panne là où elle n'est pas.
 ///
-/// Trois variants, là où les deux voisins rangent une erreur de transport dans
+/// Cinq variants, là où les deux voisins rangent une erreur de transport dans
 /// `Unexpected { status: None, … }` : `Injoignable` ne **peut pas** porter de
 /// statut, et c'est le type qui le dit plutôt qu'un `Option<u16>` qu'un lecteur
 /// aurait à discriminer. `CorpsIllisible` est un refus et jamais un succès — un
 /// 200 dont le corps ne se désérialise pas sort par `Err`, pas en miroir à
 /// champs vides.
 ///
-/// 404 et 401 sortent par `Statut` dans ce vol, et **aucun bras mort** ne les
-/// attend : V3c-2a-iii les éclate avec leurs tests.
+/// `AgentInconnu` et `JetonRefuse` sont les deux statuts dont ce client sait
+/// dire la cause et le geste : 404, un nom d'agent que le serveur ne sert pas ;
+/// 401, un `MIKA_INTERNAL_TOKEN` à régler. `Statut` garde le reste — un statut
+/// qu'aucune hypothèse de ce client ne couvre se rend tel quel, avec son corps,
+/// plutôt que rangé de force sous une cause inventée.
 #[derive(Debug)]
 pub(crate) enum SkillsRemoteIssue {
     Injoignable {
