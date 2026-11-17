@@ -446,9 +446,13 @@ donc franchi, la borne de la tête du ticket — **475** — ne l'est pas.
 **La raison de ne pas s'arrêter là.** Ce sous-seuil n'est pas une borne de
 l'opérateur : la tête du ticket n'en porte qu'une, 475. Il est un garde-fou que
 ce plan s'est donné, et sa raison est écrite : « C3 ne tiendrait pas ». Elle ne
-vaut pas ici — C3 fait **4 lignes** de `crates/mika-cli/CLAUDE.md`, donc
-**437 pour 475**, et c'est l'inverse de ce que le garde-fou protégeait : s'arrêter
-maintenant livrerait précisément « un vol qui s'arrête avant sa doc ».
+vaut pas ici — C3 fait **14 lignes** de `crates/mika-cli/CLAUDE.md`, mesurées
+avant ce commit et non estimées, donc **447 pour 475**, et c'est l'inverse de ce
+que le garde-fou protégeait : s'arrêter maintenant livrerait précisément « un vol
+qui s'arrête avant sa doc ». Les 14 lignes ne sont pas les 4 que la table
+d'estimation prévoyait, pour la même raison que le reste de l'écart : le
+paragraphe dit les trois refus et ce que chacun des deux vols suivants en fera,
+et c'est ce que la Definition of Done lui demande de dire.
 
 **D'où viennent les 79 lignes au-delà des 354 estimées.** Les six attentes
 `dead_code` coûtent **24 lignes** et non six : `rustfmt` casse
