@@ -732,7 +732,8 @@ des commandes interactives, `mika ask` comprise.
 **MCP quitte la TUI en entier.** Aucun outil de ce processus n'y touchait depuis
 V1 : le tour tourne chez spirit, qui monte son propre `McpManager`. Les deux
 rechargements de skills à chaud partent avec `skills_dirty`, un drapeau que rien
-ne posait ; l'assemblage de démarrage reste, une fois.
+ne posait ; depuis V3c-2b-A1 l'assemblage de démarrage part aussi, et la TUI
+lit le miroir de la route des skills, relu à chaque respawn.
 
 **Ce qui reste local est la seule part indépendante du provider.**
 `mika chat --model ""` est refusé au lancement, avec le message d'`ask.rs` —
@@ -761,9 +762,10 @@ elle rougit, le remède est de router l'appelant, jamais d'ajouter une ligne.
 `commands/skills_remote.rs::lire(base_url, token, agent)` fait le GET de
 `/api/v1/skills` — nom d'agent en paramètre de requête **encodé par reqwest**,
 jeton interne en `Authorization` — et rend un miroir des quatre clés de la route,
-treize champs par skill. **Rien ne l'appelle** : `app.skills` reste assemblé
-localement, et les attentes `dead_code` que portent les items sans lecteur
-tombent à V3c-2b, qui câble la TUI sur la route. Cinq refus distincts, et pas le
+treize champs par skill. **Depuis V3c-2b-A1, `spawn_agent_worker` l'appelle**,
+par `lire_les_skills` : `app.skills` porte le miroir lu, ou la cause du refus en
+une ligne, et seuls les champs `agent` et `origin`, sans lecteur dans la TUI,
+gardent leur attente `dead_code`. Cinq refus distincts, et pas le
 vocabulaire de `session_remote` : `Injoignable` (aucun statut, par construction
 du variant), `AgentInconnu` (404 — ici un 404 ne peut vouloir dire qu'agent
 inconnu, et le message nomme l'agent **demandé**, jamais une session),
