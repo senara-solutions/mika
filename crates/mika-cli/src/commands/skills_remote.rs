@@ -1,6 +1,6 @@
 //! Le transport de la route des skills de mika-spirit
-//! (`GET /api/v1/skills?agent=<nom>`, mika#1727 vol V3c-2a-ii) : les cinq
-//! miroirs du fil, un vocabulaire de refus à trois variants, et la porte
+//! (`GET /api/v1/skills?agent=<nom>`, mika#1727 vol V3c-2a-iii) : les cinq
+//! miroirs du fil, un vocabulaire de refus à cinq variants, et la porte
 //! [`lire`]. L'URL de base et le jeton arrivent **par argument**, pour la raison
 //! déjà écrite sur [`super::rewind_remote`] : un client qui résout ses propres
 //! accès ne se pilote pas depuis un test. Le jeton ne se lit donc pas ici —
@@ -15,9 +15,10 @@
 //! **État du vol.** La porte est posée et elle n'a **aucun appelant de
 //! production** : les items sans lecteur portent une attente `dead_code` que
 //! V3c-2b retire en câblant la TUI sur cette route — `app.skills` cesse alors
-//! d'être assemblé localement. V3c-2a-iii éclate avant cela les deux refus
-//! métier, 404 agent inconnu et 401 jeton refusé, qui sortent d'ici par
-//! [`SkillsRemoteIssue::Statut`] en attendant.
+//! d'être assemblé localement. Les deux refus métier de cette route, 404 agent
+//! inconnu et 401 jeton refusé, ont depuis leur variant : ce qui sort encore
+//! par [`SkillsRemoteIssue::Statut`] est un statut dont ce client ne sait rien
+//! dire de plus que ce que le serveur en a dit.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -112,20 +113,30 @@ pub(crate) struct WarningMirror {
 /// vouloir dire qu'**agent inconnu**. Un message qui nomme une session
 /// enverrait l'opérateur chercher la panne là où elle n'est pas.
 ///
-/// Trois variants, là où les deux voisins rangent une erreur de transport dans
+/// Cinq variants, là où les deux voisins rangent une erreur de transport dans
 /// `Unexpected { status: None, … }` : `Injoignable` ne **peut pas** porter de
 /// statut, et c'est le type qui le dit plutôt qu'un `Option<u16>` qu'un lecteur
 /// aurait à discriminer. `CorpsIllisible` est un refus et jamais un succès — un
 /// 200 dont le corps ne se désérialise pas sort par `Err`, pas en miroir à
 /// champs vides.
 ///
-/// 404 et 401 sortent par `Statut` dans ce vol, et **aucun bras mort** ne les
-/// attend : V3c-2a-iii les éclate avec leurs tests.
+/// `AgentInconnu` et `JetonRefuse` sont les deux statuts dont ce client sait
+/// dire la cause et le geste : 404, un nom d'agent que le serveur ne sert pas ;
+/// 401, un `MIKA_INTERNAL_TOKEN` à régler. `Statut` garde le reste — un statut
+/// qu'aucune hypothèse de ce client ne couvre se rend tel quel, avec son corps,
+/// plutôt que rangé de force sous une cause inventée.
 #[derive(Debug)]
 pub(crate) enum SkillsRemoteIssue {
     Injoignable {
         url: String,
         cause: String,
+    },
+    AgentInconnu {
+        agent: String,
+        url: String,
+    },
+    JetonRefuse {
+        url: String,
     },
     Statut {
         status: u16,
@@ -146,6 +157,39 @@ impl std::fmt::Display for SkillsRemoteIssue {
             Self::Injoignable { url, cause } => {
                 write!(f, "mika-spirit is unreachable at {url}: {cause}")
             }
+            // Le nom vient de l'argument de `lire`, jamais du corps du 404 : le
+            // serveur y renvoie une reformulation du nom qu'on vient d'envoyer,
+            // et la relire coûterait une désérialisation qui peut échouer — un
+            // spirit d'une autre version, un proxy — pour retrouver une chaîne
+            // que l'appelant détient déjà. Et cet échec-là rendrait un message
+            // sans nom d'agent, là où le nom est le seul fait utile.
+            //
+            // La limite, dite ici plutôt que gardée : un 404 ne vaut « agent
+            // inconnu » que servi par un spirit qui monte bien cette route. Un
+            // spirit qui ne la monterait pas du tout rendrait aussi un 404, et
+            // ce message nommerait l'agent à tort — distinction que le serveur
+            // lui-même ne fait pas, donc que le client ne peut pas faire.
+            Self::AgentInconnu { agent, url } => {
+                write!(
+                    f,
+                    "mika-spirit does not serve an agent named '{agent}' at {url}"
+                )
+            }
+            // La seconde moitié est la phrase du `Denied` de
+            // `session_remote::SessionRemoteIssue`, reprise telle quelle : le
+            // geste de remédiation est le même, et deux formulations d'un même
+            // geste dérivent. Elles ne sont pas mises en commun pour autant —
+            // partager un littéral entre deux `Display` de deux modules créerait
+            // une dépendance de texte là où il n'y a aucune dépendance de
+            // domaine. La première moitié, elle, nomme l'URL que le voisin ne
+            // nomme pas : `base_url` est un argument, donc « quel serveur a
+            // refusé » est la moitié de la question quand deux daemons tournent.
+            // Ni corps ni statut sur ce variant : un 401 d'ici a un corps vide
+            // ou générique, et le 401 est déjà dans le nom.
+            Self::JetonRefuse { url } => write!(
+                f,
+                "mika-spirit denied the request for {url}: set MIKA_INTERNAL_TOKEN to the server's token"
+            ),
             Self::Statut { status, url, body } => {
                 write!(f, "mika-spirit returned {status} for {url}: {body}")
             }
@@ -202,10 +246,22 @@ pub(crate) async fn lire(
     let statut = reponse.status().as_u16();
     let corps = reponse.text().await.unwrap_or_default();
     if statut != 200 {
-        return Err(SkillsRemoteIssue::Statut {
-            status: statut,
-            url,
-            body: corps,
+        // Le `if` est gardé et le `match` niché dedans : à plat, un
+        // `match statut { 200 => {}, … }` réécrirait le chemin de succès pour
+        // deux cas d'erreur, et la revue aurait à relire un diff là où rien
+        // n'a changé. Le bras `_` reste `Statut` et reste le dernier, donc il
+        // est le seul à consommer `corps` et aucun `clone` n'est nécessaire.
+        return Err(match statut {
+            404 => SkillsRemoteIssue::AgentInconnu {
+                agent: agent.to_string(),
+                url,
+            },
+            401 => SkillsRemoteIssue::JetonRefuse { url },
+            _ => SkillsRemoteIssue::Statut {
+                status: statut,
+                url,
+                body: corps,
+            },
         });
     }
     serde_json::from_str(&corps).map_err(|cause| SkillsRemoteIssue::CorpsIllisible {
@@ -371,6 +427,54 @@ mod tests {
         let message = probleme.to_string();
         assert!(message.contains("unreachable"), "{message}");
         assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_404_nomme_lagent_demande_et_jamais_une_session() {
+        // Le corps est celui que la route sert réellement pour ce statut, et
+        // non une chaîne arbitraire : c'est ce qui rend le test capable de voir
+        // qu'un futur éditeur a remis ce corps dans le message.
+        let (base, _, rendu) = appel(
+            StatusCode::NOT_FOUND,
+            r#"{"error": "agent 'fantome' not found"}"#,
+            "fantome",
+        )
+        .await;
+        let probleme = rendu.expect_err("un 404 est une erreur");
+        assert!(
+            matches!(probleme, SkillsRemoteIssue::AgentInconnu { .. }),
+            "{probleme:?}"
+        );
+        let message = probleme.to_string();
+        assert!(message.contains("fantome"), "{message}");
+        assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+        // L'assertion sans laquelle ce variant ne prouve rien : il n'existe que
+        // pour ne pas dire ce que dit le `NotFound` du voisin — « unknown
+        // agent, or unknown session » — qui enverrait l'opérateur chercher la
+        // panne du côté des sessions, où elle n'est pas.
+        assert!(
+            !message.contains("session"),
+            "un 404 d'ici ne peut vouloir dire qu'agent inconnu : {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mika1727_un_401_nomme_la_variable_de_jeton() {
+        // Corps vide : c'est ce que `require_dashboard_or_internal_token` rend
+        // sur un jeton refusé. Le test en vit, puisque c'est justement l'absence
+        // de corps qui rendait le `Statut` d'avant muet sur la cause.
+        let (base, _, rendu) = appel(StatusCode::UNAUTHORIZED, "", "mika-dev").await;
+        let probleme = rendu.expect_err("un 401 est une erreur");
+        assert!(
+            matches!(probleme, SkillsRemoteIssue::JetonRefuse { .. }),
+            "{probleme:?}"
+        );
+        let message = probleme.to_string();
+        assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+        // Le nom exact de la variable, et pas une périphrase : c'est le seul
+        // geste que l'opérateur ait à faire, et le message n'a de valeur que
+        // s'il le nomme assez précisément pour être exporté tel quel.
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
     }
 
     #[tokio::test]
