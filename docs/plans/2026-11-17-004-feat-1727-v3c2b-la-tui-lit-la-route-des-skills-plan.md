@@ -188,6 +188,28 @@ pas une seconde source de vérité** : c'est une projection de la seule, constru
 même vol que la bascule de la source, et plus aucun lecteur ne lit le registre du
 disque.
 
+**L'adaptateur ne projette que la moitié `skills` du miroir ; `handle_skills`
+lit `skipped` droit sur le miroir** (rev 4, amendement d'exécution). Les quatre
+champs de `SkillRegistry` sont **privés**, et aucun constructeur public ne porte
+`skills` et `skipped` ensemble : `from_test_entries(entries)` ne pose que les
+skills, `with_skipped(skipped)` ne pose que les ignorées, et rien de public
+n'écrit `validated_warnings` (seul `apply_load_safety_check` les dérive des
+entrées). `crates/mika-agent/` est **hors du périmètre de ce vol** par la tête du
+ticket, donc un cinquième constructeur n'est pas une option.
+
+Ce n'est toujours pas une seconde source : le pré-filtre de `handle_skills` tient
+déjà le miroir en main quand il appelle l'adaptateur, et lire `skipped` dessus est
+**un niveau d'indirection de moins**, pas un de plus. `SkippedMirror` porte
+exactement `name` et `reason`, les deux noms de champ de `SkippedSkill`, donc le
+rendu de la section `SKIPPED` et le calcul de `max_name_width` restent inchangés
+au caractère près : le delta dans `handle_skills` est la ligne de liaison, et rien
+d'autre. `handle_skill` ne lit pas `skipped` et reste servi entièrement par
+l'adaptateur.
+
+Le chiffrage de la § *Taille estimée* **ne bouge pas** : l'adaptateur perd ce
+qu'il n'aurait de toute façon pas pu construire, `handle_skills` gagne une ligne,
+et les trois bornes restent tenues aux mêmes nombres.
+
 L'adaptateur porte en tête un commentaire qui dit sa date de péremption : il est
 transitoire, il part en B2 avec ses tests, et sa seule raison d'être est la borne
 par vol.
@@ -440,7 +462,7 @@ libellé.
 
 | critère | vol | mesure |
 |---|---|---|
-| 1 | **B1** | `lire_les_skills` contre `fake_spirit` rend le miroir ; `handle_skills`/`handle_skill` servis par `miroir_en_registre(miroir_de_test())` rendent le texte attendu, comparé littéralement. « Sans aucun assemblage local » est tenu dès B1 : `assemble_agent_registry` et la lecture du disque sont retirées au commit 3 |
+| 1 | **B1** | `lire_les_skills` contre `fake_spirit` rend le miroir ; `handle_skills`/`handle_skill` sur `miroir_de_test()` — par `miroir_en_registre` pour la moitié `skills`, droit sur le miroir pour `skipped` (voir § *L'adaptateur*) — rendent le texte attendu, comparé littéralement. « Sans aucun assemblage local » est tenu dès B1 : `assemble_agent_registry` et la lecture du disque sont retirées au commit 3 |
 | 2 | **B1** | les mêmes lecteurs sur `Err("…")`, via les deux pré-filtres ; `assert!(!sortie.contains("No skills loaded."))` — un `assert` **négatif**, pas une relecture |
 | 3 | **B1** | `message_des_skills_ignorees` et `message_des_avertissements` sur `miroir_de_test()`, textes comparés littéralement |
 | 4 | **B1** | `lire_les_skills` appelée avec deux noms d'agent contre `fake_spirit` : la requête reçue porte l'agent visé (`RequeteRecue`) |
@@ -730,6 +752,17 @@ incluses). Ce plan n'attend pas cette réponse pour partir.
 
 ## Revision history
 
+- **rev 4 (2026-11-17, pilote)** : amendement d'exécution, **un seul point**.
+  Le § *L'adaptateur et les pré-filtres* dit désormais que `miroir_en_registre`
+  ne projette que la moitié `skills` du miroir, et que `handle_skills` lit
+  `skipped` droit sur le miroir que son pré-filtre tient déjà. La raison est une
+  contrainte d'API mesurée sur `main` : les quatre champs de `SkillRegistry` sont
+  privés et aucun constructeur public ne porte `skills` et `skipped` ensemble
+  (`from_test_entries` pose les uns, `with_skipped` les autres), tandis que
+  `crates/mika-agent/` est hors périmètre par la tête du ticket. L'adaptateur tel
+  que la rev 2 le formulait était donc inconstructible. Le périmètre, les tests,
+  les dix critères, les trois bornes et le chiffrage sont **inchangés**. Aucune
+  halte n'est levée par cet amendement, et il n'en ajoute aucune.
 - **rev 3 (2026-11-17, pilote)** : amendement d'exécution, **un seul point**.
   La § *Ordre des commits* passe de sept commits à cinq, parce que les commits 2
   à 5 de la rev 2 ne compilent pas isolément : le changement de type
