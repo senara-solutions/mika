@@ -353,14 +353,6 @@ async fn spawn_agent_worker(
                     )
                     .await;
 
-                    // mika#1727 vol V3b-2 — `updated_skills` vaut désormais
-                    // toujours `None` : les deux rechargements à chaud qui le
-                    // remplissaient tournaient sous `skills_dirty`, un drapeau
-                    // que rien ne posait à `true`. Le champ reste dans
-                    // `AgentResponse::Reply` parce que `tui/app.rs` le lit et
-                    // doit rester inchangé à l'octet ; il est passé en clair à
-                    // ses deux sites pour qu'on lise sur place qu'aucune
-                    // branche ne le remplit.
                     let response = match result {
                         Ok(reply) => AgentResponse::Reply {
                             content: reply.content,
@@ -370,14 +362,12 @@ async fn spawn_agent_worker(
                             // fil. L'avis d'inertie ci-dessus l'a déjà dit.
                             thinking: None,
                             input_tokens: reply.input_tokens,
-                            updated_skills: None,
                         },
                         Err(e) => AgentResponse::Reply {
                             content: format!("{e}"),
                             is_error: true,
                             thinking: None,
                             input_tokens: None,
-                            updated_skills: None,
                         },
                     };
                     if agent_tx.send(response).is_err() {

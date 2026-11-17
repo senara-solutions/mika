@@ -8,7 +8,6 @@ use tui_textarea::TextArea;
 
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::TeamRunSummary;
-use mika_agent::skills::SkillRegistry;
 use mika_agent::teams::types::{TeamEvent, TeamPhase};
 
 use crate::commands::skills_remote::EtatSkills;
@@ -329,8 +328,6 @@ pub enum AgentResponse {
         is_error: bool,
         thinking: Option<String>,
         input_tokens: Option<u32>,
-        /// If skills were hot-reloaded during this turn, contains the new registry.
-        updated_skills: Option<Arc<SkillRegistry>>,
     },
     /// Un avis du worker à destination de l'opérateur, rendu en `System` et
     /// sans rapport avec la réussite du tour (mika#1727 V1 § D3 : les entrées de
@@ -1350,11 +1347,6 @@ impl<'a> App<'a> {
                 is_error,
                 thinking,
                 input_tokens,
-                // Plus de rechargement à chaud depuis le vol V3c-2b-A1 : le
-                // miroir des skills est relu sur la route à chaque respawn, et
-                // ce champ — `None` à ses quatre sites depuis V3b-2 — part au
-                // commit suivant.
-                updated_skills: _,
             }) => {
                 // Update context token tracking
                 if let Some(tokens) = input_tokens {
@@ -2423,7 +2415,6 @@ mod tests {
                 is_error: false,
                 thinking: None,
                 input_tokens: None,
-                updated_skills: None,
             })
             .unwrap();
 
