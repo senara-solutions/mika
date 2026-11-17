@@ -328,35 +328,45 @@ marqueurs `.disabled` est déjà faite côté serveur à l'`init_agent`
 
 ---
 
-## Ordre des commits (B1 — sept commits)
+## Ordre des commits (B1 — cinq commits)
+
+> **Amendement du pilote (rev 3, 2026-11-17).** Le découpage en sept commits de
+> la rev 2 n'est pas livrable tel quel : ses commits 2 à 5 ne compilent pas
+> isolément. Le changement de type d'`App.skills` (`Arc<SkillRegistry>` →
+> `Arc<EtatSkills>`) est **atomique** — il traverse `app.rs`, `chat.rs`,
+> `autocomplete.rs`, `input.rs`, `completers.rs` et `handlers.rs` dans le même
+> geste, et chacun de ces fichiers cesse de compiler dès que l'un d'eux bouge
+> seul. Le découpage ci-dessous est le plus fin qui laisse **chaque commit
+> compilable et vert**, ce qu'un `git bisect` exige et qu'un commit cassé
+> retire. Le contenu livré, les tests et les bornes sont inchangés : seules les
+> frontières de commit bougent.
 
 1. **`feat(1727): le miroir des skills a son constructeur de test`** —
    `skills_remote.rs` : `#[derive(Default)]`, `#[cfg(test)] pub(crate) mod tests`,
    `miroir_de_test()` `pub(crate)`. Les six attentes restent encore : rien ne les
    contredit à ce commit.
-2. **`feat(1727): l'état de la TUI porte le miroir des skills`** —
-   `app.rs` (`EtatSkills`, champ, `App::new`, team mode, retrait de
-   `updated_skills` et de son lecteur), `chat_turn.rs`, les deux sites de
-   `chat.rs`, `autocomplete.rs`, `input.rs`. Les cinq constructeurs de test
-   passent par `miroir_de_test()`.
-3. **`feat(1727): la TUI lit la route des skills au lieu d'assembler`** —
-   `chat.rs` : `lire_les_skills`, les trois sites d'appel, retrait du bloc
-   d'assemblage et des deux imports. Retrait des six attentes de
-   `skills_remote.rs`. Tests de `lire_les_skills` contre `fake_spirit`, dont la
-   relecture par agent visé (`RequeteRecue`).
-4. **`feat(1727): les messages de démarrage des skills lisent le miroir`** —
-   `chat.rs` (les deux messages extraits en fonctions pures + le message `System`
-   de cause), `completers.rs` (`complete_skill`), **avec tous leurs tests** :
-   succès et échec pour chacun.
-5. **`feat(1727): un adaptateur sert les deux lecteurs le temps d'un vol`** —
-   `chat.rs` (`miroir_en_registre` + son commentaire de péremption),
-   `handlers.rs` (les deux pré-filtres), **avec leurs tests** : l'adaptateur rend
-   à donnée égale ce que le registre rendait, et chaque pré-filtre dit la cause
-   sans jamais dire `"No skills loaded."`.
-6. **`feat(1727): la garde refuse l'assemblage local des skills`** —
+2. **`feat(1727): `updated_skills` quitte la TUI`** — `app.rs` (déclaration et
+   lecteur), `chat.rs` (deux sites), `chat_turn.rs` (deux sites), `app.rs:2417`
+   (test). Indépendant du type d'`App.skills`, donc séparable **et** compilable :
+   c'est le seul morceau de l'ancien commit 2 qui le soit.
+3. **`feat(1727): la TUI lit la route des skills au lieu d'assembler`** — la
+   bascule atomique, ancien commits 2 (reste), 3, 4 et 5 réunis :
+   `chat.rs` (`lire_les_skills`, les trois sites d'appel, retrait du bloc
+   d'assemblage et des deux imports, les deux messages de démarrage extraits en
+   fonctions pures, le message `System` de cause, l'adaptateur transitoire
+   `miroir_en_registre` et son commentaire de péremption), `app.rs`
+   (`EtatSkills`, champ, `App::new`, team mode), `autocomplete.rs`, `input.rs`,
+   `completers.rs` (`complete_skill`), `handlers.rs` (les deux pré-filtres),
+   retrait des six attentes de `skills_remote.rs`. **Avec tous leurs tests**,
+   dans le même commit : `lire_les_skills` contre `fake_spirit` et la relecture
+   par agent visé (`RequeteRecue`), les deux messages de démarrage en succès et
+   en échec, l'autocomplétion vide, l'adaptateur à donnée égale, les deux
+   pré-filtres qui ne disent jamais `"No skills loaded."`. Les cinq
+   constructeurs de test passent par `miroir_de_test()`.
+4. **`feat(1727): la garde refuse l'assemblage local des skills`** —
    extension de `mika1727_v3b1_…` (4 motifs et leurs raisons), **avec ses tests
    dans le même commit**.
-7. **`docs(mika-cli): la TUI lit la route des skills`** — `CLAUDE.md`.
+5. **`docs(mika-cli): la TUI lit la route des skills`** — `CLAUDE.md`.
 
 **Chaque garde arrive avec ses tests, dans le même commit.** Aucun test ne se
 reporte à un vol suivant : B1 et B2 arrivent chacun avec les siens.
@@ -720,6 +730,14 @@ incluses). Ce plan n'attend pas cette réponse pour partir.
 
 ## Revision history
 
+- **rev 3 (2026-11-17, pilote)** : amendement d'exécution, **un seul point**.
+  La § *Ordre des commits* passe de sept commits à cinq, parce que les commits 2
+  à 5 de la rev 2 ne compilent pas isolément : le changement de type
+  d'`App.skills` traverse six fichiers d'un seul geste, et un commit qui ne
+  compile pas retire ce qu'un `git bisect` vient chercher. Le périmètre, les
+  tests, les dix critères, les trois bornes et le chiffrage sont **inchangés** —
+  seules les frontières de commit bougent. Aucune halte n'est levée par cet
+  amendement, et il n'en ajoute aucune.
 - **rev 2 (2026-11-17)** : addressed F1 (BLOCKING — plan hors borne sans
   partition commitée). La Coupe B est désormais **retenue et pratiquée**, et non
   plus seulement nommée : ce vol livre **B1** (418 numstat / 393 hors docs, sous
