@@ -2694,7 +2694,52 @@ mod tests {
         }
     }
 
-    /// A state with three agents carrying **distinct** registries, built on top
+    /// A registry whose single skill stayed **loaded** while carrying
+    /// validation warnings — the state no `SkillRegistry` constructor produces.
+    ///
+    /// It needs a **real directory**, and that is not a convenience: the only
+    /// producer of `validated_warnings` is `apply_load_safety_check`, which
+    /// reads the disk. A [`test_skill_entry`] points at a `/tmp/mika-test` path
+    /// that does not exist, so `validate_skill` answers `skill.toml not found`
+    /// — a skip-worthy failure, which lands the skill in `skipped` and never in
+    /// `validated_warnings`.
+    ///
+    /// The manifest below is shaped to warn **without** failing: `required_tools`
+    /// names a tool absent from a `tools.json` that does not exist (warning), and
+    /// neither `tools.json` nor `system_prompt.md` is written (warning: no-op
+    /// skill). Its `keywords` deliberately does **not** carry the skill's own
+    /// name — that one is a `Fail`, and the skill would be skipped instead.
+    /// `always_on = false` is what keeps the `always_on=true` half of critère 1
+    /// non-vacuous.
+    ///
+    /// The `TempDir` may die when this function returns: the registry is in
+    /// memory and the route never re-reads the disk.
+    fn test_registry_avertie() -> SkillRegistry {
+        let tmp = tempfile::tempdir().expect("a temporary skills dir");
+        let dir = tmp.path().join("avertie");
+        std::fs::create_dir_all(&dir).expect("the skill dir");
+        std::fs::write(
+            dir.join("skill.toml"),
+            r#"[skill]
+name = "avertie"
+description = "Skill chargee avec un avertissement de validation"
+always_on = false
+
+[triggers]
+keywords = ["registre"]
+
+[constraints]
+required_tools = ["outil_absent"]
+"#,
+        )
+        .expect("the skill manifest");
+
+        let mut registry = SkillRegistry::from_dir(tmp.path());
+        registry.apply_load_safety_check();
+        registry
+    }
+
+    /// A state with four agents carrying **distinct** registries, built on top
     /// of [`test_state`] rather than recopying the `AppState` literal (D6).
     ///
     /// The `"mika"` agent of `test_state` survives with an **empty** registry,
@@ -2711,7 +2756,7 @@ mod tests {
         let home = std::path::PathBuf::from("/tmp/mika-test");
         let tier = mika_common::home::AgentTier::Default;
 
-        let agents: [(&str, SkillRegistry); 3] = [
+        let agents: [(&str, SkillRegistry); 4] = [
             (
                 "skills-a",
                 SkillRegistry::from_test_entries(vec![
@@ -2735,6 +2780,7 @@ mod tests {
                     reason: "manifest parse error".to_string(),
                 }]),
             ),
+            ("skills-avertie", test_registry_avertie()),
         ];
 
         for (name, registry) in agents {
@@ -2928,6 +2974,69 @@ mod tests {
             skipped["skipped"],
             serde_json::json!([{"name": "broken-skill", "reason": "manifest parse error"}])
         );
+    }
+
+    /// Critère 1 (V3c-2a-i) — the route serves the registry's validation
+    /// `warnings`, and a property filter does not reach them.
+    ///
+    /// This is the flight's negative test: on main the root object has three
+    /// keys, so `body["warnings"]` is `Null` and both halves redden.
+    #[tokio::test]
+    async fn mika1727_the_skills_route_serves_the_validation_warnings() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        let (status, body) = skills_get(test_app(state.clone()), "?agent=skills-avertie").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            skill_names(&body),
+            vec!["avertie"],
+            "the warned skill stayed LOADED — it is not a skipped one"
+        );
+        // Both of the fixture's diagnostics, in the order `validate_skill`
+        // pushes them (step 5b then step 8): a single message would make the
+        // ordering half of critère 2 vacuous.
+        assert_eq!(
+            body["warnings"],
+            serde_json::json!([{
+                "name": "avertie",
+                "messages": [
+                    "[constraints] required_tools references 'outil_absent' which is not in \
+                     this skill's tools.json — this is OK if it's an MCP tool or a dependency \
+                     tool whose name does not follow the dep-prefix convention",
+                    "no-op skill: no tools.json and no system_prompt.md",
+                ],
+            }])
+        );
+
+        // `always_on=true` drops the skill from `skills` — the fixture declares
+        // `always_on = false` — and leaves `warnings` WHOLE.
+        let (status, filtered) =
+            skills_get(test_app(state), "?agent=skills-avertie&always_on=true").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(skill_names(&filtered), Vec::<String>::new());
+        assert_eq!(filtered["warnings"], body["warnings"]);
+    }
+
+    /// Critère 2 — an agent whose registry warns about nothing serves `[]`, and
+    /// the three keys V3c-1 shipped are untouched.
+    #[tokio::test]
+    async fn mika1727_an_agent_without_a_warning_serves_an_empty_warnings_list() {
+        let state = test_state_skills_multi();
+        state.ready.store(true, Ordering::Release);
+
+        let (status, body) = skills_get(test_app(state), "?agent=skills-a").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["warnings"],
+            serde_json::json!([]),
+            "an empty list, never an absent key"
+        );
+        assert_eq!(body["agent"], "skills-a");
+        let mut names = skill_names(&body);
+        names.sort();
+        assert_eq!(names, vec!["alpha-always", "alpha-on-demand"]);
+        assert_eq!(body["skipped"], serde_json::json!([]));
     }
 
     // --- mika#2070: the caller's session id survives the whole server hop ------
