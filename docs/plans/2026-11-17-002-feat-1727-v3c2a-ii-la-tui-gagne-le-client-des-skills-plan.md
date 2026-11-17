@@ -436,6 +436,32 @@ Un commentaire dit le pourquoi qu'on ne lit pas dans le code, pas une paraphrase
 Si le code écrit dépasse, le pilote s'arrête selon la halte ci-dessus ; il ne
 retire **pas** après coup les commentaires qui portent un pourquoi.
 
+#### Amendement du pilote — le sous-seuil de 430 est franchi de 3 lignes (2026-11-17)
+
+**Le point.** Mesuré après C2 : **433 lignes** ajoutées, plan exclu —
+`rewind_remote.rs` 6 (C1), `skills_remote.rs` 415, `commands/mod.rs` 1,
+`egress-manifest.toml` 11 (C2). Le sous-seuil de 430 de la puce ci-dessus est
+donc franchi, la borne de la tête du ticket — **475** — ne l'est pas.
+
+**La raison de ne pas s'arrêter là.** Ce sous-seuil n'est pas une borne de
+l'opérateur : la tête du ticket n'en porte qu'une, 475. Il est un garde-fou que
+ce plan s'est donné, et sa raison est écrite : « C3 ne tiendrait pas ». Elle ne
+vaut pas ici — C3 fait **4 lignes** de `crates/mika-cli/CLAUDE.md`, donc
+**437 pour 475**, et c'est l'inverse de ce que le garde-fou protégeait : s'arrêter
+maintenant livrerait précisément « un vol qui s'arrête avant sa doc ».
+
+**D'où viennent les 79 lignes au-delà des 354 estimées.** Les six attentes
+`dead_code` coûtent **24 lignes** et non six : `rustfmt` casse
+`#[cfg_attr(not(test), expect(dead_code, reason = "…"))]` sur quatre lignes
+chacune, ce que l'estimation comptait pour une. Le reste est dans les
+commentaires de `pourquoi` des miroirs et des tests, que la règle ci-dessus
+interdit de raboter après coup — et qui ne sont donc pas rabotés.
+
+**Ce qui ne change pas.** La borne de 475 reste ferme, et la halte qui s'y
+attache aussi : si C3 la franchissait, le pilote s'arrêterait avec le message
+qu'elle prescrit. Le périmètre de fichiers, les sept critères et la Definition
+of Done sont inchangés.
+
 ### Si le code s'écarte de ce plan
 
 La QA juge contre le plan de la branche, pas contre le corps du ticket. Si le
