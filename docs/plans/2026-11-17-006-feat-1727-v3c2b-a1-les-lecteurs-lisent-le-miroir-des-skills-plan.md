@@ -366,6 +366,34 @@ Transcrits du corps de mika#1727, § *Critères de V3c-2b-A1* :
    passe sur la branche.
 9. Les seules attentes retirées sont les six de `skills_remote.rs`. Aucune attente ni
    aucun `allow` neuf.
+
+   > **Amendement du pilote (2026-11-17, écart mesuré sur deux champs du miroir).**
+   > Les six attentes de **type** tombent comme écrit, et **deux attentes de champ**
+   > les remplacent : `SkillsMirror::agent` et `SkillMirror::origin`. Ce sont les
+   > deux seuls champs du miroir qu'aucune des quatre surfaces de lecture ne lit —
+   > `handle_skill` sur `origin/main` n'affichait ni l'un ni l'autre, et le critère 1
+   > (« rendu identique au caractère près ») interdit de leur donner un lecteur en
+   > les affichant. Mesuré par `cargo clippy --all-targets -p mika-cli`, qui rend
+   > `field agent is never read` et `field origin is never read` dès que les six
+   > attentes de type partent ; le plan n'avait pas mesuré ce reste.
+   >
+   > **Les retirer du miroir est interdit par le périmètre de ce vol**, et c'est ce
+   > qui fixe le choix : `crates/mika-cli/CLAUDE.md` l. 764 écrit que `lire` « rend
+   > un miroir des quatre clés de la route, **treize champs par skill** », et cette
+   > phrase n'est pas l'une des deux que ce vol a le droit de toucher (l. 735 et
+   > l. 764 § « Rien ne l'appelle »). Un miroir à douze champs la rendrait fausse en
+   > silence, et romprait le contrat de fil que `mika1727_le_miroir_relit_tout_ce_que_la_route_sert`
+   > atteste depuis V3c-2a-ii : le miroir relit **tout** ce que la route sert, parce
+   > qu'un champ absent du miroir se lit comme un champ absent de la route
+   > (motif mika#2331).
+   >
+   > Les deux attentes gardent la forme de celles qu'elles remplacent —
+   > `#[cfg_attr(not(test), expect(dead_code, reason = "…"))]`, le module de tests
+   > les lisant — et chacune porte sa raison : le champ est au miroir parce que la
+   > route le sert, et sans lecteur dans la TUI parce qu'aucune des quatre surfaces
+   > ne l'affiche. Elles sont donc **portées**, pas neuves : la dette passe de six
+   > types entiers à deux champs nommés. Rien d'autre ne change : le contenu livré,
+   > le nombre de commits et les autres critères sont ceux du plan.
 10. Seuls changent les fichiers listés plus haut, et `crates/mika-cli/CLAUDE.md` ne
     change qu'aux deux phrases nommées.
 11. `cargo build -p mika-cli --bin mika` d'abord, puis `cargo test -p mika-cli` et
@@ -388,7 +416,7 @@ Transcrits du corps de mika#1727, § *Critères de V3c-2b-A1* :
 | 6 | `grep -rn 'updated_skills' crates/mika-cli/` rend zéro ligne ; le compilateur le confirme |
 | 7 | `grep -rn 'SkillRegistry' crates/mika-cli/src/tui/` rend zéro ligne, production **et** test ; le type de `App.skills` le garantit pour la production |
 | 8 | la garde étendue jouée contre l'arbre de main rougit sur les quatre motifs ; verte sur la branche |
-| 9 | `grep -c 'expect(dead_code' crates/mika-cli/src/commands/skills_remote.rs` rend 0 ; `cargo clippy --all-targets -p mika-cli` vert ; aucun `allow` neuf au `git diff` |
+| 9 | `grep -c 'expect(dead_code' crates/mika-cli/src/commands/skills_remote.rs` rend **2** — les deux attentes de champ de l'amendement ci-dessus, portant sur `SkillsMirror::agent` et `SkillMirror::origin`, et aucune attente de type ; `cargo clippy --all-targets -p mika-cli` vert ; aucun `allow` neuf au `git diff` |
 | 10 | `git diff --name-only origin/main...HEAD` ; `git diff origin/main...HEAD -- crates/mika-cli/CLAUDE.md` ne touche que les deux phrases |
 | 11 | les quatre commandes dans cet ordre, puis `bash scripts/verify-pipeline.sh origin/main` |
 | 12 | `gh pr view <N> --json closingIssuesReferences` rend `[]` |
