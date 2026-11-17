@@ -144,11 +144,17 @@ La garde balaie **le dossier**, pas un fichier : son hôte n'a donc aucun effet 
 qu'elle couvre. Il en a un sur ce qu'elle atteste. `tui/app.rs` est retenu pour trois
 raisons mesurées :
 
-1. **C'est le fichier d'où le registre est parti.** Sur `7f2e5531`, les cinq sites de
-   production de `SkillRegistry` dans `tui/` étaient tous dans `app.rs` : l. 11 (`use`),
+1. **C'est le fichier d'où le registre est parti.** Sur `7f2e5531`, `app.rs` portait
+   cinq des sept sites de production de `SkillRegistry` dans `tui/` : l. 11 (`use`),
    332 (`updated_skills`), 578 (le champ), 690 (l'argument de `App::new`), 822
    (`SkillRegistry::empty()` du mode équipe). C'est l'arbre contre lequel le critère 4
    exige qu'elle rougisse.
+
+   **Amendement du 2026-11-17 (pilote) : ce point disait « tous dans `app.rs` ».** Faux
+   par omission — `commands/autocomplete.rs` en portait deux (l. 3 et 20), mesurés par
+   la démonstration du critère 4. L'argument d'hôte ne bouge pas (cinq sites sur sept,
+   dont le champ que le témoin vise), et le périmètre de la garde non plus : elle balaie
+   le dossier, donc elle les couvrait déjà sans qu'on les ait nommés.
 2. **Il porte la porte que le message nomme.** `app.skills: Arc<EtatSkills>` (l. 580)
    est ce que `skills_remote::lire` remplit. Le témoin de la garde vise ce champ : si
    `app.skills` disparaissait, la garde rougirait et demanderait à être re-visée — le
@@ -312,8 +318,15 @@ Le pilote colle alors le bloc livré — `MOTIF_REGISTRE`, `lignes_du_registre`,
 (l. 1883), sans en adapter une seule ligne, et lance :
 
 ```
-cargo test -p mika-cli mika1727_v3c2b_a2 -- --nocapture
+cargo test -p mika-cli --bins mika1727_v3c2b_a2 -- --nocapture
 ```
+
+**Amendement du 2026-11-17 (pilote) : `--bins` est requis, et ne l'était pas dans ce
+plan.** Sans lui, `cargo test -p mika-cli mika1727_v3c2b_a2` ne lance que les cibles
+d'intégration et matche **zéro** test — mesuré d'abord sur la branche, puis sur l'arbre
+détaché. Les tests de `tui/app.rs` vivent dans la cible binaire `mika`, et ni la lib
+(`--lib` : 0 sur 90) ni les cibles d'intégration ne les portent. Une démonstration
+lancée sans ce drapeau rend « 0 filtered out » et se lirait comme une garde verte.
 
 **Rien n'est à adapter, et c'est une propriété du témoin choisi** : `pub skills: Arc<`
 existe sur les deux arbres (`7f2e5531` l. 578 `Arc<SkillRegistry>`, branche l. 580
@@ -321,7 +334,7 @@ existe sur les deux arbres (`7f2e5531` l. 578 `Arc<SkillRegistry>`, branche l. 5
 l. 1904). La garde passe donc ses trois témoins des deux côtés, et seule la liste des
 violations diffère.
 
-**Sortie attendue, terme par terme** — cinq lignes, toutes dans `tui/app.rs` :
+**Sortie mesurée, terme par terme** — **sept** lignes, dans **deux** fichiers :
 
 | ligne | contenu sur `7f2e5531` |
 |---|---|
@@ -330,6 +343,18 @@ violations diffère.
 | `tui/app.rs:578` | `pub skills: Arc<SkillRegistry>,` |
 | `tui/app.rs:690` | `skills: Arc<SkillRegistry>,` |
 | `tui/app.rs:822` | `skills: Arc::new(SkillRegistry::empty()),` |
+| `tui/commands/autocomplete.rs:3` | `use mika_agent::skills::SkillRegistry;` |
+| `tui/commands/autocomplete.rs:20` | `pub skills: &'a SkillRegistry,` |
+
+**Amendement du 2026-11-17 (pilote) : ce tableau annonçait cinq lignes, toutes dans
+`tui/app.rs`.** Les deux dernières manquaient. La prédiction était dérivée du corps du
+ticket, qui n'a mesuré `SkillRegistry` sur `7f2e5531` que dans `tui/app.rs` (l. 11, 332,
+578) ; `commands/autocomplete.rs` en portait deux de plus, et le balayage **par
+dossier** les voit. La garde livrée n'en change pas d'une ligne : l'écart est dans la
+prédiction, pas dans le code. Et il **appuie** le choix du dossier contre la liste de
+fichiers (§ *Pourquoi `app.rs`*) : une garde par fichier visant `app.rs` seul aurait
+laissé passer `autocomplete.rs`, et c'est exactement le mode de panne que le dossier
+supprime.
 
 Et **aucune** pour les l. 2333 et 2357, qui nomment `SkillRegistry` dans le `mod tests`
 de cet arbre (ouvert l. 1882) : elles sont masquées, et leur absence de la sortie est
@@ -481,7 +506,7 @@ pas et ne la lève pas par amendement.
   l'absence du témoin dans sa moitié production.
 - Son message d'échec nomme `skills_remote::lire` et `app.skills`, et dit que le remède
   n'est jamais une entrée d'allowlist.
-- La démonstration contre `7f2e5531` est faite et sa sortie — les cinq lignes, et
+- La démonstration contre `7f2e5531` est faite et sa sortie — les sept lignes, et
   l'absence des deux lignes de test — est recopiée dans le corps de la PR.
 - La raison du motif `skills_dirty` ne dit plus que le registre s'assemble au démarrage,
   et se distingue de celle d'`updated_skills`. Le motif lui-même est toujours là, et la
@@ -541,7 +566,7 @@ Transcrits de la tête du ticket (§ *Critères de V3c-2b-A2*).
 | 1 | `rust_sources_under(src_root().join("tui"))` dans le corps du test ; `assert!(ALLOWED.is_empty())` |
 | 2 | les trois `assert!` — `!fichiers.is_empty()`, `temoin_vu`, `production.contains(TEMOIN)` |
 | 3 | `mika1727_v3c2b_a2_la_detection_distingue_le_code_du_commentaire`, une seule ligne d'échantillon, deux lectures |
-| 4 | worktree détaché sur `7f2e5531`, bloc collé sans adaptation, `cargo test -p mika-cli mika1727_v3c2b_a2` ; cinq lignes attendues, aucune pour 2333/2357 ; sortie recopiée dans la PR |
+| 4 | worktree détaché sur `7f2e5531`, bloc collé sans adaptation, `cargo test -p mika-cli --bins mika1727_v3c2b_a2` ; sept lignes mesurées, aucune pour 2333/2357 ; sortie recopiée dans la PR |
 | 5 | `git diff` sur `chat.rs` ; la chaîne neuve ne contient ni « s'assemble » ni « au démarrage » |
 | 6 | `grep -n 'SkillsMirror::agent\|SkillMirror::origin' crates/mika-cli/src/commands/skills_remote.rs` rend l'en-tête |
 | 7 | `git diff --stat` sur `CLAUDE.md` : deux emplacements ; `cargo test -p mika-common --test claude_md_size` |
