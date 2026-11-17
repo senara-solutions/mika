@@ -24,6 +24,7 @@ pub mod rewind_remote;
 pub mod session_remote;
 pub mod setup;
 pub mod skills;
+pub mod skills_remote;
 pub mod skills_variants;
 pub mod status;
 pub mod tasks;
