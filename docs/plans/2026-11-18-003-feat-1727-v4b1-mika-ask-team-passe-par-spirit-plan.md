@@ -82,11 +82,21 @@ qui résout ses propres accès ne se pilote pas depuis un test.
   - **flux fermé sans trame finale** → un échec **distinct**, jamais un succès
     (défaut 33). C'est le seul chemin où la boucle sort sans trame terminale, donc le
     distinguer est structurel, pas une garde à armer.
-- Un refus typé, `TeamRunRemoteIssue`, à quatre variantes et un `Display` à la main
-  (motif `SessionRemoteIssue`, `session_remote.rs:105`) : `Denied`, `Refus { status, url,
-  body }`, `Transport { url, cause }`, `SansTrameFinale { url }`, `RunError { error }`.
+- Un refus typé, `TeamRunRemoteIssue`, à **cinq** variantes et un `Display` à la main
+  (motif `SessionRemoteIssue`, `session_remote.rs:105`) : `Denied { url }`, `Refus { status,
+  url, body }`, `Transport { url, cause }`, `SansTrameFinale { url }`, `RunError { error }`.
   Un enum et non un `anyhow::Error` nu : le test 4 doit distinguer « fermé sans finale »
   de tout autre échec, et un `contains` sur un message mesurerait la phrase, pas le fait.
+
+  *Amendé par le pilote (vol V4-b1), sur deux points et pour deux raisons.* Le compte
+  d'abord : cette phrase disait « quatre » tout en en énumérant cinq, et c'est le compte
+  qui était faux — l'énumération est celle que le périmètre du ticket exige (un refus par
+  statut non-200, un pour le transport, un pour le flux sans finale, un pour l'échec du
+  run). Le champ de `Denied` ensuite : le critère 4 de la tête exige que **tout** refus
+  nomme l'URL, et `base_url` étant un argument, « quel serveur a refusé » est la moitié de
+  la question dès que deux daemons tournent. `Denied` ne porte **que** l'URL — ni statut ni
+  corps — sur le précédent de `skills_remote::SkillsRemoteIssue::JetonRefuse` : le 401 est
+  déjà dans le nom, et le corps d'un 401 d'ici est vide ou générique.
 
 ### R2 — L'entrée d'egress, dans le même commit que le client
 
