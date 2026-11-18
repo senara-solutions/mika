@@ -232,6 +232,10 @@ pub struct AppState {
     /// follow-up ticket. See
     /// `crates/mika-agent/docs/tasks-event-stream-frame-catalog-2026-07-10.md`.
     pub task_events_channel: Arc<super::tasks_stream::TaskEventsChannel>,
+    /// Ce qui lance une équipe pour `POST /api/v1/teams/{name}/runs`
+    /// (mika#1727 V4-a). La valeur de production est [`SpiritTeamLauncher`] ;
+    /// les tests mutent ce champ pour y poser un lanceur scripté.
+    pub team_launcher: Arc<dyn TeamLauncher>,
 }
 
 impl AppState {
@@ -369,6 +373,92 @@ impl std::fmt::Debug for AppState {
                     .collect::<Vec<_>>(),
             )
             .field("dashboard_db", &"AsyncDatabase(unscoped)")
+            // Un trait objet n'est pas `Debug` : le champ est nommé par un
+            // littéral plutôt qu'omis, pour qu'il se voie dans la sortie.
+            .field("team_launcher", &"<dyn TeamLauncher>")
             .finish_non_exhaustive()
+    }
+}
+
+// ── Le lanceur d'équipe (mika#1727 V4-a) ──────────────────────────────────
+
+/// Les arguments d'un lancement d'équipe, tels que la route les a résolus.
+///
+/// `tier` et `deployment` voyagent **ici**, et c'est la décision : ils sont
+/// portés par [`AgentState`] et non par [`AppState`] — il n'existe pas de tier
+/// « du serveur ». Les figer dans le lanceur de production au démarrage
+/// mentirait sur un agent résolu paresseusement plus tard (#1399), et le
+/// lanceur étant un *champ* de l'`AppState`, il ne peut pas appeler
+/// `resolve_agent` lui-même. C'est donc la route qui résout l'agent par défaut
+/// et transmet son autorité — exactement la doctrine inscrite sur
+/// `teams::run_team` : l'appelant fournit son autorité cachée (mika#1962,
+/// mika#2290).
+pub struct TeamLaunchRequest {
+    pub team_name: String,
+    pub goal: String,
+    pub reference_run_id: Option<String>,
+    pub tier: home::AgentTier,
+    pub deployment: home::Deployment,
+}
+
+/// Ce que la route `POST /api/v1/teams/{name}/runs` appelle pour lancer un run.
+///
+/// **Un trait, pas une closure.** Le lanceur scripté des tests porte de l'état
+/// (le scénario d'événements, le compte de lancements, l'attestation
+/// d'achèvement, le mode d'erreur) ; un trait le porte dans sa struct, là où un
+/// `Arc<dyn Fn(…) -> BoxFuture>` l'enfermerait dans un `Arc<Mutex<…>>` capturé.
+/// Et c'est l'idiome du dépôt pour l'injection de déterminisme
+/// (`MessageSender`, `LlmProvider`).
+#[async_trait::async_trait]
+pub trait TeamLauncher: Send + Sync {
+    async fn launch(
+        &self,
+        req: TeamLaunchRequest,
+        events: crate::teams::types::TeamEventCallback,
+    ) -> anyhow::Result<crate::teams::types::TeamRun>;
+}
+
+/// La valeur de production : elle appelle `teams::run_team` avec les arguments
+/// de l'outil `run_team` de spirit (`tools/run_team.rs` l. 128-139, critère 6).
+pub struct SpiritTeamLauncher {
+    pub global_home_dir: PathBuf,
+    pub settings: Settings,
+    pub github_app: Option<Arc<GitHubApp>>,
+}
+
+#[async_trait::async_trait]
+impl TeamLauncher for SpiritTeamLauncher {
+    async fn launch(
+        &self,
+        req: TeamLaunchRequest,
+        events: crate::teams::types::TeamEventCallback,
+    ) -> anyhow::Result<crate::teams::types::TeamRun> {
+        // Sa **propre** base, ouverte puis `shutdown()`ée ici comme le fait
+        // l'outil : un run d'équipe est long, et le faire passer par la poignée
+        // de l'agent servi lui ferait partager son canal `mpsc(512)`.
+        let db_path = home::container_db_path(&self.global_home_dir);
+        let team_db = AsyncDatabase::new(crate::db::Database::open(&db_path)?);
+        let result = crate::teams::run_team(
+            &req.team_name,
+            &req.goal,
+            &self.global_home_dir,
+            &self.settings,
+            Some(events),
+            team_db.clone(),
+            // Seul argument que l'outil fixe à `None` et que le corps de la
+            // requête HTTP porte : il est au périmètre de ce vol.
+            req.reference_run_id.as_deref(),
+            self.github_app.clone(),
+            // `None` **comme l'outil**, bien que l'`AppState` en porte un :
+            // brancher la dédup de revues de PR (#821) sur ce chemin serait un
+            // changement de la logique des équipes, hors périmètre. Ce n'est
+            // pas un oubli.
+            None,
+            req.tier,       // mika#1962 — l'autorité vient de l'appelant
+            req.deployment, // mika#2290 — idem, pour le sol d'hébergement
+        )
+        .await;
+        team_db.shutdown();
+        result
     }
 }

@@ -277,7 +277,29 @@ impl std::fmt::Display for TeamPhase {
 ///
 /// Used to communicate structured progress to callers (TUI, management tools).
 /// The caller decides what to display vs persist.
-#[derive(Clone, Debug)]
+///
+/// **Adjacently tagged, not internally (mika#1727 V4-a).** Three of the nine
+/// variants are newtypes carrying a `String`. Internal tagging (`tag` alone)
+/// requires every variant's content to serialize as a map; a `String` is not
+/// one, and serde fails **at runtime**, not at compile time. Converting the
+/// three into struct variants would rewrite every emission site of
+/// `teams/engine.rs` and every `match` of `crates/mika-cli/`, both outside this
+/// flight. The adjacent form takes all nine shapes without touching a site.
+///
+/// `kind` and not `event`: it is the **domain** spelling of the SSE catalog
+/// (`crates/mika-agent/docs/architecture.md` § 14.2, axis 1), `event` being the
+/// one of the server surfaces. The route's envelope
+/// (`server::team_runs::TeamRunFrame`) takes `event`, so a final error frame
+/// and `RunFailed` never carry the same word at two levels of one JSON object.
+///
+/// **No `#[serde(other)] Unknown`**, against the catalog's shared discipline: a
+/// tenth variant would make those same out-of-perimeter `match`es
+/// non-exhaustive, and `#[serde(other)]` only serves deserialization — whose
+/// sole consumer here is a test. The client lands in V4-b, and it is the flight
+/// with a consumer in hand that can decide what tolerating an unknown `kind`
+/// means for it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum TeamEvent {
     /// Transient progress message (e.g., "Decomposing goal...")
     Progress(String),
@@ -446,6 +468,108 @@ mod tests {
             NO_DELEGATION_REASON,
             "orchestrator returned a conversational reply for an actionable goal and delegated to zero members (after one reinforced retry)"
         );
+    }
+
+    /// Chaque variante de `TeamEvent` fait l'aller-retour `serde` sans perte.
+    ///
+    /// Critère 1 de mika#1727 V4-a. L'égalité porte sur les deux valeurs JSON
+    /// et non sur `TeamEvent` : dériver `PartialEq` sur un type du domaine pour
+    /// le confort d'un seul test serait une dérive que le domaine n'a pas
+    /// demandée. Le `match` **exhaustif** est ce qui fait qu'une dixième
+    /// variante ne compile pas sans être passée par ici, et la liste triée des
+    /// `kind` est ce qui fait qu'elle ne compile pas sans **valeur** au banc.
+    #[test]
+    fn mika1727_v4a_chaque_variante_de_team_event_fait_laller_retour() {
+        let cases = vec![
+            TeamEvent::Progress("Decomposing goal...".to_string()),
+            TeamEvent::PhaseChanged {
+                phase: TeamPhase::Execute,
+                iteration: 1,
+            },
+            TeamEvent::AgentStarted {
+                agent: "researcher".to_string(),
+                role: "research".to_string(),
+            },
+            TeamEvent::TasksAssigned {
+                tasks: vec![TaskAssignment {
+                    agent: "researcher".to_string(),
+                    role: "research".to_string(),
+                    task: "read the three papers".to_string(),
+                    output_file: "papers.md".to_string(),
+                    status: TaskStatus::Running,
+                }],
+                iteration: 2,
+            },
+            TeamEvent::AgentCompleted {
+                agent: "researcher".to_string(),
+                response: "Found 3 papers".to_string(),
+            },
+            TeamEvent::AgentFailed {
+                agent: "writer".to_string(),
+                error: "timeout".to_string(),
+            },
+            TeamEvent::CriticReview {
+                approved: false,
+                feedback: "missing the third paper".to_string(),
+                iteration: 3,
+            },
+            TeamEvent::Deliverable("# Rapport\n\nTrois papiers.".to_string()),
+            TeamEvent::RunFailed("orchestrator delegated to zero members".to_string()),
+        ];
+
+        let mut kinds_vus: Vec<&str> = Vec::new();
+        for event in &cases {
+            let json = serde_json::to_string(event).expect("sérialisation");
+            let back: TeamEvent = serde_json::from_str(&json).expect("désérialisation");
+            let avant = serde_json::to_value(event).expect("valeur avant");
+            let apres = serde_json::to_value(&back).expect("valeur après");
+            assert_eq!(avant, apres, "aller-retour lossy pour {event:?}");
+
+            let kind = match event {
+                TeamEvent::Progress(_) => "progress",
+                TeamEvent::PhaseChanged { .. } => "phase_changed",
+                TeamEvent::AgentStarted { .. } => "agent_started",
+                TeamEvent::TasksAssigned { .. } => "tasks_assigned",
+                TeamEvent::AgentCompleted { .. } => "agent_completed",
+                TeamEvent::AgentFailed { .. } => "agent_failed",
+                TeamEvent::CriticReview { .. } => "critic_review",
+                TeamEvent::Deliverable(_) => "deliverable",
+                TeamEvent::RunFailed(_) => "run_failed",
+            };
+            assert_eq!(
+                avant["kind"].as_str(),
+                Some(kind),
+                "mauvais discriminant pour {event:?}"
+            );
+            kinds_vus.push(kind);
+        }
+
+        kinds_vus.sort_unstable();
+        assert_eq!(
+            kinds_vus,
+            [
+                "agent_completed",
+                "agent_failed",
+                "agent_started",
+                "critic_review",
+                "deliverable",
+                "phase_changed",
+                "progress",
+                "run_failed",
+                "tasks_assigned",
+            ],
+            "les neuf variantes ne sont pas toutes au banc"
+        );
+
+        // `data.phase` garde la graphie PascalCase de `TeamPhase`, qui n'a pas de
+        // `rename_all` parce que `deserialize_checkpoint` relit cette graphie :
+        // le `rename_all` de `TeamEvent` ne descend pas dans `data`.
+        let phase = serde_json::to_value(TeamEvent::PhaseChanged {
+            phase: TeamPhase::Deliver,
+            iteration: 1,
+        })
+        .expect("valeur de phase_changed");
+        assert_eq!(phase["data"]["phase"].as_str(), Some("Deliver"));
     }
 
     #[test]
