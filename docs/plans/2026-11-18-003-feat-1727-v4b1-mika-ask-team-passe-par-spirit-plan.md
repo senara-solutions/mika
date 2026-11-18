@@ -142,6 +142,17 @@ découpeur. Rien d'autre de ce fichier ne bouge.
   `teams::open_container_db_async` + son `shutdown`, `AgentTier::from_env` et
   `Deployment::from_env`. Le tier et le déploiement sont désormais ceux de l'agent par
   défaut de spirit (défaut 34), résolus par `state.resolve_agent("")` côté route.
+
+  *Amendé par le pilote (vol V4-b1) : un fichier de plus au périmètre,
+  `crates/mika-cli/src/commands/teams.rs`, pour une suppression et pour elle seule.*
+  `run_team_ask` était **le seul appelant** de `teams::open_container_db_async`, ce que
+  ni la tête ni ce plan n'avaient mesuré : retirer l'appel laisse la fonction morte, et
+  `cargo clippy --all-targets -p mika-cli` le dit. Les deux autres issues sont fermées
+  par les critères eux-mêmes — une `#[expect(dead_code)]` est exactement ce
+  qu'interdit le critère 11, et laisser l'avertissement serait garder dans l'arbre le
+  défaut qu'une attente aurait masqué. La fonction part donc avec son dernier
+  appelant, en retraits seuls (sans effet sur la borne), et `open_container_db` — la
+  variante synchrone, qui a ses propres lecteurs — reste.
 - Les deux bras `Json` et `Yaml` construisent aujourd'hui **la même**
   `AskTeamJsonResponse`, dupliquée. Un seul constructeur,
   `enveloppe_equipe(&run, failure_reason) -> AskTeamJsonResponse`, remplace les deux :
