@@ -749,6 +749,15 @@ puce `/provider` plus bas pour ce qu'il fait, et `handlers.rs` pour le pourquoi
 mika#1591 — un override préfixé d'un provider que le spirit **en cours** n'a pas
 configuré est refusé fermement et couperait tous les tours suivants.
 
+**Le `SetModel` se mesure de bout en bout (vol V3c-2c).** L'écart É1 du plan de
+V3b-1 est fermé : `mika1727_v3c2c_apres_un_setmodel_le_tour_suivant_porte_loverride`
+(`commands/chat.rs`) appelle `spawn_agent_worker` en entier contre le factice
+de `rewind_remote`, et lit l'override sur le corps de chaque tour. Pour qu'un
+test l'atteigne sans muter l'environnement, l'adresse de spirit et le lecteur
+du jeton arrivent au worker **par le spawn** : `run` passe `spirit_url()` et
+`std::env::var`, et le worker ne relit plus l'adresse à chaque tour. Une
+bascule d'agent et `/restart` repassent par le spawn, et la relisent.
+
 **Le refus structurel.** La garde de V3b-1
 (`mika1727_v3b1_le_tour_de_la_tui_ne_construit_plus_son_provider`, module `tests`
 de `commands/chat.rs`) **garde son nom** — elle est par fichier, pas par vol — et
