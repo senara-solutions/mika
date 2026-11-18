@@ -885,7 +885,7 @@ advertises `streaming` and `stateTransitionHistory` capabilities. Auth scheme: `
 
 ### 14.2 SSE Frame Catalog
 
-mika-spirit ships three sibling SSE surfaces, each with a deliberate choice of
+mika-spirit ships four sibling SSE surfaces, each with a deliberate choice of
 discriminator key + correlation scope. They coexist by design — do NOT unify.
 
 | Surface | Discriminator | Scope | Route pattern | Crate | Introduced |
@@ -893,6 +893,7 @@ discriminator key + correlation scope. They coexist by design — do NOT unify.
 | `mika_a2a::streaming::StreamEvent` | `#[serde(tag = "kind")]` | Per-task (`a2a_broadcasters: DashMap<TaskId, Sender>`) | JSON-RPC-inline SSE (`POST /a2a/{agent}` with `message/stream` method) | `mika-a2a` | mika#1731 adds `ToolCallStart` / `ToolCallResult` variants + `Unknown` catch-all |
 | `PermissionStreamFrame` | `#[serde(tag = "event")]` | Per-process (single `AppState.permissions_channel`) | `GET /api/v1/dashboard/permissions/stream` (+ POST-back `/decide`) | `mika-agent` server | mika#1741 (sub-C AC1) |
 | `TaskEventFrame` (mika#1732) | `#[serde(tag = "event")]` | Per-process (single `AppState.task_events_channel`) | `GET /api/v1/dashboard/tasks/stream` | `mika-agent` server | this ticket |
+| `TeamRunFrame` | `#[serde(tag = "event")]`, with `TeamEvent` nested under `payload` as `#[serde(tag = "kind", content = "data")]` | Per-run (one `mpsc(256)` per request, no shared state) | `POST /api/v1/teams/{name}/runs` — **internal token only** | `mika-agent` server | mika#1727 V4-a |
 
 **Five axes of deliberate divergence:**
 
@@ -902,12 +903,30 @@ discriminator key + correlation scope. They coexist by design — do NOT unify.
 4. **Crate location** — A2A frames live in `mika-a2a` (protocol-owned); Dashboard frames live in `mika-agent` server module (deploy-owned).
 5. **Decision persistence** — Dashboard SSE surfaces may write a companion DB row when the frame carries a ratified decision. `PermissionStreamFrame::PermissionRequest` pairs with a `permission_decisions` row (mika#1733 AC4) once the operator POSTs back; task-event frames have no persistence yet (emission-from-transition sites land in a follow-up ticket). A2A `StreamEvent` writes go through the `a2a_task_map` + task-store path — orthogonal to the dashboard-SSE persistence axis.
 
-**Shared discipline (all three surfaces):**
+**Shared discipline (the first three surfaces):**
 
 - Additive variants only. No renames; no field removals.
 - Forward-compat `#[serde(other)]` catch-all (`Unknown`) — consumers tolerate future `kind`/`event` values without a re-release gate.
 - Slow-consumer discipline: `tokio::sync::broadcast` drop-oldest + an explicit `OverflowMarker` frame that surfaces the drop count on the wire.
 - UTF-8-safe truncation on preview fields (500-char cap by convention).
+
+**`TeamRunFrame`: the run outlives its client, and three divergences say why.**
+
+`POST /api/v1/teams/{name}/runs` is served under the **internal token alone**
+(`route_layer(auth::require_internal_token)` on a router group of its own) —
+launching a team is a mutation, so the dashboard token does not reach it. The run
+is spawned in its own `tokio` task, which owns the `tx` while the response owns
+only the `rx`: **a client that disconnects mid-stream does not stop the run**,
+which goes to its term and whose final frame is simply dropped. One channel per
+request, so the stream carries one run and closes on its single final frame —
+`run_completed` or `run_error`, two words because the engine can emit the
+`run_failed` event *and* the run return `Ok`, or the inverse.
+
+- **No `Unknown` catch-all.** A tenth `TeamEvent` variant would make the `match`es of `crates/mika-cli/` and `teams/engine.rs` non-exhaustive, both outside this flight; the only deserializing consumer is a test, and the client lands in V4-b.
+- **No `OverflowMarker`.** A bounded `mpsc` exposes no drop count, unlike `broadcast`'s `Lagged`: saturation loses the frame and the run continues, so there is no number to put on the wire.
+- **No 500-char truncation.** `TeamEvent::Deliverable` *is* the deliverable and `AgentCompleted.response` *is* the response — a preview cap there would be the defect, not the discipline.
+
+`data.phase` stays PascalCase (`"Execute"`): `TeamPhase` carries no `rename_all`, because `deserialize_checkpoint` reads that spelling back.
 
 **Full field-by-field references:**
 
