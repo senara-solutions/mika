@@ -32,6 +32,7 @@ pub mod sessions;
 pub mod state;
 pub mod sync_debounce;
 pub mod tasks_stream;
+pub mod team_runs;
 pub mod tier_guard;
 pub mod types;
 pub mod upstream_close_handler;
@@ -403,6 +404,21 @@ fn build_router(state: AppState) -> Router {
             auth::require_internal_token,
         ));
 
+    // Lancement d'un run d'équipe (mika#1727 V4-a) — jeton interne SEUL. Un
+    // groupe à lui seul, et non une route ajoutée à `operator_v1_routes` : la
+    // clôture par `route_layer` est ce qui porte le critère 2, et la troisième
+    // mutation du vol consiste exactement à remplacer `require_internal_token`
+    // par `require_dashboard_or_internal_token` ici.
+    let team_run_routes = Router::new()
+        .route(
+            "/teams/{name}/runs",
+            post(team_runs::handle_create_team_run),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_internal_token,
+        ));
+
     // Operator mutation routes under /api/v1 — internal token ONLY, never the
     // dashboard token. mika#2506: `iterate` spawns a pilot that writes on a
     // reviewed PR's branch; that is not an observability read, so it does not
@@ -455,6 +471,7 @@ fn build_router(state: AppState) -> Router {
             dashboard_routes
                 .merge(rewind_routes)
                 .merge(session_routes)
+                .merge(team_run_routes)
                 .merge(operator_v1_routes)
                 .layer(cors),
         )
@@ -1960,7 +1977,7 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
             .as_ref()
             .map(|s| s.expose_secret().to_string()),
         github_token: settings.agent_github_token().map(String::from),
-        github_app: global_github_app,
+        github_app: global_github_app.clone(),
         global_home_dir: global_home.to_path_buf(),
         settings: settings.clone(),
         dashboard_db,
@@ -1975,6 +1992,11 @@ pub async fn run_server(settings: &Settings) -> Result<()> {
         webhook_queue_shutdown: webhook_queue_shutdown.clone(),
         permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
         task_events_channel,
+        team_launcher: Arc::new(state::SpiritTeamLauncher {
+            global_home_dir: global_home.to_path_buf(),
+            settings: settings.clone(),
+            github_app: global_github_app,
+        }),
     };
 
     let app = build_router(state.clone());
@@ -2360,7 +2382,7 @@ mod tests {
         (engine, dispatcher)
     }
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         test_state_with_settings(test_settings())
     }
 
@@ -2542,6 +2564,14 @@ mod tests {
             webhook_queue_shutdown: CancellationToken::new(),
             permissions_channel: Arc::new(permissions_stream::PermissionsChannel::new()),
             task_events_channel: Arc::new(tasks_stream::TaskEventsChannel::new()),
+            // La valeur de production (mika#1727 V4-a) : elle ne lance rien
+            // faute d'équipe sur le disque, et les tests de `team_runs.rs`
+            // mutent le champ pour y poser leur lanceur scripté.
+            team_launcher: Arc::new(state::SpiritTeamLauncher {
+                global_home_dir: std::path::PathBuf::from("/tmp/mika-test"),
+                settings: test_settings(),
+                github_app: None,
+            }),
         }
     }
 
@@ -2608,7 +2638,7 @@ mod tests {
         }
     }
 
-    fn test_app(state: AppState) -> Router {
+    pub(super) fn test_app(state: AppState) -> Router {
         build_router(state)
     }
 
@@ -4785,7 +4815,7 @@ required_tools = ["outil_absent"]
 
     // ===== Dashboard endpoint tests =====
 
-    fn test_state_with_dashboard_token() -> AppState {
+    pub(super) fn test_state_with_dashboard_token() -> AppState {
         let mut state = test_state();
         state.dashboard_token = Some(SecretString::from("dashboard-token-secret"));
         state
