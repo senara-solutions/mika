@@ -5,8 +5,8 @@
 - **Branche** : `feat/1727/v4a-spirit-sert-les-runs-d-equipe`
 - **Base mesurée** : `main` @ `77a7cfb0`
 - **Label** : `loop-substrate` (plafond de tours : 200)
-- **Borne du groom** : 320 lignes ajoutées, posée par Vincent pour ce vol (corps du ticket,
-  § *Borne de ce vol*). **Halte du pilote** : 450 lignes ajoutées.
+- **Borne du groom** : 520 lignes ajoutées, posée par Vincent pour ce vol (corps du ticket,
+  § *Borne de ce vol*). **Halte du pilote** : 730 lignes ajoutées.
 - **Unité de toutes les bornes** : la ligne **ajoutée**, colonne 1 de
   `git diff --numstat origin/main...HEAD -- . ':!docs/plans' | awk '{a+=$1} END{print a}'` —
   code, commentaires, doc et tests ; les retraits ne comptent pas.
@@ -15,41 +15,38 @@
 
 ---
 
-## 0. HALTE BORNE DU GROOM — 518 lignes estimées pour 320
+## 0. État de la borne — 518 lignes estimées pour 520, la halte ne se déclenche pas
 
-**Ce plan s'arrête, et il ne recoupe pas.**
+**Ce vol démarre.** La révision précédente de ce plan déclarait une halte : son chiffrage
+donnait 518 lignes ajoutées contre une borne du groom de 320, et une halte du pilote à 450
+qui tombait au deuxième commit. Le corps du ticket porte maintenant, pour ce vol, d'autres
+nombres :
 
-Le chiffrage poste par poste du § *Taille estimée* donne **518 lignes ajoutées**. La borne du
-groom est **320**, posée par Vincent dans le corps du ticket :
-
-> **Si ce total dépasse `320`, le groom s'arrête et le dit. Il ne recoupe pas lui-même.**
+> **Si ce total dépasse `520`, le groom s'arrête et le dit. Il ne recoupe pas lui-même.**
 > Cette borne est posée par Vincent pour ce vol ; le plan cite cette décision.
 
-Trois faits qui vont avec, parce qu'ils changent la nature de la décision à prendre :
+et une halte du pilote à `730`. **518 ≤ 520 : la halte du groom ne se déclenche pas**, et la
+halte du pilote ne tombe plus sur un vol conforme à ce périmètre.
 
-1. **Ce n'est pas la borne du groom seule qui est dépassée.** La halte du pilote est à `450`,
-   et le seul livrable C2 (le lanceur, la route, le flux et leurs tests) pèse **436** à lui
-   seul : un vol conforme à ce périmètre ne peut pas atterrir sans déclencher la halte du
-   pilote au deuxième commit. La borne par vol de l'unité de l'architecte — 429 lignes, hors
-   `docs/` — est dépassée aussi (**500** dans cette unité). Les trois bornes refusent ce
-   périmètre, pas seulement la plus serrée.
-2. **L'estimation est conforme aux repères que le ticket donne lui-même**, et non gonflée.
-   La tête annonce « environ 320 à 420 » et le détail du § *Taille estimée* se tient dans la
-   même famille, poste par poste, avec deux écarts nommés au § 2.6 : le banc de test (206
-   contre les 160 à 200 annoncés, pour six tests dont un de déconnexion incrémentale plus le
-   lanceur scripté — à comparer aux ≈ 180 lignes de tests de `tasks_stream.rs`, qui n'a ni
-   lanceur injecté ni test de coupure), et le lanceur (78 contre 30 à 45, parce que la forme
-   choisie au § 2.4 est un trait avec sa valeur de production, et non une closure).
-3. **Aucune coupe n'est proposée ici.** Le corps du ticket dit « le plan ne choisit aucune
-   coupe » et « une halte ne se lève jamais par un amendement du plan ». Le chiffrage par
-   poste ci-dessous est exactement l'information dont Vincent a besoin pour arbitrer ;
-   l'arbitrage lui appartient.
+Trois choses à dire sur cet état, parce qu'elles décident de la lecture du reste :
 
-**Le reste du plan est écrit en entier et reste exploitable tel quel** — formes de trames,
-seam du lanceur, ordre de validation, six tests, trois mutations, ligne de doc, ordre de
-commit. Si la borne est levée ou le périmètre recoupé par Vincent, le pilote n'a pas à
-re-groomer : il lit le § 3 à partir du livrable que Vincent retient. Rien dans ce plan ne
-doit être lu comme une autorisation de démarrer malgré la halte.
+1. **Le chiffrage n'a pas bougé, et c'est volontaire.** Les postes du § *Taille estimée* sont
+   ceux que la révision précédente a soumis à l'arbitrage, inchangés poste par poste. Les
+   deux bornes que Vincent contrôle ont été relevées **au-dessus** de ce chiffrage, en
+   connaissance de lui — c'est un arbitrage sur un périmètre mesuré, pas une borne posée à
+   l'aveugle. Re-chiffrer ici, à la hausse comme à la baisse, remplacerait la chose arbitrée
+   par une autre : la marge de deux lignes se lit comme « ce plan passe, et rien de plus ».
+2. **La borne par vol de l'unité de l'architecte reste dépassée**, et le § *Taille estimée* le
+   déclare au lieu de le taire : 500 lignes hors `docs/` pour 429. Ce qui la désarme n'est pas
+   un argument de ce plan, c'est que **le découpage en vols existe déjà** — V4 est coupé en
+   V4-a, V4-b et V4-c par Vincent, chacun mergeable seul, la suite nommée par `Tracked in:`.
+3. **Aucune coupe n'est proposée, et aucune halte n'est ajoutée.** Le corps dit « le plan ne
+   choisit aucune coupe » et « le plan n'ajoute aucune halte à celles de cette tête ». Si une
+   revue d'architecte demande de recouper ou d'étendre V4-a, le groom s'arrête et le dit : il
+   ne révise pas ce plan dans ce sens.
+
+Le reste du plan — formes de trames, seam du lanceur, ordre de validation, sept fonctions de
+test, trois mutations, ligne de doc, ordre de commit — est celui que l'arbitrage a vu.
 
 ---
 
@@ -372,13 +369,22 @@ rien faute d'équipe sur le disque.
 ## Fire-Disposition
 
 **Gate N/A : ce vol ne livre aucun détecteur.** Ses livrables sont une dérive `serde`, un
-seam d'injection, une route, six tests de comportement contre la route servie, et une ligne
-de doc. Aucun scan de source, aucune garde lexicale, aucun allowlist — donc rien dont il
+seam d'injection, une route, sept fonctions de test de comportement contre la route servie,
+et une ligne de doc. Aucun scan de source, aucune garde lexicale, aucun allowlist — donc rien dont il
 faudrait déclarer la population, le témoin et le contre-témoin. La section n'est pas inventée
 pour la forme : la règle dit de ne pas la fabriquer en l'absence de détecteur.
 
-Ce que les six tests tiennent, ils le tiennent par comportement, et les trois mutations du
-§ 3.5 sont ce qui atteste qu'ils ne sont pas verts par construction.
+Ce que les sept fonctions de test tiennent, elles le tiennent par comportement, et les trois
+mutations du § 3.5 sont ce qui atteste qu'elles ne sont pas vertes par construction.
+
+**Le seul livrable qui pourrait s'y disputer est le `match` exhaustif de C1**, dont le chemin
+de succès est bien « aucune variante non couverte ». Même qualifié de détecteur, il n'appelle
+aucune des trois options : il est armé dès son commit, et sa population de violations
+existantes est **vide par construction** — les neuf variantes mesurées au § 1 sont toutes
+couvertes le jour où il atterrit, et il n'y en a pas une dixième à dispositionner. Une
+allowlist y aurait zéro entrée, donc rien à nommer, rien à référencer et rien qui puisse
+devenir stale. Ce qu'il refuse n'existe pas encore : c'est une variante future, et il la
+refuse **à la compilation**, pas à l'exécution d'une garde.
 
 ---
 
@@ -387,9 +393,9 @@ Ce que les six tests tiennent, ils le tiennent par comportement, et les trois mu
 Trois commits, dans cet ordre. Chacun compile, chacun passe ses tests, chacun arrive avec
 les siens — jamais reportés.
 
-> **Rappel, et il est opposable.** Le § 0 déclare la halte de la borne du groom. Ce § décrit
-> l'exécution si et seulement si Vincent lève la borne ou recoupe le périmètre. Le pilote qui
-> trouve ce plan tel quel ne démarre pas : il s'arrête et le dit.
+> **Le pilote démarre sur ce plan**, et il commence par C1. Le § 0 dit pourquoi : la borne du
+> groom de ce vol est `520` pour un chiffrage de 518. La halte qui reste armée est celle du
+> pilote, à `730`, mesurée après **chaque** commit — voir § *Halte du pilote sur la borne*.
 
 ### C1 — `serde` sur `TeamEvent` et son aller-retour (critère 1)
 
@@ -420,7 +426,7 @@ Vert : `cargo test -p mika-agent teams::types`.
 - `server/team_runs.rs` : la doc de module, `CreateTeamRunRequest`
   (`{"goal": "...", "reference_run_id": "..."}`, le second `#[serde(default)]`),
   `TeamRunFrame`, `CHANNEL_CAP`, le handler, les trois aides de réponse, le lanceur scripté,
-  les six tests.
+  les sept fonctions de test.
 
 **Le routeur.** Un groupe neuf, sur le modèle de `session_routes` (l. 397) :
 
@@ -438,7 +444,7 @@ seul, et non une route ajoutée à `operator_v1_routes`** : la clôture par `rou
 qui porte le critère 2, et la mutation 3 du § 3.5 consiste exactement à remplacer
 `require_internal_token` par `require_dashboard_or_internal_token` ici.
 
-**Les six tests** (noms français, idiome `tower::ServiceExt::oneshot` sur `test_app(state)`,
+**Les sept fonctions de test** (noms français, idiome `tower::ServiceExt::oneshot` sur `test_app(state)`,
 jeton interne `"test-token-secret"`, jeton du tableau de bord `"dashboard-token-secret"` via
 `test_state_with_dashboard_token()`) :
 
@@ -527,10 +533,15 @@ Après **chaque** commit :
 git diff --numstat origin/main...HEAD -- . ':!docs/plans' | awk '{a+=$1} END{print a}'
 ```
 
-**Au-delà de `450`, arrêt** : pas de commit suivant, pas de push, pas de PR, et un dernier
-message « HALTE borne : N lignes ajoutées pour `450` » avec le compte après chaque commit.
-Au chiffrage de ce plan, **C1 + C2 vaut déjà ≈ 500** : la halte tombe au deuxième commit. Ce
-n'est pas une prédiction à vérifier en route, c'est la raison du § 0.
+**Au-delà de `730`, arrêt** : pas de commit suivant, pas de push, pas de PR, et un dernier
+message « HALTE borne : N lignes ajoutées pour `730` » avec le compte après chaque commit.
+Cette halte est posée par Vincent, et ce plan ne la change pas.
+
+Au chiffrage, C1 vaut ≈ 64 et C1 + C2 ≈ 500 : la halte ne tombe sur aucun des trois commits
+si le vol se tient au périmètre. **Elle reste à mesurer après chacun malgré tout** — un
+chiffrage est une estimation, et c'est précisément l'écart entre l'estimation et la mesure
+que cette halte existe pour attraper. Un dépassement ne se lève pas en amendant ce plan : le
+pilote s'arrête et le dit, même s'il juge que la halte ne vaut pas ici.
 
 ### Si le code s'écarte de ce plan
 
@@ -603,14 +614,45 @@ Plafond de tours : 200 (loop-substrate)
 
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
-**Les trois bornes sont dépassées, et le § 0 déclare la halte.** Dans l'unité des bornes de
-ce vol (`git diff --numstat`, plan exclu), le total est **518 pour une borne de groom de 320**.
-Dans l'unité de l'architecte, qui exclut `docs/`, il vaut **500 pour 429**. Et la halte du
-pilote à **450** tombe au deuxième commit, puisque C1 + C2 pèse ≈ 500 à lui seul.
+### Le banc de test, chiffré à part et sur une mesure
 
-Ce plan ne recoupe pas, ne propose aucune coupe et n'ajoute aucune halte à celles de la tête
-du ticket : la borne est posée par Vincent, et c'est à lui de la lever ou de recouper le
-périmètre de V4-a. Le reste du plan est écrit en entier pour que l'arbitrage se fasse sur des
-postes mesurés, et pour qu'un vol recoupé n'ait pas à être re-groomé depuis zéro.
+Le corps du ticket demande que le banc se chiffre à part, et sur une mesure plutôt qu'à vue.
+Les deux lignes de banc du tableau — le lanceur scripté et les aides de lecture du flux (56),
+les sept fonctions de test (150) — font **206 lignes**, soit 40 % du total. Les deux repères
+que le ticket donne lui-même :
+
+| repère | lignes | ce qu'il porte, comparé à ce banc |
+|---|---|---|
+| tests de `tasks_stream.rs` | ≈ 180 | un flux SSE servi, **sans** lanceur injecté et **sans** test de coupure de client |
+| test É1 de V3c-2c (mesuré) | 236 | un banc de bout en bout avec son double scripté |
+
+206 tombe entre les deux, et du bon côté de chacun : au-dessus de `tasks_stream.rs` par les
+deux pièces que celui-ci n'a pas (le lanceur scripté avec son attestation d'achèvement, et la
+lecture **incrémentale** par `BodyExt::frame()` qu'exige le test de déconnexion), en dessous
+de É1 parce que rien ici ne traverse de processus. Le § 2.6 nomme cet écart au repère de la
+tête (160 à 200) comme une conséquence de décisions, pas comme un dérapage.
+
+### Les deux unités, et laquelle mord
+
+Dans l'unité des bornes de ce vol (`git diff --numstat`, plan exclu, doc comprise) le total
+est **518 pour une borne de groom de 520** : la halte ne se déclenche pas, de deux lignes.
+Dans l'unité de l'architecte, qui exclut `docs/`, il vaut **500 pour 429** — la ligne de doc
+(18) est le seul écart entre les deux unités.
+
+**Ce dépassement de 71 lignes est déclaré, pas contourné.** Ce qui le désarme n'est pas un
+argument de ce plan :
+
+- **le découpage en vols existe déjà**, et il est celui de Vincent, pas le mien : V4 est coupé
+  en V4-a (ce vol), V4-b (les clients de `mika-cli` consomment la route) et V4-c (le verrou
+  structurel). Chacun est mergeable seul, chacun part d'un `ready` humain posé après le merge
+  du précédent, et la suite est nommée par la ligne `Tracked in:` ci-dessous. L'architecte
+  juge le périmètre du vol courant, jamais la somme des trois ;
+- **les deux bornes que Vincent contrôle ont été relevées au-dessus de ce chiffrage**, en
+  connaissance de lui et de la borne de 429, que la révision précédente de ce plan lui
+  nommait explicitement. Le relèvement de 320 à 520 est un arbitrage sur ces postes-là.
+
+Ce plan ne recoupe donc pas et ne propose aucune coupe : recouper V4-a serait refaire le
+découpage de Vincent. Si une revue d'architecte demande de recouper ou d'étendre le vol, le
+groom s'arrête et le dit, au lieu de réviser ce plan dans ce sens.
 
 Tracked in: senara-solutions/mika#1727
