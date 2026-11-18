@@ -320,6 +320,63 @@ est `pub(crate)` depuis l. 535. **Aucune ligne n'est recopiée depuis `rewind_re
 
 ---
 
+## Amendements du pilote (2026-11-18)
+
+Deux points sur lesquels le code s'écarte des décisions ci-dessus. Ils sont écrits **avant**
+le commit du code qui s'en écarte, comme la tête de mika#1727 l'exige. Aucun des deux ne
+lève une halte ni ne change un critère.
+
+**A1 — D4 : `livrer_tour_de_callback` prend la tâche en paire nommée, et non en deux
+arguments.**
+
+La forme écrite en D4 — `livrer_tour_de_callback(db, base_url, agent_name, session_id,
+cadrage, task_id, statut_dorigine, model_override)` — fait **huit** arguments, et déclenche
+`clippy::too_many_arguments` (8/7) à `chat_turn.rs:206`. La CI lance
+`cargo clippy --all-targets --all-features -- -D warnings` (`.github/workflows/ci.yml:76`),
+donc le warning rougit la PR, et le **critère 9 interdit tout `allow` neuf** : il n'y avait
+pas d'issue sans toucher à la liste.
+
+Les deux arguments retirés de la liste voyagent dans un type de ce fichier :
+
+```rust
+pub(crate) struct TacheDeCallback<'a> {
+    pub task_id: &'a str,
+    pub statut_dorigine: &'a str,
+}
+```
+
+Ce sont les deux qui ne se lisent **qu'ensemble**, et qu'au seul bras d'erreur de
+`livrer_tour_de_callback_sur_endpoint` : l'identifiant seul ne dit pas à quel statut rendre
+la ligne, le statut seul ne nomme aucune ligne. Les autres candidats au regroupement
+auraient été pires : `base_url` + `agent_name` sont la paire dont D4 fait tout son argument
+de position, et un type sur elle aurait dû traverser `send_turn_to_spirit` aussi, pour un
+seuil que cette fonction-là ne frôle pas.
+
+**Ce que l'amendement ne change pas** : l'adresse reste en **deuxième position**, le
+pourquoi reste dans la doc, `spirit_turn_endpoint` (D3) est intacte, et
+`livrer_tour_de_callback_sur_endpoint` passe de 7 à 6 arguments — donc les deux livraisons
+ont de la marge sous le seuil. Les trois sites de test de `chat_turn.rs` qui appellent la
+variante `_sur_endpoint` nomment la paire au lieu de deux positions, et leurs assertions ne
+bougent pas.
+
+**A2 — D7 : le corps du registre des skills est emprunté, pas écrit ici.**
+
+D7 prescrit pour `ROUTE_SKILLS` « un miroir vide :
+`{"agent":"mika-dev","skills":[],"skipped":[],"warnings":[]}` ». Le code emprunte
+`skills_remote::tests::CORPS` (`pub(crate)`, `skills_remote.rs` l. 327) à la place, pour la
+raison que porte la doc de cette constante : c'est l'unique corps de fil de
+`/api/v1/skills` du crate, et elle interdit explicitement qu'un appelant en écrive un
+réduit — « un second corps de fil divergerait du premier sans qu'aucun test ne le voie ».
+Écrire le corps de D7 aurait été exactement le geste que le critère 6 refuse pour
+`fake_spirit`, un fichier plus loin.
+
+Au passage : **`ROUTE_SKILLS` existe déjà** dans le `mod tests` de `chat.rs` (l. 1820), donc
+ce vol n'en ajoute pas la constante — contrairement à ce que la ligne de D7 laissait
+attendre. `ROUTE_SESSIONS`, `CORPS_OUVERT` et `ROUTE_A2A` sont inchangées, `ROUTE_A2A`
+toujours écrite en entier.
+
+---
+
 ## Fire-Disposition
 
 Ce vol livre un détecteur (le test É1), donc cette section est obligatoire (mika#2306,
