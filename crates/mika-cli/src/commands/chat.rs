@@ -211,8 +211,24 @@ async fn clore_session_de_sortie(
 /// la valeur de `--model` telle que l'opérateur l'a tapée, ou `None`. Il n'est
 /// pas lu dans `ctx` parce qu'un respawn — bascule d'agent ou `/restart` — doit
 /// pouvoir repartir sans override alors que `ctx` en porte encore un.
+///
+/// `base_url` et `lire_env` arrivent **par argument** depuis le vol V3c-2c, la
+/// forme qu'`ouvrir_session_par_spirit`, `lire_les_skills` et
+/// `clore_session_de_sortie` portent déjà : tout ce qui touche le monde entre
+/// par la signature. Cette fonction les lisait, et c'est ce qui la rendait
+/// inatteignable depuis un test — poser `MIKA_SPIRIT_URL` demande `unsafe` en
+/// edition 2024, et le poserait pour tous les tests parallèles de `cargo test`
+/// à la fois. L'affectation du bras `SetModel` restait donc hors de toute
+/// mesure (l'écart É1 du plan de V3b-1) ; elle est mesurée depuis ce vol par
+/// `tests::mika1727_v3c2c_apres_un_setmodel_le_tour_suivant_porte_loverride`.
+///
+/// L'adresse est reçue **une fois** et vaut pour toute la vie du worker : ses
+/// tours ne peuvent plus partir vers deux spirits différents parce que
+/// l'environnement a bougé en cours de session.
 async fn spawn_agent_worker(
     ctx: DbContext,
+    base_url: &str,
+    lire_env: SourceEnv<'_>,
     agent_name: &str,
     session_id: Option<&str>,
     model_override: Option<String>,
@@ -245,8 +261,8 @@ async fn spawn_agent_worker(
     // l'installation du terminal.
     let (session_id, is_singleton_session) = ouvrir_session_par_spirit(
         &ctx.async_db,
-        &crate::commands::dashboard::spirit_url(),
-        &|nom| std::env::var(nom).ok(),
+        base_url,
+        lire_env,
         agent_name,
         session_id,
         canonical_session_id.as_deref(),
@@ -263,14 +279,7 @@ async fn spawn_agent_worker(
     // La lecture a lieu ici, donc à **chaque** respawn : la bascule d'agent et
     // `/restart` repassent par cette fonction, et le miroir qu'ils posent est
     // celui de l'agent qu'ils visent.
-    let etat_skills = Arc::new(
-        lire_les_skills(
-            &crate::commands::dashboard::spirit_url(),
-            &|nom| std::env::var(nom).ok(),
-            agent_name,
-        )
-        .await,
-    );
+    let etat_skills = Arc::new(lire_les_skills(base_url, lire_env, agent_name).await);
     // mika#1727 vol V3b-2 — la TUI ne connecte plus de serveur MCP. Elle en
     // montait un jeu au démarrage et le fermait en sortie, alors qu'aucun outil
     // de ce processus n'y touchait depuis V1 : le tour tourne chez spirit, qui
@@ -311,6 +320,13 @@ async fn spawn_agent_worker(
     // mika#1727 V1 — l'agent visé par l'endpoint A2A du tour. C'est le nom tel
     // que l'opérateur l'a lancé, le même que `commands::ask` met dans son URL.
     let worker_agent_name = agent_name.to_string();
+    // mika#1727 vol V3c-2c — l'adresse du spirit, possédée par le worker. Un
+    // `String` et non le `&str` reçu : la tâche `tokio::spawn` ci-dessous est
+    // `'static`, comme pour `worker_agent_name` juste au-dessus. C'est la seule
+    // adresse que les deux bras d'envoi connaissent, donc ils ne peuvent plus
+    // viser autre chose que le spirit sur lequel la session de ce worker est
+    // ouverte.
+    let worker_base = base_url.to_string();
     let handle = tokio::spawn(async move {
         while let Some(request) = user_rx.recv().await {
             match request {
@@ -346,6 +362,7 @@ async fn spawn_agent_worker(
                     // bras ne fait tourner `agent::run_agent`.
                     let result = chat_turn::send_turn_to_spirit(
                         &text,
+                        &worker_base,
                         &worker_agent_name,
                         &worker_session,
                         false,
@@ -417,11 +434,14 @@ async fn spawn_agent_worker(
                     // sur `chat_turn::livrer_tour_de_callback`.
                     let response = chat_turn::livrer_tour_de_callback(
                         &worker_db,
+                        &worker_base,
                         &worker_agent_name,
                         &worker_session,
                         &framing,
-                        &task_id,
-                        &original_status,
+                        chat_turn::TacheDeCallback {
+                            task_id: &task_id,
+                            statut_dorigine: &original_status,
+                        },
                         worker_override.as_deref(),
                     )
                     .await;
@@ -611,7 +631,22 @@ pub async fn run(
         identity_name,
         etat_skills,
         is_singleton_session,
-    ) = spawn_agent_worker(ctx, agent_name, session, model_override.map(String::from)).await?;
+    ) = spawn_agent_worker(
+        ctx,
+        // mika#1727 vol V3c-2c — les deux lectures du monde que le spawn
+        // faisait lui-même, écrites ici et aux deux respawns plus bas. Elles ne
+        // sont ni hissées dans une variable partagée ni résolues une fois pour
+        // `run` : une bascule d'agent ou un `/restart` doit repartir sur
+        // l'adresse et l'environnement d'aujourd'hui, pas sur ceux figés au
+        // lancement de la TUI — un opérateur qui relance son spirit ailleurs
+        // n'a sinon aucun geste pour le rejoindre sans quitter la session.
+        &crate::commands::dashboard::spirit_url(),
+        &|nom| std::env::var(nom).ok(),
+        agent_name,
+        session,
+        model_override.map(String::from),
+    )
+    .await?;
 
     // Build app with shared resources
     let mut app = App::new(
@@ -834,7 +869,16 @@ pub async fn run(
                     // nouveau n'a pas forcément de quoi le servir. Le vol V3b-2
                     // ne porte pas sa survie : elle est hors périmètre, et ce
                     // bras retombe donc sur le modèle que `config.toml` déclare.
-                    match spawn_agent_worker(new_ctx, &target_name, None, None).await {
+                    match spawn_agent_worker(
+                        new_ctx,
+                        &crate::commands::dashboard::spirit_url(),
+                        &|nom| std::env::var(nom).ok(),
+                        &target_name,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
                         Ok((
                             new_worker,
                             new_tx,
@@ -947,7 +991,16 @@ pub async fn run(
                     // mika#1727 — un `/restart` repart sans override, comme un
                     // démarrage sans `--model`. Le vol V3b-2 ne porte pas sa
                     // survie : elle est hors périmètre, nommément.
-                    match spawn_agent_worker(new_ctx, agent_name, None, None).await {
+                    match spawn_agent_worker(
+                        new_ctx,
+                        &crate::commands::dashboard::spirit_url(),
+                        &|nom| std::env::var(nom).ok(),
+                        agent_name,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
                         Ok((
                             new_worker,
                             new_tx,
@@ -1335,10 +1388,14 @@ mod tests {
     // Banc **emprunté** au voisin, et non recopié : un second témoin de socket
     // ouvrirait une seconde vérité sur ce que le serveur reçoit, libre d'en
     // diverger. Il est `pub(crate)` depuis V2c-1b, pour ce motif-là.
-    use crate::commands::rewind_remote::tests::fake_spirit;
+    use crate::commands::rewind_remote::tests::{RequeteRecue, fake_spirit};
     use axum::http::StatusCode;
     use mika_agent::db::Database;
+    use mika_cli::remote_ask::{CALLBACK_TURN_KEY, MODEL_OVERRIDE_KEY};
     use mika_common::dead_endpoint::DeadEndpoint;
+    use serde_json::Value;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
 
     /// Le chemin tel que le banc doit le voir : `fake_spirit` associe par le
     /// chemin **brut**. Un `format!` mal composé dans la porte tombe sur son
@@ -1886,6 +1943,236 @@ mod tests {
         assert_eq!(message_de_cause(&vide), None);
         assert_eq!(message_des_skills_ignorees(&vide), None);
         assert_eq!(message_des_avertissements(&vide), None);
+    }
+
+    // --- mika#1727 vol V3c-2c : le `SetModel` du worker se mesure (É1) ---
+
+    /// Le chemin du tour, écrit **en entier** et non composé depuis le nom
+    /// d'agent : l'argument de `ROUTE_FIN` ci-dessus. Le composer rejouerait le
+    /// `format!` de `chat_turn::spirit_turn_endpoint`, et une faute dans
+    /// celui-ci passerait inaperçue des deux côtés.
+    const ROUTE_A2A: &str = "/a2a/mika-dev";
+
+    /// Un `Task` JSON-RPC complété, la forme d'`ok_task_with_text` de
+    /// `chat_turn.rs`. Ce que le tour *rapporte* n'est pas ce que le test
+    /// mesure — il mesure ce qui est **parti** —, mais un corps que
+    /// `render_task_parts` ne saurait pas lire rendrait chaque tour en erreur,
+    /// et un worker qui échoue quatre fois de suite passerait pour un worker
+    /// qui enchaîne quatre tours.
+    const TACHE_COMPLETEE: &str = r#"{"jsonrpc":"2.0","id":1,"result":{
+      "id":"task-du-tour","kind":"task",
+      "status":{"state":"completed","message":{"messageId":"m-du-tour",
+        "role":"agent","parts":[{"kind":"text","text":"ok"}],"kind":"message"}}}}"#;
+
+    /// Un contexte que le test possède en entier : la base en mémoire de
+    /// [`base_en_memoire`], les réglages canoniques de test, et un home
+    /// temporaire qui porte un `identity.toml` **vide**.
+    ///
+    /// Les quatre champs de `DbContext` sont `pub` — rien n'est ajouté à la
+    /// production pour ce test.
+    ///
+    /// Le `TempDir` est tenu par **l'appelant** : rendu avec le contexte, il
+    /// serait détruit à la fin de l'expression et le home s'évanouirait sous
+    /// les pieds de `load_identity`.
+    ///
+    /// L'`identity.toml` est écrit vide plutôt qu'absent : un fichier absent
+    /// route `load_identity` par son chemin fail-closed, qui journalise un
+    /// incident et pose une posture que ce test n'a pas à exercer. Vide, il
+    /// parse vers les défauts d'`Identity` — `singleton` y vaut `false` —, donc
+    /// l'ouverture de session prend la branche `POST`, celle qu'É1 mesure.
+    fn contexte_de_test(home: &TempDir) -> DbContext {
+        std::fs::write(home.path().join("identity.toml"), "").expect("un identity.toml vide");
+        DbContext {
+            settings: Settings::test_defaults(),
+            async_db: AsyncDatabase::new_with_agent(
+                Database::open_in_memory().expect("une base en mémoire"),
+                "mika-dev",
+            ),
+            home_dir: home.path().to_path_buf(),
+            global_home: home.path().to_path_buf(),
+        }
+    }
+
+    /// Le corps du tour de rang `rang` relevé sur [`ROUTE_A2A`], désérialisé.
+    ///
+    /// **Filtré sur le chemin**, et non `last()` : chaque envoi est précédé
+    /// d'un `GET /api/v1/agents/mika-dev/budget` que le factice ne sert pas
+    /// (`budget_floor::attested_envelope_secs`), donc la queue du journal n'est
+    /// jamais le tour. Le rang est explicite parce que l'ordre **est** la
+    /// propriété mesurée : un lecteur qui rendrait « le dernier » laisserait
+    /// passer un override appliqué un tour trop tard.
+    fn corps_du_tour(recues: &Arc<Mutex<Vec<RequeteRecue>>>, rang: usize) -> Value {
+        let vues = recues.lock().expect("le témoin du banc");
+        let tours: Vec<&RequeteRecue> = vues.iter().filter(|v| v.chemin == ROUTE_A2A).collect();
+        let tour = tours
+            .get(rang)
+            .unwrap_or_else(|| panic!("le tour de rang {rang} ; {} relevé(s)", tours.len()));
+        assert_eq!(tour.methode, "POST");
+        serde_json::from_str(&tour.corps).expect("le corps du tour est du JSON")
+    }
+
+    /// Un message tapé, puis la réponse attendue.
+    ///
+    /// L'attente **est** la synchronisation de ce test : le worker traite ses
+    /// requêtes en série, donc une réponse reçue atteste que tout ce qui
+    /// précède dans la file est déjà appliqué. C'est ce qui remplace un
+    /// `sleep`, qu'aucun point de ce test n'emploie.
+    async fn tour_tape(
+        user_tx: &mpsc::UnboundedSender<AgentRequest>,
+        agent_rx: &mut mpsc::UnboundedReceiver<AgentResponse>,
+    ) {
+        user_tx
+            .send(AgentRequest::Message {
+                text: "salut".to_string(),
+                images: Vec::new(),
+                thinking_budget: None,
+            })
+            .expect("le worker écoute");
+        agent_rx.recv().await.expect("le worker répond au tour");
+    }
+
+    /// **Critères 3 et 4 — l'écart É1 du plan de V3b-1, mesuré.**
+    ///
+    /// Un seul worker, monté par [`spawn_agent_worker`] **en entier** contre le
+    /// banc, et quatre tours dans l'ordre. Depuis V3b-1, l'affectation de
+    /// `worker_override` dans le bras `SetModel` était le maillon qu'aucun test
+    /// ne voyait : la table d'`override_de_set_model` et le contrat de fil se
+    /// mesuraient chacun de leur côté, et le fil entre les deux se lisait à
+    /// l'œil. Ce que le vol V3c-2c change rend ce test possible : l'adresse du
+    /// spirit et le lecteur d'environnement arrivent par la signature, donc ni
+    /// `unsafe` ni `MIKA_SPIRIT_URL` muté — un état global que les tests
+    /// parallèles de `cargo test` se disputeraient.
+    ///
+    /// **Un seul test pour les cinq points, et pas cinq tests** : c'est l'ordre
+    /// qui est la propriété. Cinq tests voudraient cinq workers, et le fait
+    /// mesuré — un même `worker_override` qui traverse les tours et ne change
+    /// qu'au `SetModel` — cesserait d'exister. C'est la forme de
+    /// `chat_turn::tests::mika1727_v3b1_loverride_de_set_model_se_lit_et_se_tait`.
+    ///
+    /// Rien n'est lu sur un état interne : chaque point lit le corps que le
+    /// banc a relevé sur la socket.
+    ///
+    /// Ce test n'assertit rien sur l'en-tête `authorization` des tours :
+    /// `remote_ask::send_message_to_agent` lit le jeton du tour dans
+    /// `std::env::var`, et non dans le `lire_env` du spawn. Ce défaut de source
+    /// est nommé hors périmètre par la tête de ce vol (défaut 21), et une
+    /// assertion ici mesurerait l'environnement du processus de test.
+    #[tokio::test]
+    async fn mika1727_v3c2c_apres_un_setmodel_le_tour_suivant_porte_loverride() {
+        let (base, recues) = fake_spirit(&[
+            (ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT),
+            // Le registre est **emprunté** à `skills_remote::tests::CORPS`, le
+            // seul corps de fil de ce crate pour cette route : un corps réduit
+            // écrit ici en ouvrirait un second, libre d'en diverger. Il est
+            // servi parce qu'un 501 au milieu du journal n'apprendrait rien,
+            // pas parce qu'une assertion le lit.
+            (
+                ROUTE_SKILLS,
+                StatusCode::OK,
+                crate::commands::skills_remote::tests::CORPS,
+            ),
+            (ROUTE_A2A, StatusCode::OK, TACHE_COMPLETEE),
+        ])
+        .await;
+        let home = TempDir::new().expect("un home temporaire");
+
+        let (mut worker, user_tx, mut agent_rx, _session, _modele, _identite, _skills, _singleton) =
+            spawn_agent_worker(
+                contexte_de_test(&home),
+                &base,
+                &jeton_pose("jeton-secret"),
+                "mika-dev",
+                None,
+                Some("groq/kimi-k2".to_string()),
+            )
+            .await
+            .expect("le banc sert l'ouverture de session, et le registre n'est jamais fatal");
+
+        // 1. L'override de départ atteint le premier tour.
+        tour_tape(&user_tx, &mut agent_rx).await;
+        let tour0 = corps_du_tour(&recues, 0);
+        assert_eq!(
+            tour0["params"]["metadata"][MODEL_OVERRIDE_KEY], "groq/kimi-k2",
+            "le premier tour porte l'override reçu au spawn ; corps : {tour0}"
+        );
+
+        // 2. Un `SetModel` vers une autre valeur, et le tour suivant la porte.
+        // C'est l'affectation du bras `SetModel` qui est mesurée ici, et nulle
+        // part ailleurs.
+        user_tx
+            .send(AgentRequest::SetModel {
+                model: "anthropic/claude-sonnet-4-6".to_string(),
+            })
+            .expect("le worker écoute");
+        tour_tape(&user_tx, &mut agent_rx).await;
+        let tour1 = corps_du_tour(&recues, 1);
+        assert_eq!(
+            tour1["params"]["metadata"][MODEL_OVERRIDE_KEY], "anthropic/claude-sonnet-4-6",
+            "après un `SetModel`, le tour suivant porte la NOUVELLE valeur ; corps : {tour1}"
+        );
+
+        // 3. La moitié négative, sans laquelle un `Some(String::new())`
+        // resterait vert : une valeur blanche efface la clé, elle ne la pose
+        // pas vide — spirit refuse fermement une clé vide, donc elle couperait
+        // tous les tours suivants.
+        user_tx
+            .send(AgentRequest::SetModel {
+                model: "   ".to_string(),
+            })
+            .expect("le worker écoute");
+        tour_tape(&user_tx, &mut agent_rx).await;
+        let tour2 = corps_du_tour(&recues, 2);
+        assert!(
+            tour2["params"]["metadata"]
+                .get(MODEL_OVERRIDE_KEY)
+                .is_none(),
+            "après un `SetModel` blanc, le tour suivant ne porte PAS la clé ; corps : {tour2}"
+        );
+
+        // 4. Un tour de callback suit l'override du worker comme les autres —
+        // ici son absence, puisque le point 3 l'a effacé. Mesurer les deux
+        // faits sur le même tour est le seul moyen de dire « c'est bien le
+        // callback, et il porte ce que le worker porte » : un quatrième
+        // `SetModel` avant celui-ci mesurerait deux choses à la fois.
+        user_tx
+            .send(AgentRequest::CallbackResult {
+                task_id: "t-du-callback".to_string(),
+                label: "une tâche de fond".to_string(),
+                result: "elle a fini".to_string(),
+                trace_id: None,
+                original_status: "completed".to_string(),
+                parent_task_id: None,
+            })
+            .expect("le worker écoute");
+        agent_rx.recv().await.expect("le worker répond au callback");
+        let tour3 = corps_du_tour(&recues, 3);
+        assert_eq!(
+            tour3["params"]["metadata"][CALLBACK_TURN_KEY],
+            serde_json::json!(true),
+            "le tour de callback se nomme comme tel ; corps : {tour3}"
+        );
+        assert!(
+            tour3["params"]["metadata"]
+                .get(MODEL_OVERRIDE_KEY)
+                .is_none(),
+            "l'override du callback est celui du worker, effacé au point 3 ; corps : {tour3}"
+        );
+
+        // 5. `Quit` termine le worker. Le drapeau est posé **avant**, comme la
+        // boucle de chat le fait sur ses sorties attendues : sans lui,
+        // `supervision::supervise` lirait l'`Ok(())` du worker comme « worker
+        // exited before session closed » et pousserait un `WorkerCrashed` —
+        // le test assertirait alors sur un faux incident.
+        worker.shutdown_initiated.store(true, Ordering::Release);
+        user_tx.send(AgentRequest::Quit).expect("le worker écoute");
+        // `worker` reste entier, donc son `_ctx` ferme la base en fin de test.
+        (&mut worker.supervisor_handle)
+            .await
+            .expect("le superviseur sort sans panique");
+        assert!(
+            agent_rx.recv().await.is_none(),
+            "les deux émetteurs sont partis : le worker et son superviseur"
+        );
     }
 
     /// mika#1727 — la session de la TUI s'ouvre et se clôt sur mika-spirit.

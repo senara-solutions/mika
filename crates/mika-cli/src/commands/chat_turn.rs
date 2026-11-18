@@ -3,11 +3,17 @@
 //! # Pourquoi un module, et pas une fonction dans `chat.rs`
 //!
 //! Le worker de la TUI vit dans `chat::spawn_agent_worker`, qui exige une base
-//! ouverte, une identité sur disque et une session ouverte sur spirit.
-//! Rien de ce bras n'est atteignable depuis un test. L'envoi est donc extrait
-//! ici, au périmètre, avec ses tests en ligne : c'est la seule forme où
-//! « le tour part bien sur le fil, avec la session du tour » est une propriété
-//! mesurée plutôt qu'une lecture à l'œil.
+//! ouverte, une identité sur disque et une session ouverte sur spirit. L'envoi
+//! est donc extrait ici, au périmètre, avec ses tests en ligne : c'est la forme
+//! où « le tour part bien sur le fil, avec la session du tour » est une
+//! propriété mesurée plutôt qu'une lecture à l'œil.
+//!
+//! Le bras du worker, lui, **est** atteignable depuis le vol V3c-2c : l'adresse
+//! de spirit arrive par argument jusqu'ici, donc un test monte le worker entier
+//! contre un factice — c'est l'écart É1 du plan de V3b-1, mesuré par
+//! `chat::tests::mika1727_v3c2c_apres_un_setmodel_le_tour_suivant_porte_loverride`.
+//! Les deux mesures ne se remplacent pas : celle d'ici tient le contrat de fil
+//! d'un envoi, celle de là-bas tient l'ordre des tours d'un même worker.
 //!
 //! # Ce que ce module ne fait pas
 //!
@@ -39,12 +45,19 @@ pub(crate) struct TurnReply {
 /// raison : c'est l'adresse que `budget_floor::attested_envelope_secs` sait
 /// reconnaître comme locale, donc celle qui obtient l'enveloppe d'envoi
 /// attestée par agent (mika#2759).
-fn spirit_turn_endpoint(agent_name: &str) -> String {
-    format!(
-        "{}/a2a/{}",
-        crate::commands::dashboard::spirit_url(),
-        agent_name
-    )
+///
+/// `base_url` arrive **par argument** depuis le vol V3c-2c, là où cette
+/// fonction lisait `dashboard::spirit_url()`. C'est ce qui rend le bras du
+/// worker mesurable : un test ne peut pas poser `MIKA_SPIRIT_URL` sans
+/// `unsafe`, ni sans course avec les tests parallèles de `cargo test`.
+///
+/// L'adresse n'est pas normalisée au passage — pas de `trim_end_matches('/')`,
+/// contrairement à `skills_remote::lire`. Ce vol déplace la lecture, il ne
+/// change pas ce qu'elle rend : une barre finale compose ici la même URL
+/// qu'avant le déplacement, et la corriger maintenant ferait passer pour un
+/// effet de bord une décision que personne n'a prise.
+fn spirit_turn_endpoint(base_url: &str, agent_name: &str) -> String {
+    format!("{base_url}/a2a/{agent_name}")
 }
 
 /// L'unique site par lequel un tour de la TUI atteint mika-spirit.
@@ -76,14 +89,21 @@ fn spirit_turn_endpoint(agent_name: &str) -> String {
 /// n'est pas un callback. **Le bras `CallbackResult` le pose `true`**, depuis
 /// le vol V3a-2b, par [`livrer_tour_de_callback`] : c'est le seul site du crate
 /// à le faire.
+///
+/// `base_url` est l'adresse que le worker a reçue à son spawn (vol V3c-2c), et
+/// non plus celle que cette porte relisait dans l'environnement : le worker en
+/// tient une seule pour toute sa vie, donc ses tours ne peuvent plus partir
+/// vers deux spirits différents au gré d'un `MIKA_SPIRIT_URL` qui bougerait en
+/// cours de session.
 pub(crate) async fn send_turn_to_spirit(
     text: &str,
+    base_url: &str,
     agent_name: &str,
     session_id: &str,
     callback_turn: bool,
     model_override: Option<&str>,
 ) -> Result<TurnReply> {
-    let endpoint = spirit_turn_endpoint(agent_name);
+    let endpoint = spirit_turn_endpoint(base_url, agent_name);
     send_turn_to_endpoint(text, &endpoint, session_id, callback_turn, model_override).await
 }
 
@@ -137,6 +157,21 @@ async fn send_turn_to_endpoint(
     })
 }
 
+/// La tâche de callback qu'un tour en échec doit rendre au poll suivant.
+///
+/// Les deux champs ne se lisent **qu'ensemble**, et qu'à un seul endroit — le
+/// bras d'erreur de [`livrer_tour_de_callback_sur_endpoint`] : l'identifiant
+/// seul ne dit pas à quel statut rendre la ligne, et le statut seul ne nomme
+/// aucune ligne. Les passer en paire nommée est ce qui garde les deux
+/// livraisons sous l'arité que ce dépôt lint (`clippy -D warnings`), là où une
+/// huitième place sur [`livrer_tour_de_callback`] n'avait d'autre issue qu'un
+/// `allow` — c'est-à-dire une exception locale à un seuil que tout le workspace
+/// respecte.
+pub(crate) struct TacheDeCallback<'a> {
+    pub task_id: &'a str,
+    pub statut_dorigine: &'a str,
+}
+
 /// Le tour de callback de la TUI, livré sur le fil (mika#1727, vol V3a-2b).
 ///
 /// C'était le **dernier** appel local de la boucle dans `mika-cli` : le bras
@@ -178,26 +213,24 @@ async fn send_turn_to_endpoint(
 /// [`send_turn_to_spirit`] pour le pourquoi (mika#2304). Un tour de callback le
 /// porte comme les autres — le modèle que l'opérateur a choisi vaut pour la
 /// reprise d'une tâche autant que pour ce qu'il tape.
+///
+/// `base_url` arrive en deuxième position, juste après la base de données,
+/// comme sur
+/// [`send_turn_to_spirit`] : c'est l'adresse du spawn (vol V3c-2c), et un tour
+/// de callback part vers le même spirit que les tours tapés — il reprend une
+/// tâche de cette session-là.
 pub(crate) async fn livrer_tour_de_callback(
     db: &AsyncDatabase,
+    base_url: &str,
     agent_name: &str,
     session_id: &str,
     cadrage: &str,
-    task_id: &str,
-    statut_dorigine: &str,
+    tache: TacheDeCallback<'_>,
     model_override: Option<&str>,
 ) -> AgentResponse {
-    let endpoint = spirit_turn_endpoint(agent_name);
-    livrer_tour_de_callback_sur_endpoint(
-        db,
-        &endpoint,
-        session_id,
-        cadrage,
-        task_id,
-        statut_dorigine,
-        model_override,
-    )
-    .await
+    let endpoint = spirit_turn_endpoint(base_url, agent_name);
+    livrer_tour_de_callback_sur_endpoint(db, &endpoint, session_id, cadrage, tache, model_override)
+        .await
 }
 
 /// Le corps de [`livrer_tour_de_callback`], l'endpoint déjà résolu.
@@ -213,8 +246,7 @@ async fn livrer_tour_de_callback_sur_endpoint(
     endpoint: &str,
     session_id: &str,
     cadrage: &str,
-    task_id: &str,
-    statut_dorigine: &str,
+    tache: TacheDeCallback<'_>,
     model_override: Option<&str>,
 ) -> AgentResponse {
     match send_turn_to_endpoint(cadrage, endpoint, session_id, true, model_override).await {
@@ -228,9 +260,12 @@ async fn livrer_tour_de_callback_sur_endpoint(
             // `mark_task_delivered` a posé `delivered` ; la remise au statut
             // d'origine est ce qui rend la tâche à
             // `get_undelivered_callback_tasks`.
-            if let Err(reset_err) = db.update_task_status(task_id, statut_dorigine).await {
+            if let Err(reset_err) = db
+                .update_task_status(tache.task_id, tache.statut_dorigine)
+                .await
+            {
                 tracing::warn!(
-                    task_id = %task_id,
+                    task_id = %tache.task_id,
                     error = %reset_err,
                     "failed to unclaim callback task after agent error"
                 );
@@ -816,8 +851,10 @@ mod tests {
             &endpoint,
             "sess-cb-v3a2b",
             "[callback: run_claude_pilot] terminé",
-            &task_id,
-            "completed",
+            TacheDeCallback {
+                task_id: &task_id,
+                statut_dorigine: "completed",
+            },
             None,
         )
         .await;
@@ -891,8 +928,10 @@ mod tests {
                 &endpoint,
                 "sess-cb-mort",
                 "[callback: run_claude_pilot] terminé",
-                &task_id,
-                statut_dorigine,
+                TacheDeCallback {
+                    task_id: &task_id,
+                    statut_dorigine,
+                },
                 None,
             )
             .await;
@@ -948,8 +987,10 @@ mod tests {
             &endpoint,
             "sess-cb-modele",
             "[callback: run_claude_pilot] terminé",
-            &task_id,
-            "completed",
+            TacheDeCallback {
+                task_id: &task_id,
+                statut_dorigine: "completed",
+            },
             Some("groq/kimi-k2"),
         )
         .await;
