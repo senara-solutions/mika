@@ -1883,6 +1883,119 @@ impl<'a> App<'a> {
 mod tests {
     use super::*;
 
+    /// Le nom que la production de `tui/` n'a plus le droit de porter.
+    const MOTIF_REGISTRE: &str = "SkillRegistry";
+
+    /// Les lignes de `production` qui nomment [`MOTIF_REGISTRE`] hors commentaire,
+    /// préfixées du fichier et de leur numéro dans le fichier d'origine.
+    ///
+    /// Extraite de la garde parce que son contre-témoin l'exerce sur deux
+    /// échantillons : une détection écrite inline ne se contre-témoigne qu'en
+    /// fabriquant un faux arbre sur le disque, et c'est alors le fabricant qu'on
+    /// teste, pas la détection.
+    fn lignes_du_registre(fichier: &str, production: &str) -> Vec<String> {
+        production
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(MOTIF_REGISTRE))
+            .map(|(i, l)| format!("{fichier}:{}: {}", i + 1, l.trim()))
+            .collect()
+    }
+
+    /// La garde structurelle d'A2 : la production de `tui/` ne nomme plus le
+    /// registre des skills (mika#1727, vol V3c-2b-A2).
+    ///
+    /// **Par dossier, et non par fichier** — l'inverse de `v2c1b` et de `v3b1`, et
+    /// c'est délibéré : un fichier neuf de `tui/` est couvert sans qu'on y pense.
+    /// Le dossier, et non le crate, parce que `commands/skills.rs` construit
+    /// légitimement un `SkillRegistry` sur le disque en neuf endroits : une garde
+    /// par crate serait née avec neuf entrées d'allowlist, et une allowlist peuplée
+    /// ne refuse plus rien (mika#2309).
+    #[test]
+    fn mika1727_v3c2b_a2_la_tui_ne_nomme_plus_le_registre_des_skills() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le remède
+        // est la porte que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+
+        // Le témoin vise le champ que la route remplit, dans la moitié
+        // **production** du fichier d'où le registre est parti. Sans lui, une garde
+        // qui balaie un chemin faux — ou dont le masquage a dérapé — serait verte
+        // **par cécité** (mika#2398).
+        const TEMOIN_FICHIER: &str = "tui/app.rs";
+        const TEMOIN: &str = "pub skills: Arc<";
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let racine = scanner.src_root().join("tui");
+        let fichiers = mika_common::source_guard::rust_sources_under(&racine);
+        assert!(
+            !fichiers.is_empty(),
+            "la garde n'a lu aucun fichier sous {}",
+            racine.display()
+        );
+
+        let mut temoin_vu = false;
+        let mut violations: Vec<String> = Vec::new();
+        for chemin in &fichiers {
+            let relatif = chemin
+                .strip_prefix(scanner.src_root())
+                .unwrap_or(chemin)
+                .display()
+                .to_string();
+            let production = scanner.production_of(chemin);
+            if relatif == TEMOIN_FICHIER {
+                temoin_vu = true;
+                assert!(
+                    production.contains(TEMOIN),
+                    "la garde n'a pas lu la moitié production de {TEMOIN_FICHIER}"
+                );
+                // Contre-témoin de masquage : la table de ce test vit dans la moitié
+                // test de ce même fichier et contient `SkillRegistry` en clair. Un
+                // masquage perdu ferait donc la garde se dénoncer elle-même, et le
+                // réflexe serait de « réparer » par une entrée d'allowlist —
+                // précisément le piège.
+                assert!(
+                    !production.contains("fn test_empty_assistant_row_skipped"),
+                    "la garde n'a pas masqué la moitié test de {TEMOIN_FICHIER}"
+                );
+            }
+            violations.extend(lignes_du_registre(&relatif, &production));
+        }
+        assert!(temoin_vu, "le balayage n'a pas vu {TEMOIN_FICHIER}");
+
+        assert!(
+            violations.is_empty(),
+            "mika#1727 vol V3c-2b-A2 — `SkillRegistry` revient dans la production de \
+             `tui/`. La TUI lit les skills de son agent sur la route de mika-spirit : \
+             la porte est `skills_remote::lire`, et ce qu'elle en rend se lit sur \
+             `app.skills`. Le remède est de passer par là, jamais une entrée \
+             d'allowlist :\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// Contre-témoin : la détection voit le code et ignore le commentaire
+    /// (mika#1727, vol V3c-2b-A2).
+    ///
+    /// La **même** ligne dans les deux cas : un échantillon différent de chaque
+    /// côté prouverait seulement que deux lignes différentes se lisent
+    /// différemment.
+    #[test]
+    fn mika1727_v3c2b_a2_la_detection_distingue_le_code_du_commentaire() {
+        const LIGNE: &str = "    let registre: Arc<SkillRegistry> = assemble(&dir);";
+
+        let vues = lignes_du_registre("tui/echantillon.rs", LIGNE);
+        assert_eq!(vues.len(), 1, "{vues:?}");
+        assert!(vues[0].starts_with("tui/echantillon.rs:1: "), "{vues:?}");
+
+        let en_commentaire = format!("    // {}", LIGNE.trim());
+        assert!(
+            lignes_du_registre("tui/echantillon.rs", &en_commentaire).is_empty(),
+            "un commentaire n'est pas une violation"
+        );
+    }
+
     // === session_message_to_chat_message tests (mika#1667) ===
 
     fn session_message(role: &str, content: &str) -> mika_agent::db::SessionMessage {

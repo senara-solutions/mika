@@ -2015,7 +2015,7 @@ mod tests {
             ),
             (
                 "skills_dirty",
-                "le registre s'assemble une fois, au démarrage",
+                "plus rien ne marque un registre à réassembler : la TUI n'en assemble plus",
             ),
             (
                 "assemble_agent_registry",
