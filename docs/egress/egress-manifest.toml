@@ -393,6 +393,17 @@ call_site          = "crates/mika-cli/src/commands/session_remote.rs"
 owner              = "@samidarko"
 
 [[sink]]
+id                 = "cli-spirit-team-runs"
+destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
+destination_source = "config"
+class              = "internal"
+data               = "un POST vers /api/v1/teams/{name}/runs : le nom d'équipe dans le chemin, le but et le run de référence facultatif dans le corps JSON, le jeton interne en en-tête Authorization ; la réponse est un flux SSE"
+logged             = false
+client_site        = "crates/mika-cli/src/commands/team_runs_remote.rs"
+call_site          = "crates/mika-cli/src/commands/team_runs_remote.rs"
+owner              = "@samidarko"
+
+[[sink]]
 id                 = "cli-spirit-iterate"
 destination        = "MIKA_SPIRIT_URL (défaut http://localhost:8080)"
 destination_source = "config"

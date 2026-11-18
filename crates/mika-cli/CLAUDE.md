@@ -172,6 +172,50 @@ both `mika ask --team` and `mika chat --team` classify through — and it names 
 `RunStatus` variant, reading `RunStatus::disposition()` instead, so a seventh
 variant fails to compile in `mika-agent` and nowhere here.
 
+### `mika ask --team` est un client de mika-spirit (mika#1727, vol V4-b1)
+
+`run_team_ask` **ne fait plus tourner l'équipe dans son propre processus**. Il
+lance le run par `commands/team_runs_remote.rs::lancer_run_equipe` — un `POST`
+de `/api/v1/teams/{name}/runs`, puis la lecture du flux SSE jusqu'à sa trame
+finale — et c'est mika-spirit qui décompose, délègue, révise et livre. La TUI,
+elle, part au vol V4-b2 ; `commands/chat.rs` appelle donc encore
+`teams::run_team(` et c'est le régime nominal, ce qui est aussi pourquoi la garde
+textuelle du vol balaie `ask.rs` **seul**.
+
+**`MIKA_INTERNAL_TOKEN` est exigé, et le refus tombe avant tout appel.** Le jeton
+est lu par `session_remote::jeton_interne` — l'unique lecture du crate — et
+`MIKA_DASHBOARD_TOKEN` ne suffit pas : la route est sous `require_internal_token`.
+La lecture vient **après** les vérifications du but et de `--run-id`, qui n'ont
+pas bougé : les poser plus haut ferait répondre « jeton absent » à un but vide.
+
+**Aucun repli local.** Un refus de statut, une erreur de transport, un `run_error`
+ou un flux fermé sans trame finale sortent en échec, stdout vide — par
+conséquence de l'ordre des gestes (l'erreur remonte avant le premier `println!`),
+non par une politique à rappeler sur chaque format. Il n'y a **pas** de chemin qui
+relancerait l'équipe ici si spirit est à terre : c'est le mode de panne que ce vol
+supprime, pas un qu'il déplace.
+
+**Le tier et le déploiement sont désormais ceux de l'agent par défaut de
+spirit.** `AgentTier::from_env()` et `Deployment::from_env()` lisaient
+l'environnement de **ce** processus ; la route les résout par `resolve_agent("")`
+côté serveur. Un shell qui exporte `MIKA_AGENT_TIER` ne change donc plus rien au
+run — c'est le daemon qu'il faut regarder (`mika agents budget`), et un tier posé
+dans le shell qui ne se retrouve pas dans le run est le régime nominal après ce
+vol, non une panne (classe mika#2340).
+
+**Un flux fermé sans trame finale ne désigne pas le run à relire.** Le run
+*survit* au client, mais le refus ne peut pas nommer ce qu'aucune trame n'a nommé :
+tant que `run_completed` ou `run_error` n'est pas passée, l'identifiant du run
+n'est pas arrivé, donc il n'y a pas de `mika teams log` à faire sur un
+identifiant précis. Le message le dit dans ces termes. Le lire comme « le run est
+perdu » est faux, et le lire comme « le run est disponible quelque part sous son
+identifiant » l'est aussi.
+
+**Une perte d'événement n'est pas détectable côté client.** La route pousse ses
+trames dans un `mpsc` de 256 en `try_send` et un client lent en perd **sans
+marqueur** (`crates/mika-agent/docs/architecture.md` § 14.2). Un trou dans la
+suite des lignes `  > …` ne se lit donc pas comme un défaut du client.
+
 **A lost reply is an error, not an empty answer (mika#2270).** On both paths — the
 local mika-spirit thin-client path and `--remote` — a `Task` the renderer cannot
 read makes `mika ask` exit **non-zero** with a message naming what was inspected

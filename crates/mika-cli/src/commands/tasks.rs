@@ -1036,7 +1036,12 @@ async fn get_task_detail_from_spirit_into<W: std::io::Write>(
 /// cut across two packets is a property of the **buffer**, and a test making the
 /// server emit in two `sleep`-separated writes would go green without measuring
 /// anything on the day a layer coalesced them.
-fn drain_events(buffer: &mut Vec<u8>, on_payload: &mut impl FnMut(&str)) {
+///
+/// `pub(crate)` depuis le vol V4-b1 de mika#1727 : il y a désormais **deux**
+/// flux SSE dans le crate — celui des tâches ici, celui des runs d'équipe dans
+/// `team_runs_remote` — et un seul découpeur, pour que la propriété de
+/// re-raboutage attestée juste au-dessus vaille pour les deux.
+pub(crate) fn drain_events(buffer: &mut Vec<u8>, on_payload: &mut impl FnMut(&str)) {
     // Split on SSE event separator (`\r\n\r\n` / `\n\n` / `\r\r`, spec § 9.2).
     // Keep the trailing partial event in the buffer for the next read.
     while let Some((sep_idx, sep_len)) = find_event_separator(buffer) {

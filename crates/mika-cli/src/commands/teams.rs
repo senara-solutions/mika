@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 use std::io::{self, IsTerminal, Write};
 
-use mika_agent::async_db::AsyncDatabase;
 use mika_agent::db::{Database, format_ts};
 use mika_common::home;
 use mika_common::team;
@@ -41,13 +40,11 @@ pub(crate) fn open_container_db(global_home: &std::path::Path) -> Result<Databas
     Database::open(&db_path).map_err(|e| anyhow::anyhow!("Failed to open database: {e}"))
 }
 
-/// Open the shared container database (async, for team run command).
-pub(crate) fn open_container_db_async(global_home: &std::path::Path) -> Result<AsyncDatabase> {
-    let db_path = home::container_db_path(global_home);
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let db = Database::open(&db_path)?;
-    Ok(AsyncDatabase::new(db))
-}
+// mika#1727 vol V4-b1 — `open_container_db_async` vivait ici, et `ask::run_team_ask`
+// en était le seul appelant : la base ouverte en asynchrone servait au run d'équipe
+// que ce processus faisait tourner. Le run part chez mika-spirit, qui ouvre la
+// sienne, donc la fonction part avec son dernier appelant. `open_container_db` — la
+// variante synchrone, lue par les commandes de lecture de ce fichier — reste.
 
 fn list(global_home: &std::path::Path, format: &crate::cli::OutputFormat) -> Result<()> {
     let teams = team::list_teams(global_home);
