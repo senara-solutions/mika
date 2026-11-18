@@ -748,10 +748,50 @@ struct TeamRunMeta {
     failure_reason: Option<String>,
 }
 
+/// L'unique constructeur de l'enveloppe que sérialisent les formats `json` et
+/// `yaml`.
+///
+/// Les deux bras en bâtissaient chacun une, à l'identique : deux copies libres
+/// de diverger sur un champ, alors que cette forme est précisément ce que le
+/// test 7 mesure octet pour octet. Un seul constructeur, et le compilateur tient
+/// qu'il n'y en a pas d'autre.
+fn enveloppe_equipe(
+    run: &mika_agent::teams::types::TeamRun,
+    failure_reason: Option<String>,
+) -> AskTeamJsonResponse {
+    AskTeamJsonResponse {
+        role: "assistant",
+        // Unchanged on purpose (mika#1940, scope-out (d)): this format already
+        // carried the correct discriminant in `team_run.status`, so it was never
+        // the broken surface, and emptying it would take information away from
+        // consumers of a wire format that worked.
+        content: run.deliverable.clone(),
+        team_run: TeamRunMeta {
+            run_id: run.run_id.clone(),
+            status: format!("{}", run.status),
+            iterations: run.iteration,
+            failure_reason,
+        },
+    }
+}
+
 /// Run a team workflow in non-interactive mode (mika ask --team).
 ///
-/// Runs the full team cycle (decompose → execute → review → deliver),
-/// prints progress to stderr and the deliverable to stdout.
+/// Depuis le vol V4-b1 de mika#1727, cette fonction ne fait plus tourner
+/// l'équipe : elle lance le run **sur mika-spirit** par
+/// [`team_runs_remote::lancer_run_equipe`] et en lit le flux. La progression va
+/// toujours sur stderr et le livrable sur stdout.
+///
+/// **Aucun repli local** (défaut 32) : un refus, une erreur de transport, un
+/// `run_error` ou un flux fermé sans trame finale sortent en échec. stdout reste
+/// vide par **conséquence de l'ordre des gestes** — l'erreur remonte avant le
+/// premier `println!` — et non par une politique qu'on pourrait oublier
+/// d'appliquer sur un quatrième format (même argument que sur
+/// `tasks::get_task_detail_from_spirit_into`).
+///
+/// Ce que le run perd en partant chez spirit : le tier et le déploiement sont
+/// désormais ceux de **l'agent par défaut de spirit** (défaut 34), résolus par
+/// la route, et non plus ceux de l'environnement de ce processus.
 pub async fn run_team_ask(
     team_name: &str,
     message: &str,
@@ -760,8 +800,8 @@ pub async fn run_team_ask(
     global_home: &std::path::Path,
 ) -> Result<()> {
     use crate::commands::team_outcome::{self, TeamOutcome};
+    use crate::commands::team_runs_remote;
     use mika_agent::teams::types::TeamEvent;
-    use mika_common::config::Settings;
 
     // mika#1982: same as the local path above — the goal arrives resolved, and
     // the second copy of the sentinel read that used to live here is gone.
@@ -811,8 +851,22 @@ pub async fn run_team_ask(
         }
     }
 
-    let settings = Settings::load(global_home)?;
+    // L'URL et le jeton se résolvent ici, là où `Settings::load` se lisait :
+    // **avant tout appel**, et **après** les vérifications ci-dessus, que ce vol
+    // garde telles quelles (défaut 35). Les poser au-dessus d'elles ferait
+    // répondre « jeton absent » à un but vide ou à un `--run-id` mal formé,
+    // c'est-à-dire déplacerait un refus que personne n'a demandé de déplacer.
+    //
+    // Le `.env` de la home est déjà chargé par l'appelant (`main.rs`, branche
+    // `--team`) ; `spirit_url()` le recharge pour son compte quand
+    // `MIKA_SPIRIT_URL` est absente.
+    let base_url = crate::commands::dashboard::spirit_url();
+    let token = crate::commands::session_remote::jeton_interne(&|cle| std::env::var(cle).ok())
+        .map_err(anyhow::Error::msg)?;
 
+    // Le bloc est inchangé (mika#1940 et avant) : seul son type d'accueil change
+    // — il est désormais le rappel que le client du flux appelle pour chaque
+    // `TeamEvent` décodé, dans l'ordre reçu.
     let callback = |event: TeamEvent| match event {
         TeamEvent::Progress(msg) => {
             eprintln!("  > {msg}");
@@ -846,26 +900,13 @@ pub async fn run_team_ask(
         TeamEvent::RunFailed(_) => {}   // handled below
     };
 
-    let team_db = crate::commands::teams::open_container_db_async(global_home)?;
-
-    let github_app = mika_common::github_app::GitHubApp::from_settings(&settings);
-    let run = mika_agent::teams::run_team(
-        team_name,
-        &goal,
-        global_home,
-        &settings,
-        Some(Box::new(callback)),
-        team_db.clone(),
-        run_id,
-        github_app,
-        None, // CLI: no AppState for session-scoped dedup (#821)
-        // mika#1962 — CLI process start is the tier init boundary.
-        mika_common::home::AgentTier::from_env(),
-        // mika#2290 — same boundary for the posed hosting fact.
-        mika_common::home::Deployment::from_env(),
-    )
-    .await?;
-    team_db.shutdown();
+    // Le refus porte son propre `Display` (statut, URL, corps, ou la cause du
+    // transport) : le remonter par `anyhow` le met sur stderr et sort en non-zéro
+    // sans qu'une ligne de stdout ait été écrite.
+    let run =
+        team_runs_remote::lancer_run_equipe(&base_url, &token, team_name, &goal, run_id, callback)
+            .await
+            .map_err(|issue| anyhow::anyhow!("{issue}"))?;
 
     // mika#1940 — one classifier for both CLI surfaces, reading the enum's own
     // exhaustive disposition rather than a pattern written here.
@@ -901,33 +942,11 @@ pub async fn run_team_ask(
             TeamOutcome::Pending { note } => eprintln!("Note: {note}"),
         },
         OutputFormat::Json => {
-            let response = AskTeamJsonResponse {
-                role: "assistant",
-                // Unchanged on purpose (mika#1940, scope-out (d)): this format
-                // already carried the correct discriminant in `team_run.status`,
-                // so it was never the broken surface, and emptying it would take
-                // information away from consumers of a wire format that worked.
-                content: run.deliverable.clone(),
-                team_run: TeamRunMeta {
-                    run_id: run.run_id.clone(),
-                    status: format!("{}", run.status),
-                    iterations: run.iteration,
-                    failure_reason: failure_reason.clone(),
-                },
-            };
+            let response = enveloppe_equipe(&run, failure_reason);
             println!("{}", serde_json::to_string(&response)?);
         }
         OutputFormat::Yaml => {
-            let response = AskTeamJsonResponse {
-                role: "assistant",
-                content: run.deliverable.clone(),
-                team_run: TeamRunMeta {
-                    run_id: run.run_id.clone(),
-                    status: format!("{}", run.status),
-                    iterations: run.iteration,
-                    failure_reason,
-                },
-            };
+            let response = enveloppe_equipe(&run, failure_reason);
             print!("{}", yaml_serde::to_string(&response)?);
         }
     }
@@ -945,6 +964,91 @@ pub async fn run_team_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Test 7 du vol V4-b1** — l'enveloppe d'un `run_completed` est celle
+    /// d'avant, octet pour octet, et elle part désormais du `TeamRun` **du fil**.
+    ///
+    /// Le run est désérialisé depuis la charge que porte une trame
+    /// `run_completed`, puis passé par [`enveloppe_equipe`], l'unique
+    /// constructeur : la mesure couvre donc la chaîne entière — fil, décodage,
+    /// enveloppe — et non la seule structure, qu'un ré-encodage de soi-même
+    /// n'aurait rien prouvé (même raison que sur la garde mika#1940 juste
+    /// en dessous, dont le littéral est repris ici tel quel).
+    ///
+    /// Le détail qui mérite d'être épinglé : le fil porte `"Completed"` —
+    /// `RunStatus` dérive `Serialize` **sans** `rename_all` — pendant que
+    /// l'enveloppe rend `"completed"`, parce qu'elle lit le `Display` de ce même
+    /// enum. Les deux graphies sont voulues, et c'est ici qu'on le voit.
+    #[test]
+    fn mika1727_v4b1_lenveloppe_dun_run_completed_est_celle_davant() {
+        let run: mika_agent::teams::types::TeamRun = serde_json::from_str(
+            r#"{"run_id":"run-1","team_name":"squad","goal":"le but","status":"Completed","iteration":2,"deliverable":"the answer"}"#,
+        )
+        .expect("la charge d'une trame run_completed se décode en TeamRun");
+
+        assert_eq!(
+            serde_json::to_string(&enveloppe_equipe(&run, None)).unwrap(),
+            r#"{"role":"assistant","content":"the answer","team_run":{"run_id":"run-1","status":"completed","iterations":2}}"#
+        );
+    }
+
+    /// **Test 8 du vol V4-b1** — `ask.rs` ne fait plus tourner l'équipe ici.
+    ///
+    /// Le motif est composé par `concat!` pour que l'aiguille n'apparaisse pas
+    /// littéralement dans le fichier qu'elle balaie : écrite d'un trait, elle se
+    /// trouverait elle-même et la garde serait rouge par construction.
+    ///
+    /// **Le balayage porte sur ce seul fichier**, et c'est délibéré :
+    /// `commands/chat.rs` appelle légitimement encore `teams::run_team(` — c'est
+    /// le travail du vol V4-b2 — donc un scan de tout le crate serait un faux
+    /// rouge. La garde grandira avec le périmètre, fichier par fichier, au vol
+    /// qui câble chacun.
+    ///
+    /// **Aucune allowlist.** Il n'y a qu'un fichier à balayer et un seul remède
+    /// possible : router l'appel par `team_runs_remote::lancer_run_equipe`. Une
+    /// liste d'exceptions ici n'aurait servi qu'à éteindre la garde.
+    #[test]
+    fn mika1727_v4b1_ask_ne_fait_plus_tourner_lequipe_en_local() {
+        const NEEDLE: &str = concat!("teams::", "run_team", "(");
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let chemin = scanner.src_root().join("commands").join("ask.rs");
+        let production = scanner.production_of(&chemin);
+
+        // Témoin : le balayage a bien lu la production de ce fichier. Un chemin
+        // faux, ou un masquage qui aurait tout effacé, serait vert par cécité.
+        assert!(
+            production.contains("pub async fn run_team_ask"),
+            "le balayage n'a pas lu la production de {} — chemin ou masquage cassé",
+            chemin.display()
+        );
+        // Contre-témoin : la moitié test est masquée. Sans lui, le `concat!`
+        // ci-dessus serait une précaution qu'on croirait nécessaire alors que
+        // c'est le masquage qui fait le travail — et l'inverse : si le masquage
+        // lâchait, on « réparerait » la garde par une exception.
+        assert!(
+            !production.contains("fn mika1727_v4b1_ask_ne_fait_plus_tourner_lequipe_en_local"),
+            "la moitié test de {} n'est pas masquée",
+            chemin.display()
+        );
+
+        let violations: Vec<String> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim_start().starts_with("//") && line.contains(NEEDLE))
+            .map(|(idx, line)| format!("commands/ask.rs:{} — {}", idx + 1, line.trim()))
+            .collect();
+
+        assert!(
+            violations.is_empty(),
+            "mika#1727 V4-b1 — `mika ask --team` fait de nouveau tourner l'équipe \
+             dans son propre processus. Le remède est de router l'appel par \
+             `team_runs_remote::lancer_run_equipe`, qui lance le run sur \
+             mika-spirit :\n{}",
+            violations.join("\n")
+        );
+    }
 
     /// The team envelope is byte-identical on a successful run (mika#1940 R7).
     ///
