@@ -249,8 +249,13 @@ pub(crate) async fn lancer_run_equipe(
 // sortirait — le lint d'egress ne le verrait plus. `skills_remote.rs` porte la
 // même note, répétée ici plutôt que pointée : un lecteur qui déplace un item ne
 // lit pas le fichier d'à côté.
+// `pub(crate)` sur le module depuis le vol V4-b2, pour la raison écrite sur
+// `rewind_remote::tests` : les tests du worker d'équipe (`commands/chat.rs`)
+// composent leurs corps SSE par le [`tests::flux`] d'ici plutôt qu'une seconde
+// copie libre d'en diverger. Le module reste sous `#[cfg(test)]`, donc rien de
+// cela n'existe en production.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Banc **emprunté** au voisin, et non recopié : un second témoin de socket
     // ouvrirait une seconde vérité sur ce que le serveur reçoit, libre d'en
@@ -266,7 +271,11 @@ mod tests {
     /// Les trames jointes par le séparateur SSE, et un séparateur final pour
     /// que la dernière soit complète : `drain_events` laisse en place une trame
     /// partielle, donc une dernière sans séparateur ne serait jamais rendue.
-    fn flux(trames: &[&str]) -> String {
+    ///
+    /// `pub(crate)` depuis le vol V4-b2 : les tests du worker d'équipe
+    /// (`chat.rs`) servent les mêmes corps SSE par le même banc, et une seconde
+    /// composeuse de trames ouvrirait une seconde vérité sur le format du fil.
+    pub(crate) fn flux(trames: &[&str]) -> String {
         trames
             .iter()
             .map(|t| format!("data: {t}\n\n"))
@@ -478,6 +487,144 @@ mod tests {
             recues.lock().expect("le témoin du banc").len(),
             0,
             "aucune requête ne doit partir pour un nom invalide"
+        );
+    }
+
+    /// L'allowlist du vol V4-b2 : vide, et le reste.
+    const V4B2_ALLOWED: &[&str] = &[];
+
+    /// **Test 7 du vol V4-b2** — aucune ligne de la moitié production de
+    /// `mika-cli` ne fait tourner une équipe dans ce processus.
+    ///
+    /// La garde vit **à côté de la porte de remplacement**, suivant le précédent
+    /// `mika1727_v2a_*` (`chat_turn.rs`) : chez le voisin qui offre le chemin
+    /// légitime, pour que le lecteur qui la fait rougir trouve le remède sous
+    /// les yeux.
+    ///
+    /// Elle balaie **tout le crate**, et elle subsume celle de V4-b1 — qui
+    /// balayait `ask.rs` seul parce que `chat.rs` appelait encore légitimement
+    /// `teams::run_team(`. Ce vol retire cette dernière violation, donc la garde
+    /// atterrit armée, verte et sans allowlist à peupler.
+    ///
+    /// Le motif est composé par `concat!` pour que l'aiguille n'apparaisse pas
+    /// littéralement dans le fichier qu'elle balaie. La garde vit dans la moitié
+    /// test, donc `production_of` la masque déjà ; le `concat!` la rend
+    /// insensible à une régression du masquage lui-même, et c'est la forme que
+    /// V4-b1 portait.
+    ///
+    /// Le remède quand ce test rougit est de router l'appelant par
+    /// [`lancer_run_equipe`], **jamais** d'élargir [`V4B2_ALLOWED`] (mika#2201).
+    #[test]
+    fn mika1727_v4b2_aucune_ligne_de_production_de_mika_cli_nappelle_teams_run_team() {
+        const NEEDLE: &str = concat!("teams::", "run_team", "(");
+
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let src_root = scanner.src_root().to_path_buf();
+        let mut violations: Vec<String> = Vec::new();
+
+        scanner.for_each(|path, production| {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if V4B2_ALLOWED.contains(&rel.as_str()) {
+                return;
+            }
+            for (idx, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains(NEEDLE) {
+                    violations.push(format!("{rel}:{} — {}", idx + 1, line.trim()));
+                }
+            }
+        });
+
+        assert!(
+            violations.is_empty(),
+            "mika#1727 V4-b2 — `mika-cli` fait de nouveau tourner une équipe \
+             dans son propre processus. Le remède est de router l'appel par \
+             `team_runs_remote::lancer_run_equipe`, qui lance le run sur \
+             mika-spirit, et jamais d'élargir V4B2_ALLOWED :\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// Anti-vacuité (mika#2103, mika#2205, mika#2398) du scan ci-dessus.
+    ///
+    /// Un balayage qui ne voit rien refuse tout aussi silencieusement qu'un
+    /// balayage conforme : il passe la revue, passe la CI par construction, et
+    /// laisse la régression atterrir. Les deux fichiers nommés ici sont les deux
+    /// moitiés de la propriété — celui d'où l'appel part dans ce vol, et celui
+    /// d'où il est parti en V4-b1.
+    ///
+    /// Les chemins portent `commands/` exprès : `Path::ends_with` compare par
+    /// composants, donc le suffixe nu `chat.rs` serait satisfait par n'importe
+    /// quel `chat.rs` de l'arbre.
+    #[test]
+    fn mika1727_v4b2_le_scan_du_lancement_dequipe_nest_pas_vide() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let files = scanner.files();
+
+        assert!(
+            files.len() > 10,
+            "le balayage de `mika-cli` doit voir tout son arbre ; vu {} fichier(s)",
+            files.len()
+        );
+        for expected in ["commands/chat.rs", "commands/ask.rs"] {
+            assert!(
+                files.iter().any(|p| p.ends_with(expected)),
+                "le balayage doit voir {expected} ; sinon la garde du vol V4-b2 \
+                 n'inspecte pas ce qu'elle prétend"
+            );
+        }
+    }
+
+    /// Le contre-témoin de masquage, et l'allowlist assertie vide.
+    ///
+    /// Le premier : `production_of` du fichier qui porte la garde ne contient
+    /// pas le nom du test de la garde, donc la moitié `#[cfg(test)]` est bien
+    /// masquée — et le vert du scan n'est pas le vert d'un balayage qui lit
+    /// tout. Sans lui, le `concat!` ci-dessus serait une précaution qu'on
+    /// croirait nécessaire alors que c'est le masquage qui fait le travail.
+    ///
+    /// Le second : une allowlist peuplée ne refuse plus rien (mika#2309). Une
+    /// entrée dans [`V4B2_ALLOWED`] n'est pas un réglage, c'est le vol V4-b2
+    /// annulé.
+    #[test]
+    fn mika1727_v4b2_le_masquage_tient_et_lallowlist_est_livree_vide() {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let chemin = scanner
+            .src_root()
+            .join("commands")
+            .join("team_runs_remote.rs");
+        let production = scanner.production_of(&chemin);
+
+        // Témoin positif : le balayage a bien lu la production de ce fichier. Un
+        // chemin faux, ou un masquage qui aurait tout effacé, serait vert par
+        // cécité.
+        assert!(
+            production.contains("pub(crate) async fn lancer_run_equipe"),
+            "le balayage n'a pas lu la production de {} — chemin ou masquage cassé",
+            chemin.display()
+        );
+        assert!(
+            !production.contains(
+                "fn mika1727_v4b2_aucune_ligne_de_production_de_mika_cli_nappelle_teams_run_team"
+            ),
+            "la moitié test de {} n'est pas masquée",
+            chemin.display()
+        );
+
+        assert!(
+            V4B2_ALLOWED.is_empty(),
+            "mika#1727 V4-b2 — V4B2_ALLOWED est livrée vide et doit le rester : \
+             un site qui fait tourner une équipe dans `mika-cli` se route par la \
+             porte, il ne s'exempte pas. Trouvé : {V4B2_ALLOWED:?}"
         );
     }
 }
