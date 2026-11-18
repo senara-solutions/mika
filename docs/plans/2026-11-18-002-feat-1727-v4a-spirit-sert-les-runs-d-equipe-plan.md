@@ -478,7 +478,9 @@ dans `launch`, qui prend deux paramètres.
 
 ### C3 — la doc (critère 8)
 
-`crates/mika-agent/docs/architecture.md`, § 14.2, et rien d'autre.
+`docs/architecture.md` **et** sa copie `crates/mika-agent/docs/architecture.md`, § 14.2 des
+deux, au même contenu, et rien d'autre. Voir l'amendement en fin de poste : le ticket n'a
+listé que la copie, qui est générée.
 
 - une **quatrième ligne** au tableau :
   `TeamRunFrame` (mika#1727 V4-a) | `#[serde(tag = "event")]` ; `TeamEvent` imbriqué sous
@@ -493,11 +495,28 @@ dans `launch`, qui prend deux paramètres.
   tableau du § 2.1 note aussi que `data.phase` reste en PascalCase, parce que `TeamPhase` sert
   le checkpoint.
 
-**Ce fichier est la copie locale au crate.** `scripts/sync-agent-docs.sh` synchronise depuis
-`docs/`, et le job `docs-sync` de CI échoue sur une PR qui modifie `docs/` sans l'avoir
-lancé — ce vol ne touche pas `docs/`, le sens est donc l'inverse et le job n'a rien à dire.
-Le pilote qui le trouve rouge s'arrête et le dit, il ne lance pas le script (il écrirait dans
-`docs/`, hors des fichiers autorisés).
+**Amendement du pilote, 2026-11-18 — un fichier de plus : `docs/architecture.md`.**
+
+Le paragraphe que ce bloc remplace se trompait sur deux faits que le dépôt mesure, et sa
+prescription (« ne toucher que la copie, s'arrêter si `docs-sync` est rouge ») rendait le
+critère 8 et le critère 11 contradictoires.
+
+- **Le sens de la copie.** `scripts/sync-agent-docs.sh` a `SRC="$ROOT/docs"` et
+  `DST="$ROOT/crates/mika-agent/docs"` : il copie `docs/` **vers** la copie locale au crate,
+  et n'écrit jamais dans `docs/`. La raison avancée pour ne pas le lancer était donc fausse.
+- **L'issue du job.** `.github/workflows/ci.yml` l. 358-367 lance le script **puis** exige
+  `git diff --exit-code crates/mika-agent/docs/`. Une modification de la seule copie est donc
+  écrasée par le `cp` et rend le diff non vide : `docs-sync` est **rouge par construction**,
+  pas par accident. Mesuré ici : `git diff --stat origin/main:docs/architecture.md
+  origin/main:crates/mika-agent/docs/architecture.md` est vide — les deux fichiers sont
+  identiques sur main, donc le job est vert sur main et c'est bien ce vol qui le romprait.
+
+Le même contenu va donc dans les **deux** fichiers, `docs/` étant la source unique de vérité
+que le `CLAUDE.md` racine désigne et la copie crate-local un repli pour crates.io. C'est un
+écart au critère 9, nommé ici comme la tête du ticket le demande : un fichier de plus, pour
+que le critère 8 soit tenable sans rompre le critère 11. Le script n'est toujours pas lancé —
+les deux éditions sont faites à la main, à l'identique. Coût : 21 lignes ajoutées de plus,
+soit 724 pour la halte de 730, qui n'est ni levée ni déplacée.
 
 ### Fin de pipeline
 
@@ -508,8 +527,9 @@ mika-spirit`, `cargo test -p mika-agent`, `cargo clippy --all-targets -p mika-ag
 `git diff --name-only origin/main...HEAD` ne doit rendre que : `docs/plans/<ce plan>`,
 `crates/mika-agent/src/teams/types.rs`, `crates/mika-agent/src/server/team_runs.rs`,
 `crates/mika-agent/src/server/mod.rs`, `crates/mika-agent/src/server/state.rs`,
-`crates/mika-agent/docs/architecture.md`. Toute autre entrée est un écart au critère 9 :
-arrêt, pas d'élargissement.
+`crates/mika-agent/docs/architecture.md`, `docs/architecture.md` (sept chemins — voir
+l'amendement du § C3). Toute autre entrée est un écart au critère 9 : arrêt, pas
+d'élargissement.
 
 ### 3.5 — Les trois mutations (critère 7)
 
@@ -567,9 +587,9 @@ reste va en commentaire sur mika#1727 ou dans la PR.
 - `SpiritTeamLauncher::launch` ouvre sa base, appelle `teams::run_team` avec les arguments de `tools/run_team.rs:128-139` — `None` pour `pr_reviews_posted`, `tier` et `deployment` reçus par argument —, puis `shutdown()`.
 - Les sept fonctions de test du § 3 C2 sont vertes dans `server/team_runs.rs`, sans fournisseur réel et sans équipe sur le disque pour les chemins d'erreur.
 - Les trois mutations du § 3.5 ont été faites chacune seule dans un worktree détaché, et la PR porte la sortie rouge de chacune.
-- `architecture.md` § 14.2 porte la quatrième ligne du tableau, la route, son jeton, la survie du run au client, et les trois écarts motivés à la discipline partagée.
+- `architecture.md` § 14.2 porte la quatrième ligne du tableau, la route, son jeton, la survie du run au client, et les trois écarts motivés à la discipline partagée — dans `docs/` **et** dans la copie crate-local, au même contenu (amendement du § C3).
 - `cargo build -p mika-agent --bin mika-spirit`, `cargo test -p mika-agent`, `cargo clippy --all-targets -p mika-agent` et `bash scripts/verify-pipeline.sh origin/main` sont verts ; aucun `#[allow]` ni `#[ignore]` neuf.
-- `git diff --name-only origin/main...HEAD` ne rend que les six chemins du § *Fin de pipeline* ; `crates/mika-cli/`, `teams/mod.rs`, `tools/run_team.rs` et `crates/mika-agent/CLAUDE.md` sont intacts.
+- `git diff --name-only origin/main...HEAD` ne rend que les sept chemins du § *Fin de pipeline* ; `crates/mika-cli/`, `teams/mod.rs`, `tools/run_team.rs` et `crates/mika-agent/CLAUDE.md` sont intacts.
 - La PR porte `Refs mika#1727` et aucun `Closes`, `Fixes` ni `Resolves`, y compris si le gabarit de reprise l'ouvre.
 
 ## 5. Acceptance criteria
@@ -607,8 +627,9 @@ Les douze critères de V4-a, transcrits du corps du ticket.
 | `server/team_runs.rs` — le lanceur scripté et les aides de lecture du flux (C2) | 56 |
 | `server/team_runs.rs` — les sept fonctions de test du § 3 C2 (C2) | 150 |
 | `architecture.md` — la quatrième ligne du tableau, la phrase du critère 8, les trois écarts motivés (C3) | 18 |
+| `docs/architecture.md` — le même contenu, la copie crate-local étant générée (C3, amendement du pilote) | 21 |
 
-Total estimé : 518 lignes
+Total estimé : 539 lignes
 
 Plafond de tours : 200 (loop-substrate)
 
