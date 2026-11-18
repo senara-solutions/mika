@@ -62,6 +62,10 @@ pub(crate) enum TeamRunRemoteIssue {
     RunError {
         error: String,
     },
+    NomInvalide {
+        team_name: String,
+        cause: String,
+    },
 }
 
 // `Display` à la main : rien à chaîner, aucune frontière de bibliothèque.
@@ -91,6 +95,18 @@ impl std::fmt::Display for TeamRunRemoteIssue {
                  be going on mika-spirit, but no frame named its id, so there is no run to re-read"
             ),
             Self::RunError { error } => write!(f, "the team run failed: {error}"),
+            // « so no request was made » n'est pas de l'ornement : ce variant est
+            // le seul des six à ne porter ni URL ni statut, parce que rien n'a
+            // été tenté (mika#2331 — une provenance qu'on n'a pas ne s'invente
+            // pas). Le message doit donc dire lui-même qu'il n'y a pas de réseau
+            // à regarder, comme `RunError` dit que le transport n'est pas en
+            // cause. La cause vient de `team::validate_team_name`, qui a cinq
+            // refus distincts : « nom invalide » tout court renverrait
+            // l'opérateur lire le code du juge.
+            Self::NomInvalide { team_name, cause } => write!(
+                f,
+                "'{team_name}' is not a valid team name, so no request was made: {cause}"
+            ),
         }
     }
 }
@@ -138,10 +154,22 @@ pub(crate) async fn lancer_run_equipe(
     reference_run_id: Option<&str>,
     mut on_event: impl FnMut(TeamEvent),
 ) -> Result<TeamRun, TeamRunRemoteIssue> {
-    // Le nom d'équipe va dans le chemin par `format!`. Un nom portant un
-    // caractère réservé produirait un autre chemin, donc un 404 là où la route
-    // aurait rendu son 400 : écart assumé, parce que `team::validate_team_name`
-    // est le juge de ce nom et qu'il tourne côté serveur.
+    // Le nom d'équipe va dans le chemin par `format!`, donc un caractère
+    // réservé produirait un **autre chemin** — un 404, ou une route voisine —
+    // là où la route aurait rendu son 400. Le juge serveur ne peut pas refuser
+    // une requête qui ne l'atteint pas. La porte appelle donc le même
+    // `team::validate_team_name` avant de composer l'URL : ce n'est pas une
+    // seconde politique, c'est le même juge appelé du côté où le nom devient un
+    // chemin.
+    //
+    // `map_err` et non un `?` direct : `validate_team_name` rend un
+    // `anyhow::Result<()>`, et cette porte rend `TeamRunRemoteIssue`.
+    mika_common::team::validate_team_name(team_name).map_err(|cause| {
+        TeamRunRemoteIssue::NomInvalide {
+            team_name: team_name.to_string(),
+            cause: cause.to_string(),
+        }
+    })?;
     let url = format!(
         "{}/api/v1/teams/{team_name}/runs",
         base_url.trim_end_matches('/')
@@ -415,5 +443,41 @@ mod tests {
         );
         let message = probleme.to_string();
         assert!(message.contains(&format!("{base}{ROUTE}")), "{message}");
+    }
+
+    /// **Test 5 du vol V4-b2** — un nom invalide est refusé avant tout octet.
+    ///
+    /// Le banc est **armé** et ne verra rien : l'assertion sur le compte de
+    /// requêtes est la moitié portante du test. Un refus rendu *après* l'appel
+    /// — la porte compose `/api/v1/teams/../x/runs`, le serveur rend un 404, et
+    /// la porte traduit — passerait un test qui ne regarderait que le variant.
+    #[tokio::test]
+    async fn mika1727_v4b2_la_porte_refuse_un_nom_invalide_sans_aucune_requete() {
+        let (base, recues) = fake_spirit(&[(ROUTE, StatusCode::OK, &flux(&[RUN_COMPLETE]))]).await;
+
+        let probleme = lancer_run_equipe(&base, JETON, "../x", "le but", None, |_| {})
+            .await
+            .expect_err("un nom invalide est refusé");
+
+        assert!(
+            matches!(&probleme, TeamRunRemoteIssue::NomInvalide { team_name, .. } if team_name == "../x"),
+            "{probleme:?}"
+        );
+        // Le nom et la cause se lisent dans le `Display` : c'est lui que
+        // l'opérateur verra, et lui seul tient la promesse du critère 1.
+        let message = probleme.to_string();
+        assert!(message.contains("../x"), "{message}");
+        // La cause vient du juge, et elle est nommée : le message ne se résume
+        // pas à « nom invalide ».
+        let cause_du_juge = mika_common::team::validate_team_name("../x")
+            .expect_err("`../x` n'est pas un nom d'équipe")
+            .to_string();
+        assert!(message.contains(&cause_du_juge), "{message}");
+
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            0,
+            "aucune requête ne doit partir pour un nom invalide"
+        );
     }
 }
