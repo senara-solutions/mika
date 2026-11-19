@@ -2,6 +2,12 @@
 
 Agent container: SQLite DB, agent loop, tools, prompt assembly, A2A server endpoints, HTTP server binary (mika-spirit). This is the core crate where most development happens.
 
+## Les onze points d'entrée sont verrouillés hors du crate (mika#1727, vol V4-c)
+
+Les fonctions qui **lancent** — `run_agent`, `run_silent_agent`, `run_team_agent` et les deux variantes à échéance (`agent_loop/`), `run_team` et `resume_team_run` (`teams/`), `TaskEngine::{new, startup_recovery, spawn_tick_loop, tick}` — sont `pub(crate)` sans la feature `test-support` et `pub` avec. Corps inchangés ; types, structures de paramètres et aides pures restent publics. La feature est éteinte par défaut et allumée pour les seules cibles de test du paquet par une **dev-dépendance de `mika-agent` sur lui-même** : un `#[cfg(test)]` n'y suffirait pas, un fichier de `tests/` étant un crate séparé. La forme est **deux déclarations sous `#[cfg]` déléguant à un corps privé** (`*_verrouille`), jamais un réexport : `pub use` d'un `pub(crate)` est l'erreur dure E0364/E0365. `teams/mod.rs` porte la variante « module privé », ses douze paramètres rendant la première forme coûteuse en `#[allow]` neufs.
+
+**Portée honnête.** Le verrou mord sur le jeu de features **par défaut** — `cargo check -p mika-cli`, ce que lance `ci.yml`. Sous `--all-features` ou `cargo test`, les features d'une dev-dépendance s'unifient et un appel fautif compilerait : les gardes textuelles de `mika-cli` restent la ceinture, et son `tests/garde_cargo_feature_test_support.rs` y refuse `test-support` dans `[dependencies]`.
+
 ## Agent Loop
 
 Reference moved to [`docs/agent-internals/agent-loop.md`](../../docs/agent-internals/agent-loop.md) (91 KB). Read it before changing this subsystem, and document new material there, not here.
