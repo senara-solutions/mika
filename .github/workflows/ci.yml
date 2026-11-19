@@ -1170,7 +1170,13 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show  # reads rust-toolchain.toml
       - name: Install security tools
-        run: cargo install cargo-audit cargo-deny --locked
+        # cargo-deny est épinglé : sans version, `cargo install` prend la
+        # dernière publiée, et la 0.22.0 exige rustc 1.95 alors que
+        # rust-toolchain.toml fixe 1.93. Le job rougissait alors sur toute PR
+        # avant d'avoir audité quoi que ce soit (2026-11-19, mika#3112). La
+        # 0.21.0 est celle du dernier run vert de main. Monter ce pin va avec
+        # une montée de toolchain, jamais seul.
+        run: cargo install cargo-audit cargo-deny@0.21.0 --locked
       - name: Run cargo-audit
         run: cargo audit
       - name: Run cargo-deny
