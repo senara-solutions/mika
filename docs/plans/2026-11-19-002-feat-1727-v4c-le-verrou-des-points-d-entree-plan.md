@@ -142,6 +142,8 @@ crate externe qui ne voit pas les items `pub(crate)` de la lib.
 - `crates/mika-agent/src/agent_loop/mod.rs`
 - `crates/mika-agent/src/teams/mod.rs`
 - `crates/mika-agent/src/task_engine/engine.rs`
+- `crates/mika-agent/src/task_engine/tick_cli_guard_scan.rs` (**amendement du
+  2026-11-19, voir ci-dessous**)
 - `crates/mika-cli/tests/garde_cargo_feature_test_support.rs` (**neuf**)
 - `crates/mika-agent/CLAUDE.md`
 - `crates/mika-cli/CLAUDE.md`
@@ -151,6 +153,47 @@ crate externe qui ne voit pas les items `pub(crate)` de la lib.
 comportement ; `.github/workflows/` ; `docs/egress/` ; les fichiers sous
 CODEOWNERS ; les quatre accès locaux du défaut 47 ; les gardes textuelles
 existantes, qui ne bougent pas ; tout fichier sous `crates/mika-agent/tests/`.
+
+### Amendement du 2026-11-19 — `tick_cli_guard_scan.rs` entre au périmètre
+
+**Le point.** Le plan ne nommait pas
+`crates/mika-agent/src/task_engine/tick_cli_guard_scan.rs`, et le critère 10 ne
+l'autorisait pas (il ne porte aucune des quatre méthodes). Il est ajouté au
+périmètre, et le critère 10 est lu comme l'incluant.
+
+**La raison, mesurée.** Ce fichier porte la garde de mika#3042 : elle extrait le
+corps de `tick` par scan de source, ancrée sur la signature littérale
+`TICK_SIGNATURE = "pub async fn tick(&mut self) {"`, et vérifie qu'aucun
+balayage terminal de parente `self_dev` n'y vit hors de `if
+!self.dispatcher.cli_mode`. La forme (i) renomme le corps en `tick_verrouille`
+et laisse sous la signature d'origine une coquille d'une ligne. La garde a donc
+rougi — `ac3_le_scan_echoue_ferme_plutot_que_de_se_taire`, sur l'ancre « le
+corps extrait doit aller jusqu'au bas du bloc de scan DB ». **C'est son travail
+exact** : elle est fail-closed précisément pour qu'un `tick` renommé ne la laisse
+pas scanner un texte vide en silence (classe mika#2205).
+
+**Ce qui change, et ce qui ne change pas.** `TICK_SIGNATURE` désigne désormais
+`async fn tick_verrouille(&mut self) {`, c'est-à-dire **le même corps réel**
+qu'avant le vol. La fixture de contrôle `TICK_SANS_GARDE` et les deux assertions
+qui citent la signature sont réalignées sur ce nom. Le prédicat, le recensement
+fermé `TERMINAL_PARENT_SWEEPS`, les six sites du contrôle et les deux moitiés
+fail-closed ne bougent pas : la garde surveille après le vol exactement ce
+qu'elle surveillait avant. Ce n'est pas un désarmement, et ce n'est pas une
+exception ajoutée — c'est le réancrage qu'imposait son propre rouge.
+
+**Ce que ce n'est pas.** Ce n'est pas une halte. Les haltes de ce vol sont la
+borne de lignes et un `verify-pipeline` rouge ; un écart de périmètre se traite
+par cet amendement, conformément à la tête du ticket (*« il amende le plan sur la
+branche dans un commit `docs(plans)` avant de pousser le code qui s'en
+écarte »*). Ce n'est pas non plus une des « gardes textuelles existantes qui ne
+bougent pas » : celles-là sont les scans de `mika-cli` (`chat_turn.rs`,
+`team_runs_remote.rs`) qui tiennent la ceinture du vol, et ils ne sont pas
+touchés.
+
+**Coût.** 11 lignes ajoutées, toutes du commentaire qui porte la raison du
+réancrage ; aucune assertion retirée. Poste R8 au tableau de taille.
+
+---
 
 `crates/mika-agent/src/lib.rs` n'est **pas** touché, et c'est une conclusion, pas
 un oubli. Le réexport glob `pub mod agent { pub use crate::agent_loop::*; }`
@@ -482,8 +525,16 @@ panne de lecture.
 | R5 — quatre doubles visibilités dans `task_engine/engine.rs` + commentaire de forme | 51 |
 | R6 — `crates/mika-cli/tests/garde_cargo_feature_test_support.rs` : prédicat, garde, témoin, contre-témoin | 54 |
 | R7 — le défaut 48 : `crates/mika-agent/CLAUDE.md` et `crates/mika-cli/CLAUDE.md` | 28 |
+| R8 — réancrage de la garde mika#3042 sur le corps réel de `tick` (`tick_cli_guard_scan.rs`), amendement du 2026-11-19 | 11 |
 
-Total estimé : 312 lignes
+Total estimé : 312 lignes au groom ; 323 avec R8
+
+**R8 ne rouvre pas le groom.** Le `Total estimé : 312` est le chiffre sur lequel
+Vincent a tranché le 2026-11-19 en levant la borne du groom à 312. R8 est un
+surcoût **constaté à l'exécution** — la garde de mika#3042 a rougi sur le
+renommage du corps de `tick` — et non une réestimation du périmètre groomé. Il
+est porté ici pour que le compte mesuré et le compte annoncé se répondent. La
+halte du pilote (480, levée du 2026-11-19) n'est pas approchée.
 Plafond de tours : 200 (loop-substrate)
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
