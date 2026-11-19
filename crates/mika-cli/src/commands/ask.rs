@@ -992,64 +992,6 @@ mod tests {
         );
     }
 
-    /// **Test 8 du vol V4-b1** — `ask.rs` ne fait plus tourner l'équipe ici.
-    ///
-    /// Le motif est composé par `concat!` pour que l'aiguille n'apparaisse pas
-    /// littéralement dans le fichier qu'elle balaie : écrite d'un trait, elle se
-    /// trouverait elle-même et la garde serait rouge par construction.
-    ///
-    /// **Le balayage porte sur ce seul fichier**, et c'est délibéré :
-    /// `commands/chat.rs` appelle légitimement encore `teams::run_team(` — c'est
-    /// le travail du vol V4-b2 — donc un scan de tout le crate serait un faux
-    /// rouge. La garde grandira avec le périmètre, fichier par fichier, au vol
-    /// qui câble chacun.
-    ///
-    /// **Aucune allowlist.** Il n'y a qu'un fichier à balayer et un seul remède
-    /// possible : router l'appel par `team_runs_remote::lancer_run_equipe`. Une
-    /// liste d'exceptions ici n'aurait servi qu'à éteindre la garde.
-    #[test]
-    fn mika1727_v4b1_ask_ne_fait_plus_tourner_lequipe_en_local() {
-        const NEEDLE: &str = concat!("teams::", "run_team", "(");
-
-        let scanner =
-            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
-        let chemin = scanner.src_root().join("commands").join("ask.rs");
-        let production = scanner.production_of(&chemin);
-
-        // Témoin : le balayage a bien lu la production de ce fichier. Un chemin
-        // faux, ou un masquage qui aurait tout effacé, serait vert par cécité.
-        assert!(
-            production.contains("pub async fn run_team_ask"),
-            "le balayage n'a pas lu la production de {} — chemin ou masquage cassé",
-            chemin.display()
-        );
-        // Contre-témoin : la moitié test est masquée. Sans lui, le `concat!`
-        // ci-dessus serait une précaution qu'on croirait nécessaire alors que
-        // c'est le masquage qui fait le travail — et l'inverse : si le masquage
-        // lâchait, on « réparerait » la garde par une exception.
-        assert!(
-            !production.contains("fn mika1727_v4b1_ask_ne_fait_plus_tourner_lequipe_en_local"),
-            "la moitié test de {} n'est pas masquée",
-            chemin.display()
-        );
-
-        let violations: Vec<String> = production
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| !line.trim_start().starts_with("//") && line.contains(NEEDLE))
-            .map(|(idx, line)| format!("commands/ask.rs:{} — {}", idx + 1, line.trim()))
-            .collect();
-
-        assert!(
-            violations.is_empty(),
-            "mika#1727 V4-b1 — `mika ask --team` fait de nouveau tourner l'équipe \
-             dans son propre processus. Le remède est de router l'appel par \
-             `team_runs_remote::lancer_run_equipe`, qui lance le run sur \
-             mika-spirit :\n{}",
-            violations.join("\n")
-        );
-    }
-
     /// The team envelope is byte-identical on a successful run (mika#1940 R7).
     ///
     /// `failure_reason` is additive and `skip_serializing_if`-omitted, so a run

@@ -177,10 +177,10 @@ variant fails to compile in `mika-agent` and nowhere here.
 `run_team_ask` **ne fait plus tourner l'équipe dans son propre processus**. Il
 lance le run par `commands/team_runs_remote.rs::lancer_run_equipe` — un `POST`
 de `/api/v1/teams/{name}/runs`, puis la lecture du flux SSE jusqu'à sa trame
-finale — et c'est mika-spirit qui décompose, délègue, révise et livre. La TUI,
-elle, part au vol V4-b2 ; `commands/chat.rs` appelle donc encore
-`teams::run_team(` et c'est le régime nominal, ce qui est aussi pourquoi la garde
-textuelle du vol balaie `ask.rs` **seul**.
+finale — et c'est mika-spirit qui décompose, délègue, révise et livre. **La TUI
+y est passée au vol V4-b2** : plus aucune ligne de la moitié production du crate
+n'appelle `teams::run_team(`, et c'est une garde **du crate** qui le tient —
+celle de `ask.rs`, qui balayait ce fichier seul, est partie avec ce vol.
 
 **`MIKA_INTERNAL_TOKEN` est exigé, et le refus tombe avant tout appel.** Le jeton
 est lu par `session_remote::jeton_interne` — l'unique lecture du crate — et
@@ -477,7 +477,7 @@ provenance (motif mika#2331). Depuis que l'écran n'existe que si la session s'e
 ouverte sur spirit, le jeton **a été lu** à ce point du démarrage : la seule
 cause restante est un daemon qui s'est tu entre l'ouverture et la sonde. Le
 chemin `--team` garde `is_dashboard_running()` — son tour ne passe pas par ce
-bras, et il part au vol V4.
+bras, et la sonde lui reste après le vol V4-b2 (défaut 42).
 
 ### La TUI ne possède plus de moteur de tâches (mika#1727, vol V2a sur 4)
 
@@ -851,6 +851,34 @@ parce que `commands/skills.rs` construit légitimement le registre sur le disque
 Allowlist livrée vide et assertie vide, un témoin sur `app.skills`, un
 contre-témoin de masquage et un contre-témoin de détection. Quand elle rougit, le
 remède est `skills_remote::lire` par `app.skills`, jamais une ligne d'allowlist.
+
+### Le mode équipe de la TUI passe par mika-spirit (mika#1727, vol V4-b2)
+
+`mika chat --team` **ne fait plus tourner l'équipe dans son propre processus**.
+`chat::servir_les_buts_dequipe` — le worker sorti de `run_team` — envoie chaque
+but par `team_runs_remote::lancer_run_equipe` (`POST /api/v1/teams/{name}/runs`,
+puis le flux SSE jusqu'à sa trame finale) et pousse chaque `TeamEvent` reçu sur
+le canal de la TUI, dans l'ordre. Le `TeamRun` rendu passe par le même
+`team_outcome::classify` qu'avant ; un refus du client devient un
+`TeamEvent::RunFailed` qui porte son `Display`.
+
+**`MIKA_INTERNAL_TOKEN` est lu avant l'écran.** `acces_du_mode_equipe` prend
+`dashboard::spirit_url()` et `session_remote::jeton_interne` **avant** les
+canaux, le hook de panique et `enable_raw_mode` : sans jeton, le `?` de
+`run_team` sort en non-zéro qui nomme la variable, et l'écran ne s'affiche pas.
+
+**Aucun repli local.** `Settings::load`, l'App GitHub, `AgentTier::from_env()`
+et `Deployment::from_env()` ne sont plus lus par ce worker : il n'y a pas de
+chemin qui relancerait l'équipe ici si spirit est à terre.
+
+**La porte refuse un nom invalide sans aucune requête.** `lancer_run_equipe`
+appelle `mika_common::team::validate_team_name` **avant** de composer l'URL : le
+nom entre dans le chemin par `format!`, donc un caractère réservé ferait un
+*autre* chemin — un 404 — là où le juge serveur aurait rendu son 400.
+
+**Ce qui reste local** (défaut 42) : le résumé du run de référence de `--run-id`,
+lu dans la base du conteneur ; la sonde `is_dashboard_running()` ; et la
+persistance des tours par `tui/app.rs`.
 
 - **Slash commands:** `/clear`, `/compact`, `/model`, `/provider`, `/think`, `/agent`, `/undo`, `/rewind`, `/inbox`, `/restart`
 - `/clear` opens a new session on mika-spirit and then ends the old one — **in that order**, through `session_remote::{ouvrir, clore}` (mika#1727, vol V2d-4b; see above for what each failure returns). It then notifies the agent worker, drains stale responses from `agent_rx`, and resets all transient state; user preferences (`thinking_level`, model, provider) are preserved; `active_background_task_count` is intentionally NOT reset (agent-scoped, not session-scoped). On a singleton agent it clears the display only, calls nothing, and keeps its session

@@ -30,7 +30,6 @@ use mika_agent::agent;
 use mika_agent::async_db::AsyncDatabase;
 use mika_agent::prompt;
 use mika_agent::teams::types::TeamEvent;
-use mika_common::config::Settings;
 use mika_common::team;
 use std::path::Path;
 
@@ -203,6 +202,35 @@ async fn clore_session_de_sortie(
         }
     }
     Ok(())
+}
+
+/// L'adresse de mika-spirit et le jeton interne du mode équipe, lus **avant**
+/// le hook de panique et avant `enable_raw_mode` (mika#1727, vol V4-b2).
+///
+/// Avant, parce qu'un refus qui attendrait le premier but se produirait
+/// terminal rendu, écran ouvert, hook de panique posé : l'opérateur verrait
+/// « run failed » dans une TUI là où la cause est une variable absente de son
+/// shell. Le `?` de l'appelant est ce qui garantit que l'écran ne s'affiche pas
+/// — c'est l'ordre des instructions dans [`run_team`] qui porte la propriété,
+/// et `tests::mika1727_v4b2_sans_jeton_la_lecture_qui_precede_lecran_refuse_en_nommant_la_variable`
+/// atteste le refus et son texte.
+///
+/// `lire_env` arrive par argument, comme sur [`ouvrir_session_par_spirit`] : un
+/// lecteur qui résout ses propres accès ne se pilote pas depuis un test.
+///
+/// `spirit_url()` d'abord, `jeton_interne` ensuite, et l'ordre n'a rien
+/// d'accidentel pour qui relit : `spirit_url()` charge `~/.mika/.env` quand
+/// `MIKA_SPIRIT_URL` est absente. En production le `.env` est déjà chargé par
+/// `main.rs` (branche `--team`) avant l'appel, donc l'ordre ne porte rien
+/// aujourd'hui — mais l'inverse créerait une dépendance silencieuse au
+/// chargement de l'appelant.
+fn acces_du_mode_equipe(lire_env: SourceEnv<'_>) -> Result<(String, String)> {
+    let base_url = crate::commands::dashboard::spirit_url();
+    // `map_err` et non un `?` direct : la lecture commune rend un `String`,
+    // pour la raison écrite sur `jeton_interne`. Le refus nomme
+    // `MIKA_INTERNAL_TOKEN` parce que c'est elle qui le nomme.
+    let jeton = jeton_interne(lire_env).map_err(anyhow::Error::msg)?;
+    Ok((base_url, jeton))
 }
 
 /// Spawn the agent worker task. Returns the worker, channels, and context info needed for App.
@@ -1103,6 +1131,110 @@ pub async fn run(
     Ok(())
 }
 
+/// Le worker du mode équipe de la TUI : chaque but part à mika-spirit
+/// (mika#1727, vol V4-b2), là où il lançait l'équipe dans ce processus.
+///
+/// Sortie du `tokio::spawn` pour la raison de [`ouvrir_session_par_spirit`] :
+/// tout ce qui touche le monde arrive **par argument**, donc un test joue le
+/// worker entier contre `fake_spirit` sans muter l'environnement. C'est la forme
+/// que V3c-2c a posée pour le worker d'agent (adresse et lecteur de jeton par
+/// argument du spawn).
+///
+/// Les arguments sont possédés (`String`, non `&str`) parce que le seul appelant
+/// les passe à un `tokio::spawn` qui leur survit.
+pub(crate) async fn servir_les_buts_dequipe(
+    base_url: String,
+    token: String,
+    team_name: String,
+    reference_run_id: Option<String>,
+    mut team_rx: mpsc::UnboundedReceiver<TeamRequest>,
+    response_tx: mpsc::UnboundedSender<TeamEvent>,
+) {
+    while let Some(request) = team_rx.recv().await {
+        match request {
+            TeamRequest::Goal(goal) => {
+                let tx = response_tx.clone();
+                let callback = move |event: TeamEvent| {
+                    let _ = tx.send(event);
+                };
+
+                match crate::commands::team_runs_remote::lancer_run_equipe(
+                    &base_url,
+                    &token,
+                    &team_name,
+                    &goal,
+                    reference_run_id.as_deref(),
+                    callback,
+                )
+                .await
+                {
+                    Ok(run) => {
+                        // mika#1940 — same classifier as `mika ask --team`.
+                        let event = match crate::commands::team_outcome::classify(&run) {
+                            // Routing a failure to `RunFailed` is what makes
+                            // the damage structurally impossible rather than
+                            // merely forbidden: the TUI persists to the DB
+                            // only on the `Deliverable` branch
+                            // (`tui/app.rs`, `save_message("", "assistant",
+                            // …)`). Before this, a `FailedNoDelegation` run
+                            // carried `deliverable = Some(retry_reply)`, so
+                            // a failed run's text became a durable
+                            // `assistant` turn, re-read as context by every
+                            // later turn — the only one of the three defect
+                            // sites whose damage outlived the session.
+                            TeamOutcome::Failed {
+                                diagnostic,
+                                partial,
+                            } => {
+                                let mut msg = diagnostic;
+                                if let Some(partial) = partial {
+                                    msg.push('\n');
+                                    msg.push_str(
+                                        crate::commands::team_outcome::PARTIAL_OUTPUT_MARKER,
+                                    );
+                                    msg.push('\n');
+                                    msg.push_str(&partial);
+                                }
+                                TeamEvent::RunFailed(msg)
+                            }
+                            TeamOutcome::Delivered { text } => TeamEvent::Deliverable(text),
+                            TeamOutcome::CompletedWithoutDeliverable => {
+                                TeamEvent::Deliverable(String::new())
+                            }
+                            // Current behaviour kept deliberately: the TUI
+                            // answers an empty deliverable with "Team
+                            // completed with no deliverable.", which is
+                            // false for a suspended run (it did not
+                            // complete, it is awaiting callbacks). Fixing
+                            // that needs an extra `TeamEvent` variant whose
+                            // fan-out touches both CLI callbacks, the TUI
+                            // and the engine's emission sites —
+                            // disproportionate for a p3 this is not about.
+                            // `ask.rs`, which has no interface state
+                            // machine, gets the honest note today; the
+                            // asymmetry is deliberate and tracked
+                            // (mika#1940, scope-out (b)).
+                            TeamOutcome::Pending { .. } => TeamEvent::Deliverable(String::new()),
+                        };
+                        let _ = response_tx.send(event);
+                    }
+                    // Un seul bras d'erreur, et **aucun repli local** : les six
+                    // variants de `TeamRunRemoteIssue` y passent, `RunError` et
+                    // `SansTrameFinale` comprises. C'est ce qui fait que ni un
+                    // `run_error` ni un flux tronqué ne peuvent produire un
+                    // `Deliverable`, et donc que le mode équipe ne persiste
+                    // jamais un échec en tour `assistant` durable — le motif
+                    // écrit sur le bras `Failed` ci-dessus vaut mot pour mot.
+                    Err(issue) => {
+                        let _ = response_tx.send(TeamEvent::RunFailed(format!("{issue}")));
+                    }
+                }
+            }
+            TeamRequest::Quit => break,
+        }
+    }
+}
+
 /// Run the TUI in team mode. Each user message is sent as a goal to `run_team()`.
 pub async fn run_team(
     team_name: &str,
@@ -1112,7 +1244,11 @@ pub async fn run_team(
 ) -> Result<()> {
     let team_dir = team::team_dir(global_home, team_name);
 
-    let (team_tx, mut team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
+    // Avant les canaux, avant le hook de panique et avant `enable_raw_mode` :
+    // un refus ici sort par le `?` et l'écran ne s'affiche pas.
+    let (base_url, token) = acces_du_mode_equipe(&|cle| std::env::var(cle).ok())?;
+
+    let (team_tx, team_rx_worker) = mpsc::unbounded_channel::<TeamRequest>();
     let (response_tx, response_rx) = mpsc::unbounded_channel::<TeamEvent>();
 
     // Use the shared container DB for team conversation persistence
@@ -1121,108 +1257,14 @@ pub async fn run_team(
     let team_db = mika_agent::async_db::AsyncDatabase::open(&db_path)?;
 
     // Spawn team worker
-    let worker_home = global_home.to_path_buf();
-    let worker_name = team_name.to_string();
-    let worker_team_db = team_db.clone();
-    let worker_run_id = run_id.map(|s| s.to_string());
-    let team_worker_handle = tokio::spawn(async move {
-        let settings = match Settings::load(&worker_home) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = response_tx.send(TeamEvent::RunFailed(format!(
-                    "Failed to load settings: {e}"
-                )));
-                return;
-            }
-        };
-
-        let github_app = mika_common::github_app::GitHubApp::from_settings(&settings);
-        while let Some(request) = team_rx_worker.recv().await {
-            match request {
-                TeamRequest::Goal(goal) => {
-                    let tx = response_tx.clone();
-                    let callback = move |event: TeamEvent| {
-                        let _ = tx.send(event);
-                    };
-
-                    match mika_agent::teams::run_team(
-                        &worker_name,
-                        &goal,
-                        &worker_home,
-                        &settings,
-                        Some(Box::new(callback)),
-                        worker_team_db.clone(),
-                        worker_run_id.as_deref(),
-                        github_app.clone(),
-                        None, // CLI: no AppState for session-scoped dedup (#821)
-                        // mika#1962 — CLI process start is the tier init boundary.
-                        mika_common::home::AgentTier::from_env(),
-                        // mika#2290 — same boundary for the posed hosting fact.
-                        mika_common::home::Deployment::from_env(),
-                    )
-                    .await
-                    {
-                        Ok(run) => {
-                            // mika#1940 — same classifier as `mika ask --team`.
-                            let event = match crate::commands::team_outcome::classify(&run) {
-                                // Routing a failure to `RunFailed` is what makes
-                                // the damage structurally impossible rather than
-                                // merely forbidden: the TUI persists to the DB
-                                // only on the `Deliverable` branch
-                                // (`tui/app.rs`, `save_message("", "assistant",
-                                // …)`). Before this, a `FailedNoDelegation` run
-                                // carried `deliverable = Some(retry_reply)`, so
-                                // a failed run's text became a durable
-                                // `assistant` turn, re-read as context by every
-                                // later turn — the only one of the three defect
-                                // sites whose damage outlived the session.
-                                TeamOutcome::Failed {
-                                    diagnostic,
-                                    partial,
-                                } => {
-                                    let mut msg = diagnostic;
-                                    if let Some(partial) = partial {
-                                        msg.push('\n');
-                                        msg.push_str(
-                                            crate::commands::team_outcome::PARTIAL_OUTPUT_MARKER,
-                                        );
-                                        msg.push('\n');
-                                        msg.push_str(&partial);
-                                    }
-                                    TeamEvent::RunFailed(msg)
-                                }
-                                TeamOutcome::Delivered { text } => TeamEvent::Deliverable(text),
-                                TeamOutcome::CompletedWithoutDeliverable => {
-                                    TeamEvent::Deliverable(String::new())
-                                }
-                                // Current behaviour kept deliberately: the TUI
-                                // answers an empty deliverable with "Team
-                                // completed with no deliverable.", which is
-                                // false for a suspended run (it did not
-                                // complete, it is awaiting callbacks). Fixing
-                                // that needs an extra `TeamEvent` variant whose
-                                // fan-out touches both CLI callbacks, the TUI
-                                // and the engine's emission sites —
-                                // disproportionate for a p3 this is not about.
-                                // `ask.rs`, which has no interface state
-                                // machine, gets the honest note today; the
-                                // asymmetry is deliberate and tracked
-                                // (mika#1940, scope-out (b)).
-                                TeamOutcome::Pending { .. } => {
-                                    TeamEvent::Deliverable(String::new())
-                                }
-                            };
-                            let _ = response_tx.send(event);
-                        }
-                        Err(e) => {
-                            let _ = response_tx.send(TeamEvent::RunFailed(format!("{e}")));
-                        }
-                    }
-                }
-                TeamRequest::Quit => break,
-            }
-        }
-    });
+    let team_worker_handle = tokio::spawn(servir_les_buts_dequipe(
+        base_url,
+        token,
+        team_name.to_string(),
+        run_id.map(|s| s.to_string()),
+        team_rx_worker,
+        response_tx,
+    ));
 
     // Load previous run context if a reference run was provided
     let (previous_run, run_warning) = if let Some(ref_id) = run_id {
@@ -1392,6 +1434,11 @@ mod tests {
     use axum::http::StatusCode;
     use mika_agent::db::Database;
     use mika_cli::remote_ask::{CALLBACK_TURN_KEY, MODEL_OVERRIDE_KEY};
+    // Importé ici et non en tête de fichier depuis le vol V4-b2 : la production
+    // de ce module ne charge plus de `Settings` — le worker d'équipe est parti
+    // avec `Settings::load`, et seule la fixture du worker d'agent en construit
+    // encore un.
+    use mika_common::config::Settings;
     use mika_common::dead_endpoint::DeadEndpoint;
     use serde_json::Value;
     use std::sync::Mutex;
@@ -2373,5 +2420,187 @@ mod tests {
              chaque ligne nomme, jamais une entrée d'allowlist :\n{}",
             violations.join("\n")
         );
+    }
+
+    // ---- Vol V4-b2 : le worker du mode équipe, joué en entier ---------------
+
+    /// L'équipe du banc, et le chemin que `fake_spirit` doit voir.
+    ///
+    /// Le chemin est écrit **en entier** et non composé depuis [`EQUIPE_DU_BANC`] :
+    /// le composer ici rejouerait le `format!` de la porte, et une faute dans
+    /// celui-ci passerait inaperçue des deux côtés. Le banc associe par le
+    /// chemin brut, donc un chemin faux tombe sur son `fallback` à 501.
+    const EQUIPE_DU_BANC: &str = "squad";
+    const ROUTE_RUNS: &str = "/api/v1/teams/squad/runs";
+
+    /// Le worker d'équipe monté **en entier** contre `corps`, puis arrêté.
+    ///
+    /// Rend les événements reçus sur le canal de la TUI **dans l'ordre**, et le
+    /// témoin des requêtes relevées par le banc. Le `Quit` puis l'attente du
+    /// `JoinHandle` sont la synchronisation de ces tests : le worker traite ses
+    /// requêtes en série, donc un worker sorti atteste que le but qui précède
+    /// est entièrement traité. C'est ce qui remplace un `sleep`, qu'aucun de ces
+    /// tests n'emploie.
+    async fn worker_dequipe_contre(corps: &str) -> (Vec<TeamEvent>, Arc<Mutex<Vec<RequeteRecue>>>) {
+        let (base, recues) = fake_spirit(&[(ROUTE_RUNS, StatusCode::OK, corps)]).await;
+        let (team_tx, team_rx) = mpsc::unbounded_channel::<TeamRequest>();
+        let (response_tx, mut response_rx) = mpsc::unbounded_channel::<TeamEvent>();
+
+        let worker = tokio::spawn(servir_les_buts_dequipe(
+            base,
+            "jeton-secret".to_string(),
+            EQUIPE_DU_BANC.to_string(),
+            None,
+            team_rx,
+            response_tx,
+        ));
+
+        team_tx
+            .send(TeamRequest::Goal("le but".to_string()))
+            .expect("le worker écoute");
+        team_tx.send(TeamRequest::Quit).expect("le worker écoute");
+        worker.await.expect("le worker sort sans panique");
+
+        let mut recus = Vec::new();
+        while let Ok(event) = response_rx.try_recv() {
+            recus.push(event);
+        }
+        (recus, recues)
+    }
+
+    /// Les événements du canal rendus en étiquettes, pour s'asserter **en
+    /// séquence** : un `contains` passerait sur un worker qui les rend à
+    /// l'envers, et c'est l'ordre qui est le critère.
+    fn etiquettes(recus: &[TeamEvent]) -> Vec<String> {
+        recus
+            .iter()
+            .map(|e| match e {
+                TeamEvent::Progress(m) => format!("progress:{m}"),
+                TeamEvent::Deliverable(m) => format!("deliverable:{m}"),
+                TeamEvent::RunFailed(m) => format!("runfailed:{m}"),
+                autre => format!("inattendu:{autre:?}"),
+            })
+            .collect()
+    }
+
+    /// La trame finale du fil, empruntée à `team_runs_remote::tests` par sa
+    /// forme : écrite à la main plutôt qu'en sérialisant un `TeamRun` Rust, ce
+    /// qui mesurerait serde contre lui-même. `"status":"Completed"` en
+    /// PascalCase est bien ce que la route produit.
+    const RUN_LIVRE: &str = r#"{"event":"run_completed","run":{"run_id":"run-9","team_name":"squad","goal":"le but","status":"Completed","iteration":1,"deliverable":"la réponse de l'équipe"}}"#;
+
+    /// **Test 1 du vol V4-b2** — un but part en `POST` vers la route, avec son
+    /// jeton et son corps.
+    ///
+    /// Les faits se lisent sur la socket et non sur l'appel : c'est ce que le
+    /// serveur reçoit qui tient le contrat. L'adresse et le jeton arrivent par
+    /// la signature du worker, donc rien n'est muté dans l'environnement.
+    #[tokio::test]
+    async fn mika1727_v4b2_un_but_part_en_post_vers_la_route_avec_le_jeton_et_le_corps() {
+        let corps = crate::commands::team_runs_remote::tests::flux(&[RUN_LIVRE]);
+        let (_, recues) = worker_dequipe_contre(&corps).await;
+
+        let vues = recues.lock().expect("le témoin du banc");
+        assert_eq!(vues.len(), 1, "un seul appel attendu pour un seul but");
+        let vue = &vues[0];
+        assert_eq!(vue.methode, "POST");
+        assert_eq!(vue.chemin, ROUTE_RUNS);
+        assert_eq!(vue.autorisation.as_deref(), Some("Bearer jeton-secret"));
+        let envoye: Value = serde_json::from_str(&vue.corps).expect("un corps JSON");
+        assert_eq!(envoye["goal"], "le but");
+    }
+
+    /// **Test 2 du vol V4-b2** — les trois événements arrivent dans l'ordre,
+    /// puis le livrable.
+    ///
+    /// L'ordre est asserté sur la **séquence entière**. C'est la propriété que
+    /// le rappel du worker porte, et la mutation 2 du plan la fait rougir.
+    #[tokio::test]
+    async fn mika1727_v4b2_les_trois_evenements_arrivent_dans_lordre_puis_le_livrable() {
+        let corps = crate::commands::team_runs_remote::tests::flux(&[
+            r#"{"event":"team_event","payload":{"kind":"progress","data":"un"}}"#,
+            r#"{"event":"team_event","payload":{"kind":"progress","data":"deux"}}"#,
+            r#"{"event":"team_event","payload":{"kind":"progress","data":"trois"}}"#,
+            RUN_LIVRE,
+        ]);
+        let (recus, _) = worker_dequipe_contre(&corps).await;
+
+        assert_eq!(
+            etiquettes(&recus),
+            [
+                "progress:un",
+                "progress:deux",
+                "progress:trois",
+                "deliverable:la réponse de l'équipe",
+            ],
+            "les trois événements puis le livrable, dans l'ordre émis"
+        );
+    }
+
+    /// **Test 3 du vol V4-b2** — une trame `run_error` donne un `RunFailed` qui
+    /// porte l'erreur du run, et **aucun** `Deliverable`.
+    ///
+    /// L'absence de `Deliverable` est la moitié portante : `tui/app.rs` ne
+    /// persiste un tour `assistant` durable que sur ce bras-là, donc un échec
+    /// qui s'y rendrait survivrait à la session.
+    #[tokio::test]
+    async fn mika1727_v4b2_un_run_error_donne_un_runfailed_qui_porte_lerreur() {
+        let corps = crate::commands::team_runs_remote::tests::flux(&[
+            r#"{"event":"run_error","error":"la décomposition a échoué"}"#,
+        ]);
+        let (recus, _) = worker_dequipe_contre(&corps).await;
+
+        let lus = etiquettes(&recus);
+        assert_eq!(lus.len(), 1, "un seul événement attendu ; vu {lus:?}");
+        assert!(
+            lus[0].starts_with("runfailed:") && lus[0].contains("la décomposition a échoué"),
+            "{lus:?}"
+        );
+        assert!(
+            !recus.iter().any(|e| matches!(e, TeamEvent::Deliverable(_))),
+            "un run en erreur ne produit jamais de livrable ; vu {lus:?}"
+        );
+    }
+
+    /// **Test 4 du vol V4-b2** — un flux fermé sans trame finale donne un
+    /// `RunFailed`, jamais un `Deliverable`.
+    ///
+    /// Les deux `team_event` sont bien passés : l'échec ne vient pas d'une
+    /// lecture qui n'a rien lu, mais de l'absence de trame terminale.
+    #[tokio::test]
+    async fn mika1727_v4b2_un_flux_ferme_sans_trame_finale_donne_un_runfailed() {
+        let corps = crate::commands::team_runs_remote::tests::flux(&[
+            r#"{"event":"team_event","payload":{"kind":"progress","data":"un"}}"#,
+            r#"{"event":"team_event","payload":{"kind":"progress","data":"deux"}}"#,
+        ]);
+        let (recus, _) = worker_dequipe_contre(&corps).await;
+
+        let lus = etiquettes(&recus);
+        assert_eq!(
+            lus.len(),
+            3,
+            "les deux événements, puis le refus ; vu {lus:?}"
+        );
+        assert_eq!(&lus[..2], ["progress:un", "progress:deux"]);
+        assert!(lus[2].starts_with("runfailed:"), "{lus:?}");
+        assert!(
+            !recus.iter().any(|e| matches!(e, TeamEvent::Deliverable(_))),
+            "un flux tronqué ne produit jamais de livrable ; vu {lus:?}"
+        );
+    }
+
+    /// **Test 6 du vol V4-b2** — sans jeton, la lecture qui précède l'écran
+    /// refuse en nommant la variable.
+    ///
+    /// Le refus est mesuré sur [`acces_du_mode_equipe`] parce que c'est elle qui
+    /// porte la lecture ; que `run_team` l'appelle **avant** le hook de panique
+    /// et `enable_raw_mode` est tenu par l'ordre de ses instructions, et son `?`
+    /// est ce qui garantit que l'écran ne s'affiche pas.
+    #[test]
+    fn mika1727_v4b2_sans_jeton_la_lecture_qui_precede_lecran_refuse_en_nommant_la_variable() {
+        let refus = acces_du_mode_equipe(&|_| None)
+            .expect_err("sans jeton, le mode équipe refuse avant l'écran");
+        let message = refus.to_string();
+        assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
     }
 }
