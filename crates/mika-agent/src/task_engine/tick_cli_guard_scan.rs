@@ -35,7 +35,12 @@ const TASKS_SRC: &str = include_str!("../db/tasks.rs");
 const CLI_GUARD: &str = "if !self.dispatcher.cli_mode";
 
 /// La signature dont [`tick_body`] extrait le corps.
-const TICK_SIGNATURE: &str = "pub async fn tick(&mut self) {";
+///
+/// Depuis mika#1727 V4-c, `tick` porte deux déclarations sous `#[cfg]` qui
+/// délèguent toutes deux au corps privé `tick_verrouille` : c'est ce corps-là
+/// que le scan doit lire, et non l'une des deux coquilles d'une ligne. Le
+/// réalignement est le geste qu'imposait le rouge fail-closed de ce scan.
+const TICK_SIGNATURE: &str = "async fn tick_verrouille(&mut self) {";
 
 /// Le terme qui tient `settle_dispatch_parents` hors du prédicat de mika#3042.
 const SETTLE_COMPLEMENT_PREDICATE: &str = "AND COALESCE(parent.source, '') != 'self_dev'";
@@ -231,7 +236,7 @@ fn blank_noncode(src: &str) -> String {
         .expect("le blanchiment remplace octet par octet, donc l'UTF-8 reste valide")
 }
 
-/// Le corps de `pub async fn tick`, blanchi de ses chaînes et de ses
+/// Le corps de `tick`, blanchi de ses chaînes et de ses
 /// commentaires, accolades équilibrées.
 ///
 /// **Rend `None` plutôt qu'un corps vide** quand la signature n'est pas là ou
@@ -324,7 +329,7 @@ fn unguarded_sweeps(body: &str) -> Vec<&'static str> {
 /// au recensement : le contrôle prouve que le scan rend les six sites visés, et
 /// pas tout ce qu'il croise.
 const TICK_SANS_GARDE: &str = r#"
-    pub async fn tick(&mut self) {
+    async fn tick_verrouille(&mut self) {
         self.heartbeat.tick();
         self.tick_count = self.tick_count.wrapping_add(1);
         if self.tick_count.is_multiple_of(DB_SCAN_INTERVAL_TICKS) {
@@ -356,9 +361,9 @@ const SITES_DU_CONTROLE: [&str; 6] = [
 #[test]
 fn ac3_aucun_balayage_terminal_de_parente_self_dev_hors_garde_cli() {
     let body = tick_body(ENGINE_SRC).expect(
-        "la signature `pub async fn tick(&mut self) {` doit être trouvable dans \
-         engine.rs, accolades équilibrées — un `tick` renommé rougit ici plutôt \
-         que de rendre un corps vide",
+        "la signature `async fn tick_verrouille(&mut self) {` doit être trouvable \
+         dans engine.rs, accolades équilibrées — un corps de `tick` renommé \
+         rougit ici plutôt que de rendre un corps vide",
     );
     let violations = unguarded_sweeps(&body);
     assert!(
@@ -392,8 +397,10 @@ fn ac3_le_meme_scan_rougit_sur_une_copie_sans_la_garde() {
 /// mika#3042 AC3 — fail-closed, des deux côtés.
 ///
 /// À gauche : un corps introuvable rend `None`, et le test ci-dessus
-/// `expect`-e — renommer `tick` fait rougir le scan au lieu de le faire passer
-/// sur un corps vide.
+/// `expect`-e — renommer le corps de `tick` fait rougir le scan au lieu de le
+/// faire passer sur un corps vide. C'est ce qui s'est produit à mika#1727 V4-c,
+/// et c'est ce qui a imposé le réalignement de [`TICK_SIGNATURE`] plutôt qu'un
+/// scan devenu muet sur une coquille d'une ligne.
 ///
 /// À droite : chaque entrée du recensement apparaît au moins une fois dans le
 /// corps réel. Une entrée morte — appel supprimé ou renommé en amont — rougit,
@@ -407,7 +414,7 @@ fn ac3_le_scan_echoue_ferme_plutot_que_de_se_taire() {
         "sans la signature de `tick`, le scan n'a pas de cible : il doit le dire"
     );
     assert!(
-        tick_body("pub async fn tick(&mut self) { if x {").is_none(),
+        tick_body("async fn tick_verrouille(&mut self) { if x {").is_none(),
         "des accolades qui ne se referment pas ne font pas un corps"
     );
 

@@ -6056,7 +6056,26 @@ pub struct AgentParams<'a> {
 
 /// Run the agent loop for a single inbound message.
 /// Returns `AgentOutput` with text response, thinking, and usage info.
+///
+/// Verrouillé hors du crate sans la feature `test-support` (mika#1727 V4-c) :
+/// aucun crate externe — `mika-cli` au premier chef — ne peut compiler un
+/// lancement d'agent en local. La forme est deux déclarations sous `#[cfg]`
+/// déléguant à un corps privé renommé, et non un réexport, parce que Rust ne
+/// sait pas **élargir** une visibilité par `pub use` : réexporter un item
+/// `pub(crate)` est l'erreur dure E0364/E0365. Les trois sites du fichier
+/// suivent cette forme ; leurs corps ne changent pas d'un octet.
+#[cfg(not(feature = "test-support"))]
+pub(crate) async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
+    run_agent_verrouille(params).await
+}
+
+/// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+#[cfg(feature = "test-support")]
 pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
+    run_agent_verrouille(params).await
+}
+
+async fn run_agent_verrouille(params: &AgentParams<'_>) -> Result<AgentOutput> {
     let trace_id = params
         .trace_id
         .clone()
@@ -6166,11 +6185,17 @@ pub async fn run_agent(params: &AgentParams<'_>) -> Result<AgentOutput> {
 /// contract; either use [`run_agent`] (which honors the global budget) or add
 /// a justified scope item to extend the contract.
 ///
-/// `cfg`-gating with `#[cfg(any(test, feature = "test-utils"))]` was rejected
-/// because Rust's integration test model treats `tests/*.rs` as a separate crate
-/// that does not see the `test` cfg of the lib it depends on, so the function
-/// would be invisible to the eval suite without an awkward self-dev-dep. The
-/// naming (`*_with_deadline`) and docstring are the contract enforcement here.
+/// `cfg`-gating est désormais le contrat (mika#1727 V4-c) : cette fonction
+/// n'**existe** pas sans la feature `test-support`, que seule la dev-dépendance
+/// de `mika-agent` sur lui-même allume. Le paragraphe qui tenait ici jusqu'à ce
+/// vol rejetait ce gating au motif qu'il aurait demandé « an awkward
+/// self-dev-dep » ; V4-c livre exactement cette dev-dépendance, et le motif est
+/// caduc. Une déclaration unique plutôt que le couple `pub(crate)` / `pub` des
+/// autres points d'entrée : sans appelant interne, un bras `pub(crate)` serait
+/// une fonction que personne ne joint, donc un `dead_code` à taire par un
+/// `#[allow]` neuf — ce que le critère 7 du vol interdit. Ne pas exister est
+/// strictement plus fort que `pub(crate)` pour la propriété visée.
+#[cfg(feature = "test-support")]
 pub async fn run_agent_with_deadline(
     params: &AgentParams<'_>,
     deadline: Instant,
@@ -7510,7 +7535,21 @@ impl SilentTurnOutcome {
 /// Unlike `run_agent`, the agent's text output is NOT delivered to the user.
 /// The agent must use `send_message` tool to contact the user.
 /// If no `send_message` call is made, the run is a silent no-op.
+///
+/// Verrouillé hors du crate sans `test-support` — voir [`run_agent`] pour la
+/// forme et sa raison.
+#[cfg(not(feature = "test-support"))]
+pub(crate) async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<SilentTurnOutcome> {
+    run_silent_agent_verrouille(params).await
+}
+
+/// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+#[cfg(feature = "test-support")]
 pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<SilentTurnOutcome> {
+    run_silent_agent_verrouille(params).await
+}
+
+async fn run_silent_agent_verrouille(params: &SilentAgentParams<'_>) -> Result<SilentTurnOutcome> {
     let trigger_label = match &params.trigger {
         SilentTrigger::Heartbeat => "heartbeat",
         SilentTrigger::Reflection => "reflection",
@@ -7541,6 +7580,7 @@ pub async fn run_silent_agent(params: &SilentAgentParams<'_>) -> Result<SilentTu
 
 /// **Test-only entry point** for silent mode that exposes the deadline.
 /// See [`run_agent_with_deadline`] for the gating rationale.
+#[cfg(feature = "test-support")]
 pub async fn run_silent_agent_with_deadline(
     params: &SilentAgentParams<'_>,
     deadline: Instant,
@@ -8442,7 +8482,21 @@ pub struct TeamAgentParams<'a> {
 /// - Does NOT save messages to DB and does NOT run compaction
 /// - Returns `Some(text)` when the assistant produced a text response,
 ///   or `None` for tool-use-only turns.
+///
+/// Verrouillé hors du crate sans `test-support` — voir [`run_agent`] pour la
+/// forme et sa raison.
+#[cfg(not(feature = "test-support"))]
+pub(crate) async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<TeamAgentOutcome> {
+    run_team_agent_verrouille(params).await
+}
+
+/// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+#[cfg(feature = "test-support")]
 pub async fn run_team_agent(params: &TeamAgentParams<'_>) -> Result<TeamAgentOutcome> {
+    run_team_agent_verrouille(params).await
+}
+
+async fn run_team_agent_verrouille(params: &TeamAgentParams<'_>) -> Result<TeamAgentOutcome> {
     let deadline = Instant::now()
         + Duration::from_secs(crate::planning::policy::team_agent_timeout_secs(params.llm));
     run_team_agent_inner(params, deadline).await
