@@ -91,7 +91,11 @@ Les gardes textuelles existantes **ne bougent pas** : elles restent la ceinture.
   "$TARGET" -p mika-agent -p mika-cli`, **sans feature et sans `-D warnings`** ;
   l. 76 lance `cargo clippy --all-targets --all-features -- -D warnings`.
 
-### Les onze fonctions du défaut 44, localisées
+### Les treize points d'entrée du défaut 44, localisés
+
+> **Onze au groom, treize depuis l'amendement du 2026-11-19 (bis)** ci-dessous.
+> Les lignes 12 et 13 ont été ajoutées par le bearing de Prime ; partout ailleurs
+> dans ce plan, « les onze » se lit « les treize ».
 
 | # | fonction | fichier | ligne | appelants internes |
 |---|---|---|---|---|
@@ -106,9 +110,11 @@ Les gardes textuelles existantes **ne bougent pas** : elles restent la ceinture.
 | 9 | `TaskEngine::startup_recovery` | `task_engine/engine.rs` | 1005 | `server/mod.rs:2225` |
 | 10 | `TaskEngine::spawn_tick_loop` | `task_engine/engine.rs` | 1386 | `server/mod.rs:2247` |
 | 11 | `TaskEngine::tick` | `task_engine/engine.rs` | 1407 | `engine.rs:1394`, depuis `spawn_tick_loop` |
+| 12 | `TaskDispatcher::check_and_dispatch_parent` | `task_engine/dispatcher.rs` | 847 | `server/handlers.rs:759, 812, 819`, `task_engine/engine.rs:1674, 5632` |
+| 13 | `TaskDispatcher::dispatch` | `task_engine/dispatcher.rs` | 867 | `dispatcher.rs:862` (depuis la 12), `task_engine/engine.rs:5572` |
 
-`heartbeat`, `enqueue` et `cancel` de `TaskEngine` ne sont **pas** des onze et ne
-bougent pas. Les quatre binaires de `mika-agent` (`mika-spirit`, `calibrate`,
+`heartbeat`, `enqueue` et `cancel` de `TaskEngine` ne sont **pas** des treize et
+ne bougent pas. Les quatre binaires de `mika-agent` (`mika-spirit`, `calibrate`,
 `eval-diff`, `verify_bundled_skills`) n'appellent **aucune** des onze — vérifié
 par scan de `crates/mika-agent/src/bin/` — donc `cargo build -p mika-agent --bin
 mika-spirit` reste vert sans feature, bien qu'un binaire du même paquet soit un
@@ -144,6 +150,8 @@ crate externe qui ne voit pas les items `pub(crate)` de la lib.
 - `crates/mika-agent/src/task_engine/engine.rs`
 - `crates/mika-agent/src/task_engine/tick_cli_guard_scan.rs` (**amendement du
   2026-11-19, voir ci-dessous**)
+- `crates/mika-agent/src/task_engine/dispatcher.rs` (**amendement du 2026-11-19
+  (bis), voir ci-dessous**)
 - `crates/mika-cli/tests/garde_cargo_feature_test_support.rs` (**neuf**)
 - `crates/mika-agent/CLAUDE.md`
 - `crates/mika-cli/CLAUDE.md`
@@ -192,6 +200,67 @@ touchés.
 
 **Coût.** 11 lignes ajoutées, toutes du commentaire qui porte la raison du
 réancrage ; aucune assertion retirée. Poste R8 au tableau de taille.
+
+### Amendement du 2026-11-19 (bis) — `TaskDispatcher::dispatch` et `check_and_dispatch_parent` entrent au verrou
+
+**Le point.** Le verrou s'étend à deux méthodes de
+`crates/mika-agent/src/task_engine/dispatcher.rs` — `TaskDispatcher::dispatch`
+(l. 867) et `TaskDispatcher::check_and_dispatch_parent` (l. 847) — sous la forme
+(i), celle déjà employée pour `TaskEngine::new`. Les onze points d'entrée
+deviennent **treize**, et `dispatcher.rs` entre au périmètre des fichiers
+touchés. Source : le **bearing de Prime du 2026-11-19, qui vaut le mot de
+Vincent**, porté au corps du ticket sous *« Complément du 2026-11-19 »*.
+
+**L'écart à la liste d'origine, nommé.** La tête du ticket nomme, pour le moteur
+de tâches, `TaskDispatcher::dispatch` et `TaskDispatcher::check_and_dispatch_parent`.
+Le plan avait retenu à leur place `TaskEngine::startup_recovery` et
+`TaskEngine::tick`, par un raisonnement sur *ce qui lance le moteur* plutôt que
+sur *ce qui lance une tâche* : `new`, `startup_recovery`, `spawn_tick_loop` et
+`tick` sont le cycle de vie du moteur, et c'est ce cycle que la TUI faisait
+tourner dans son propre processus (`chat.rs:183-269`, mesure du corps du
+ticket). Les deux méthodes du dispatcher ne sont pas ce cycle : elles sont le
+geste unitaire qu'il appelle. **Le bearing tranche que les deux lectures sont
+dues** — le verrou ne porte pas seulement sur le démarrage du moteur mais aussi
+sur le lancement d'une tâche, qui est joignable sans lui. La liste n'est donc
+pas corrigée mais **élargie** : les quatre méthodes de `TaskEngine` restent au
+verrou, les deux du dispatcher s'y ajoutent.
+
+**Ce qui change, et ce qui ne change pas.** Chacune des deux porte désormais
+deux déclarations sous `#[cfg]` déléguant à un corps privé `*_verrouille`
+inchangé, byte pour byte. **La structure `TaskDispatcher` et tous ses champs
+restent `pub`** — le verrou porte sur deux méthodes, jamais sur le type, que
+`mika-cli` construit encore. Aucun appelant interne ne change : les trois sites
+de `server/handlers.rs` (l. 759, 812, 819) et les trois de `task_engine/engine.rs`
+(l. 1674, 5572, 5632) sont intra-crate et voient le bras `pub(crate)`. Les deux
+fichiers de `crates/mika-agent/tests/` qui appellent `dispatch`
+(`eval/test_credit_hold_2944.rs`, `eval/test_callback_delivery_starvation.rs`)
+restent couverts par la dev-dépendance sur soi-même, qui leur allume
+`test-support` : **aucun fichier sous `crates/mika-agent/tests/` ne change**, le
+critère 4 tient.
+
+**Pourquoi la forme (i) et pas la (ii).** `dispatch` prend un paramètre,
+`check_and_dispatch_parent` un aussi : aucune des deux n'approche le seuil
+clippy de 7, donc aucun `#[allow]` neuf n'est dû. C'est exactement le cas des
+quatre méthodes de `TaskEngine` (§ *Mécanisme*, R5), et la raison invoquée pour
+la forme (ii) dans `teams/mod.rs` — 12 paramètres — ne s'applique pas ici.
+
+**Pas de `dead_code`.** Les deux ont des appelants internes (tableau ci-dessus),
+donc leur bras `pub(crate)` est joint. Le traitement à déclaration unique réservé
+à `run_agent_with_deadline` et `run_silent_agent_with_deadline` (§ R3) ne les
+concerne pas.
+
+**Lecture du critère 10.** Il autorise *« les fichiers de `task_engine/` qui
+portent les quatre méthodes »*. `dispatcher.rs` est sous `task_engine/` et porte
+deux des treize : le critère est lu comme l'incluant, l'élargissement venant du
+bearing qui l'a produit.
+
+**Ce que ce n'est pas.** Ce n'est pas une halte. Les bornes ne changent pas :
+halte du pilote à `480`, mesurée après chaque commit. Ce n'est pas non plus une
+réouverture du groom — le bearing est une décision opérateur, pas une
+réestimation du périmètre groomé.
+
+**Coût.** 24 lignes ajoutées (poste R9), plus la mise à jour du compte « onze »
+dans les deux `CLAUDE.md` (R7 passe de 28 à 30).
 
 ---
 
@@ -411,6 +480,16 @@ détaché, sortie collée dans la PR :
 3. Ajouter `features = ["test-support"]` sur `mika-agent` dans `[dependencies]`
    de `mika-cli` ⇒ la garde du critère 5 **rouge**.
 
+**Quatrième mutation, due par l'amendement du 2026-11-19 (bis).** Un appel à
+`mika_agent::task_engine::TaskDispatcher::dispatch` depuis
+`crates/mika-cli/src/lib.rs` ⇒ `cargo check -p mika-cli` **rouge**. Le code
+attendu est **E0624** (*« method is private »*), et non E0603 comme aux
+mutations 1 et 2 : une méthode `pub(crate)` d'un type `pub` se refuse à
+l'appel, là où une fonction libre `pub(crate)` se refuse au chemin. Cette
+différence de code est ce qui atteste que c'est bien la **méthode** qui est
+verrouillée et non le type, lequel reste public par décision du bearing. Sortie
+recopiée dans la PR.
+
 **Portée honnête du verrou, dite plutôt que surestimée.** Le verrou mord sur le
 jeu de features par défaut : `cargo check -p mika-cli`, qui est exactement ce que
 ci.yml l. 295 lance et ce que le critère 6 nomme. Sous `--all-features` ou sous
@@ -524,17 +603,20 @@ panne de lecture.
 | R4 — `teams/mod.rs` : module privé `verrou` + deux `use` sous `#[cfg]` (96 lignes réindentées + 13 d'échafaudage) | 109 |
 | R5 — quatre doubles visibilités dans `task_engine/engine.rs` + commentaire de forme | 51 |
 | R6 — `crates/mika-cli/tests/garde_cargo_feature_test_support.rs` : prédicat, garde, témoin, contre-témoin | 54 |
-| R7 — le défaut 48 : `crates/mika-agent/CLAUDE.md` et `crates/mika-cli/CLAUDE.md` | 28 |
+| R7 — le défaut 48 : `crates/mika-agent/CLAUDE.md` et `crates/mika-cli/CLAUDE.md` | 30 |
 | R8 — réancrage de la garde mika#3042 sur le corps réel de `tick` (`tick_cli_guard_scan.rs`), amendement du 2026-11-19 | 11 |
+| R9 — deux doubles visibilités dans `task_engine/dispatcher.rs` (`dispatch`, `check_and_dispatch_parent`) + commentaire de forme, amendement du 2026-11-19 (bis) | 24 |
 
-Total estimé : 312 lignes au groom ; 323 avec R8
+Total estimé : 312 lignes au groom ; 349 avec R8 et R9
 
-**R8 ne rouvre pas le groom.** Le `Total estimé : 312` est le chiffre sur lequel
-Vincent a tranché le 2026-11-19 en levant la borne du groom à 312. R8 est un
-surcoût **constaté à l'exécution** — la garde de mika#3042 a rougi sur le
-renommage du corps de `tick` — et non une réestimation du périmètre groomé. Il
-est porté ici pour que le compte mesuré et le compte annoncé se répondent. La
-halte du pilote (480, levée du 2026-11-19) n'est pas approchée.
+**Ni R8 ni R9 ne rouvrent le groom.** Le `Total estimé : 312` est le chiffre sur
+lequel Vincent a tranché le 2026-11-19 en levant la borne du groom à 312. R8 est
+un surcoût **constaté à l'exécution** — la garde de mika#3042 a rougi sur le
+renommage du corps de `tick` — et non une réestimation du périmètre groomé. R9
+est un **élargissement décidé par le bearing de Prime du 2026-11-19**, qui vaut
+le mot de Vincent et qui dit explicitement que les bornes ne changent pas. Les
+deux sont portés ici pour que le compte mesuré et le compte annoncé se
+répondent. La halte du pilote (480, levée du 2026-11-19) n'est pas approchée.
 Plafond de tours : 200 (loop-substrate)
 Borne par vol : 429 lignes estimées — (200 − 27 − 30) × 9 / 3
 
