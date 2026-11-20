@@ -682,6 +682,18 @@ jobs:
       # identity, which would have failed on this very runner.
       - name: The harness of verify-pipeline.sh, the script every flight ends on (mika#861)
         run: bash scripts/verify-pipeline-test.sh
+      # The containment canary installed the egress proxy unconditionally and
+      # BEFORE any check, which made the binary newer than the running daemon,
+      # got the proxy restarted, and cut the CONNECT tunnels of whatever pilot
+      # was flying: measured 2026-11-01, a pilot dead at turn 18 on `502 …
+      # inference gateway`. The defect was masked by an operator rule — "canary
+      # only on an idle engine" — so it cost ~40 min of deferral per deploy and
+      # would have come back silently the day the rule was forgotten. The canary
+      # had NO suite at all before this one. Hermetic by construction: `HOME` and
+      # `PILOT_LOG_DIR` are redirected to fixtures and the canary refuses before
+      # reaching bwrap, the relay or the network.
+      - name: The canary asks "does a pilot fly?" before installing (mika#3051)
+        run: bash scripts/test-canary-pilot-containment.sh
 
   # ───────────────────────────────────────────────────────────────────────────
   # The other half of the mika#2793 catch-up: the guards of the plumbing EVERY
