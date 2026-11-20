@@ -30,6 +30,11 @@ path = "src/bin/verify_bundled_skills.rs"
 
 [features]
 telemetry = ["mika-common/telemetry"]
+# Ouvre les onze points d'entrée du défaut 44 aux crates externes (mika#1727
+# vol V4-c). Éteinte par défaut : hors de mika-agent, un lancement d'agent,
+# d'équipe ou du moteur de tâches ne compile pas. Allumée pour les tests du
+# crate par la dev-dépendance sur soi-même, plus bas.
+test-support = []
 
 [dependencies]
 mika-common.workspace = true
@@ -96,6 +101,14 @@ tracing-subscriber.workspace = true
 # Consumers: mika#1969 (fetch_url builtin) + mika#1971 (web_search substrate cut).
 # Reuses the workspace pin also used by mika-gateway's egress-search/egress-fetch tests.
 wiremock.workspace = true
+# Dev-dépendance sur soi-même : la seule façon d'allumer `test-support` pour les
+# cibles de test du paquet sans l'allumer pour sa lib ni pour ses binaires. Un
+# `#[cfg(any(test, feature = …))]` ne suffirait pas : un fichier de `tests/` est
+# un crate séparé, qui ne voit pas le `cfg(test)` de la lib dont il dépend. Sous
+# le résolveur de l'edition 2024, les features d'une dev-dépendance s'unifient
+# dans les builds qui incluent les cibles de test (`cargo test`, `--all-targets`)
+# et PAS dans `cargo check -p mika-agent` ni dans `cargo build` (mika#1727 V4-c).
+mika-agent = { path = ".", features = ["test-support"] }
 
 [lints]
 workspace = true

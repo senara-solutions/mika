@@ -946,7 +946,25 @@ pub struct TaskEngine {
 }
 
 impl TaskEngine {
+    /// Verrouillées hors du crate sans la feature `test-support` (mika#1727
+    /// V4-c) : les quatre méthodes qui **lancent** le moteur de tâches
+    /// — `new`, `startup_recovery`, `spawn_tick_loop`, `tick` — portent deux
+    /// déclarations sous `#[cfg]` déléguant à un corps privé renommé. Pas un
+    /// réexport : Rust ne sait pas élargir une visibilité par `pub use`
+    /// (E0364/E0365). `heartbeat`, `enqueue` et `cancel` ne lancent rien et
+    /// restent `pub`.
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn new(db: AsyncDatabase, dispatcher: Arc<TaskDispatcher>) -> Self {
+        Self::new_verrouille(db, dispatcher)
+    }
+
+    /// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+    #[cfg(feature = "test-support")]
     pub fn new(db: AsyncDatabase, dispatcher: Arc<TaskDispatcher>) -> Self {
+        Self::new_verrouille(db, dispatcher)
+    }
+
+    fn new_verrouille(db: AsyncDatabase, dispatcher: Arc<TaskDispatcher>) -> Self {
         let (tx, rx) = mpsc::channel(64);
         Self {
             db,
@@ -1002,7 +1020,20 @@ impl TaskEngine {
     /// 3. Loads `pending` and `recurring_active` tasks into the `BinaryHeap`.
     ///
     /// Returns `(loaded_count, queue_len)` for the caller to aggregate across agents.
+    ///
+    /// Verrouillée hors du crate sans `test-support` — voir [`Self::new`].
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) async fn startup_recovery(&mut self) -> Result<(usize, usize)> {
+        self.startup_recovery_verrouille().await
+    }
+
+    /// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+    #[cfg(feature = "test-support")]
     pub async fn startup_recovery(&mut self) -> Result<(usize, usize)> {
+        self.startup_recovery_verrouille().await
+    }
+
+    async fn startup_recovery_verrouille(&mut self) -> Result<(usize, usize)> {
         let now = crate::timestamp::now();
 
         // mika#2515 — un instrument désarmé se lit exactement comme un
@@ -1383,7 +1414,20 @@ impl TaskEngine {
     /// Spawn the 1-second tick loop as a background task.
     ///
     /// The returned `JoinHandle` can be aborted on shutdown.
+    ///
+    /// Verrouillée hors du crate sans `test-support` — voir [`Self::new`].
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) fn spawn_tick_loop(engine: Arc<Mutex<Self>>) -> JoinHandle<()> {
+        Self::spawn_tick_loop_verrouille(engine)
+    }
+
+    /// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+    #[cfg(feature = "test-support")]
     pub fn spawn_tick_loop(engine: Arc<Mutex<Self>>) -> JoinHandle<()> {
+        Self::spawn_tick_loop_verrouille(engine)
+    }
+
+    fn spawn_tick_loop_verrouille(engine: Arc<Mutex<Self>>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1400,11 +1444,23 @@ impl TaskEngine {
     /// One tick: drain the re-enqueue channel, run periodic DB scan, then fire
     /// all due tasks (up to MAX_PER_TICK).
     ///
-    /// Visibility: `pub` so integration tests can drive the tick pipeline
-    /// (e.g. mika#1712's `tests/eval/test_phantom_task_row_sweep.rs` exercises
-    /// the sweep-from-tick wiring end-to-end). Production callers still go
+    /// Visibility: `pub` **sous la feature `test-support` seulement**, pour que
+    /// les tests d'intégration pilotent le tick (mika#1712,
+    /// `tests/eval/test_phantom_task_row_sweep.rs`) ; `pub(crate)` sans elle
+    /// (mika#1727 V4-c) — voir [`Self::new`]. Production callers still go
     /// through [`Self::spawn_tick_loop`].
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) async fn tick(&mut self) {
+        self.tick_verrouille().await
+    }
+
+    /// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+    #[cfg(feature = "test-support")]
     pub async fn tick(&mut self) {
+        self.tick_verrouille().await
+    }
+
+    async fn tick_verrouille(&mut self) {
         // Update wedge-watchdog heartbeat (mika#1850) — MUST be first line of
         // tick body so a wedge in downstream awaits still tells the watchdog
         // "the previous tick reached this point at time T". If we placed it

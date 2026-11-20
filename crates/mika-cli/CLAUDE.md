@@ -6,6 +6,8 @@ TUI CLI binary (`mika`): ratatui chat interface with clap subcommands.
 
 `src/main.rs` is the binary entry point and owns the full module tree under it (`init`, `commands`, `tui`, `wizard`). `src/lib.rs` is a minimal library surface (currently re-exporting `supervision` only) for types and primitives that need to be reachable from integration tests under `crates/mika-cli/tests/`. The binary tree and the library tree are independent — the binary accesses lib re-exports as `mika_cli::*`. Keep `lib.rs` minimal; do not bloat it to make arbitrary binary modules reachable from tests (most logic stays binary-private and is tested via inline `#[cfg(test)] mod tests`).
 
+**Ce crate ne peut plus compiler un lancement local (mika#1727, vol V4-c).** Les treize points d'entrée de `mika-agent` — les trois `run_*agent`, les deux variantes à échéance, `run_team`, `resume_team_run`, les quatre méthodes de `TaskEngine` et `TaskDispatcher::{check_and_dispatch_parent, dispatch}` — sont `pub(crate)` hors de sa feature `test-support`, que `tests/garde_cargo_feature_test_support.rs` refuse de voir allumée dans `[dependencies]` ; le verrou porte sur le jeu de features par défaut, donc les gardes textuelles de ce crate restent la ceinture.
+
 ## Subcommands
 
 `status`, `memory`, `reminders`, `config`, `setup`, `mcp`, `skills`, `tasks`, `ask`, `doctor`, `dashboard`, `token`, `credential-helper`, `provider`, `model`, `agents`, `teams`, `webhook`, `kg`, `logs`, `plan-callout`, `arch-disposition`, `flight-verdicts`.

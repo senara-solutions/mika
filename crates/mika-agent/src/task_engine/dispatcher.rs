@@ -844,7 +844,27 @@ impl TaskDispatcher {
     ///
     /// This is a convenience wrapper around `try_complete_parent_on_sibling_done`
     /// that handles logging and error cases. Call sites only need a single line.
+    ///
+    /// Verrouillées hors du crate sans la feature `test-support` (mika#1727
+    /// V4-c, amendement du 2026-11-19 bis) : les deux méthodes qui **lancent**
+    /// une tâche — `check_and_dispatch_parent` et `dispatch` — portent deux
+    /// déclarations sous `#[cfg]` déléguant à un corps privé renommé, la forme
+    /// de `TaskEngine::new`. Pas un réexport : Rust ne sait pas élargir une
+    /// visibilité par `pub use` (E0364/E0365). La structure `TaskDispatcher` et
+    /// ses champs restent `pub` — c'est la méthode qui se verrouille et non le
+    /// type, ce qu'un appel refusé atteste par E0624 plutôt que par E0603.
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) async fn check_and_dispatch_parent(&self, task_id: &str) {
+        self.check_and_dispatch_parent_verrouille(task_id).await
+    }
+
+    /// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+    #[cfg(feature = "test-support")]
     pub async fn check_and_dispatch_parent(&self, task_id: &str) {
+        self.check_and_dispatch_parent_verrouille(task_id).await
+    }
+
+    async fn check_and_dispatch_parent_verrouille(&self, task_id: &str) {
         match self.db.try_complete_parent_on_sibling_done(task_id).await {
             Ok(Some(parent_id)) => {
                 info!(
@@ -864,7 +884,21 @@ impl TaskDispatcher {
     }
 
     /// Dispatch a task by its ID: load from DB, match on `action_type`, execute.
+    ///
+    /// Verrouillée hors du crate sans `test-support` — voir
+    /// `Self::check_and_dispatch_parent`.
+    #[cfg(not(feature = "test-support"))]
+    pub(crate) async fn dispatch(&self, task_id: &str) -> Result<(), DispatchError> {
+        self.dispatch_verrouille(task_id).await
+    }
+
+    /// Voir le bras `#[cfg(not(feature = "test-support"))]` ci-dessus.
+    #[cfg(feature = "test-support")]
     pub async fn dispatch(&self, task_id: &str) -> Result<(), DispatchError> {
+        self.dispatch_verrouille(task_id).await
+    }
+
+    async fn dispatch_verrouille(&self, task_id: &str) -> Result<(), DispatchError> {
         let task = self
             .db
             .get_task(task_id)

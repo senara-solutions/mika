@@ -2218,6 +2218,7 @@ dependencies = [
  "http-body-util",
  "libc",
  "mika-a2a",
+ "mika-agent",
  "mika-common",
  "regex",
  "reqwest 0.12.28",
