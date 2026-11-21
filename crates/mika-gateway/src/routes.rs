@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine;
+use mika_common::telegram::{MAX_TEXT_UTF16_UNITS, text_len_utf16};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -2655,10 +2656,7 @@ async fn handle_admin_tenant_outbound_messages(
 /// prefix leaked into a family member's first-hour Telegram greeting, breaking
 /// the persona's "warm, French, no jargon" contract before she even said
 /// hello. Pure function so the branch is unit-testable without HTTP scaffolding.
-///
-/// `pub(crate)` since mika#3114: `telegram_split` composes every chunk through
-/// it, so the prefix keeps a single composition site even once one `/send` turns
-/// into several `sendMessage` calls.
+/// `pub(crate)` since mika#3114: `telegram_split` composes every chunk through it.
 pub(crate) fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
     match agent_name {
         Some(name) if name != mika_common::agent::DEFAULT_AGENT => {
@@ -2668,12 +2666,10 @@ pub(crate) fn format_outbound_text(agent_name: Option<&str>, text: &str) -> Stri
     }
 }
 
-/// What a chunked send actually delivered, and what stopped it (mika#3114).
-///
-/// `delivered` is the `telegram_message_id` of every chunk Telegram accepted, in
-/// order. It is **not** emptied by a failure: the chunks that did land are real
-/// messages a user can reply to, so they still each need an `outbound_messages`
-/// row.
+/// What a chunked send delivered, and what stopped it (mika#3114). `delivered`
+/// holds the `telegram_message_id` of every accepted chunk, in order, and is **not**
+/// emptied by a failure: the chunks that landed are real messages a user can reply
+/// to, so each still needs an `outbound_messages` row.
 pub(crate) struct ChunkedSendOutcome {
     pub(crate) delivered: Vec<i64>,
     pub(crate) failure: Option<TelegramApiError>,
@@ -2681,18 +2677,14 @@ pub(crate) struct ChunkedSendOutcome {
 
 /// Send `chunks` in order, one `sendMessage` each, stopping at the first failure.
 ///
-/// **Stopping is the point.** Carrying on past a failed chunk would deliver a
-/// text with a hole in the middle and no way for the reader to know, which is
-/// worse than the 502 this fix exists to remove. Chunk k+1 is never attempted.
+/// **Stopping is the point:** carrying on past a failed chunk would deliver a text
+/// with a hole in the middle and no way for the reader to know — worse than the 502
+/// this fix removes. Chunk k+1 is never attempted. Neither event carries the body
+/// (mika#2126, restated by mika#2291).
 ///
-/// `send` is injected rather than reading a client from `AppState`: the
-/// production surface stays as narrow as it is today (`api_url` hard-codes
-/// `https://api.telegram.org`, and `should_fall_back_to_plain` already declared
-/// widening it for test-only observability out of scope), and the seam is what
-/// lets AC2 observe the posted texts.
-///
-/// The message body is **never** logged, on either event — the mika#2126
-/// standard this file holds throughout, restated by mika#2291.
+/// `send` is injected rather than read from `AppState` because `api_url` hard-codes
+/// the Telegram host and `should_fall_back_to_plain` already declared widening it
+/// for test-only observability out of scope; the seam is what lets AC2 see the sends.
 pub(crate) async fn send_in_chunks<F, Fut>(
     chat_id: i64,
     request_id: Option<&str>,
@@ -2709,30 +2701,11 @@ where
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         match send(chunk.clone()).await {
             Ok(message_id) => {
-                // One line per accepted sendMessage, carrying the same
-                // `telegram_message_id` field operators already grep for; the
-                // two index fields are new and absent from a single-chunk send's
-                // meaning only in that they read 0 of 1.
-                info!(
-                    chat_id,
-                    request_id = ?request_id,
-                    telegram_message_id = message_id,
-                    chunk_index,
-                    chunk_count,
-                    "sent to telegram"
-                );
+                info!(chat_id, request_id = ?request_id, telegram_message_id = message_id, chunk_index, chunk_count, "sent to telegram");
                 delivered.push(message_id);
             }
             Err(e) => {
-                warn!(
-                    chat_id,
-                    request_id = ?request_id,
-                    chunk_index,
-                    chunk_count,
-                    delivered = delivered.len(),
-                    error = %e,
-                    "telegram_send_chunk_failed"
-                );
+                warn!(chat_id, request_id = ?request_id, chunk_index, chunk_count, delivered = delivered.len(), error = %e, "telegram_send_chunk_failed");
                 return ChunkedSendOutcome {
                     delivered,
                     failure: Some(e),
@@ -2812,15 +2785,9 @@ pub(crate) async fn handle_send(
             .into_response();
     }
 
-    // Split at the Telegram limit, prefix included, so a long text leaves as
-    // several sendMessage calls instead of one 400 and a lost message
-    // (mika#3114). A text that already fits yields exactly one chunk, composed
-    // by `format_outbound_text` as before.
-    let chunks = split_outbound_text(
-        payload.agent_name.as_deref(),
-        &payload.text,
-        mika_common::telegram::MAX_TEXT_UTF16_UNITS,
-    );
+    // Split at the limit, prefix included: several sends beat one 400 (mika#3114).
+    let agent_name = payload.agent_name.as_deref();
+    let chunks = split_outbound_text(agent_name, &payload.text, MAX_TEXT_UTF16_UNITS);
 
     // Resolve the Telegram client: per-customer bot token if customer_id is provided,
     // otherwise fall back to the global single-bot client.
@@ -2877,16 +2844,10 @@ pub(crate) async fn handle_send(
         }
     };
 
-    // Only a real split says anything: a single chunk is the nominal regime and
-    // a line per send would be the churn mika#2131 bounds.
+    // Only a real split says anything: a single chunk is the nominal regime and a
+    // line per send would be the churn mika#2131 bounds.
     if chunks.len() > 1 {
-        info!(
-            chat_id = payload.chat_id,
-            request_id = ?payload.request_id,
-            chunk_count = chunks.len(),
-            total_len_utf16 = mika_common::telegram::text_len_utf16(&payload.text),
-            "telegram_send_split"
-        );
+        info!(chat_id = payload.chat_id, request_id = ?payload.request_id, chunk_count = chunks.len(), total_len_utf16 = text_len_utf16(&payload.text), "telegram_send_split");
     }
 
     let tg_ref = &tg_client;
@@ -2899,10 +2860,9 @@ pub(crate) async fn handle_send(
     )
     .await;
 
-    // One outbound_messages row per delivered chunk, with the same agent_name,
-    // so `resolve_reply_agent` routes a reply made to any of them. This runs on
-    // the failure arm too: the chunks that landed before it are messages the
-    // user can reply to right now.
+    // One row per delivered chunk, same agent_name, so `resolve_reply_agent` routes
+    // a reply made to any of them — on the failure arm too, since the chunks that
+    // landed are messages the user can reply to right now.
     if let Some(ref name) = payload.agent_name {
         for &message_id in &outcome.delivered {
             if let Err(e) = sqlx::query(
@@ -2925,8 +2885,7 @@ pub(crate) async fn handle_send(
         }
     }
 
-    // Same status arms as before the split: the failure of a chunk is reported
-    // exactly as the failure of the whole send used to be.
+    // A chunk's failure is reported exactly as the whole send's failure used to be.
     match outcome.failure {
         None => StatusCode::OK.into_response(),
         Some(TelegramApiError::BotBlocked) => {
@@ -3178,108 +3137,76 @@ mod tests {
 
     use super::*;
 
+    /// A sender that records what it posted and accepts everything.
+    fn recording_sender(
+        log: &Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn(String) -> std::future::Ready<Result<i64, TelegramApiError>> {
+        let log = Arc::clone(log);
+        move |chunk: String| {
+            let mut sent = log.lock().expect("recorder mutex");
+            sent.push(chunk);
+            std::future::ready(Ok(sent.len() as i64))
+        }
+    }
+
     /// AC2 — the defect, end to end: a text over the limit leaves as several
     /// ordered sends, each under the limit, and arrives whole.
     #[tokio::test]
     async fn mika3114_ac2_a_long_text_is_delivered_whole_and_in_order() {
+        const LIMIT: usize = MAX_TEXT_UTF16_UNITS;
         let text = "Paragraphe du test de bout en bout de mika#3114.\n\n".repeat(120);
         assert!(
-            mika_common::telegram::text_len_utf16(&text) > 4096,
-            "the fixture must exceed the limit for this test to mean anything"
+            text_len_utf16(&text) > LIMIT,
+            "the fixture must exceed the limit"
         );
 
-        let chunks = split_outbound_text(
-            Some("mika-dev"),
-            &text,
-            mika_common::telegram::MAX_TEXT_UTF16_UNITS,
-        );
+        let chunks = split_outbound_text(Some("mika-dev"), &text, LIMIT);
         assert!(chunks.len() > 1, "a 6 000-unit text must be split");
 
         let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&posted);
-        let outcome = send_in_chunks(42, Some("req-3114"), &chunks, move |chunk: String| {
-            let recorder = Arc::clone(&recorder);
-            async move {
-                let mut sent = recorder.lock().expect("recorder mutex");
-                sent.push(chunk);
-                Ok::<_, TelegramApiError>(sent.len() as i64)
-            }
-        })
-        .await;
-
+        let outcome =
+            send_in_chunks(42, Some("req-3114"), &chunks, recording_sender(&posted)).await;
         assert!(outcome.failure.is_none());
         assert_eq!(outcome.delivered.len(), chunks.len());
 
-        // Scoped: the negative control below awaits, and no guard may cross it.
-        {
-            let sent = posted.lock().expect("recorder mutex");
-            assert_eq!(*sent, chunks, "one send per chunk, in order");
-            let mut rejoined = String::new();
-            for one in sent.iter() {
-                assert!(
-                    mika_common::telegram::text_len_utf16(one)
-                        <= mika_common::telegram::MAX_TEXT_UTF16_UNITS,
-                    "a send of {} UTF-16 units is what Telegram refuses",
-                    mika_common::telegram::text_len_utf16(one)
-                );
-                rejoined.push_str(
-                    one.strip_prefix("[mika-dev] ")
-                        .expect("every send carries the agent prefix"),
-                );
-            }
-            assert_eq!(rejoined, text, "the rejoined sends are the posted text");
+        let sent = posted.lock().expect("recorder mutex").clone();
+        assert_eq!(sent, chunks, "one send per chunk, in order");
+        let mut rejoined = String::new();
+        for one in sent.iter() {
+            let units = text_len_utf16(one);
+            assert!(
+                units <= LIMIT,
+                "a send of {units} units is what Telegram refuses"
+            );
+            rejoined.push_str(one.strip_prefix("[mika-dev] ").expect("agent prefix"));
         }
+        assert_eq!(rejoined, text, "the rejoined sends are the posted text");
 
-        // Negative control, in the same test: handed the whole text as one
-        // chunk — the pre-fix shape — the very same sender posts a single send
-        // of more than 4096 units, which is the 400 this fix removes.
+        // Negative control, same sender: handed the whole text as one chunk — the
+        // pre-fix shape — it posts a single send over the limit, the 400 this removes.
         let unsplit: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&unsplit);
         let whole = vec![format_outbound_text(Some("mika-dev"), &text)];
-        send_in_chunks(42, Some("req-3114"), &whole, move |chunk: String| {
-            let recorder = Arc::clone(&recorder);
-            async move {
-                recorder.lock().expect("recorder mutex").push(chunk);
-                Ok::<_, TelegramApiError>(1)
-            }
-        })
-        .await;
+        send_in_chunks(42, Some("req-3114"), &whole, recording_sender(&unsplit)).await;
         let unsplit = unsplit.lock().expect("recorder mutex");
         assert_eq!(unsplit.len(), 1);
-        assert!(
-            mika_common::telegram::text_len_utf16(&unsplit[0])
-                > mika_common::telegram::MAX_TEXT_UTF16_UNITS
-        );
+        assert!(text_len_utf16(&unsplit[0]) > LIMIT);
     }
 
     /// AC4 — a text under the limit keeps today's path: one send, byte for byte
     /// what `format_outbound_text` composes, one delivered id.
     #[tokio::test]
     async fn mika3114_ac4_a_short_text_keeps_the_single_send_path() {
-        let text = "coucou";
-        let chunks = split_outbound_text(
-            Some("mika-dev"),
-            text,
-            mika_common::telegram::MAX_TEXT_UTF16_UNITS,
-        );
-        assert_eq!(chunks, vec![format_outbound_text(Some("mika-dev"), text)]);
+        let expected = format_outbound_text(Some("mika-dev"), "coucou");
+        let chunks = split_outbound_text(Some("mika-dev"), "coucou", MAX_TEXT_UTF16_UNITS);
+        assert_eq!(chunks, vec![expected.clone()]);
 
         let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&posted);
-        let outcome = send_in_chunks(42, None, &chunks, move |chunk: String| {
-            let recorder = Arc::clone(&recorder);
-            async move {
-                recorder.lock().expect("recorder mutex").push(chunk);
-                Ok::<_, TelegramApiError>(7)
-            }
-        })
-        .await;
+        let outcome = send_in_chunks(42, None, &chunks, recording_sender(&posted)).await;
 
         assert!(outcome.failure.is_none());
-        assert_eq!(outcome.delivered, vec![7]);
+        assert_eq!(outcome.delivered, vec![1]);
         let sent = posted.lock().expect("recorder mutex");
-        assert_eq!(sent.len(), 1, "one send, as before the split");
-        assert_eq!(sent[0], format_outbound_text(Some("mika-dev"), text));
+        assert_eq!(*sent, vec![expected], "one send, as before the split");
     }
 
     #[test]

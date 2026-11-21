@@ -1,42 +1,18 @@
 //! Split outbound Telegram text at the UTF-16 limit (mika#3114).
 //!
-//! Telegram caps `sendMessage`'s `text` field at 4096 UTF-16 units and answers
-//! 400 "message is too long" beyond it. `handle_send` sent the text it received
-//! in a single call, so the gateway answered 502 and **the message was lost** —
-//! 418 of them since 2026-09-20, plus 420 `telegram_html_fallback_failed` lines
-//! carrying the same description, the plain-text fallback of mika#2291 being
-//! just as long as the HTML it replaces.
-//!
-//! This module is the one place that decides where the text is cut. The send
-//! loop lives in `routes::send_in_chunks`; the rendering of each piece is
-//! unchanged and stays in `telegram::send_message_impl`.
+//! Telegram caps `text` at 4096 UTF-16 units and answers 400 beyond it, so a long
+//! `/send` became a 502 and a lost message. This module decides where the text is
+//! cut; `routes::send_in_chunks` sends the pieces and `telegram::send_message_impl`
+//! renders each one, unchanged. Measurement, surfaces and named degradations:
+//! `crates/mika-gateway/CLAUDE.md` § *Outbound Splitting*.
 //!
 //! **The cut predicate reuses the recognizer instead of asking it for offsets.**
-//! `telegram_markdown::Segment` carries no position in the source text and the
-//! markers have been stripped, so the position is not reconstructible — and
-//! `telegram_markdown.rs` is out of scope for this fix, so no offset function can
-//! be added there. Instead, a cut at index `k` is *neutral* when
-//!
-//! ```text
-//! render_plain(tokenize(&s[..k])) + render_plain(tokenize(&s[k..]))
-//!     == render_plain(tokenize(s))
-//! ```
-//!
-//! A cut inside `**bold**` leaves `**bo` on the left (unpaired markers, so
-//! verbatim) and `ld**` on the right: the equality breaks and the cut is
-//! refused. A clean cut leaves the segments intact on both sides and the
-//! equality holds. The predicate therefore refuses, by construction, any cut
-//! that changes what the recognizer sees — which is exactly the invariant asked
-//! for, without a second recognition.
-//!
-//! **Named degradation, tracked on senara-solutions/mika#2983.** A fenced code
-//! block longer than the limit has no neutral cut candidate at all (the
-//! predicate refuses every cut inside a fence), so the split falls back on the
-//! progress floor and the backticks end up unbalanced across the pieces.
-//! `tokenize` does not recognize an unclosed fence — its backticks stay `Plain`
-//! verbatim — so Telegram accepts the send and the reader sees apparent ```.
-//! That is cosmetic: the message is no longer lost, which is the measured
-//! defect. Re-opening the fence with its language tag is the follow-up.
+//! `Segment` carries no source position and `telegram_markdown.rs` is out of scope
+//! here, so a cut at `k` is kept only when it is *neutral*:
+//! `render_plain(tokenize(&s[..k])) + render_plain(tokenize(&s[k..]))` equals
+//! `render_plain(tokenize(s))`. A cut inside `**bold**` leaves unpaired markers on
+//! both sides and the equality breaks — any cut that would change what the
+//! recognizer sees is refused by construction.
 
 use mika_common::telegram::text_len_utf16;
 
@@ -45,23 +21,14 @@ use crate::telegram_markdown::{render_plain, tokenize};
 
 /// Split `text` into pieces that each fit `limit` UTF-16 units, prefix included.
 ///
-/// `limit` is a parameter rather than a constant read at the site so tests can
-/// exercise the split on short texts; production passes
-/// `mika_common::telegram::MAX_TEXT_UTF16_UNITS`.
-///
-/// **The prefix has a single composition site.** Every piece — including the
-/// single piece of a text that already fits — is composed by
+/// **The prefix has a single composition site**: every piece goes through
 /// [`format_outbound_text`], so a text under the limit returns *literally*
-/// `vec![format_outbound_text(agent_name, text)]` and the identity with today's
-/// path is guaranteed by construction rather than by inspection. The prefix is
-/// repeated on every piece so `resolve_reply_agent` routes a reply made to any
-/// one of them.
-///
-/// The concatenation of the pieces, prefixes removed, is always the input: no
-/// loss, no reordering. Even the degenerate case where the budget cannot hold
-/// the first `char` emits the remainder whole rather than dropping it — an
-/// oversized send that Telegram refuses is still accounted for, a silent
-/// truncation would not be.
+/// `vec![format_outbound_text(agent_name, text)]` — identity with today's path by
+/// construction, not by inspection — and the prefix repeats on each piece so
+/// `resolve_reply_agent` routes a reply made to any of them. The pieces concatenated,
+/// prefixes removed, are always the input: even a budget too small for the first
+/// `char` emits the remainder whole, since an oversized send Telegram refuses is
+/// accountable where a silent truncation would not be.
 pub(crate) fn split_outbound_text(
     agent_name: Option<&str>,
     text: &str,
@@ -73,9 +40,7 @@ pub(crate) fn split_outbound_text(
         return vec![full];
     }
 
-    // The prefix is measured through the composition itself rather than
-    // re-derived from `agent_name`: a second formula is a second chance to
-    // disagree with `format_outbound_text` about what the prefix is.
+    // Measured through the composition, never recomputed from the agent name.
     let prefix_units = full_units.saturating_sub(text_len_utf16(text));
     let budget = limit.saturating_sub(prefix_units);
 
@@ -93,21 +58,16 @@ pub(crate) fn split_outbound_text(
     chunks
 }
 
-/// Where to cut `rest` so the piece holds `budget` UTF-16 units.
-///
-/// Preference order: end of paragraph, then end of line, then a space, then the
-/// hard boundary. A candidate is retained only when it is neutral for the
-/// recognizer ([`cut_is_neutral`]); the hard boundary is the **progress floor**
-/// that guarantees termination when nothing is neutral.
+/// Where to cut `rest` so the piece holds `budget` UTF-16 units. Preference: end of
+/// paragraph, end of line, a space, then the hard boundary. A candidate is retained
+/// only when [`cut_is_neutral`]; the hard boundary is the **progress floor** that
+/// guarantees termination when nothing is neutral.
 fn choose_cut(rest: &str, budget: usize) -> usize {
     if text_len_utf16(rest) <= budget {
         return rest.len();
     }
 
-    // The largest `char`-boundary index whose accumulated UTF-16 units stay
-    // within budget. Accumulating `c.len_utf16()` over `char_indices()` is what
-    // keeps a cut out of the middle of a character *and* out of the middle of a
-    // surrogate pair: a non-BMP `char` contributes its 2 units in one piece.
+    // Accumulating `c.len_utf16()` keeps the cut out of a character *and* of a pair.
     let mut hard = rest.len();
     let mut units = 0usize;
     for (idx, c) in rest.char_indices() {
@@ -119,15 +79,12 @@ fn choose_cut(rest: &str, budget: usize) -> usize {
     }
 
     let head = &rest[..hard];
-    // Computed once per slice, outside the candidate loop: the predicate is the
-    // only expensive part of this function, and the three candidates share the
-    // same reference rendering.
+    // Once per slice: the three candidates share one rendering of the baseline.
     let baseline = render_plain(&tokenize(rest));
 
-    // Each candidate cuts *after* its separator, so the right-hand piece starts
-    // at a line start where the separator was a newline — which is what keeps
-    // the heading and bullet rules of `tokenize` firing identically on both
-    // sides of the cut.
+    // Each candidate cuts *after* its separator, so a newline separator leaves the
+    // right-hand piece starting at a line start — `tokenize`'s heading and bullet
+    // rules then fire identically on both sides.
     let candidates = [
         head.rfind("\n\n").map(|i| i + 2),
         head.rfind('\n').map(|i| i + 1),
@@ -143,9 +100,8 @@ fn choose_cut(rest: &str, budget: usize) -> usize {
 }
 
 /// Whether cutting `rest` at `cut` leaves the recognizer's reading unchanged.
-///
-/// `baseline` is `render_plain(tokenize(rest))`, passed in rather than computed
-/// here so the three candidates of one slice share a single rendering.
+/// `baseline` is `render_plain(tokenize(rest))`, passed in so one slice's candidates
+/// share a single rendering.
 fn cut_is_neutral(rest: &str, cut: usize, baseline: &str) -> bool {
     let mut joined = render_plain(&tokenize(&rest[..cut]));
     joined.push_str(&render_plain(&tokenize(&rest[cut..])));
@@ -156,58 +112,44 @@ fn cut_is_neutral(rest: &str, cut: usize, baseline: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// A text under the limit yields one piece, identical to today's path.
+    /// AC1(a) — a text under the limit is one piece, identical to today's path.
     #[test]
     fn mika3114_a_text_under_the_limit_is_one_untouched_piece() {
-        let chunks = split_outbound_text(None, "bonjour", 4096);
-        assert_eq!(chunks, vec!["bonjour".to_string()]);
-
-        let chunks = split_outbound_text(Some("mika-dev"), "bonjour", 4096);
+        assert_eq!(split_outbound_text(None, "bonjour", 4096), vec!["bonjour"]);
         assert_eq!(
-            chunks,
+            split_outbound_text(Some("mika-dev"), "bonjour", 4096),
             vec![format_outbound_text(Some("mika-dev"), "bonjour")]
         );
     }
 
-    /// 10 000 characters in paragraphs: every piece fits, prefix included, and
-    /// the concatenation is the input — no loss, no reordering.
+    /// AC1(b) — 10 000 characters in paragraphs: every piece fits, prefix included,
+    /// and the concatenation is the input. No loss, no reordering.
     #[test]
     fn mika3114_ten_thousand_characters_split_without_loss() {
-        let mut text = String::new();
-        while text.len() < 10_000 {
-            text.push_str("Paragraphe de remplissage pour le test de decoupage.\n\n");
-        }
+        let mut text = "Paragraphe de remplissage pour le test de decoupage.\n\n".repeat(200);
         text.truncate(10_000); // ASCII filler: bytes == chars == UTF-16 units.
         assert_eq!(text_len_utf16(&text), 10_000);
 
-        let prefix = "[mika-dev] ";
         let chunks = split_outbound_text(Some("mika-dev"), &text, 4096);
         assert!(chunks.len() > 1, "a 10 000-unit text must be split");
 
         let mut rejoined = String::new();
         for chunk in &chunks {
-            assert!(
-                text_len_utf16(chunk) <= 4096,
-                "chunk of {} UTF-16 units exceeds the limit",
-                text_len_utf16(chunk)
-            );
-            let body = chunk
-                .strip_prefix(prefix)
-                .expect("every chunk carries the agent prefix");
-            rejoined.push_str(body);
+            let units = text_len_utf16(chunk);
+            assert!(units <= 4096, "chunk of {units} units exceeds the limit");
+            rejoined.push_str(chunk.strip_prefix("[mika-dev] ").expect("agent prefix"));
         }
         assert_eq!(rejoined, text);
     }
 
-    /// Non-BMP emoji: the limit is counted in UTF-16 units, not in bytes and not
-    /// in `char`s, and no cut falls inside a surrogate pair.
+    /// AC1(d) — the limit is counted in UTF-16 units, not in bytes and not in
+    /// `char`s, and no cut falls inside a surrogate pair.
     #[test]
     fn mika3114_non_bmp_emoji_are_counted_in_utf16_units() {
         let text = "👆".repeat(50);
         let limit = 20;
 
-        // The three counts disagree, which is what makes the assertion below a
-        // measurement of the UTF-16 one rather than a coincidence.
+        // The three counts disagree, so the piece count below measures the UTF-16 one.
         assert_eq!(text.len(), 200);
         assert_eq!(text.chars().count(), 50);
         assert_eq!(text_len_utf16(&text), 100);
@@ -219,36 +161,25 @@ mod tests {
 
         for chunk in &chunks {
             assert_eq!(text_len_utf16(chunk), limit);
-            assert!(
-                !chunk.contains('\u{fffd}'),
-                "a cut inside a surrogate pair would surface as U+FFFD"
-            );
+            assert!(!chunk.contains('\u{fffd}'), "a split pair reads as U+FFFD");
         }
         assert_eq!(chunks.concat(), text);
     }
 
-    /// A `**bold**` straddling the limit: the cut falls before it.
+    /// AC1(e) — a `**gras**` straddling the limit: the cut falls before it.
     #[test]
     fn mika3114_a_cut_never_falls_inside_a_bold_run() {
-        // The hard boundary at 20 units lands inside `**gras**`; the space just
-        // before it is the candidate the preference order retains.
+        // The hard boundary at 20 units lands inside `**gras**`; the space before it
+        // is the candidate the preference order retains.
         let text = "0123456789 0123 **gras** fin";
         let chunks = split_outbound_text(None, text, 20);
 
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0], "0123456789 0123 ");
-        assert_eq!(chunks[1], "**gras** fin");
-        assert!(
-            !chunks[0].ends_with('*'),
-            "the first piece must not end on a prefix of the bold run"
-        );
-        assert!(chunks[1].starts_with("**"));
+        assert_eq!(chunks, vec!["0123456789 0123 ", "**gras** fin"]);
+        assert!(!chunks[0].ends_with('*'), "no prefix of the bold run kept");
 
-        // And the retained cut satisfies the invariance predicate itself.
+        // The control shows the predicate is not vacuously true of every index.
         let baseline = render_plain(&tokenize(text));
         assert!(cut_is_neutral(text, chunks[0].len(), &baseline));
-        // Control: a cut inside the run is refused, so the assertion above is
-        // not vacuously true of every index.
         assert!(!cut_is_neutral(text, 18, &baseline));
     }
 }
