@@ -2653,7 +2653,11 @@ async fn handle_admin_tenant_outbound_messages(
 /// prefix leaked into a family member's first-hour Telegram greeting, breaking
 /// the persona's "warm, French, no jargon" contract before she even said
 /// hello. Pure function so the branch is unit-testable without HTTP scaffolding.
-fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
+///
+/// `pub(crate)` since mika#3114: `telegram_split` composes every chunk through
+/// it, so the prefix keeps a single composition site even once one `/send` turns
+/// into several `sendMessage` calls.
+pub(crate) fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
     match agent_name {
         Some(name) if name != mika_common::agent::DEFAULT_AGENT => {
             format!("[{name}] {text}")
