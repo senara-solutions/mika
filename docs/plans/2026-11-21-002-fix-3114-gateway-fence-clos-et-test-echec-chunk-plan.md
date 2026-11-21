@@ -29,9 +29,9 @@ dépôt, non sur une appréciation :
    tests. L'AC1(c) en impose **six** (a–f), chacun avec sa fixture et son assertion de
    non-perte. Le ticket les estimait à 70 lignes au total ; la mesure du vol 1 donne
    ~102, plus un helper d'assertion partagé.
-2. **La couche de capture `tracing` coûte ~32 lignes avant le premier test** :
+2. **La couche de capture `tracing` coûte ~34 lignes avant le premier test** :
    `SharedBuffer`, son `impl Write` et son `impl MakeWriter` occupent
-   `egress_search/tests_e4_no_log.rs:32-63`, et ce module est privé à `egress_search` —
+   `egress_search/tests_e4_no_log.rs:32-65`, et ce module est privé à `egress_search` —
    le modèle est réutilisable par copie, pas par import, sans toucher un crate hors
    périmètre. Le ticket estimait 45 lignes pour le test d'AC3 *couche comprise*.
 
@@ -47,9 +47,39 @@ ou fusionner des cas reviendrait à acheter la borne avec de la couverture — e
 ce que la tête interdit au pilote (« il ne resserre pas la prose ni les tests pour
 repasser sous la borne »).
 
+**Remesure du 2026-11-21, seconde passe de groom : le chiffre tient, et il ne tient pas
+à la conception.** L'objection naturelle à une halte est « ta conception est
+surdimensionnée ; une plus maigre passerait sous la borne ». Elle a été instruite en
+mesurant la variante la plus maigre qui respecte encore l'AC1(c), et elle ne passe pas :
+
+| variante | ce qu'elle change | total estimé |
+|---|---|---|
+| Conception ci-dessous (C1–C4) | `fence_spans(text) -> Vec<FenceSpan>` | **342** |
+| Variante maigre | `fence_at(rest, at) -> Option<String>` : même grammaire, retour anticipé, pas de `struct` ni de `Vec` (≈ −15 lignes de production) | **~327** |
+| Variante maigre **sans** le test d'accord T7 | retire la seule garde contre la divergence du scanner et de `tokenize` | **~310** |
+
+La troisième ligne n'est pas une option : elle achète 17 lignes en retirant la garde
+que § *C1* nomme comme le risque principal du vol — une réplique de grammaire sans test
+d'accord est une seconde grammaire qui dérive en silence. Et même ainsi elle reste
+au-dessus de 300. **Aucune variante compatible avec les six cas nommés de l'AC1(c) et
+avec l'AC2 n'atteint la borne**, parce que le dépassement est dans les tests que la tête
+énumère, pas dans un choix de structure de données. C'est cela, et non le total lui-même,
+qui rend la halte non levable par une re-conception.
+
+Les faits de code qui fondent les deux densités ont été revérifiés à cette passe :
+`telegram_split.rs:115-184` (4 tests, 70 lignes), `egress_search/tests_e4_no_log.rs:32-65`
+(34 lignes de couche de capture), et la conservation du corps par la fermeture `"\n```"`
+rejouée à la main sur `strip_fence_decoration:290-298` pour les deux lignes du tableau F2.
+
 **Ce que la halte attend de l'opérateur.** Une décision, pas un amendement : lever la
 borne pour ce vol, ou retirer explicitement un des deux points de son périmètre. Le
 plan n'en choisit aucun.
+
+**Et si ce plan est dispatché à un pilote malgré la halte** : le pilote s'arrête au
+premier tour et le dit, sans écrire une ligne de code. La levée de la borne est un mot
+écrit de l'opérateur sur le ticket ou dans la PR, jamais une lecture du plan — « une
+halte ne se lève jamais par un amendement du plan ». La conception ci-dessous est écrite
+en entier pour qu'une levée n'ait rien à re-groomer, pas pour autoriser le vol.
 
 ## Contexte mesuré
 
@@ -397,7 +427,7 @@ découpage.
 
 Total estimé : 342 lignes
 Plafond de tours : 150 (défaut)
-Borne par vol : 300 lignes estimées — borne validée par Vincent le 2026-11-21 pour ce ticket (groom 300, pilote 420) ; la dérivation mika#2693 `(150 − 27 − 30) × 9 / 3 = 279` est écrite pour mémoire et la tête du ticket la déclare non applicable ici
+Borne par vol : 300 lignes estimées — borne de ce ticket, fixée par Vincent le 2026-11-21 (groom 300, pilote 420) ; la dérivation mika#2693 donnerait 279 lignes estimées — (150 − 27 − 30) × 9 / 3 — et la tête du ticket la déclare non applicable à ce vol. **Les deux nombres sont sous l'estimation de 342 : la halte ne dépend pas du choix entre eux**, et la plus serrée des deux mord de toute façon.
 
 **Le total est au-dessus des deux bornes, et le plan ne découpe pas.** Ce n'est pas une
 omission : la tête du ticket prescrit, pour exactement ce cas, une halte groom sans
