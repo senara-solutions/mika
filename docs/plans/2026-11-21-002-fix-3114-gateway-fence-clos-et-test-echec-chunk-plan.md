@@ -1,28 +1,40 @@
 # mika#3114 vol 2 — le bloc clôturé plus long que la limite, et le test de l'échec au morceau 2 sur 3
 
-**Disposition de ce plan : HALTE GROOM.** L'estimation du vol, mesurée sur le dépôt, est de
-**310 lignes de code** hors `docs/` et hors `CLAUDE.md`, au-dessus de la borne groom de
-**300** fixée par Vincent dans la tête du ticket. Le plan **ne propose aucune coupe** : la
-tête l'interdit explicitement (« il ne renvoie rien à un vol 3 », « le plan ne choisit
-aucune coupe », « une halte ne se lève jamais par un amendement du plan »). Le détail du
-chiffre est au § *Taille estimée*.
-
-La conception ci-dessous est écrite **en entier**, et c'est délibéré : c'est elle qui fonde
-le chiffre, et une levée de halte par l'opérateur ne doit rien avoir à re-groomer.
+**Disposition de ce plan : prêt pour l'implémentation.** La halte groom que portaient les
+quatre premières passes est **levée par l'opérateur** — mot de samidarko du 2026-11-21 à
+~13:58Z, en commentaire du ticket : « la borne de groom est levée pour le vol 2 de ce
+ticket, à environ 332 lignes (unité du ticket), soit le plan 0113a8d7 tel que chiffré par le
+quatrième groom. La levée vaut pour ce vol seulement. » Cette passe **ne re-chiffre rien et
+ne re-conçoit rien** : le chiffre que l'opérateur a validé est celui du quatrième groom, et
+la conception qui le fonde est celle ci-dessous, inchangée. Elle enregistre la levée, et
+c'est tout. Le détail du chiffre est au § *Taille estimée*.
 
 Refs senara-solutions/mika#3114, senara-solutions/mika#2983.
 
-## Halte groom
+## La borne groom, et sa levée
 
 | | |
 |---|---|
-| Borne groom (tête du ticket, validée par Vincent le 2026-11-21) | 300 lignes estimées |
-| Estimation de ce vol | **310 lignes** (hors `docs/`, hors `CLAUDE.md`) |
+| Borne groom d'origine (tête du ticket, validée par Vincent le 2026-11-21) | 300 lignes estimées |
+| Estimation de ce vol (quatrième groom, `0113a8d7`) | **310 lignes** (hors `docs/`, hors `CLAUDE.md`) |
 | Mesure attendue dans l'unité du ticket (`':!docs/plans'`, `CLAUDE.md` inclus) | ~332 lignes |
-| Dépassement | +10 lignes estimées (+3 %) |
-| Borne pilote (mesure réelle) | 420 — marge réelle |
+| **Borne groom levée** (mot de l'opérateur, 2026-11-21 ~13:58Z) | **~332 lignes, unité du ticket** — soit 310 estimées hors `docs/`/`CLAUDE.md` |
+| Portée de la levée | **ce vol seulement** |
+| Borne pilote (mesure réelle, inchangée) | 420 — marge réelle |
 
-**Le dépassement est dans les tests, et les tests sont énumérés par la tête.** Les 192 lignes
+**Ce que la levée change, et ce qu'elle ne change pas.** Elle lève la seule chose qui
+bloquait : le dépassement de 10 lignes estimées sur la borne groom. Elle ne touche ni le
+périmètre (les deux points de la tête, en entier, dans une seule PR), ni la borne pilote de
+420, ni l'interdiction de couper. **La halte pilote reste armée** : si la mesure réelle
+dépasse 420, le pilote s'arrête et le dit, sans resserrer la prose ni les tests.
+
+**Au pilote, en un mot.** Il n'y a plus de halte à l'entrée. Commence par le § *Ordre de
+commit*, mesure tôt (`git diff --shortstat origin/main...HEAD -- . ':!docs/plans'`) et
+compare à 420, jamais à 300 : cette borne-là est levée pour ce vol.
+
+### Pourquoi l'estimation vaut 310 et pas les ≈ 200 de la tête
+
+**L'écart est dans les tests, et les tests sont énumérés par la tête.** Les 192 lignes
 de tests sont imposées cas par cas : six cas nommés (a–f) par l'AC1(c), et un test avec
 capture de log et contrôle négatif par l'AC2. Les deux densités qui les fondent sont des
 mesures de ce dépôt, revérifiées à cette passe :
@@ -30,31 +42,23 @@ mesures de ce dépôt, revérifiées à cette passe :
 1. **Les tests de ce module coûtent ~17 lignes pièce**, doc-comment compris : les quatre
    tests du vol 1 occupent `telegram_split.rs:115-184`, soit 70 lignes pour 4 tests. Un
    helper d'assertion partagé amortit une part des six cas, pas la totalité.
-2. **La couche de capture `tracing` coûte 34 lignes avant le premier test** :
+2. **La couche de capture `tracing` coûte ~34 lignes avant le premier test** :
    `SharedBuffer`, son `impl Write` et son `impl MakeWriter` occupent
-   `egress_search/tests_e4_no_log.rs:32-65`, et ce module est privé à `egress_search` — le
-   modèle est réutilisable par **copie**, pas par import, sans toucher un crate hors
-   périmètre.
+   `egress_search/tests_e4_no_log.rs:35-63` (29 lignes), plus les `use` qui les portent, et
+   ce module est privé à `egress_search` — le modèle est réutilisable par **copie**, pas par
+   import, sans toucher un crate hors périmètre.
 
-La tête estimait 70 lignes pour les tests d'AC1(c) et 45 pour celui d'AC3 couche comprise ;
-la mesure donne ~108 et ~84. C'est là, et nulle part ailleurs, qu'est l'écart avec
-l'estimation de ≈ 200 de la tête.
+La tête estimait 70 lignes pour les tests d'AC1(c) et 45 pour le test de l'échec au morceau
+2 sur 3, couche de capture comprise ; la mesure donne ~108 et ~84. C'est là, et nulle part
+ailleurs, qu'est l'écart avec l'estimation de ≈ 200 de la tête.
 
-**Pourquoi le dépassement n'est pas compressible.** Resserrer la prose des tests ou fusionner
-des cas nommés achèterait la borne avec de la couverture — exactement ce que la tête interdit
+**Et pourquoi ce chiffre n'était pas compressible.** Resserrer la prose des tests ou fusionner
+des cas nommés aurait acheté la borne avec de la couverture — exactement ce que la tête interdit
 au pilote (« il ne resserre pas la prose ni les tests pour repasser sous la borne »). Du côté
 production, la conception retenue est la moins chère des deux instruites : 96 lignes contre
-112 pour le scanner de grammaire abandonné (§ *C1*). Il n'y a plus de gras d'un côté, et en
-retirer de l'autre coûterait un critère d'acceptation.
-
-**Ce que la halte attend de l'opérateur.** Une décision, pas un amendement : lever la borne
-groom pour ce vol, ou retirer explicitement un des deux points de son périmètre. Le plan n'en
-choisit aucun. Deux faits utiles à cette décision, et rien de plus : le dépassement est de
-10 lignes, et la borne pilote de 420 garde de la marge sur une mesure attendue à ~332.
-
-**Si ce plan est dispatché à un pilote malgré la halte** : le pilote s'arrête au premier tour
-et le dit, sans écrire une ligne de code. La levée de la borne est un mot écrit de l'opérateur
-sur le ticket ou dans la PR, jamais une lecture du plan.
+112 pour le scanner de grammaire abandonné (§ *C1*). Il n'y a pas de gras d'un côté, et en
+retirer de l'autre coûterait un critère d'acceptation. C'est ce constat, et non une préférence
+de rédaction, que la levée de l'opérateur ratifie.
 
 ## Contexte mesuré
 
@@ -279,7 +283,7 @@ grammaire, et T5 garde la propriété qui en tenait lieu.
 
 ### Dans `routes.rs`
 
-- **T8 (AC3)** — un envoi faux qui accepte le morceau 1 et refuse le morceau 2, sur un texte
+- **T8 (AC2)** — un envoi faux qui accepte le morceau 1 et refuse le morceau 2, sur un texte
   de trois morceaux : `outcome.delivered.len() == 1`, `outcome.failure` présent, l'envoi faux
   appelé **exactement deux fois** (le morceau 3 n'est jamais tenté), une ligne
   `telegram_send_chunk_failed` capturée portant `chunk_index = 1`, `chunk_count = 3`,
@@ -288,7 +292,7 @@ grammaire, et T5 garde la propriété qui en tenait lieu.
   (`SharedBuffer` + `MakeWriter`, `tracing-subscriber` déjà en dev-dépendance). **Contrôle
   négatif dans le même test** : avec un envoi qui accepte tout, le même texte donne trois
   envois et aucune ligne `telegram_send_chunk_failed`.
-- **T9 (AC3, statut)** — `status_for_send_failure` rend 410 sur `BotBlocked`, 429 avec
+- **T9 (AC2, statut)** — `status_for_send_failure` rend 410 sur `BotBlocked`, 429 avec
   l'en-tête `retry-after` sur `RateLimited { retry_after: Some(n) }`, 429 sans en-tête sur
   `retry_after: None`, 502 sur le reste.
 
@@ -339,6 +343,13 @@ assertion préalable, un subscriber mal câblé rendrait le test vert en ne capt
 ## Acceptance criteria
 
 Transcrits verbatim de la tête du ticket.
+
+**Comment lire les renvois « ACn » de ce plan.** Ils désignent les critères **numérotés
+ci-dessous**, qui sont ceux de la tête : « AC2 » est le critère 2 (le test de l'échec au
+morceau 2 sur 3) et « AC3 » est le critère 3 (les tests existants restent verts sans
+retouche). La tête intitule par ailleurs son § *Point 2* « (AC3) » en référence à son
+ancienne numérotation du vol 1 — ce plan ne reprend pas cet usage, et « AC1(c) » reste la
+seule étiquette héritée, parce que la tête la porte dans son critère 1 lui-même.
 
 1. AC1(c) dans `telegram_split.rs`, testé sur :
    - (a) un bloc ` ```rust ` de plus de 4096 unités : chaque morceau fait au plus 4096
@@ -416,21 +427,35 @@ binaire déployé porte le correctif (classe mika#2340) **avant** de toucher au 
 
 Total estimé : 310 lignes
 Plafond de tours : 150 (défaut)
-Borne par vol : 300 lignes estimées — (150 − 27 − 30) × 9 / 3 = 279, surchargée à 300 par Vincent dans la tête du ticket le 2026-11-21
+Borne par vol : 310 lignes estimées — (150 − 27 − 30) × 9 / 3 = 279, surchargée à 300 par la tête du ticket le 2026-11-21, puis levée à ~332 en unité du ticket (soit 310 hors `docs/` et `CLAUDE.md`) par le mot de l'opérateur du 2026-11-21 ~13:58Z, pour ce vol seulement
 
 Tracked in: senara-solutions/mika#2983
 
-**Sur les deux nombres de cette ligne.** La dérivation mika#2693 donne 279 ; la tête du ticket
-déclare ce calcul non applicable à ce vol et fixe les bornes à la main (groom 300, pilote 420).
-**Les deux sont sous l'estimation de 310 : la halte ne dépend pas du choix entre eux**, et la
-plus serrée mord de toute façon.
+**Sur les trois nombres de cette ligne.** La dérivation mika#2693 donne 279 ; la tête du ticket
+déclare ce calcul non applicable à ce vol et fixe les bornes à la main (groom 300, pilote 420) ;
+l'opérateur lève ensuite la borne groom à ~332 en unité du ticket, chiffre pris sur ce plan tel
+que le quatrième groom l'a mesuré. La dérivation reste écrite parce que c'est elle qui rend la
+borne recalibrable : la levée est une décision sur **ce vol**, pas une nouvelle calibration de
+flotte. La borne pilote de 420 n'est pas touchée et c'est elle qui mord désormais.
 
-**Le total est au-dessus des deux bornes, et le plan ne découpe pas.** Ce n'est pas une
-omission : la tête du ticket prescrit, pour exactement ce cas, une halte groom sans coupe —
-« si le plan estime le vol au-dessus de 300 lignes, le groom s'arrête, écrit la halte et le
-chiffre, et ne propose aucune coupe », et « il ne renvoie rien à un vol 3 ». La disposition de
-ce plan est donc la halte du § *Halte groom*, la suite appartient à l'opérateur, et les deux
-restes du vol 1 demeurent tracés par la ligne `Tracked in:` ci-dessus.
+**Un seul vol, et voici pourquoi il tient.** Le total de 310 est à la borne, non au-dessus :
+le plan ne découpe donc pas, et la règle mika#2693 point 4 s'applique. Trois raisons qu'il
+tienne en un vol de 150 tours :
+
+1. **Le périmètre est fermé par la tête et ne peut pas grossir.** Deux points nommés, six cas
+   de test énumérés (a–f), un test d'AC2. Rien à découvrir en vol.
+2. **Les commits 1 et 2 (22 + 84 = 106 lignes, soit 34 % du total) ne changent aucun
+   comportement** —
+   une extraction de fonction et un test d'un comportement déjà livré au vol 1. Ils sont verts
+   au premier essai ou le disent tout de suite, et ils ne consomment pas de tours d'aller-retour.
+3. **Le commit 3 touche un seul fichier de production** (`telegram_split.rs`, 96 lignes) dont
+   l'oracle de correction existe déjà (§ *C1*) : la boucle d'itération est `cargo test -p
+   mika-gateway`, locale et rapide, pas un cycle de build-déploie-observe.
+
+La tête interdit par ailleurs tout renvoi à un vol 3 (« il ne renvoie rien à un vol 3 »). Les
+deux restes du vol 1 que ce vol ne traite pas — la relance de `GatewaySender`, la garde de
+l'outil `send_message` — restent tracés par la ligne `Tracked in:` ci-dessus, sans ouverture de
+ticket (§ *Gel des tickets*).
 
 Les lignes comptées incluent les doc-comments Rust, que `git diff --shortstat` compte et que la
 densité documentaire de ce dépôt rend non négligeables. `crates/mika-gateway/CLAUDE.md` est hors
