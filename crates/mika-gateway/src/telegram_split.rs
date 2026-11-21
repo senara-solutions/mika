@@ -13,6 +13,22 @@
 //! `render_plain(tokenize(s))`. A cut inside `**bold**` leaves unpaired markers on
 //! both sides and the equality breaks — any cut that would change what the
 //! recognizer sees is refused by construction.
+//!
+//! **A fenced block longer than the budget is cut inside it, and the cut is
+//! repaired** (vol 2 of mika#3114): the chunk ends with an added `"\n```"` and the
+//! remainder is reopened with ``` ```{label} ```, the same label as the original
+//! opening, empty label included. Without that repair the block had no neutral
+//! candidate at all, so the floor split its backticks across two chunks and the
+//! reader saw apparent fences around unrendered code.
+//!
+//! **The oracle validates the repair, so no grammar is replicated here.** The same
+//! equality is checked on the two *repaired* halves ([`repair_is_neutral`]), which is
+//! why the label can be a guess: a wrong one, a closing fence mistaken for an
+//! opening, or a fence that was never open all fail the equality and fall back to
+//! today's floor. The reopening rides on the remainder rather than being carried
+//! separately, so the next turn measures it as ordinary text; the budget reserves the
+//! closing fence before choosing the cut, which is how the added characters count
+//! against the 4096-unit limit instead of overflowing it.
 
 use mika_common::telegram::text_len_utf16;
 
