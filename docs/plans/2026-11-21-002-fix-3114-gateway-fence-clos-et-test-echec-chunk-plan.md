@@ -208,9 +208,38 @@ budget_corps = budget − CLOSE_UNITS                      (CLOSE_UNITS = 4, "\n
 ```
 
 - `reopen_units = text_len_utf16("```{label}\n")` = `3 + label + 1`.
-- Dans le corps, la coupe tombe de préférence au dernier `\n` sous `budget_corps`, sinon au
-  plancher — jamais dans un `char` ni dans une paire de substitution, puisque `hard_boundary`
-  accumule `c.len_utf16()`.
+- Dans le corps, la coupe tombe de préférence au dernier `\n` sous `budget_corps` **situé
+  passé la moitié de `budget_corps`**, sinon au plancher, et jamais à un décalage inférieur
+  ou égal à la longueur de la réouverture. Jamais dans un `char` ni dans une paire de
+  substitution, puisque `hard_boundary` accumule `c.len_utf16()`. Voir l'amendement
+  ci-dessous.
+
+#### Amendement du 2026-11-21 (après le pilote) : l'ordre des candidats dans un bloc
+
+**Le point.** L'ordre écrit à cette passe, « dernier `\n` sous `budget_corps`, sinon le
+plancher », sans autre condition, est remplacé par deux filtres, livrés dans `fence_cut`
+(`crates/mika-gateway/src/telegram_split.rs`, commit 7ee112f6) :
+
+1. **La fin de ligne n'est préférée que passé la moitié du budget** :
+   `text_len_utf16(&rest[..c]) * 2 >= budget_corps`. En deçà, le candidat est le plancher.
+2. **Progression stricte** : un candidat `cand <= reopen.len()` est écarté, puisque le reste
+   porte la réouverture et qu'une coupe à ce décalage ne le raccourcirait pas.
+
+**La raison.** La réouverture ` ```{label}\n ` régénère un `\n` à un décalage fixe et bas au
+début de chaque reste. Sans le filtre 1, ce `\n` est redécouvert à chaque tour comme le
+dernier `\n` disponible sur un corps sans retour à la ligne : le découpage rampe de quelques
+unités par tour, ou ne progresse plus du tout, ce qui fait une boucle sans fin. Le filtre 2
+borne le cas limite où la seule coupe possible tomberait dans la réouverture elle-même.
+
+**Ce que l'amendement ne change pas.** Aucun critère d'acceptation n'est retiré ni affaibli.
+La préférence reste « fin de ligne, puis plancher ». La réparation est toujours validée par
+`repair_is_neutral` (C1), et un refus retombe sur le plancher d'aujourd'hui (C2). Les
+caractères ajoutés comptent toujours dans la limite (C3).
+
+**Pourquoi après le code.** La tête demandait ce commit `docs(plans)` avant le code qui
+s'écarte. Le pilote a déclaré l'écart dans le corps de la PR #3116 sans amender le plan.
+Ce commit répare cet oubli de procédure, à la demande de l'opérateur (commentaire du
+2026-11-21 sur la PR #3116, qui lève aussi la borne pilote à 558 lignes pour cette seule PR).
 - Le morceau émis est `format_outbound_text(agent, &format!("{open}{corps}\n```"))` — **le
   préfixe garde son site de composition unique**, propriété du vol 1 qu'il serait facile de
   perdre ici.
