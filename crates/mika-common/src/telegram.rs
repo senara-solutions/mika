@@ -1,11 +1,18 @@
 //! Limites du transport Telegram, nommées là où les deux crates les voient.
 //!
 //! `mika-agent` s'en sert pour refuser avant l'appel réseau ; `mika-gateway`
-//! s'en sert pour refuser le texte tel qu'il partira, préfixe compris.
+//! s'en sert pour découper le texte tel qu'il partira, préfixe compris.
 //!
-//! **Qui découpe :** l'agent. Le gateway envoie tel quel (`send as-is`) parce
-//! qu'il insère une ligne `outbound_messages` par envoi et que le routage des
-//! réponses (`reply_to_message`) dépend de cette relation 1:1. Voir mika#2134.
+//! **Qui découpe : le gateway** (mika#3114), dans
+//! `crates/mika-gateway/src/telegram_split.rs` : `handle_send` coupe tout texte
+//! qui dépasse la limite en plusieurs `sendMessage`, dans l'ordre et sans perte.
+//! La relation 1:1 de mika#2134 tient toujours, par **morceau envoyé** et non par
+//! appel à `/send` — une ligne `outbound_messages` et le même préfixe `[agent] `
+//! sur chacun. Jusqu'à mika#3114 ce fichier disait l'inverse et prêtait au gateway
+//! une garde à 4096 qu'il n'avait pas : un texte trop long partait tel quel,
+//! Telegram répondait 400, le message était perdu. L'outil `send_message` de
+//! l'agent garde la sienne, plus conservatrice ; son message au modèle dit encore
+//! que le gateway ne découpe pas. `Tracked in:` senara-solutions/mika#2983.
 
 /// Nombre maximal d'unités UTF-16 dans le champ `text` de `sendMessage`.
 ///

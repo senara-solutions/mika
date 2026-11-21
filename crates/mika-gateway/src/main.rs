@@ -18,6 +18,7 @@ mod routes;
 mod settings;
 mod telegram;
 mod telegram_markdown;
+mod telegram_split;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

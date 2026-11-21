@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,6 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine;
+use mika_common::telegram::{MAX_TEXT_UTF16_UNITS, text_len_utf16};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
@@ -30,6 +32,7 @@ use crate::telegram::{
     CustomerTelegramClient, Locale, LocaleSource, ParsedMessage, TelegramApiError, TelegramClient,
     TelegramUpdate, parse_agent_prefix, parse_update, resolve_locale,
 };
+use crate::telegram_split::split_outbound_text;
 
 /// Carries HTTP method and path from request to response extensions,
 /// making them available to TraceLayer's `on_response` callback as
@@ -2653,12 +2656,67 @@ async fn handle_admin_tenant_outbound_messages(
 /// prefix leaked into a family member's first-hour Telegram greeting, breaking
 /// the persona's "warm, French, no jargon" contract before she even said
 /// hello. Pure function so the branch is unit-testable without HTTP scaffolding.
-fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
+/// `pub(crate)` since mika#3114: `telegram_split` composes every chunk through it.
+pub(crate) fn format_outbound_text(agent_name: Option<&str>, text: &str) -> String {
     match agent_name {
         Some(name) if name != mika_common::agent::DEFAULT_AGENT => {
             format!("[{name}] {text}")
         }
         _ => text.to_string(),
+    }
+}
+
+/// What a chunked send delivered, and what stopped it (mika#3114). `delivered`
+/// holds the `telegram_message_id` of every accepted chunk, in order, and is **not**
+/// emptied by a failure: the chunks that landed are real messages a user can reply
+/// to, so each still needs an `outbound_messages` row.
+pub(crate) struct ChunkedSendOutcome {
+    pub(crate) delivered: Vec<i64>,
+    pub(crate) failure: Option<TelegramApiError>,
+}
+
+/// Send `chunks` in order, one `sendMessage` each, stopping at the first failure.
+///
+/// **Stopping is the point:** carrying on past a failed chunk would deliver a text
+/// with a hole in the middle and no way for the reader to know — worse than the 502
+/// this fix removes. Chunk k+1 is never attempted. Neither event carries the body
+/// (mika#2126, restated by mika#2291).
+///
+/// `send` is injected rather than read from `AppState` because `api_url` hard-codes
+/// the Telegram host and `should_fall_back_to_plain` already declared widening it
+/// for test-only observability out of scope; the seam is what lets AC2 see the sends.
+pub(crate) async fn send_in_chunks<F, Fut>(
+    chat_id: i64,
+    request_id: Option<&str>,
+    chunks: &[String],
+    send: F,
+) -> ChunkedSendOutcome
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<i64, TelegramApiError>>,
+{
+    let chunk_count = chunks.len();
+    let mut delivered: Vec<i64> = Vec::with_capacity(chunk_count);
+
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        match send(chunk.clone()).await {
+            Ok(message_id) => {
+                info!(chat_id, request_id = ?request_id, telegram_message_id = message_id, chunk_index, chunk_count, "sent to telegram");
+                delivered.push(message_id);
+            }
+            Err(e) => {
+                warn!(chat_id, request_id = ?request_id, chunk_index, chunk_count, delivered = delivered.len(), error = %e, "telegram_send_chunk_failed");
+                return ChunkedSendOutcome {
+                    delivered,
+                    failure: Some(e),
+                };
+            }
+        }
+    }
+
+    ChunkedSendOutcome {
+        delivered,
+        failure: None,
     }
 }
 
@@ -2727,9 +2785,9 @@ pub(crate) async fn handle_send(
             .into_response();
     }
 
-    // Render outbound text via the pure helper so the branch is unit-testable.
-    let owned_text = format_outbound_text(payload.agent_name.as_deref(), &payload.text);
-    let text_to_send = &owned_text;
+    // Split at the limit, prefix included: several sends beat one 400 (mika#3114).
+    let agent_name = payload.agent_name.as_deref();
+    let chunks = split_outbound_text(agent_name, &payload.text, MAX_TEXT_UTF16_UNITS);
 
     // Resolve the Telegram client: per-customer bot token if customer_id is provided,
     // otherwise fall back to the global single-bot client.
@@ -2786,46 +2844,63 @@ pub(crate) async fn handle_send(
         }
     };
 
-    // Send to Telegram (no message splitting — send as-is)
-    match tg_client.send_message(payload.chat_id, text_to_send).await {
-        Ok(message_id) => {
-            info!(chat_id = payload.chat_id, request_id = ?payload.request_id, telegram_message_id = message_id, "sent to telegram");
+    // Only a real split says anything: a single chunk is the nominal regime and a
+    // line per send would be the churn mika#2131 bounds.
+    if chunks.len() > 1 {
+        info!(chat_id = payload.chat_id, request_id = ?payload.request_id, chunk_count = chunks.len(), total_len_utf16 = text_len_utf16(&payload.text), "telegram_send_split");
+    }
 
-            // Store outbound message mapping for reply routing
-            if let Some(ref name) = payload.agent_name
-                && let Err(e) = sqlx::query(
-                    "INSERT INTO outbound_messages (telegram_message_id, chat_id, agent_name) VALUES ($1, $2, $3)",
-                )
-                .bind(message_id)
-                .bind(payload.chat_id)
-                .bind(name)
-                .execute(&state.pool)
-                .await
+    let tg_ref = &tg_client;
+    let chat_id = payload.chat_id;
+    let outcome = send_in_chunks(
+        chat_id,
+        payload.request_id.as_deref(),
+        &chunks,
+        move |chunk: String| async move { tg_ref.send_message(chat_id, &chunk).await },
+    )
+    .await;
+
+    // One row per delivered chunk, same agent_name, so `resolve_reply_agent` routes
+    // a reply made to any of them — on the failure arm too, since the chunks that
+    // landed are messages the user can reply to right now.
+    if let Some(ref name) = payload.agent_name {
+        for &message_id in &outcome.delivered {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO outbound_messages (telegram_message_id, chat_id, agent_name) VALUES ($1, $2, $3)",
+            )
+            .bind(message_id)
+            .bind(chat_id)
+            .bind(name)
+            .execute(&state.pool)
+            .await
             {
                 warn!(
                     error = %e,
-                    chat_id = payload.chat_id,
+                    chat_id,
                     telegram_message_id = message_id,
                     agent_name = %name,
                     "failed to store outbound message mapping — reply routing will not work for this message"
                 );
             }
-
-            StatusCode::OK.into_response()
         }
-        Err(TelegramApiError::BotBlocked) => {
-            warn!(chat_id = payload.chat_id, request_id = ?payload.request_id, "bot blocked by user");
+    }
+
+    // A chunk's failure is reported exactly as the whole send's failure used to be.
+    match outcome.failure {
+        None => StatusCode::OK.into_response(),
+        Some(TelegramApiError::BotBlocked) => {
+            warn!(chat_id, request_id = ?payload.request_id, "bot blocked by user");
             StatusCode::GONE.into_response()
         }
-        Err(TelegramApiError::RateLimited { retry_after }) => {
+        Some(TelegramApiError::RateLimited { retry_after }) => {
             let mut resp_headers = HeaderMap::new();
             if let Some(secs) = retry_after {
                 resp_headers.insert("retry-after", HeaderValue::from(secs));
             }
             (StatusCode::TOO_MANY_REQUESTS, resp_headers).into_response()
         }
-        Err(e) => {
-            warn!(chat_id = payload.chat_id, request_id = ?payload.request_id, error = %e, "telegram send failed");
+        Some(e) => {
+            warn!(chat_id, request_id = ?payload.request_id, error = %e, "telegram send failed");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -3058,7 +3133,81 @@ struct PairingResultRow {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// A sender that records what it posted and accepts everything.
+    fn recording_sender(
+        log: &Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn(String) -> std::future::Ready<Result<i64, TelegramApiError>> {
+        let log = Arc::clone(log);
+        move |chunk: String| {
+            let mut sent = log.lock().expect("recorder mutex");
+            sent.push(chunk);
+            std::future::ready(Ok(sent.len() as i64))
+        }
+    }
+
+    /// AC2 — the defect, end to end: a text over the limit leaves as several
+    /// ordered sends, each under the limit, and arrives whole.
+    #[tokio::test]
+    async fn mika3114_ac2_a_long_text_is_delivered_whole_and_in_order() {
+        const LIMIT: usize = MAX_TEXT_UTF16_UNITS;
+        let text = "Paragraphe du test de bout en bout de mika#3114.\n\n".repeat(120);
+        assert!(
+            text_len_utf16(&text) > LIMIT,
+            "the fixture must exceed the limit"
+        );
+
+        let chunks = split_outbound_text(Some("mika-dev"), &text, LIMIT);
+        assert!(chunks.len() > 1, "a 6 000-unit text must be split");
+
+        let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let outcome =
+            send_in_chunks(42, Some("req-3114"), &chunks, recording_sender(&posted)).await;
+        assert!(outcome.failure.is_none());
+        assert_eq!(outcome.delivered.len(), chunks.len());
+
+        let sent = posted.lock().expect("recorder mutex").clone();
+        assert_eq!(sent, chunks, "one send per chunk, in order");
+        let mut rejoined = String::new();
+        for one in sent.iter() {
+            let units = text_len_utf16(one);
+            assert!(
+                units <= LIMIT,
+                "a send of {units} units is what Telegram refuses"
+            );
+            rejoined.push_str(one.strip_prefix("[mika-dev] ").expect("agent prefix"));
+        }
+        assert_eq!(rejoined, text, "the rejoined sends are the posted text");
+
+        // Negative control, same sender: handed the whole text as one chunk — the
+        // pre-fix shape — it posts a single send over the limit, the 400 this removes.
+        let unsplit: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let whole = vec![format_outbound_text(Some("mika-dev"), &text)];
+        send_in_chunks(42, Some("req-3114"), &whole, recording_sender(&unsplit)).await;
+        let unsplit = unsplit.lock().expect("recorder mutex");
+        assert_eq!(unsplit.len(), 1);
+        assert!(text_len_utf16(&unsplit[0]) > LIMIT);
+    }
+
+    /// AC4 — a text under the limit keeps today's path: one send, byte for byte
+    /// what `format_outbound_text` composes, one delivered id.
+    #[tokio::test]
+    async fn mika3114_ac4_a_short_text_keeps_the_single_send_path() {
+        let expected = format_outbound_text(Some("mika-dev"), "coucou");
+        let chunks = split_outbound_text(Some("mika-dev"), "coucou", MAX_TEXT_UTF16_UNITS);
+        assert_eq!(chunks, vec![expected.clone()]);
+
+        let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let outcome = send_in_chunks(42, None, &chunks, recording_sender(&posted)).await;
+
+        assert!(outcome.failure.is_none());
+        assert_eq!(outcome.delivered, vec![1]);
+        let sent = posted.lock().expect("recorder mutex");
+        assert_eq!(*sent, vec![expected], "one send, as before the split");
+    }
 
     #[test]
     fn test_is_health_probe() {

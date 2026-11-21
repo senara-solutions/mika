@@ -159,12 +159,53 @@ the text left by a path that does not traverse `send_message_impl`, and establis
 which path comes before any fix. There is no such path today, so that finding would be
 information about the architecture before it is information about the rendering.
 
-**Known adjacent gap, deliberately out of scope.** `mika-common/src/telegram.rs`
-claims the gateway refuses text at 4096 "as it will be sent, prefix included"; that
-mirror guard **does not exist** — `handle_send` only checks `text.len() > 50_000`
-bytes (`routes.rs`). The unfinished half of mika#2134, unrelated to rendering, and
-covered incidentally by the fallback (a length 400 fails identically on the second
-send and returns that error). Follow-up ticket to open.
+## Outbound Splitting (mika#3114)
+
+**The gateway splits, and it is the only place that does.** `handle_send` cuts any
+text over Telegram's 4096-UTF-16-unit cap into several `sendMessage` calls, in order,
+through `telegram_split::split_outbound_text` then `routes::send_in_chunks` — one
+site, so every present and future `/send` caller inherits it. Only the agent's
+`send_message` **tool** ever applied the limit; `GatewaySender::try_send` and
+`mika notify` had no guard, and those paths lost **418 sends since 2026-09-20** plus
+420 `telegram_html_fallback_failed` lines carrying the same `message is too long`
+(mika#2291's plain fallback is just as long). The 50 000-byte guard and
+`send_message_impl`'s rendering are unchanged, and a text under the limit still
+yields one chunk composed by `format_outbound_text`, byte for byte today's path.
+
+- **UTF-16 units, prefix included** (`text_len_utf16`). The `[agent] ` prefix repeats
+  on **every** chunk and there is one `outbound_messages` row per **delivered**
+  chunk, so `resolve_reply_agent` routes a reply made to any — mika#2134's 1:1
+  relation is per chunk, not per `/send`.
+- **Cut preference:** end of paragraph, end of line, a space, then the hard `char`
+  boundary, never inside a `char` or a surrogate pair; and refused unless the
+  recognizer reads both sides as it read the whole (`cut_is_neutral`), the hard
+  boundary being the **progress floor** that guarantees termination.
+- **Never a silent loss:** the send stops at the first failed chunk, k+1 is never
+  attempted. Status arms unchanged: 410 `BotBlocked`, 429 + `retry-after`, 502.
+
+**Two named leftovers, `Tracked in:` senara-solutions/mika#2983.** `GatewaySender`
+re-sends the whole text after a failure, so chunks 1..k−1 arrive twice — a visible
+duplicate beats a loss, and the WARN below makes it accountable. And a fenced block
+longer than the limit has no neutral candidate, so the floor leaves its backticks
+unbalanced; `tokenize` keeps an unclosed fence verbatim, so Telegram accepts the send
+and the reader sees apparent ```. The agent tool's refusal message, still saying the
+gateway does not split, is tracked there too.
+
+**Operator surfaces** (`$MIKA_GATEWAY_LOG_FILE` or stdout). No event carries the
+body — the mika#2126 standard this crate holds throughout, restated by mika#2291.
+
+- `telegram_send_split` (INFO — `chat_id`, `request_id`, `chunk_count`,
+  `total_len_utf16`), emitted **only when a split happened**, a single chunk being
+  the churn mika#2131 bounds. **Expected regime: non-empty.**
+- `telegram_send_chunk_failed` (WARN — `chat_id`, `request_id`, `chunk_index`,
+  `chunk_count`, `delivered`, `error`). **Expected regime: zero lines.** `delivered`
+  tells a partial delivery from a total failure.
+- `sent to telegram` (INFO) now also carries `chunk_index` and `chunk_count`.
+
+**Post-deploy probe.** An agent sends a >4096-character message with a code block to
+the operator's chat: expected several ordered messages, the code legible, one
+`telegram_send_split`, no `message is too long` from that deploy on. **Halt:** if it
+reappears, establish the deployed binary carries the fix (class mika#2340) first.
 
 ## User-Facing Copy and Locale (mika#2025)
 
