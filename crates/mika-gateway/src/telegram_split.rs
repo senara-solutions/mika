@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn mika3114_ten_thousand_characters_split_without_loss() {
         let mut text = "Paragraphe de remplissage pour le test de decoupage.\n\n".repeat(200);
-        text.truncate(10_000); // ASCII filler: bytes == chars == UTF-16 units.
+        text.truncate(10_000); // safe-byte-slice: pure-ASCII filler, every offset is a char boundary — the assertion below measures it.
         assert_eq!(text_len_utf16(&text), 10_000);
 
         let chunks = split_outbound_text(Some("mika-dev"), &text, 4096);
