@@ -3318,7 +3318,10 @@ mod tests {
         .await;
 
         assert_eq!(outcome.delivered.len(), 1, "chunk 1 landed, and only it");
-        assert!(outcome.failure.is_some(), "the failure is reported, not lost");
+        assert!(
+            outcome.failure.is_some(),
+            "the failure is reported, not lost"
+        );
         assert_eq!(
             posted.lock().expect("recorder mutex").len(),
             2,
@@ -3384,8 +3387,11 @@ mod tests {
         );
 
         // No `retry_after` means no header, never a fabricated delay.
-        let limited_bare =
-            status_for_send_failure(42, None, TelegramApiError::RateLimited { retry_after: None });
+        let limited_bare = status_for_send_failure(
+            42,
+            None,
+            TelegramApiError::RateLimited { retry_after: None },
+        );
         assert_eq!(limited_bare.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(limited_bare.headers().get("retry-after").is_none());
 
