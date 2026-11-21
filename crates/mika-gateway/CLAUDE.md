@@ -180,16 +180,24 @@ yields one chunk composed by `format_outbound_text`, byte for byte today's path.
   boundary, never inside a `char` or a surrogate pair; and refused unless the
   recognizer reads both sides as it read the whole (`cut_is_neutral`), the hard
   boundary being the **progress floor** that guarantees termination.
+- **A fenced block longer than the budget is cut inside it, closed, and reopened**
+  (vol 2): the chunk ends with an added `"\n```"` and the next one reopens with
+  ``` ```{label} ```, the original label, empty label included, every intermediate
+  chunk of a 3+-chunk block included. **The same oracle validates the repair**
+  (`repair_is_neutral`), so no grammar is replicated and the label may be a guess: a
+  wrong one — a closing fence read as an opening, a fence that was never open — fails
+  the equality and falls back to the floor, which is why an **unclosed** fence gets no
+  added fence at all. The budget reserves the close before choosing the cut, so the
+  added characters count **against** the 4096 units rather than overflowing them;
+  inside the block the cut prefers a line end past half the budget, then the floor.
 - **Never a silent loss:** the send stops at the first failed chunk, k+1 is never
-  attempted. Status arms unchanged: 410 `BotBlocked`, 429 + `retry-after`, 502.
+  attempted. Status arms unchanged: 410 `BotBlocked`, 429 + `retry-after`, 502 —
+  `status_for_send_failure`, named in vol 2 so the property is asserted and not read.
 
-**Two named leftovers, `Tracked in:` senara-solutions/mika#2983.** `GatewaySender`
+**One named leftover, `Tracked in:` senara-solutions/mika#2983.** `GatewaySender`
 re-sends the whole text after a failure, so chunks 1..k−1 arrive twice — a visible
-duplicate beats a loss, and the WARN below makes it accountable. And a fenced block
-longer than the limit has no neutral candidate, so the floor leaves its backticks
-unbalanced; `tokenize` keeps an unclosed fence verbatim, so Telegram accepts the send
-and the reader sees apparent ```. The agent tool's refusal message, still saying the
-gateway does not split, is tracked there too.
+duplicate beats a loss, and the WARN below makes it accountable. The agent tool's
+refusal message, still saying the gateway does not split, is tracked there too.
 
 **Operator surfaces** (`$MIKA_GATEWAY_LOG_FILE` or stdout). No event carries the
 body — the mika#2126 standard this crate holds throughout, restated by mika#2291.
@@ -202,10 +210,13 @@ body — the mika#2126 standard this crate holds throughout, restated by mika#22
   tells a partial delivery from a total failure.
 - `sent to telegram` (INFO) now also carries `chunk_index` and `chunk_count`.
 
-**Post-deploy probe.** An agent sends a >4096-character message with a code block to
-the operator's chat: expected several ordered messages, the code legible, one
-`telegram_send_split`, no `message is too long` from that deploy on. **Halt:** if it
-reappears, establish the deployed binary carries the fix (class mika#2340) first.
+**Post-deploy probe.** An agent sends the operator's chat a >4096-character message
+whose ` ```rust ` block alone exceeds 4096 units. Expected: several ordered messages,
+**the code rendered as a block in each of them with no apparent fence** — vol 2 made
+that an expectation rather than a hope — one `telegram_send_split`, and from that
+deploy on no `message is too long` and no `telegram_send_chunk_failed`. **Halt:** if
+apparent fences reappear, establish the deployed binary carries the fix (class
+mika#2340) before touching the splitting.
 
 ## User-Facing Copy and Locale (mika#2025)
 
