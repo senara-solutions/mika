@@ -3149,9 +3149,72 @@ struct PairingResultRow {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Write};
     use std::sync::Mutex;
 
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+
     use super::*;
+
+    /// A `MakeWriter` collecting every formatted line, so a test reads the bytes a
+    /// log file would hold. Copied from `egress_search::tests_e4_no_log` rather than
+    /// shared: that module is private to its own subtree, and widening its visibility
+    /// for a test helper is a larger change than the twenty lines below.
+    #[derive(Clone, Default)]
+    struct SharedBuffer {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.inner.lock().expect("capture mutex")).to_string()
+        }
+    }
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner
+                .lock()
+                .expect("capture mutex")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedBuffer {
+        type Writer = SharedBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Capture everything `send` emits, at the most verbose filter a deployment
+    /// could run: a line this misses is a line no operator sees either.
+    async fn captured_lines<F, Fut>(chunks: &[String], send: F) -> (ChunkedSendOutcome, String)
+    where
+        F: Fn(String) -> Fut,
+        Fut: Future<Output = Result<i64, TelegramApiError>>,
+    {
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(buffer.clone())
+                .with_ansi(false)
+                .with_filter(EnvFilter::new("trace")),
+        );
+        let guard = set_default(subscriber);
+        let outcome = send_in_chunks(42, Some("req-3114"), chunks, send).await;
+        drop(guard);
+        (outcome, buffer.text())
+    }
 
     /// A sender that records what it posted and accepts everything.
     fn recording_sender(
@@ -3223,6 +3286,79 @@ mod tests {
         assert_eq!(outcome.delivered, vec![1]);
         let sent = posted.lock().expect("recorder mutex");
         assert_eq!(*sent, vec![expected], "one send, as before the split");
+    }
+
+    /// AC2 — the failure at chunk 2 of 3: one chunk delivered, chunk 3 never
+    /// attempted, and an operator line that names the partial delivery without
+    /// carrying a byte of the body (mika#2126).
+    #[tokio::test]
+    async fn mika3114_ac2_a_failure_at_chunk_two_of_three_stops_and_is_observable() {
+        // The sentinel is body content: its absence from the capture is the mika#2126
+        // assertion, and it is what makes that assertion non-vacuous.
+        const BODY_SENTINEL: &str = "PRIVE-3114-NE-PAS-JOURNALISER";
+        let text =
+            format!("Paragraphe {BODY_SENTINEL} du test de l'échec au deuxième morceau.\n\n")
+                .repeat(127);
+        let chunks = split_outbound_text(Some("mika-dev"), &text, MAX_TEXT_UTF16_UNITS);
+        assert_eq!(chunks.len(), 3, "the fixture must be exactly three chunks");
+
+        let posted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (outcome, captured) = captured_lines(&chunks, |chunk: String| {
+            let mut sent = posted.lock().expect("recorder mutex");
+            sent.push(chunk);
+            std::future::ready(if sent.len() == 2 {
+                Err(TelegramApiError::Other {
+                    status: 500,
+                    body: String::new(),
+                })
+            } else {
+                Ok(sent.len() as i64)
+            })
+        })
+        .await;
+
+        assert_eq!(outcome.delivered.len(), 1, "chunk 1 landed, and only it");
+        assert!(outcome.failure.is_some(), "the failure is reported, not lost");
+        assert_eq!(
+            posted.lock().expect("recorder mutex").len(),
+            2,
+            "chunk 3 is never attempted — carrying on would deliver a text with a hole"
+        );
+
+        // Anti-vacuity first (mika#2205): the capture holds something, and holds the
+        // event, before anything is asserted about what it does *not* hold.
+        assert!(!captured.is_empty(), "the capture layer saw nothing at all");
+        assert!(
+            captured.contains("telegram_send_chunk_failed"),
+            "the WARN an operator greps for is missing:\n{captured}"
+        );
+        for field in ["chunk_index=1", "chunk_count=3", "delivered=1"] {
+            assert!(
+                captured.contains(field),
+                "`{field}` missing — the line cannot tell a partial delivery from a \
+                 total failure:\n{captured}"
+            );
+        }
+        assert!(
+            !captured.contains(BODY_SENTINEL),
+            "the message body reached the log — mika#2126 violated:\n{captured}"
+        );
+
+        // Negative control: the same text through a sender that accepts everything
+        // gives three sends and no failure line. Without it, a `send_in_chunks` that
+        // warned on every chunk — or never warned — would read the same above.
+        let all_ok: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let (ok_outcome, ok_captured) = captured_lines(&chunks, recording_sender(&all_ok)).await;
+        assert_eq!(ok_outcome.delivered.len(), 3);
+        assert!(ok_outcome.failure.is_none());
+        assert!(
+            !ok_captured.contains("telegram_send_chunk_failed"),
+            "a successful send must emit no failure line:\n{ok_captured}"
+        );
+        assert!(
+            !ok_captured.contains(BODY_SENTINEL),
+            "the body reached the log on the success path:\n{ok_captured}"
+        );
     }
 
     /// AC2 — the status a failed chunk answers is the one the whole send answered
