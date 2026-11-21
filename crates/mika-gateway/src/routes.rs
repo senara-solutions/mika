@@ -2720,6 +2720,36 @@ where
     }
 }
 
+/// The status `/send` answers for a failed send, split or not (mika#3114).
+///
+/// Extracted from `handle_send` **without changing any arm**: the point is that a
+/// chunk's failure is reported exactly as the whole send's failure used to be, and
+/// that property is only assertable on a fabricated `TelegramApiError` if the mapping
+/// has a name. The `warn!` lines move with the arms that emit them.
+fn status_for_send_failure(
+    chat_id: i64,
+    request_id: Option<&str>,
+    error: TelegramApiError,
+) -> Response {
+    match error {
+        TelegramApiError::BotBlocked => {
+            warn!(chat_id, request_id = ?request_id, "bot blocked by user");
+            StatusCode::GONE.into_response()
+        }
+        TelegramApiError::RateLimited { retry_after } => {
+            let mut resp_headers = HeaderMap::new();
+            if let Some(secs) = retry_after {
+                resp_headers.insert("retry-after", HeaderValue::from(secs));
+            }
+            (StatusCode::TOO_MANY_REQUESTS, resp_headers).into_response()
+        }
+        e => {
+            warn!(chat_id, request_id = ?request_id, error = %e, "telegram send failed");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
 /// POST /send — containers deliver outbound messages to Telegram.
 ///
 /// Authenticated via `require_bearer_token` middleware.
@@ -2888,21 +2918,7 @@ pub(crate) async fn handle_send(
     // A chunk's failure is reported exactly as the whole send's failure used to be.
     match outcome.failure {
         None => StatusCode::OK.into_response(),
-        Some(TelegramApiError::BotBlocked) => {
-            warn!(chat_id, request_id = ?payload.request_id, "bot blocked by user");
-            StatusCode::GONE.into_response()
-        }
-        Some(TelegramApiError::RateLimited { retry_after }) => {
-            let mut resp_headers = HeaderMap::new();
-            if let Some(secs) = retry_after {
-                resp_headers.insert("retry-after", HeaderValue::from(secs));
-            }
-            (StatusCode::TOO_MANY_REQUESTS, resp_headers).into_response()
-        }
-        Some(e) => {
-            warn!(chat_id, request_id = ?payload.request_id, error = %e, "telegram send failed");
-            StatusCode::BAD_GATEWAY.into_response()
-        }
+        Some(e) => status_for_send_failure(chat_id, payload.request_id.as_deref(), e),
     }
 }
 
@@ -3207,6 +3223,50 @@ mod tests {
         assert_eq!(outcome.delivered, vec![1]);
         let sent = posted.lock().expect("recorder mutex");
         assert_eq!(*sent, vec![expected], "one send, as before the split");
+    }
+
+    /// AC2 — the status a failed chunk answers is the one the whole send answered
+    /// before the split. Asserted on the extracted mapping, arm by arm, so the claim
+    /// is on the statuses themselves and not on a reading of `handle_send`.
+    #[test]
+    fn mika3114_ac2_the_failure_statuses_are_the_pre_split_ones() {
+        let blocked = status_for_send_failure(42, Some("req"), TelegramApiError::BotBlocked);
+        assert_eq!(blocked.status(), StatusCode::GONE);
+
+        let limited = status_for_send_failure(
+            42,
+            Some("req"),
+            TelegramApiError::RateLimited {
+                retry_after: Some(7),
+            },
+        );
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            limited.headers().get("retry-after").map(|v| v.as_bytes()),
+            Some(&b"7"[..]),
+            "the header Telegram asked us to echo"
+        );
+
+        // No `retry_after` means no header, never a fabricated delay.
+        let limited_bare =
+            status_for_send_failure(42, None, TelegramApiError::RateLimited { retry_after: None });
+        assert_eq!(limited_bare.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited_bare.headers().get("retry-after").is_none());
+
+        // Everything else is a 502, the arm `handle_send` closed with.
+        for other in [
+            TelegramApiError::Unauthorized,
+            TelegramApiError::BadRequest {
+                message: "message is too long".to_string(),
+            },
+            TelegramApiError::Other {
+                status: 500,
+                body: String::new(),
+            },
+        ] {
+            let resp = status_for_send_failure(42, Some("req"), other);
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        }
     }
 
     #[test]
