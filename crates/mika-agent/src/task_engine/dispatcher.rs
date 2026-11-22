@@ -10354,11 +10354,59 @@ mod tests {
             .count()
     }
 
-    const TEST_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/1614";
+    /// Le numéro d'issue que porte [`TEST_ISSUE_URL`]. Depuis mika#3118
+    /// l'auto-fire relit le consentement à la forge, donc ces tests passent
+    /// par le double de `gh`, qui **panique** sous `FIXTURE_ISSUE_FLOOR`
+    /// (mika#2713) : le numéro vit dans la bande des fixtures, pas sur 1614.
+    const TEST_ISSUE_NUMBER: u64 = 990_118;
+
+    const TEST_ISSUE_URL: &str = "https://github.com/senara-solutions/mika/issues/990118";
 
     /// Le plan que le callout du corps nomme, et que la preuve liée porte
     /// depuis mika#2981 — déjà normalisé (relatif au dépôt, sous `docs/plans/`).
     const TEST_GROOM_PLAN: &str = "docs/plans/2026-10-30-001-fix-1614-plan.md";
+
+    /// L'URL et le numéro ne peuvent pas diverger en silence : l'un sert au
+    /// `reference_url` du parent, l'autre au sujet du double de `gh`, et la
+    /// production dérive le second du premier.
+    #[test]
+    fn mika3118_lurl_de_test_et_le_numero_de_fixture_concordent() {
+        crate::gh_process::assert_fixture_issue(TEST_ISSUE_NUMBER);
+        assert!(
+            TEST_ISSUE_URL.ends_with(&format!("/issues/{TEST_ISSUE_NUMBER}")),
+            "TEST_ISSUE_URL ({TEST_ISSUE_URL}) ne porte pas l'issue {TEST_ISSUE_NUMBER}"
+        );
+    }
+
+    /// L'URL d'une issue de la bande des fixtures (mika#2713) : chaque test qui
+    /// arme sa propre charge de consentement a besoin de SON numéro, parce que
+    /// le double de `gh` indexe les charges par sujet.
+    fn fixture_issue_url(issue: u64) -> String {
+        crate::gh_process::assert_fixture_issue(issue);
+        format!("https://github.com/senara-solutions/mika/issues/{issue}")
+    }
+
+    /// Le consentement tient : issue ouverte, label `ready` présent.
+    const CONSENT_HELD_JSON: &str = r#"{"state":"OPEN","labels":[{"name":"ready"}]}"#;
+
+    /// L'issue est ouverte mais l'opérateur a retiré `ready`.
+    const CONSENT_READY_ABSENT_JSON: &str =
+        r#"{"state":"OPEN","labels":[{"name":"type:bug"},{"name":"priority:high"}]}"#;
+
+    /// L'issue est fermée — `ready` encore posé ne rachète rien (mika#3050).
+    const CONSENT_CLOSED_JSON: &str = r#"{"state":"CLOSED","labels":[{"name":"ready"}]}"#;
+
+    /// Le champ `labels` manque : la lecture est illisible, et une absence de
+    /// champ ne se lit JAMAIS comme une absence de label (mika#2331, mika#2981).
+    const CONSENT_UNREADABLE_JSON: &str = r#"{"state":"OPEN"}"#;
+
+    /// Arme la réponse de `gh issue view` pour une issue de fixture.
+    fn arm_consent(issue: u64, json: &str) {
+        crate::gh_process::set_canned_stdout(
+            crate::gh_process::GhSubject::Issue(issue),
+            json.as_bytes().to_vec(),
+        );
+    }
 
     #[tokio::test]
     async fn test_auto_fire_skips_non_groom_class() {
@@ -10453,6 +10501,9 @@ mod tests {
         let (parent_id, callback_id) =
             create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        // Le consentement tient à la forge (mika#3118) : l'étape 4bis laisse
+        // passer, de sorte que ce test mesure toujours l'étape 5a.
+        arm_consent(TEST_ISSUE_NUMBER, CONSENT_HELD_JSON);
 
         // Token + PLAN_GROOMED present, but empty registry has no run_claude_pilot
         // tool → step 5a returns BEFORE the dispatch_class flip (5c).
@@ -10734,6 +10785,11 @@ mod tests {
         let (parent_id, callback_id) =
             create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        // Le consentement tient à la forge (mika#3118) : sans cette charge, la
+        // relecture de l'étape 4bis échouerait et écrirait une row d'audit, ce
+        // qui ferait rougir l'assertion « rien d'écrit » ci-dessous pour une
+        // raison étrangère au frein que ce test mesure.
+        arm_consent(TEST_ISSUE_NUMBER, CONSENT_HELD_JSON);
 
         try_dispatch_pilot_after_groom_success(
             &db,
@@ -10771,6 +10827,9 @@ mod tests {
         let (parent_id, callback_id) =
             create_groom_callback_pair(&db, true, Some(TEST_ISSUE_URL)).await;
         let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+        // Le consentement tient à la forge (mika#3118) : l'étape 4bis ne doit
+        // pas être la raison pour laquelle rien ne part ici.
+        arm_consent(TEST_ISSUE_NUMBER, CONSENT_HELD_JSON);
 
         try_dispatch_pilot_after_groom_success(
             &db,
@@ -11749,6 +11808,254 @@ mod tests {
             crate::qa_build_callback::UndeliveredVerdictCause::AgentBusyStarvation,
             "l'attribution est POSITIVE, jamais inférée d'une absence"
         );
+    }
+
+    // ---- mika#3118 — l'auto-fire relit le consentement de l'opérateur -----
+
+    /// Les quatre issues de la garde de consentement de l'étape 4bis.
+    ///
+    /// La population mesurée ici est celle des **quatre verdicts** que la
+    /// relecture à la forge peut rendre : `Held` laisse partir, et les trois
+    /// autres refusent en nommant *lequel* (mika#2205 — rien ne s'infère par
+    /// soustraction, mika#2331 — une absence est `None`, mika#2981 — un échec
+    /// réseau ne fait jamais décoller un vol).
+    ///
+    /// Chaque test de refus arme **son** numéro d'issue de fixture : le double
+    /// de `gh` indexe ses charges par sujet, et deux tests parallèles qui se
+    /// partageraient un sujet se voleraient leur réponse (mika#2713 D4).
+    mod mika3118_consentement_a_lautofire {
+        use super::*;
+
+        /// Les rows d'audit du dispatcheur pour ce parent, avec leur motif —
+        /// `groom_pilot_audit_outcomes` ne rend que l'`after_value`, et V4 a
+        /// besoin de prouver que le détail de l'illisibilité est *porté*.
+        async fn consent_audit_rows(
+            db: &AsyncDatabase,
+            parent_id: &str,
+        ) -> Vec<(String, Option<String>)> {
+            db.get_audit_events("system-mika")
+                .await
+                .expect("la lecture des audit_events ne doit pas échouer")
+                .into_iter()
+                .filter(|e| e.tool_name == GROOM_PILOT_DISPATCHER_TOOL && e.target_key == parent_id)
+                .map(|e| (e.after_value.unwrap_or_default(), e.reasoning))
+                .collect()
+        }
+
+        /// Le socle commun des trois tests de refus : un parent groom convergé
+        /// sur `issue`, un registre portant **réellement** `run_claude_pilot`,
+        /// et la charge de consentement armée.
+        ///
+        /// Le registre réel est ce qui rend ces tests porteurs : une garde
+        /// placée *sous* l'étape 5c laisserait la bascule du `dispatch_class`
+        /// se produire, et l'assertion « le parent est resté `groom` » rougirait.
+        async fn refuse_run(
+            issue: u64,
+            consent_json: &str,
+        ) -> (AsyncDatabase, String, Vec<(String, Option<String>)>) {
+            let db = test_db();
+            let url = fixture_issue_url(issue);
+            arm_consent(issue, consent_json);
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, true, Some(&url)).await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+            let (_tmp, registry) = dev_pilot_registry();
+
+            try_dispatch_pilot_after_groom_success(
+                &db,
+                &task,
+                Some("ghp_token"),
+                &registry,
+                no_stop_home(),
+            )
+            .await;
+
+            let rows = consent_audit_rows(&db, &parent_id).await;
+            (db, parent_id, rows)
+        }
+
+        /// **V1 / AC1 — `Held` laisse partir le pilote.**
+        ///
+        /// Contrôle positif, et sans lui toute la garde pourrait refuser
+        /// inconditionnellement en passant V2-V4. Le registre est **vide** à
+        /// dessein : on ne peut pas mesurer un dispatch complet (au-delà de 5c
+        /// la fonction valide puis *spawne réellement* un sous-processus), donc
+        /// ce qu'on épingle est que le contrôle a **dépassé** l'étape 4bis et
+        /// atteint le saut préexistant de 5a — aucune row d'audit n'est écrite.
+        #[tokio::test]
+        async fn mika3118_un_consentement_tenant_laisse_passer_lauto_fire() {
+            let db = test_db();
+            let issue = 990_121;
+            let url = fixture_issue_url(issue);
+            arm_consent(issue, CONSENT_HELD_JSON);
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, true, Some(&url)).await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+            try_dispatch_pilot_after_groom_success(
+                &db,
+                &task,
+                Some("ghp_token"),
+                &skills_empty(),
+                no_stop_home(),
+            )
+            .await;
+
+            let rows = consent_audit_rows(&db, &parent_id).await;
+            assert!(
+                rows.is_empty(),
+                "`ready` posé sur une issue ouverte : la garde ne refuse rien et \
+                 n'écrit rien — le contrôle doit atteindre l'étape 5a. Trouvé {rows:?}"
+            );
+            assert_eq!(
+                dispatch_class_of(&db, &parent_id).await,
+                "groom",
+                "le saut de 5a (outil absent du registre) précède la bascule 5c"
+            );
+        }
+
+        /// **V2 / AC2 — `ready` retiré ⇒ refus nommé.**
+        ///
+        /// L'incident du 09/11 : l'opérateur avait demandé « ne pas lancer
+        /// dev-pilot » et le pilote est parti quand même, parce qu'aucune des
+        /// cinq préconditions ne relisait le consentement.
+        #[tokio::test]
+        async fn mika3118_ready_absent_refuse_lauto_fire_et_le_nomme() {
+            let (db, parent_id, rows) = refuse_run(990_122, CONSENT_READY_ABSENT_JSON).await;
+
+            assert_eq!(
+                rows.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+                vec![GROOM_PILOT_READY_ABSENT_VALUE],
+                "une issue ouverte sans `ready` doit écrire exactement le refus \
+                 qui la nomme — trouvé {rows:?}"
+            );
+            assert_eq!(
+                dispatch_class_of(&db, &parent_id).await,
+                "groom",
+                "le refus tombe AVANT la bascule 5c (#1001) — le slot `implement` \
+                 du parent ne doit pas être consommé par un vol qui ne part pas"
+            );
+            assert!(
+                implement_callback_labels(&db, &parent_id).await.is_empty(),
+                "aucun callback d'implémentation ne doit avoir été créé"
+            );
+        }
+
+        /// **V3 / AC3 — issue fermée ⇒ refus distinct du précédent.**
+        ///
+        /// `ready` est encore posé dans la charge : c'est délibéré. Une issue
+        /// fermée n'est plus un consentement, quoi que portent ses labels
+        /// (mika#3050), et la valeur d'audit doit se **séparer** de celle de V2,
+        /// sinon l'opérateur ne peut plus distinguer les deux causes.
+        #[tokio::test]
+        async fn mika3118_une_issue_fermee_refuse_lauto_fire_sous_sa_propre_valeur() {
+            let (db, parent_id, rows) = refuse_run(990_123, CONSENT_CLOSED_JSON).await;
+
+            assert_eq!(
+                rows.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+                vec![GROOM_PILOT_ISSUE_CLOSED_VALUE],
+                "une issue fermée doit écrire sa propre valeur, pas celle de \
+                 `ready` absent — trouvé {rows:?}"
+            );
+            assert_ne!(
+                GROOM_PILOT_ISSUE_CLOSED_VALUE, GROOM_PILOT_READY_ABSENT_VALUE,
+                "deux causes distinctes ne partagent jamais un nom (mika#2205)"
+            );
+            assert_eq!(
+                dispatch_class_of(&db, &parent_id).await,
+                "groom",
+                "le refus tombe avant la bascule 5c"
+            );
+        }
+
+        /// **V4 / AC4 — une lecture illisible refuse, et le dit.**
+        ///
+        /// Fail-closed (mika#2981) : un vol ne décolle **jamais parce que** la
+        /// lecture a échoué. La charge omet `labels` — ce qui prouve du même
+        /// coup qu'un champ manquant n'est pas compté comme « `ready` absent » :
+        /// l'absence d'information est `Unreadable`, pas un verdict (mika#2331).
+        #[tokio::test]
+        async fn mika3118_un_consentement_illisible_refuse_et_porte_son_motif() {
+            let (db, parent_id, rows) = refuse_run(990_124, CONSENT_UNREADABLE_JSON).await;
+
+            assert_eq!(
+                rows.iter().map(|(v, _)| v.as_str()).collect::<Vec<_>>(),
+                vec![GROOM_PILOT_CONSENT_UNREADABLE_VALUE],
+                "un champ `labels` manquant est illisible, jamais « `ready` \
+                 absent » — trouvé {rows:?}"
+            );
+            let reason = rows[0]
+                .1
+                .as_deref()
+                .expect("le refus pour illisibilité doit PORTER son détail");
+            assert!(
+                reason.contains(GROOM_PILOT_CONSENT_UNREADABLE_VALUE)
+                    && reason.contains("990124")
+                    && reason.len() > GROOM_PILOT_CONSENT_UNREADABLE_VALUE.len() + 40,
+                "le motif doit nommer la valeur, l'issue ET la raison de la \
+                 lecture — trouvé {reason:?}"
+            );
+            assert_eq!(
+                dispatch_class_of(&db, &parent_id).await,
+                "groom",
+                "le refus tombe avant la bascule 5c"
+            );
+        }
+
+        /// **V5** — le vocabulaire est un format de fil, comme les quatre
+        /// valeurs de mika#2498 (`mika2498_les_valeurs_daudit_sont_un_format_de_fil`).
+        ///
+        /// Six issues passent désormais sous le même `tool_name` : un
+        /// `GROUP BY after_value` ne les sépare que si les six valeurs sont
+        /// deux à deux distinctes. Les renommer casse une requête d'opérateur
+        /// et un dashboard ; ce test est l'endroit où ça se voit.
+        #[test]
+        fn mika3118_les_valeurs_du_consentement_sont_un_format_de_fil() {
+            assert_eq!(GROOM_PILOT_READY_ABSENT_VALUE, "ready_absent_at_autofire");
+            assert_eq!(GROOM_PILOT_ISSUE_CLOSED_VALUE, "issue_closed_at_autofire");
+            assert_eq!(
+                GROOM_PILOT_CONSENT_UNREADABLE_VALUE,
+                "consent_unreadable_at_autofire"
+            );
+
+            let valeurs = [
+                GROOM_PILOT_DISPATCHED_VALUE,
+                GROOM_PILOT_STOPPED_VALUE,
+                GROOM_PILOT_READY_ABSENT_VALUE,
+                GROOM_PILOT_ISSUE_CLOSED_VALUE,
+                GROOM_PILOT_CONSENT_UNREADABLE_VALUE,
+            ];
+            let uniques: std::collections::BTreeSet<&str> = valeurs.iter().copied().collect();
+            assert_eq!(
+                uniques.len(),
+                valeurs.len(),
+                "les issues du dispatcheur doivent être deux à deux distinctes, \
+                 sinon aucune ne se lit sans soustraction (mika#2205) — {valeurs:?}"
+            );
+
+            // Les quatre verdicts du log structuré : même exigence, autre surface.
+            let verdicts = [
+                AutofireConsent::Held.verdict(),
+                AutofireConsent::ReadyAbsent.verdict(),
+                AutofireConsent::IssueClosed.verdict(),
+                AutofireConsent::Unreadable("gh a échoué".to_string()).verdict(),
+            ];
+            assert_eq!(
+                verdicts,
+                ["held", "ready_absent", "issue_closed", "unreadable"],
+                "le vocabulaire des verdicts est lu par les requêtes de logs"
+            );
+            let verdicts_uniques: std::collections::BTreeSet<&str> =
+                verdicts.iter().copied().collect();
+            assert_eq!(verdicts_uniques.len(), verdicts.len());
+
+            // Et le motif : seul le verdict illisible en porte un (mika#2331).
+            assert_eq!(AutofireConsent::Held.reason(), None);
+            assert_eq!(AutofireConsent::ReadyAbsent.reason(), None);
+            assert_eq!(AutofireConsent::IssueClosed.reason(), None);
+            assert_eq!(
+                AutofireConsent::Unreadable("gh a échoué".to_string()).reason(),
+                Some("gh a échoué")
+            );
+        }
     }
 
     // ---- mika#2671 — pas de tour LLM pour un callback de build périmé -----
