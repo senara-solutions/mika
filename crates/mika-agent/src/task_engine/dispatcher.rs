@@ -5566,8 +5566,17 @@ impl AutofireConsent {
 /// `canonical_tokens::tests::mika3118_le_site_dengagement_du_consentement_est_unique`
 /// — dans les deux sens : le scan rougit si un second site apparaît *et* si le
 /// seul disparaît.
-async fn autofire_consent_at_dispatch(token: &str, repo: &str, issue: u64) -> AutofireConsent {
-    match crate::ready_label::reread_issue_consent_via_gh(token, repo, issue).await {
+///
+/// `owner_repo` est la forme complète `senara-solutions/mika`, celle que toute
+/// API de la forge exige. Le paramètre le **nomme** depuis mika#3141 : il
+/// s'appelait `repo`, et c'est ce nom qui a rendu invisible le nom court passé
+/// par l'étape 4bis.
+async fn autofire_consent_at_dispatch(
+    token: &str,
+    owner_repo: &str,
+    issue: u64,
+) -> AutofireConsent {
+    match crate::ready_label::reread_issue_consent_via_gh(token, owner_repo, issue).await {
         Ok(crate::ready_label::RearmConsent::Held) => AutofireConsent::Held,
         Ok(crate::ready_label::RearmConsent::ReadyAbsent) => AutofireConsent::ReadyAbsent,
         Ok(crate::ready_label::RearmConsent::Closed) => AutofireConsent::IssueClosed,
@@ -5682,7 +5691,11 @@ async fn try_dispatch_pilot_after_groom_success(
         Some(url) => url.to_string(),
         None => return,
     };
-    let (repo, issue_num) = match parse_repo_issue_from_url(&reference_url) {
+    let IssueCoordinates {
+        owner_repo,
+        repo_short,
+        issue: issue_num,
+    } = match parse_repo_issue_from_url(&reference_url) {
         Some(parsed) => parsed,
         None => return,
     };
@@ -5725,7 +5738,7 @@ async fn try_dispatch_pilot_after_groom_success(
             event = "groom_pilot_autofire_stopped",
             parent_task_id = %parent_id,
             callback_task_id = %task.id,
-            repo = %repo,
+            repo = %repo_short,
             issue = issue_num,
             stop_file = %stop_file.display(),
             trace_id = %trace_id,
@@ -5734,7 +5747,7 @@ async fn try_dispatch_pilot_after_groom_success(
         );
 
         let system_session = format!("system-{}", parent.agent_id);
-        let reason = format!("groom_pilot_autofire_stopped (issue: {repo}#{issue_num})");
+        let reason = format!("groom_pilot_autofire_stopped (issue: {repo_short}#{issue_num})");
         if let Err(e) = db
             .log_audit_event(
                 &system_session,
@@ -5810,8 +5823,16 @@ async fn try_dispatch_pilot_after_groom_success(
     //    `unwrap_or_default` n'est donc pas un défaut silencieux mais une branche
     //    inatteignable, et le préférer à un `expect` évite un panic sur un chemin
     //    fire-and-forget.
+    //
+    //    **C'est `owner_repo` qui part, jamais `repo_short`** (mika#3141). Le
+    //    lecteur finit dans un `gh issue view --repo <…>`, qui exige la forme
+    //    `[HOST/]OWNER/REPO` et refuse `mika` tout court ; le nom nu faisait donc
+    //    échouer la lecture, et tout vol post-groom était refusé en
+    //    `consent_unreadable` — un refus sûr, mais qui coupait la chaîne
+    //    « `ready` sur ticket non groomé → auto-groom → pilote » de mika#996.
     let consent =
-        autofire_consent_at_dispatch(github_token.unwrap_or_default(), &repo, issue_num).await;
+        autofire_consent_at_dispatch(github_token.unwrap_or_default(), &owner_repo, issue_num)
+            .await;
 
     //    La sonde a un dénominateur : elle est émise à **chaque** passage,
     //    branche saine comprise (R5). Motif `kg_budget_resolved` (mika#1833) /
@@ -5824,7 +5845,7 @@ async fn try_dispatch_pilot_after_groom_success(
         event = "groom_autofire_consent_checked",
         verdict = consent.verdict(),
         reason = consent.reason(),
-        repo = %repo,
+        repo = %repo_short,
         issue = issue_num,
         parent_task_id = %parent_id,
         callback_task_id = %task.id,
@@ -5856,7 +5877,7 @@ async fn try_dispatch_pilot_after_groom_success(
             after_value,
             parent_task_id = %parent_id,
             callback_task_id = %task.id,
-            repo = %repo,
+            repo = %repo_short,
             issue = issue_num,
             trace_id = %trace_id,
             "engine: groom-pilot auto-fire refused — the operator's consent does not \
@@ -5865,8 +5886,8 @@ async fn try_dispatch_pilot_after_groom_success(
 
         let system_session = format!("system-{}", parent.agent_id);
         let reason = match consent.reason() {
-            Some(detail) => format!("{after_value} (issue: {repo}#{issue_num}): {detail}"),
-            None => format!("{after_value} (issue: {repo}#{issue_num})"),
+            Some(detail) => format!("{after_value} (issue: {repo_short}#{issue_num}): {detail}"),
+            None => format!("{after_value} (issue: {repo_short}#{issue_num})"),
         };
         if let Err(e) = db
             .log_audit_event(
@@ -5968,11 +5989,12 @@ async fn try_dispatch_pilot_after_groom_success(
 
     // 5d. The dispatch input the LLM would have provided. `prompt` is the bare
     //     `<repo>#<num>` reference (dispatch-lib's worktree-setup parser requires
-    //     the bare form, mika#1593). `task_id` is the reused (now implement)
-    //     parent.
+    //     the bare form, mika#1593) — c'est `repo_short`, et c'est le seul site de
+    //     cette fonction où la forme courte est ce qu'il **faut** (mika#3141).
+    //     `task_id` is the reused (now implement) parent.
     let dispatch_input = serde_json::json!({
         "skill": "dev-pilot",
-        "prompt": format!("{repo}#{issue_num}"),
+        "prompt": format!("{repo_short}#{issue_num}"),
         "task_id": parent_id,
     });
 
@@ -6076,13 +6098,13 @@ async fn try_dispatch_pilot_after_groom_success(
     info!(
         parent_task_id = %parent_id,
         callback_task_id = %callback_task_id,
-        repo = %repo,
+        repo = %repo_short,
         issue = issue_num,
         "engine: auto-fired dev-pilot dispatch after groom success \
          (mika#1614 — engine-side direct spawn, task reuse, no webhook round-trip)"
     );
 
-    let reason = format!("groom_pilot_dispatch_fired (issue: {repo}#{issue_num})");
+    let reason = format!("groom_pilot_dispatch_fired (issue: {repo_short}#{issue_num})");
     if let Err(e) = db
         .log_audit_event(
             &system_session,
@@ -6383,6 +6405,11 @@ async fn try_report_groom_architect_unreadable(db: &AsyncDatabase, task: &Task) 
 /// dispatch dont le parent est illisible reste un fait mesuré, et le jeter
 /// rétrécirait la population en silence (motif mika#2496).
 ///
+/// Le premier membre est le **nom court** ([`IssueCoordinates::repo_short`]) :
+/// ses deux appelants n'en font qu'un champ `repo=` de ligne de log, et le nom
+/// court est ce que les opérateurs y lisent depuis l'origine. Un appelant qui
+/// voudrait interroger la forge prend `owner_repo` au parseur, pas cette paire.
+///
 /// Extrait parce que les deux lecteurs rétrospectifs de ce module
 /// (`try_report_pilot_cost_overrun`, `try_report_groom_architect_unreadable`) en
 /// portaient une copie **à l'octet près, commentaire compris**. Ce qui les
@@ -6395,9 +6422,9 @@ async fn parent_issue_coordinates(
     if let Some(parent_id) = &task.parent_task_id
         && let Ok(Some(parent)) = db.get_task_unscoped(parent_id).await
         && let Some(url) = parent.reference_url.as_deref()
-        && let Some((r, n)) = parse_repo_issue_from_url(url)
+        && let Some(c) = parse_repo_issue_from_url(url)
     {
-        return (Some(r), Some(n));
+        return (Some(c.repo_short), Some(c.issue));
     }
     (None, None)
 }
@@ -6414,12 +6441,45 @@ fn audit_session_id(task: &Task) -> String {
         .unwrap_or_else(|| format!("callback-{}", task.id))
 }
 
-/// Parse `senara-solutions/<repo>/issues/<n>` from a reference URL.
-/// Returns `(repo, issue_number)` on match, `None` otherwise.
-fn parse_repo_issue_from_url(url: &str) -> Option<(String, u64)> {
-    let after_org = url.split("senara-solutions/").nth(1)?;
-    let mut parts = after_org.split('/');
-    let repo = parts.next()?.to_string();
+/// L'organisation sur laquelle la boucle opère, ici en **contrôle** et jamais en
+/// source : l'`owner` rendu par [`parse_repo_issue_from_url`] est celui que l'URL
+/// porte, et cette constante ne sert qu'à refuser une URL qui en nomme une autre.
+/// Composer `senara-solutions` avec le nom court aurait rendu un `owner/repo`
+/// juste par coïncidence, vrai tant que le dépôt reste dans cette organisation.
+const GITHUB_ORG: &str = "senara-solutions";
+
+/// Les coordonnées d'une issue, dans les **deux** formes que cette chaîne exige.
+///
+/// Les deux sont portées côte à côte parce qu'aucune n'est dérivable de l'autre
+/// au point d'usage : le nom court ne contient pas l'organisation, et un
+/// accesseur qui la recomposerait laisserait le nom nu atteignable depuis
+/// n'importe quel appelant. C'est exactement ce qui a cassé l'auto-fire de
+/// mika#3118 — `gh issue view --repo mika` refuse l'argument (« expected the
+/// "[HOST/]OWNER/REPO" format »), donc tout vol post-groom était refusé en
+/// `consent_unreadable` (mika#3141).
+struct IssueCoordinates {
+    /// `senara-solutions/mika` — la forme que TOUTE API de la forge exige.
+    owner_repo: String,
+    /// `mika` — le nom court, celui que lisent les opérateurs dans les lignes
+    /// `repo=` et celui que le brief du pilote porte.
+    repo_short: String,
+    issue: u64,
+}
+
+/// Parse `github.com/<owner>/<repo>/issues/<n>` from a reference URL.
+/// Returns the issue's [`IssueCoordinates`] on match, `None` otherwise.
+///
+/// L'`owner` est **lu** dans l'URL puis vérifié contre [`GITHUB_ORG`] : une URL
+/// d'une autre organisation ne se résout pas, et celle de la nôtre rend son
+/// `owner/repo` complet sans qu'aucun appelant ait à le recomposer.
+fn parse_repo_issue_from_url(url: &str) -> Option<IssueCoordinates> {
+    let after_host = url.split_once("github.com/")?.1;
+    let mut parts = after_host.split('/');
+    let owner = parts.next()?;
+    if owner != GITHUB_ORG {
+        return None;
+    }
+    let repo_short = parts.next()?.to_string();
     let kind = parts.next()?;
     if kind != "issues" {
         return None;
@@ -6427,8 +6487,12 @@ fn parse_repo_issue_from_url(url: &str) -> Option<(String, u64)> {
     let n_str = parts.next()?;
     // Strip any query string from the number.
     let n_str = n_str.split('?').next().unwrap_or(n_str);
-    let n: u64 = n_str.parse().ok()?;
-    Some((repo, n))
+    let issue: u64 = n_str.parse().ok()?;
+    Some(IssueCoordinates {
+        owner_repo: format!("{owner}/{repo_short}"),
+        repo_short,
+        issue,
+    })
 }
 
 /// Parse structured fields from callback result text.
@@ -11829,7 +11893,11 @@ mod tests {
         /// Les rows d'audit du dispatcheur pour ce parent, avec leur motif —
         /// `groom_pilot_audit_outcomes` ne rend que l'`after_value`, et V4 a
         /// besoin de prouver que le détail de l'illisibilité est *porté*.
-        async fn consent_audit_rows(
+        ///
+        /// `pub(super)` depuis mika#3141 : le module frère mesure la **même**
+        /// population d'audit — « l'étape 4bis a-t-elle refusé ? » — et une
+        /// seconde copie de cette lecture pourrait dériver de celle-ci.
+        pub(super) async fn consent_audit_rows(
             db: &AsyncDatabase,
             parent_id: &str,
         ) -> Vec<(String, Option<String>)> {
@@ -12055,6 +12123,201 @@ mod tests {
                 AutofireConsent::Unreadable("gh a échoué".to_string()).reason(),
                 Some("gh a échoué")
             );
+        }
+    }
+
+    // ---- mika#3141 — l'auto-fire passe l'`owner/repo` complet au lecteur ----
+
+    /// La forme du dépôt que l'étape 4bis remet au lecteur de consentement.
+    ///
+    /// La régression de mika#3139 : `parse_repo_issue_from_url` rendait le nom
+    /// **court** (`mika`), l'étape 4bis le passait au lecteur, et
+    /// `gh issue view --repo mika` refusait l'argument (« expected the
+    /// "[HOST/]OWNER/REPO" format »). Tout auto-fire post-groom tombait donc en
+    /// `consent_unreadable` — refus sûr, mais la chaîne mika#996 (`ready` sur
+    /// ticket non groomé → auto-groom → pilote) était coupée.
+    ///
+    /// Deux tests de bout en bout plutôt qu'un, et leurs preuves sont
+    /// indépendantes : le premier lit l'**`argv`** remis au double de `gh`,
+    /// donc il ne dépend d'aucune charge ; le second lit le **comportement**,
+    /// donc il resterait vert si l'`argv` était juste et la traduction cassée.
+    /// Le premier seul passerait si quelqu'un armait la charge sur le sujet
+    /// entier ; le second seul passerait si quelqu'un échangeait la charge par
+    /// motif contre une charge par sujet.
+    mod mika3141_owner_repo_au_lecteur {
+        use super::*;
+
+        /// Le `--repo` que la forge exige, tel qu'il doit apparaître dans
+        /// l'`argv`. Non recomposé dans les tests non plus : c'est la chaîne
+        /// littérale que l'URL de fixture porte.
+        const OWNER_REPO_ATTENDU: &str = "--repo senara-solutions/mika";
+
+        /// La forme nue qui a produit l'incident — ce que l'`argv` ne doit
+        /// **jamais** porter. Le `--json` qui suit est ce qui la rend sans
+        /// ambiguïté : sans lui, le motif serait un préfixe de la forme juste.
+        const OWNER_REPO_NU: &str = "--repo mika --json";
+
+        /// Arme la charge de consentement **par motif d'`argv`**, sur la seule
+        /// forme complète (mika#3047 pour le mécanisme).
+        ///
+        /// Aucune charge par défaut n'est posée, et c'est tout l'intérêt : un
+        /// appel portant le nom nu ne trouve aucun motif, reçoit le `b"[]"` du
+        /// double, et le contrat fail-closed du lecteur le rend illisible. La
+        /// charge n'est donc atteignable **que** par la forme juste.
+        fn arm_consent_sur_owner_repo_complet(issue: u64) {
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(issue),
+                OWNER_REPO_ATTENDU,
+                CONSENT_HELD_JSON.as_bytes().to_vec(),
+            );
+        }
+
+        /// Fait tourner l'auto-fire sur un groom convergé dont le parent porte
+        /// l'URL de fixture, registre **vide** : le contrôle s'arrête au saut
+        /// préexistant de l'étape 5a, après avoir traversé l'étape 4bis.
+        async fn autofire_sur(issue: u64) -> (AsyncDatabase, String) {
+            let db = test_db();
+            let url = fixture_issue_url(issue);
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, true, Some(&url)).await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+            try_dispatch_pilot_after_groom_success(
+                &db,
+                &task,
+                Some("ghp_token"),
+                &skills_empty(),
+                no_stop_home(),
+            )
+            .await;
+
+            (db, parent_id)
+        }
+
+        /// Les appels `gh` que le double a vus pour cette issue de fixture. Le
+        /// journal est global au processus, donc le filtre par sujet est ce qui
+        /// rend la lecture indifférente à l'exécution parallèle (mika#2713 D4).
+        fn appels_pour(issue: u64) -> Vec<String> {
+            crate::gh_process::recorded_calls()
+                .into_iter()
+                .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(issue))
+                .map(|c| c.args)
+                .collect()
+        }
+
+        /// **V1 / AC1 — l'`argv` remis à `gh` porte l'`owner/repo` complet.**
+        ///
+        /// La mesure est sur le journal d'appels, jamais sur une charge : elle
+        /// reste vraie quelle que soit la réponse armée, et c'est précisément
+        /// ce qui distingue ce test de son frère ci-dessous.
+        #[tokio::test]
+        async fn mika3141_lappel_de_relecture_porte_lowner_repo_complet() {
+            let issue = 990_160;
+            arm_consent_sur_owner_repo_complet(issue);
+
+            let _ = autofire_sur(issue).await;
+
+            let appels = appels_pour(issue);
+            assert!(
+                !appels.is_empty(),
+                "l'étape 4bis doit avoir relu le consentement à la forge — aucun \
+                 appel `gh` enregistré pour #{issue}"
+            );
+            assert!(
+                appels.iter().all(|a| a.contains(OWNER_REPO_ATTENDU)),
+                "`gh issue view` exige la forme `[HOST/]OWNER/REPO` : chaque appel \
+                 doit porter `{OWNER_REPO_ATTENDU}`. Trouvé {appels:?}"
+            );
+            assert!(
+                !appels.iter().any(|a| a.contains(OWNER_REPO_NU)),
+                "aucun appel ne doit porter le nom nu (`{OWNER_REPO_NU}`) — c'est \
+                 l'argument que la forge refuse, et la régression de mika#3139. \
+                 Trouvé {appels:?}"
+            );
+        }
+
+        /// **V2 / AC2 — et le consentement armé est donc *lu*, donc le vol part.**
+        ///
+        /// La charge ne répond qu'à la forme complète (voir
+        /// [`arm_consent_sur_owner_repo_complet`]) : un nom nu reçoit `[]`, que
+        /// le contrat fail-closed du lecteur rend illisible, et l'étape 4bis
+        /// écrit alors sa row `consent_unreadable`. Exiger **zéro** row est
+        /// donc exiger que la lecture ait abouti.
+        ///
+        /// Le parent reste `groom` : le registre est vide, donc le saut de
+        /// l'étape 5a précède la bascule 5c — la même borne que le contrôle
+        /// positif de mika#3118.
+        #[tokio::test]
+        async fn mika3141_le_consentement_tenant_est_lu_et_laisse_partir_lauto_fire() {
+            let issue = 990_161;
+            arm_consent_sur_owner_repo_complet(issue);
+
+            let (db, parent_id) = autofire_sur(issue).await;
+
+            let rows = mika3118_consentement_a_lautofire::consent_audit_rows(&db, &parent_id).await;
+            assert!(
+                rows.is_empty(),
+                "le consentement tient et la lecture doit aboutir : l'étape 4bis \
+                 ne refuse rien et n'écrit rien. Une row `{}` ici signifie que le \
+                 lecteur a reçu une forme de dépôt que la forge refuse. Trouvé \
+                 {rows:?}",
+                GROOM_PILOT_CONSENT_UNREADABLE_VALUE
+            );
+            assert_eq!(
+                dispatch_class_of(&db, &parent_id).await,
+                "groom",
+                "le saut de 5a (outil absent du registre) précède la bascule 5c"
+            );
+        }
+
+        /// **V3 / AC3 — l'aller-retour depuis une `reference_url` réelle.**
+        ///
+        /// Les deux formes sortent du **même** parse : le nom court pour les
+        /// lignes `repo=` et le brief du pilote, l'`owner/repo` pour la forge.
+        /// L'`owner` est celui que l'URL porte, pas un littéral recomposé.
+        #[test]
+        fn mika3141_le_parse_rend_les_deux_formes_du_depot() {
+            let coords =
+                parse_repo_issue_from_url("https://github.com/senara-solutions/mika/issues/990131")
+                    .expect("une URL d'issue de l'organisation doit se résoudre");
+
+            assert_eq!(coords.owner_repo, "senara-solutions/mika");
+            assert_eq!(coords.repo_short, "mika");
+            assert_eq!(coords.issue, 990_131);
+
+            // Le strip de query string, inchangé : `?foo=bar` ne fait pas d'un
+            // numéro un illisible.
+            let avec_query = parse_repo_issue_from_url(
+                "https://github.com/senara-solutions/mika/issues/990131?foo=bar",
+            )
+            .expect("une query string ne rend pas l'URL illisible");
+            assert_eq!(avec_query.owner_repo, "senara-solutions/mika");
+            assert_eq!(avec_query.issue, 990_131);
+        }
+
+        /// **V4 / AC4 — ce que le parse refuse, et il le refuse par `None`.**
+        ///
+        /// L'organisation est un **contrôle** : lire l'`owner` dans l'URL ne
+        /// veut pas dire accepter n'importe lequel. Une autre organisation ne
+        /// se résout pas, comme avant mika#3141 — le contrat d'organisation du
+        /// dispatcheur est inchangé.
+        #[test]
+        fn mika3141_le_parse_refuse_ce_qui_nest_pas_une_issue_de_lorganisation() {
+            for url in [
+                // Une autre organisation : le contrôle mord.
+                "https://github.com/autre-org/mika/issues/990131",
+                // Segment 2 ≠ `issues` : une PR n'est pas une issue ici.
+                "https://github.com/senara-solutions/mika/pull/990131",
+                // Un numéro illisible.
+                "https://github.com/senara-solutions/mika/issues/pas-un-nombre",
+                // Pas d'hôte reconnu du tout.
+                "senara-solutions/mika#990131",
+            ] {
+                assert!(
+                    parse_repo_issue_from_url(url).is_none(),
+                    "`{url}` ne doit pas se résoudre : une coordonnée devinée ferait \
+                     partir un vol sur le mauvais ticket"
+                );
+            }
         }
     }
 

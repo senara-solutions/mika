@@ -193,12 +193,14 @@ pub(crate) const REARM_CONSENT_RECHECK_TOOL_NAME: &str = "ready_label_rearm_rech
 /// # Pourquoi les coordonnées se lisent dans le LABEL
 ///
 /// La traversée `parent_issue_coordinates` (`task_engine/dispatcher.rs`) existe
-/// et fonctionne, mais elle passe par `parse_repo_issue_from_url`, qui rend le
-/// **repo nu** (`"mika"`) — alors que [`read_ready_label_timeline`] interpole
-/// `repos/{repo}/issues/{issue}/timeline` et exige `owner/repo`. Re-préfixer
-/// `senara-solutions/` serait un littéral d'organisation codé en dur dans le
-/// dispatcher. Le label, lui, porte déjà `location.owner_repo()` : l'information
-/// exacte, à sa source, sans devinette.
+/// et fonctionne, mais elle rend le **repo nu** (`"mika"`) — c'est ce que ses
+/// deux appelants écrivent dans leur champ `repo=` — alors que
+/// [`read_ready_label_timeline`] interpole `repos/{repo}/issues/{issue}/timeline`
+/// et exige `owner/repo`. Son parseur sait rendre la forme complète depuis
+/// mika#3141 (`IssueCoordinates::owner_repo`, lue dans l'URL et non recomposée),
+/// mais la paire que cette traversée rend reste la forme courte. Le label, lui,
+/// porte déjà `location.owner_repo()` : l'information exacte, à sa source, sans
+/// devinette.
 ///
 /// # Pourquoi `None` est le discriminant, et non une erreur
 ///
@@ -703,11 +705,26 @@ impl RearmConsentCensus {
 /// absent n'est **jamais** [`RearmConsent::ReadyAbsent`] — « le champ n'est pas
 /// là » et « le label n'est pas posé » sont deux faits distincts, et les
 /// confondre terminerait une parente sur une réponse tronquée.
+///
+/// **La forme de `owner_repo` est refusée ici, avant le réseau** (mika#3141). Un
+/// nom nu (`"mika"`) part jusqu'à `gh`, qui le refuse — « expected the
+/// "[HOST/]OWNER/REPO" format » — et rend donc une illisibilité dont le motif ne
+/// nomme pas la cause : l'appelant a passé la mauvaise forme. Le refus vit dans
+/// le lecteur et non chez ses trois appelants, parce que c'est ici que l'exigence
+/// est connue ; même rang que le refus frère de
+/// [`parse_ready_label_task_label`], qui écarte le repo nu pour la même raison.
 pub(crate) async fn reread_issue_consent_via_gh(
     token: &str,
     owner_repo: &str,
     number: u64,
 ) -> Result<RearmConsent, String> {
+    if !owner_repo.contains('/') {
+        return Err(format!(
+            "`owner_repo` sans organisation : « {owner_repo} » n'a pas la forme \
+             `owner/repo` qu'exige `gh issue view --repo` (attendu p. ex. \
+             `senara-solutions/{owner_repo}`) pour l'issue #{number}"
+        ));
+    }
     let output = run_gh(
         token,
         GhSubject::Issue(number),
@@ -2448,6 +2465,44 @@ async fn consomme(db: &AsyncDatabase, id: &str) {
         assert_eq!(
             argv[0],
             format!("issue view {n} --repo senara-solutions/mika --json state,labels"),
+        );
+    }
+
+    /// **mika#3141 — un `owner_repo` sans organisation est refusé AVANT le
+    /// réseau, et le motif nomme la cause.**
+    ///
+    /// Le défaut mesuré le 2026-11-22 : l'étape 4bis de l'auto-fire passait le
+    /// nom court (`mika`), `gh issue view --repo mika` le refusait, et le motif
+    /// que l'opérateur lisait était « gh issue view a échoué », qui désigne la
+    /// forge alors que la cause est chez l'appelant.
+    ///
+    /// Le refus vit **ici** parce que c'est ici que l'exigence de forme est
+    /// connue — chez les trois appelants il faudrait trois copies, et la
+    /// quatrième manquerait. Et il tombe **sous** le réseau : aucun appel n'est
+    /// enregistré, ce qui est la moitié vérifiable de « avant le spawn ».
+    #[tokio::test]
+    async fn mika3141_un_repo_sans_organisation_est_refuse_avant_le_spawn() {
+        let n = 990_162u64;
+        crate::gh_process::assert_fixture_issue(n);
+
+        let e = reread_issue_consent_via_gh("fake-token", "mika", n)
+            .await
+            .expect_err("un nom de dépôt nu n'est pas un `owner/repo`");
+        assert!(
+            e.contains("owner_repo") && e.contains("owner/repo") && e.contains("mika"),
+            "le motif doit nommer le paramètre, la forme attendue et la valeur \
+             reçue — sinon il désigne la forge pour une faute de l'appelant : {e}"
+        );
+
+        let argv = crate::gh_process::recorded_calls()
+            .into_iter()
+            .filter(|c| c.subject == crate::gh_process::GhSubject::Issue(n))
+            .map(|c| c.args)
+            .collect::<Vec<_>>();
+        assert!(
+            argv.is_empty(),
+            "le refus tombe avant le spawn : aucun appel `gh` ne doit avoir été \
+             enregistré pour #{n}. Trouvé {argv:?}"
         );
     }
 
