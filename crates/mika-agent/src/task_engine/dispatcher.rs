@@ -5464,6 +5464,117 @@ const GROOM_PILOT_DISPATCHED_VALUE: &str = "implement_dispatched";
 /// parti et rien n'a été écrit.
 const GROOM_PILOT_STOPPED_VALUE: &str = "stopped_by_sentinel";
 
+/// L'issue mika#3118 : le ticket parent est **ouvert** mais ne porte pas (ou
+/// plus) `ready` — le consentement positif de l'opérateur (mika#841 / mika#2772).
+///
+/// C'est la forme exacte de l'incident du 2026-11-09 : un groom commandé par
+/// `mika ask` avec la consigne « ne pas lancer dev-pilot » a fait partir le
+/// pilote `a5aaafd5` à 20:00:51Z sur mika#1727, qui ne portait pas `ready`. Une
+/// consigne en langage naturel n'arrête rien ; seule une porte mécanique le peut.
+const GROOM_PILOT_READY_ABSENT_VALUE: &str = "ready_absent_at_autofire";
+
+/// L'issue mika#3118 : le ticket parent est **clos** à l'instant du dispatch.
+///
+/// Distincte de [`GROOM_PILOT_READY_ABSENT_VALUE`] et jamais fondue avec elle
+/// (mika#2205) : « le ticket est fermé » et « le ticket est ouvert sans `ready` »
+/// sont deux populations, dont la seconde est la seule que l'opérateur ré-arme en
+/// posant un label. Une population commune n'est plus soustractible.
+const GROOM_PILOT_ISSUE_CLOSED_VALUE: &str = "issue_closed_at_autofire";
+
+/// L'issue mika#3118 : la relecture du consentement n'a pas pu être faite, ou sa
+/// réponse était hors contrat.
+///
+/// **Fail-closed, et c'est une disposition obligatoire plutôt qu'un choix**
+/// (doctrine mika#2981) : un vol ne peut pas partir *parce que* le réseau
+/// manque. Et jamais confondue avec [`GROOM_PILOT_READY_ABSENT_VALUE`] —
+/// « `ready` n'est pas posé » et « je n'ai pas pu lire si `ready` est posé » sont
+/// deux populations, la seconde devant rester vide en régime sain.
+const GROOM_PILOT_CONSENT_UNREADABLE_VALUE: &str = "consent_unreadable_at_autofire";
+
+/// Ce que la relecture du consentement a trouvé à l'instant du dispatch
+/// (mika#3118 D2).
+///
+/// **Quatre variantes et non un `bool`.** Un `bool` aurait suffi à *décider* — et
+/// c'est précisément pourquoi il ne suffit pas : la décision est la même sur
+/// trois branches (refuser) alors que le **fait** y est différent, et c'est le
+/// fait que l'audit et la sonde doivent porter. Motif de
+/// [`crate::ready_label::RearmConsentCensus`] (mika#3050 D1) et de
+/// `GroomVerdictState` : un vocabulaire clos, un verdict par branche, aucune
+/// population inférable par soustraction.
+///
+/// La quatrième variante porte son motif plutôt que de le laisser au log : c'est
+/// ce motif que l'opérateur lira quand un refus sera un faux refus.
+#[derive(Debug)]
+enum AutofireConsent {
+    /// Ouvert et portant `ready` : le pilote part. C'est le **dénominateur** du
+    /// taux de refus (R5).
+    Held,
+    /// Ouvert, sans `ready`.
+    ReadyAbsent,
+    /// Clos.
+    IssueClosed,
+    /// Illisible — le `Err` de [`crate::ready_label::reread_issue_consent_via_gh`],
+    /// qui est fail-closed champ par champ (`state` hors du couple
+    /// `OPEN`/`CLOSED`, `labels` absent ou non-tableau).
+    Unreadable(String),
+}
+
+impl AutofireConsent {
+    /// La valeur de `verdict` que la sonde `groom_autofire_consent_checked`
+    /// porte. Quatre valeurs deux à deux distinctes : c'est ce qui donne au
+    /// taux de refus un dénominateur (R5, rappel du frère mika#3050).
+    fn verdict(&self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::ReadyAbsent => "ready_absent",
+            Self::IssueClosed => "issue_closed",
+            Self::Unreadable(_) => "unreadable",
+        }
+    }
+
+    /// Le motif d'une relecture illisible, `None` sur les trois autres branches.
+    ///
+    /// `None` et non `""` : le champ doit être **absent** du log, pas vide
+    /// (mika#2331). L'`impl Value for Option<T>` de `tracing` s'en charge dès
+    /// lors que c'est bien un `Option` qu'on lui passe.
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Held | Self::ReadyAbsent | Self::IssueClosed => None,
+            Self::Unreadable(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Relit le consentement de l'opérateur à la forge, à l'instant du dispatch
+/// (mika#3118 R1/R2).
+///
+/// **Aucun second lecteur n'est écrit.**
+/// [`crate::ready_label::reread_issue_consent_via_gh`] répond déjà à cette
+/// question exacte — « le consentement tient-il à cet instant ? » — en lisant
+/// l'**état** du ticket et non sa timeline, avec un contrat fail-closed champ
+/// par champ. Le prédicat de présence reste
+/// `webhook_dispatch::labels_carry_ready` à travers lui, l'unique lecteur du
+/// consentement positif de mika#2772. Cette fonction n'est qu'un **traducteur**
+/// de son `Result` vers le vocabulaire d'audit de ce dispatcheur.
+///
+/// Aucune valeur en base ne tient lieu de réponse : la fenêtre entre la mise en
+/// file du groom et la fin de sa convergence est de l'ordre de la dizaine de
+/// minutes (19:39:16Z → 20:00:51Z sur l'incident du 2026-11-09), et c'est dans
+/// cette fenêtre qu'un opérateur retire un label.
+///
+/// **Site d'engagement unique**, et sa cardinalité est assertée par
+/// `canonical_tokens::tests::mika3118_le_site_dengagement_du_consentement_est_unique`
+/// — dans les deux sens : le scan rougit si un second site apparaît *et* si le
+/// seul disparaît.
+async fn autofire_consent_at_dispatch(token: &str, repo: &str, issue: u64) -> AutofireConsent {
+    match crate::ready_label::reread_issue_consent_via_gh(token, repo, issue).await {
+        Ok(crate::ready_label::RearmConsent::Held) => AutofireConsent::Held,
+        Ok(crate::ready_label::RearmConsent::ReadyAbsent) => AutofireConsent::ReadyAbsent,
+        Ok(crate::ready_label::RearmConsent::Closed) => AutofireConsent::IssueClosed,
+        Err(reason) => AutofireConsent::Unreadable(reason),
+    }
+}
+
 /// mika#1289 — When a dev-groom callback delivers with `Outcome: PLAN_GROOMED`
 /// in its result text, dispatch dev-pilot. This is the structural counterpart
 /// to the LLM-mediated prompt-level path in `self-dev-callback` (mika#996 /
