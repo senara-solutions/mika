@@ -6696,6 +6696,41 @@ async fn phase2_reconcile_stuck_ready(
             }
         };
 
+        // mika#3117 — le verdict du dernier grooming, dernier contrôle avant le
+        // dispatch.
+        //
+        // **Pourquoi ici et pas plus haut.** Trois portes gardent déjà cette
+        // phase et les trois sont désarmées sur ce chemin par construction : la
+        // porte mika#2545 ne lit le verdict que sur un dispatch de *groom*, le
+        // parc mika#2315 ne mord que sur une timeline, et le `is_groomed` du
+        // vivier groomé-pas-ready ne regarde que le corps du ticket — qu'un
+        // callout `GROOMED` périmé satisfait pendant qu'un ESCALATE récent le
+        // contredit (mesure du 2026-11-16 : un `phase2_stuck_rescue` 3 min après
+        // un `ESCALATE second-pass`). Aucune des trois n'est modifiée ; celle-ci
+        // s'ajoute.
+        //
+        // **Après `attempted += 1` exprès**, même raison que la relecture d'état
+        // juste au-dessus (précédent mika#3047) : c'est un contrôle du dispatch,
+        // donc borné par le même budget — au plus `MAX_STUCK_RESCUE_PER_TICK`
+        // lectures base par tick, quoi que porte le vivier. Avant l'incrément, ce
+        // serait une lecture par candidat et par tick.
+        //
+        // **Avant le churn** des lignes plus bas, donc avant le remove→add : un
+        // refus ne touche ni le label, ni `rescued`, ni le budget de re-drive. Le
+        // geste humain de retirer puis reposer `ready` reste la seule sortie —
+        // la porte mika#2545 garde son discriminant `originating_message`, donc
+        // le dispatch qui suit ce geste porte un message d'origine et traverse.
+        if let Some(filter) = groom_halt_exclusion(db, n).await {
+            warn!(
+                issue = n,
+                filter,
+                "auto_pull: le dernier grooming de ce ticket interdit de le \
+                 réengager ; aucun dispatch, aucun churn (mika#3117)"
+            );
+            ledger.record(ExclusionPhase::Phase2StuckReady, n, filter);
+            continue;
+        }
+
         // AC3 — c'est `fresh`, et non la copie du tick, que le fetcher injecté
         // rend au handler.
         let action =
@@ -13183,18 +13218,28 @@ This ticket has been GROOMED and is ready.
     }
 
     async fn tick_pret_a_dispatcher(n: u64) -> TickPretADispatcher {
+        tick_pret_a_dispatcher_avec_verdict(n, crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED).await
+    }
+
+    /// [`tick_pret_a_dispatcher`], le `result` du callback de groom laissé au
+    /// choix de l'appelant (mika#3117).
+    ///
+    /// La preuve de grooming était déjà semée ici — c'est elle qui route le
+    /// handler vers `dev-pilot` — et c'est **la même row** que la garde du
+    /// verdict lit. Un second ensemencement à côté dirait deux histoires sur un
+    /// seul ticket ; le paramètre dit la seule qui existe.
+    async fn tick_pret_a_dispatcher_avec_verdict(
+        n: u64,
+        verdict_du_groom: &str,
+    ) -> TickPretADispatcher {
         crate::gh_process::assert_fixture_issue(n);
 
         let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
         let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
         // L'API d'écriture de production (mika#2310), jamais un `INSERT` SQL
         // brut — voir `mika2470_the_handler_decides_groom_vs_implement`.
-        let (parente_de_groom, _) = crate::db::tests::completed_groom_pair(
-            &sync_db,
-            "mika",
-            &url,
-            crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED,
-        );
+        let (parente_de_groom, _) =
+            crate::db::tests::completed_groom_pair(&sync_db, "mika", &url, verdict_du_groom);
         assert!(
             sync_db
                 .update_task_completed(&parente_de_groom, "mika", None)
@@ -13250,7 +13295,15 @@ This ticket has been GROOMED and is ready.
     /// (`FILTER_IN_FLIGHT`). Ce que ce test lit est ce que la phase 2 a
     /// réellement obtenu : une parente de plus, et la ligne de routage du
     /// handler.
+    /// `#[serial_test::serial]` depuis mika#3117 : ce test est l'un des deux de
+    /// cette moitié qui franchissent la relecture, donc l'un des deux qui
+    /// atteignent `groom_verdict_state` et son callsite `tracing`. Un callsite ne
+    /// s'enregistre qu'à sa première atteinte, et un thread sans abonné l'éteint
+    /// alors **globalement** — y compris pour les tests capturants de
+    /// `skills::executor` (doctrine mika#2646, défaut fondateur PR #2643). T2 à
+    /// T4 n'y arrivent pas : leur relecture refuse en amont.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3047_la_relecture_confirme_ready_et_le_dispatch_part() {
         let n = 990_105u64;
         let t = tick_pret_a_dispatcher(n).await;
@@ -13509,7 +13562,10 @@ This ticket has been GROOMED and is ready.
     /// n'utilise plus la copie du tick » — part au vol 2 (§ 6 du plan) : il
     /// répond d'une autre question, l'absence de *tout autre* chemin, que ce
     /// test ne couvre pas et ne prétend pas couvrir.
+    /// `#[serial_test::serial]` : le second des deux qui atteignent le callsite
+    /// `tracing` de `groom_verdict_state` — même raison qu'en T1.
     #[tokio::test]
+    #[serial_test::serial]
     async fn mika3047_le_handler_decide_sur_la_lecture_fraiche_pas_sur_le_tick() {
         let n = 990_109u64;
         let t = tick_pret_a_dispatcher(n).await;
@@ -13546,6 +13602,224 @@ This ticket has been GROOMED and is ready.
              fraîche. `dev-groom_dispatch_prepared` ici voudrait dire que la \
              copie du tick est encore celle qui part au dispatch : la relecture \
              aurait été payée et jetée"
+        );
+    }
+
+    // ── mika#3117 : la phase 2 lit le verdict du dernier grooming ──
+
+    /// **La mesure du 2026-11-16 rejouée.** Un `phase2_stuck_rescue` est parti
+    /// 3 min après un `ESCALATE second-pass`, sur un ticket dont le corps portait
+    /// encore un callout `GROOMED` : les trois portes existantes étaient toutes
+    /// satisfaites, et aucune ne lisait le verdict.
+    ///
+    /// La fixture est exactement celle de T1 — même corps groomé, même `ready`,
+    /// même relecture qui confirme — à un seul octet près : le `result` du
+    /// callback de groom. T1 reste le contrôle positif de celui-ci.
+    ///
+    /// L'observable est triple, et chaque tiers ferme une porte différente :
+    /// aucune parente créée (rien n'est préparé), aucune écriture forge (le churn
+    /// n'a pas eu lieu, donc le `ready` de l'opérateur est intact), et la ligne de
+    /// ledger sous son propre nom (l'exclusion est comptable).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_un_ticket_escalade_nest_pas_resecouru() {
+        let n = 990_120u64;
+        let t = tick_pret_a_dispatcher_avec_verdict(n, mika3117_groom_halt_exclusion::ESCALATED)
+            .await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3117-phase2";
+        let rescued = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "un ticket escaladé n'est pas secouru");
+        assert!(
+            ledger.entries.contains(&(
+                ExclusionPhase::Phase2StuckReady,
+                n,
+                FILTER_GROOM_ESCALATED
+            )),
+            "l'exclusion porte le nom du verdict, pas celui d'une tenue par \
+             label : ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture,
+            "aucune parente créée : c'est le pilote de 22:40:15Z qui n'est pas né"
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture, et le remove→add du churn en particulier : le \
+             `ready` que porte le ticket est celui de l'opérateur, et le geste \
+             humain de le retirer puis le reposer doit rester la seule sortie"
+        );
+        assert_eq!(
+            audit_after_values(&t.db, session, "ready_label_handled").await,
+            Vec::<String>::new(),
+            "le handler n'a pas été appelé : le refus est en amont du dispatch"
+        );
+    }
+
+    /// **Le contrôle qui sépare « lit le verdict » de « refuse toute escalade ».**
+    /// Une retenue d'attestation d'ancrage (mika#3027) rend les mêmes octets de
+    /// disposition qu'un ESCALATE d'architecte, et elle doit **traverser** : la
+    /// mesure du 2026-11-03 dit que la passe suivante converge, et la dépense est
+    /// déjà bornée par le frein mika#2786 en amont.
+    ///
+    /// Sans ce test, un traducteur qui refuserait les deux serait vert partout
+    /// ailleurs, et garerait pour un geste d'opérateur une population qui se
+    /// débloque seule — sous le nom d'un verdict d'architecte.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_une_retenue_dancrage_traverse_la_phase_2() {
+        let n = 990_121u64;
+        let t =
+            tick_pret_a_dispatcher_avec_verdict(n, mika3117_groom_halt_exclusion::WITHHELD).await;
+        crate::gh_process::set_canned_stdout_for(
+            crate::gh_process::GhSubject::Issue(n),
+            "issue view",
+            relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let session = "auto-pull-3117-withheld";
+        let _ = phase2_reconcile_stuck_ready(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            session,
+            &mut ledger,
+            false,
+            &t.fx.ctx(),
+        )
+        .await;
+
+        assert!(
+            !ledger
+                .entries
+                .iter()
+                .any(|(_, _, reason)| *reason == FILTER_GROOM_ESCALATED
+                    || *reason == FILTER_GROOM_VERDICT_UNREADABLE),
+            "aucune des deux exclusions de ce vol sur une retenue d'ancrage : \
+             ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            parents_for(&t.db, n).await,
+            t.parentes_de_la_fixture + 1,
+            "une parente de plus : le dispatch a bien atteint l'étape 7 du \
+             handler, exactement comme en T1"
+        );
+    }
+
+    /// **La borne par tick (lecture base).** La garde est placée APRÈS
+    /// `attempted += 1`, donc elle est bornée par le même budget que le dispatch :
+    /// au plus [`MAX_STUCK_RESCUE_PER_TICK`] lectures base par tick, quelle que
+    /// soit la taille du vivier.
+    ///
+    /// Le discriminant est exact et il est le point du test : avec sept candidats
+    /// tous escaladés, une garde placée **avant** l'incrément rendrait sept lignes
+    /// de ledger, et une garde placée après en rend cinq. Chaque ligne vient d'une
+    /// lecture et d'une seule — le filtre n'est enregistré que par le site qui
+    /// vient de lire — donc compter les lignes compte les lectures.
+    ///
+    /// Les deux candidats reportés ne sont pas perdus : le tick suivant repart de
+    /// la tête du vivier. Ce que la borne achète, c'est qu'une forge ou une base
+    /// lente ne fasse pas payer le vivier entier à chaque tick.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_la_lecture_du_verdict_est_bornee_par_le_budget_du_tick() {
+        let premiers = 990_130u64;
+        let candidats: Vec<u64> = (0..7).map(|i| premiers + i).collect();
+        assert!(
+            candidats.len() > MAX_STUCK_RESCUE_PER_TICK,
+            "le vivier doit dépasser la borne, sinon le test ne mesure rien"
+        );
+
+        let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+        for &n in &candidats {
+            crate::gh_process::assert_fixture_issue(n);
+            let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+            let (parente, _) = crate::db::tests::completed_groom_pair(
+                &sync_db,
+                "mika",
+                &url,
+                mika3117_groom_halt_exclusion::ESCALATED,
+            );
+            assert!(
+                sync_db
+                    .update_task_completed(&parente, "mika", None)
+                    .expect("terminer la parente de groom"),
+                "sinon le filtre 4 de la phase 2 écarte le candidat comme \
+                 `in_flight` et aucune lecture n'a lieu"
+            );
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(n),
+                "/timeline?",
+                r#"[{"event":"labeled","label":{"name":"ready"},"actor":{"login":"samidarko"},"created_at":"2020-01-01T00:00:00Z"}]"#,
+            );
+            crate::gh_process::set_canned_stdout_for(
+                crate::gh_process::GhSubject::Issue(n),
+                "issue view",
+                relecture_cannee("OPEN", &["ready"], GROOMED_BODY),
+            );
+        }
+        let db = AsyncDatabase::new_with_agent(sync_db, "mika");
+        let issues: Vec<Issue> = candidats
+            .iter()
+            .map(|&n| make_issue(n, GROOMED_BODY, &["ready"], "t"))
+            .collect();
+        let fx = test_ctx_fixture();
+
+        let mut ledger = ExclusionLedger::default();
+        let rescued = phase2_reconcile_stuck_ready(
+            &db,
+            "fake-token",
+            &fake_label_auth(),
+            &issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-borne",
+            &mut ledger,
+            false,
+            &fx.ctx(),
+        )
+        .await;
+
+        assert_eq!(rescued, 0, "les sept sont escaladés");
+        let lectures = ledger
+            .entries
+            .iter()
+            .filter(|(_, _, reason)| *reason == FILTER_GROOM_ESCALATED)
+            .count();
+        assert_eq!(
+            lectures, MAX_STUCK_RESCUE_PER_TICK,
+            "exactement {MAX_STUCK_RESCUE_PER_TICK} lectures, pas {} : la garde \
+             est placée après `attempted += 1`, donc le budget du dispatch la \
+             borne. Ledger = {:?}",
+            candidats.len(),
+            ledger.entries
         );
     }
 
@@ -15046,7 +15320,11 @@ Un ticket à plusieurs vols.
 
         /// Ce que `_escalate_groom` écrit sur un ESCALATE d'**architecte** : pas
         /// de ligne `Engine reason:`.
-        const ESCALATED: &str = "claude-pilot completed (status: done).\n\
+        ///
+        /// Visibilité élargie au parent : les tests comportementaux des trois
+        /// phases sèment ce `result` par le chemin d'écriture de production, et
+        /// une seconde copie de la fixture dériverait de celle-ci.
+        pub(super) const ESCALATED: &str = "claude-pilot completed (status: done).\n\
              GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
              Verdict: ESCALATE — human review required.\n\
              \n\
@@ -15055,7 +15333,10 @@ Un ticket à plusieurs vols.
         /// Ce que `_escalate_groom` écrit quand c'est le **moteur** qui a retenu
         /// l'attestation d'ancrage (mika#3027) : mêmes octets de disposition, plus
         /// la ligne `Engine reason:` portant la forme fixe.
-        const WITHHELD: &str = "claude-pilot completed (status: success).\n\
+        ///
+        /// Visibilité élargie pour la même raison qu'[`ESCALATED`] : c'est la
+        /// fixture du contrôle « `AnchorWithheld` traverse les trois phases ».
+        pub(super) const WITHHELD: &str = "claude-pilot completed (status: success).\n\
              GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
              Verdict: ESCALATE — human review required.\n\
              Engine reason: F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld \
