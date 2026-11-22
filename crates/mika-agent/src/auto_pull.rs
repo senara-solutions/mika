@@ -2041,6 +2041,51 @@ const FILTER_ISSUE_CLOSED_AT_DISPATCH: &str = "issue_closed_at_dispatch";
 /// son défaut (mika#2331).
 const FILTER_DISPATCH_REREAD_FAILED: &str = "dispatch_reread_failed";
 
+/// Le dernier grooming de ce ticket a rendu un verdict TERMINAL (mika#3117).
+///
+/// La tenue que ce module ne lisait pas. Les trois seules tenues lues étaient
+/// `blocked`, `operator-review` et le label de refus — toutes des **labels**,
+/// donc tous posés par quelqu'un. Un ESCALATE d'architecte ne pose aucun label :
+/// il vit dans le `result` du callback de groom, que seule la porte mika#2545
+/// lisait, et seulement sur le chemin du dispatch de groom. D'où les quatre
+/// mesures du ticket, dont celle du 2026-11-10 : quatre grooms sur le même
+/// ESCALATE du #1727, environ 12 $, arrêtés par le compteur de re-drive et non
+/// par le verdict.
+///
+/// **Le remède est un geste d'opérateur**, et c'est ce qui le distingue de ses
+/// voisins : lire l'escalade, décider, puis retirer et reposer `ready` à la main
+/// — la porte mika#2545 garde son discriminant `originating_message.is_none()`,
+/// donc le geste humain reste la seule sortie. Un ticket qui s'inscrit ici
+/// s'inscrira à l'identique à chaque tick jusqu'à ce geste, exactement comme
+/// [`FILTER_NO_READY_LABEL_EVENT`] : le compte ne décroît pas tout seul, et c'est
+/// l'information.
+///
+/// Distinct de [`FILTER_OPERATOR_HELD`] bien que les deux rendent « quelqu'un
+/// d'autre le tient » : celui-là se lit sur les labels et se lève en les
+/// retirant, celui-ci se lit dans l'historique des callbacks et aucun retrait de
+/// label ne l'efface. Les fondre ferait d'un verdict d'architecte une tenue
+/// d'opérateur, et l'opérateur qui groupe `audit_events` compterait deux
+/// populations sous un nom (mika#2205).
+const FILTER_GROOM_ESCALATED: &str = "groom_escalate_terminal";
+
+/// On n'a pas pu établir si le dernier grooming a escaladé (mika#3117,
+/// fail-closed).
+///
+/// Quatrième nom pour la même disposition, et non une fusion dans
+/// [`FILTER_GROOM_ESCALATED`] : c'est une **panne de lecture** — erreur base, ou
+/// callback terminal dont le `result` est NULL — pas un verdict du ticket. Même
+/// trajectoire que [`FILTER_DISPATCH_REREAD_FAILED`] en face de
+/// `ready_absent_at_dispatch` : fondu dans le verdict, il gonflerait le compte
+/// des escalades de refus qui n'en sont pas, et rendrait les deux populations non
+/// soustractables.
+///
+/// **Le coût est nommé et il est convergent.** Un `result` NULL sur un callback
+/// terminal est anormal — le chemin de complétion en écrit toujours un — donc la
+/// population est quasi vide ; et une base injoignable arrête la boucle entière
+/// bien avant d'avoir à décider de ce ticket. Le remède est de réparer la
+/// lecture, pas de filtrer plus fort.
+const FILTER_GROOM_VERDICT_UNREADABLE: &str = "groom_verdict_unreadable";
+
 /// `audit_events.tool_name` for per-ticket exclusion rows.
 ///
 /// SOLE WRITER: [`ExclusionLedger::flush`]. One literal, one site — a call site
@@ -2473,6 +2518,64 @@ fn groomed_candidate_exclusion(
         return Some(FILTER_FOREIGN_PLAN);
     }
     None
+}
+
+/// Le dernier grooming de ce ticket interdit-il de le réengager, et sous quel nom
+/// (mika#3117) ?
+///
+/// **Seul traducteur** entre le verdict de grooming et le vocabulaire de filtres
+/// de ce module, appelé par les trois phases. Un seul site, parce que la
+/// disposition de chaque état est une décision — `AnchorWithheld` passe,
+/// `Unreadable` refuse — et que trois copies de cette table dériveraient l'une
+/// de l'autre au premier état ajouté.
+///
+/// **Ce n'est pas un second lecteur du marqueur.** La grammaire de
+/// `Outcome: ESCALATE` garde son site unique dans
+/// [`crate::skills::executor::groom_escalate_verdict`] ; cette fonction appelle
+/// le lecteur et ne fait que nommer sa sortie. Un `contains("ESCALATE")` écrit
+/// ici serait le faux positif ancré que mika#2050 a mesuré, réintroduit à côté de
+/// sa correction.
+///
+/// **Pourquoi `AnchorWithheld` passe.** Un `Outcome: ESCALATE` écrit par le
+/// MOTEUR en retenant l'attestation d'ancrage (mika#3027) n'est pas un jugement
+/// d'architecte : la mesure du 2026-11-03 dit que la passe suivante converge, et
+/// la dépense est déjà bornée par le frein mika#2786 en amont. Le refuser ici
+/// garerait pour un geste d'opérateur une population qui se débloque seule — et
+/// le ferait sous le nom d'un verdict d'architecte.
+///
+/// **Pourquoi `Unreadable` refuse sous son propre nom.** On ne prouve pas
+/// l'absence d'escalade à partir d'une absence de texte. Le refus est fail-closed
+/// et il est comptable séparément : voir
+/// [`FILTER_GROOM_VERDICT_UNREADABLE`] pour le coût, qui est nommé et convergent.
+///
+/// Une lecture base par appel, donc **au plus une par candidat réellement
+/// engagé** : aucune phase ne l'appelle sur sa population, chacune l'appelle sur
+/// le ticket qu'elle est sur le point d'engager.
+async fn groom_halt_exclusion(db: &AsyncDatabase, issue: u64) -> Option<&'static str> {
+    // Même forme que le site de la porte mika#2545 (`skills/executor.rs`) : les
+    // deux interrogent la même colonne, et une URL d'une autre forme ne
+    // retrouverait aucune ligne — un refus muet déguisé en nominal.
+    let issue_url = format!("https://github.com/{DEFAULT_REPO}/issues/{issue}");
+    // `match` exhaustif sans bras `_ =>`, comme le site de la porte : un
+    // cinquième état du verdict devra être disposé ici par le compilateur, pas
+    // tomber dans le silence du bras par défaut.
+    match crate::skills::executor::groom_verdict_state(db, &issue_url).await {
+        crate::skills::executor::GroomVerdictState::NotEscalated => None,
+        crate::skills::executor::GroomVerdictState::AnchorWithheld => None,
+        crate::skills::executor::GroomVerdictState::Escalated => Some(FILTER_GROOM_ESCALATED),
+        crate::skills::executor::GroomVerdictState::Unreadable(reason) => {
+            // Le motif est porté par l'état mais pas par le ledger, qui ne tient
+            // qu'un `&'static str`. Il s'écrit donc ici, une fois, pour que
+            // « base muette » et « callback sans result » restent distinguables
+            // derrière le compte unique du filtre.
+            warn!(
+                issue,
+                reason = %reason,
+                "auto_pull: verdict de grooming illisible, ticket refusé (mika#3117)"
+            );
+            Some(FILTER_GROOM_VERDICT_UNREADABLE)
+        }
+    }
 }
 
 /// Pure selection predicate for the Phase 2 stuck-ready reconciler (mika#1824
@@ -14915,5 +15018,195 @@ Un ticket à plusieurs vols.
              ce que rendait `max_by`, et l'inverser déplacerait la promotion sans \
              qu'aucun critère ne l'ait demandé"
         );
+    }
+
+    // ───────── mika#3117 — le verdict de grooming, lu par l'auto-pull ─────────
+    //
+    // `#[serial_test::serial]` porte sur **tous** les tests de ce module, et la
+    // raison n'est pas locale : `groom_verdict_state` émet un événement
+    // `tracing`, et un callsite `tracing` ne s'enregistre qu'à sa PREMIÈRE
+    // atteinte, où son `Interest` est décidé par le défaut du thread qui
+    // l'enregistre. Un test d'ici qui l'atteint le premier sans abonné
+    // l'éteindrait **globalement**, y compris pour les tests capturants de
+    // `skills::executor::tests::mika2545_escalate_terminal` (défaut fondateur :
+    // PR #2643, doctrine mika#2646). La population des porteurs est donc close
+    // par lecture sur les DEUX modules, et ce vol l'élargit : voir le préambule
+    // de l'autre moitié.
+    mod mika3117_groom_halt_exclusion {
+        use super::*;
+        use crate::async_db::AsyncDatabase;
+        use crate::db::tests::{GROOM_ISSUE_URL, db, groom_callback, groom_parent};
+        use crate::skills::executor::{GroomVerdictState, groom_escalate_verdict};
+
+        /// Le numéro que [`GROOM_ISSUE_URL`] porte. Les deux doivent dire le même
+        /// ticket, sinon le traducteur interrogerait une URL que la fixture n'a
+        /// pas semée — et répondrait `NotEscalated` en lisant zéro ligne, c'est-à-
+        /// dire « rien à refuser » pour une raison qui n'est pas celle du test.
+        const ISSUE: u64 = 123;
+
+        /// Ce que `_escalate_groom` écrit sur un ESCALATE d'**architecte** : pas
+        /// de ligne `Engine reason:`.
+        const ESCALATED: &str = "claude-pilot completed (status: done).\n\
+             GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
+             Verdict: ESCALATE — human review required.\n\
+             \n\
+             Outcome: ESCALATE — first-pass";
+
+        /// Ce que `_escalate_groom` écrit quand c'est le **moteur** qui a retenu
+        /// l'attestation d'ancrage (mika#3027) : mêmes octets de disposition, plus
+        /// la ligne `Engine reason:` portant la forme fixe.
+        const WITHHELD: &str = "claude-pilot completed (status: success).\n\
+             GROOM ESCALATED (terminal): mika-arch escalated at first-pass.\n\
+             Verdict: ESCALATE — human review required.\n\
+             Engine reason: F1: (BLOCKING) [mika-engine] review-anchor: attestation withheld \
+             after the corrective re-prompt — anchors_found=3, anchors_valid=2, \
+             miss_reason=QuoteNotInBrief: paraphrase.\n\
+             Outcome: ESCALATE — first-pass";
+
+        /// Le cas nominal : le grooming a convergé.
+        const GROOMED: &str = "claude-pilot completed.\nOutcome: PLAN_GROOMED";
+
+        /// Un parent de groom portant [`GROOM_ISSUE_URL`], et sous lui les
+        /// callbacks terminaux donnés, `results[0]` étant le plus récent.
+        ///
+        /// Même forme que `seeded_rows` côté `skills::executor` : c'est ce que la
+        /// production écrit, et c'est le seul moyen de faire répondre le lecteur
+        /// sans le réimplémenter dans le test.
+        fn seeded(results: &[Option<&str>]) -> AsyncDatabase {
+            let sync = db();
+            let parent_id = sync
+                .create_task(&groom_parent("mika", GROOM_ISSUE_URL))
+                .unwrap();
+            sync.update_task_status(&parent_id, "in_progress").unwrap();
+            for (rank, result) in results.iter().enumerate() {
+                let callback_id = sync
+                    .create_task(&groom_callback("mika", &parent_id, "groom"))
+                    .unwrap();
+                assert!(
+                    sync.update_task_completed(&callback_id, "mika", *result)
+                        .unwrap()
+                );
+                // Forcé plutôt que subi : les `created_at` sont à la seconde, donc
+                // deux rows nées dans le même test la partagent et l'ordre
+                // retomberait sur le départage `id DESC` du lecteur, c'est-à-dire
+                // sur un UUID v4.
+                crate::db::tests::set_created_at(
+                    &sync,
+                    &callback_id,
+                    &format!("2026-11-22T10:{:02}:00Z", 59 - rank),
+                );
+            }
+            AsyncDatabase::new_with_agent(sync, "mika")
+        }
+
+        /// **Les quatre états dans un seul test**, parce que c'est une table de
+        /// vérité et qu'elle se lit comme telle : quatre états, deux dispositions,
+        /// et la frontière entre les deux est la décision du vol. Éclatée en
+        /// quatre tests, un état ajouté sans disposition ne rougirait nulle part.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3117_la_table_de_verite_des_quatre_etats() {
+            // 1. ESCALATE d'architecte → refus, sous le nom du verdict.
+            let db = seeded(&[Some(ESCALATED)]);
+            assert_eq!(
+                groom_halt_exclusion(&db, ISSUE).await,
+                Some(FILTER_GROOM_ESCALATED),
+                "le verdict terminal du dernier grooming est exactement la tenue \
+                 que ce module ne lisait pas"
+            );
+
+            // 2. Retenue d'ancrage du moteur → PASSE. La mesure du 2026-11-03 dit
+            //    que la passe suivante converge, et le frein mika#2786 borne déjà
+            //    la dépense en amont : la garer ici pour un geste d'opérateur
+            //    bloquerait une population qui se débloque seule.
+            assert_eq!(
+                groom_escalate_verdict(Some(WITHHELD.to_string())),
+                GroomVerdictState::AnchorWithheld,
+                "épingle de la fixture : sans ça, le cas suivant testerait \
+                 `Escalated` en croyant tester la retenue d'ancrage"
+            );
+            let db = seeded(&[Some(WITHHELD)]);
+            assert_eq!(
+                groom_halt_exclusion(&db, ISSUE).await,
+                None,
+                "une retenue d'ancrage n'est pas un jugement d'architecte"
+            );
+
+            // 3. Le cas nominal → passe.
+            let db = seeded(&[Some(GROOMED)]);
+            assert_eq!(groom_halt_exclusion(&db, ISSUE).await, None);
+
+            // 4. `result` NULL sur un callback terminal → refus fail-closed, sous
+            //    son PROPRE nom. On ne prouve pas l'absence d'escalade à partir
+            //    d'une absence de texte.
+            let db = seeded(&[None]);
+            assert_eq!(
+                groom_halt_exclusion(&db, ISSUE).await,
+                Some(FILTER_GROOM_VERDICT_UNREADABLE),
+                "une panne de lecture refuse, et son compte est séparable de \
+                 celui des escalades (mika#2205)"
+            );
+        }
+
+        /// **Le contrôle de bonne foi de la table.** Un ticket dont le grooming
+        /// n'a jamais tourné n'a aucun callback terminal, donc aucune ligne — et
+        /// il doit passer. Sans ce contrôle, un traducteur qui refuserait *tout*
+        /// passerait les quatre cas ci-dessus en apparence, et fermerait la boucle
+        /// entière : plus aucun ticket ne serait jamais promu.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3117_un_ticket_jamais_groome_ne_refuse_rien() {
+            let db = AsyncDatabase::new_with_agent(db(), "mika");
+            assert_eq!(
+                groom_halt_exclusion(&db, ISSUE).await,
+                None,
+                "zéro ligne est le cas nominal du tout premier grooming, pas une \
+                 preuve d'escalade"
+            );
+        }
+
+        /// Le `result` le plus récent décide, et c'est tout le défaut du
+        /// 2026-11-16 : un `GROOMED` ancien derrière un ESCALATE récent ne doit
+        /// pas rouvrir la porte.
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn mika3117_un_groomed_ancien_ne_couvre_pas_une_escalade_recente() {
+            let db = seeded(&[Some(ESCALATED), Some(GROOMED)]);
+            assert_eq!(
+                groom_halt_exclusion(&db, ISSUE).await,
+                Some(FILTER_GROOM_ESCALATED),
+                "l'ordre est du plus récent au plus ancien : le grooming qui a \
+                 convergé la semaine dernière ne survit pas à celui qui a escaladé \
+                 hier"
+            );
+        }
+
+        /// **Format de fil.** Les deux noms sont persistés dans `audit_events` et
+        /// un opérateur les groupe. Les épingler ici, et les épingler
+        /// **distincts** de tous leurs voisins, est ce qui empêche une fusion de
+        /// rendre deux populations non soustractables (mika#2205).
+        #[test]
+        fn mika3117_les_deux_filtres_sont_distincts_et_epingles() {
+            assert_eq!(FILTER_GROOM_ESCALATED, "groom_escalate_terminal");
+            assert_eq!(FILTER_GROOM_VERDICT_UNREADABLE, "groom_verdict_unreadable");
+
+            // Le verdict et la panne de lecture ne se fondent pas l'un dans
+            // l'autre, et ni l'un ni l'autre ne se fond dans la tenue par label —
+            // dont le remède est de retirer le label, là où celui du verdict est
+            // de lire l'escalade et de décider.
+            let voisins = [
+                FILTER_GROOM_ESCALATED,
+                FILTER_GROOM_VERDICT_UNREADABLE,
+                FILTER_OPERATOR_HELD,
+                FILTER_NOT_GROOMED,
+                FILTER_DISPATCH_REREAD_FAILED,
+            ];
+            let uniques: HashSet<&str> = voisins.iter().copied().collect();
+            assert_eq!(
+                uniques.len(),
+                voisins.len(),
+                "deux filtres de même valeur comptent une population sous un nom"
+            );
+        }
     }
 }
