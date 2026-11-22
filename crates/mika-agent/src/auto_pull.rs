@@ -5646,6 +5646,27 @@ async fn phase0_feed_ready_pool(
             ),
         }
 
+        // mika#3117 — le verdict du dernier grooming, lu juste avant de reposer
+        // le label. La mesure du 2026-11-17 : `ready` retiré à la main à 13:04Z,
+        // reposé par le feeder à 13:10:32Z sur un ticket dont le grooming avait
+        // escaladé. Le feeder n'en lisait rien — pour lui le ticket était groomé
+        // et sans `ready`, donc à pousser.
+        //
+        // Placée après la porte de promotion pour la même raison qu'en phase 1 :
+        // l'ajout est strictement additif, la porte garde ses deux issues et son
+        // escalade. Le `continue` est le comportement de tous les autres refus de
+        // cette boucle — candidat suivant, et la borne du tick reste `slots`.
+        if let Some(filter) = groom_halt_exclusion(db, n).await {
+            warn!(
+                issue = n,
+                filter,
+                "auto_feeder: le dernier grooming de ce ticket interdit de lui \
+                 reposer `ready` ; candidat suivant (mika#3117)"
+            );
+            ledger.record(ExclusionPhase::Phase0Feeder, n, filter);
+            continue;
+        }
+
         let outcome = apply_ready_label(
             db,
             github_token,
@@ -5781,7 +5802,40 @@ impl Phase1Probe for GateProbe<'_> {
             )
             .await
             {
-                GateOutcome::Allowed => Phase1Verdict::Promote,
+                // mika#3117 — le verdict du dernier grooming, lu ici et non au
+                // site du label.
+                //
+                // **Pourquoi la sonde et pas `apply_ready_label`.** Un refus doit
+                // faire DESCENDRE le classement, pas arrêter le tick : un ticket
+                // escaladé reste groomé, sans `ready` et sans marqueur, donc il
+                // revient en tête à chaque tick. Rendre `None` depuis la boucle
+                // figerait la phase 1 sur exactement la population que ce vol
+                // vise — le défaut que l'AC3 de mika#3058 a fermé pour le déclin.
+                // `TryNext` est le seul verdict qui ait ce sens, et il ne s'écrit
+                // qu'ici.
+                //
+                // **Pourquoi après la porte de promotion et pas avant.** Plus
+                // haut coûterait moins d'appels forge, mais un ticket à la fois
+                // escaladé et périmé recevrait alors une exclusion silencieuse au
+                // lieu du [`REFUSAL_LABEL`] qu'il reçoit aujourd'hui — un
+                // changement de comportement hors périmètre. Ici, l'ajout est
+                // strictement additif : la porte décide d'abord, exactement comme
+                // avant.
+                GateOutcome::Allowed => match groom_halt_exclusion(self.db, candidate.number).await
+                {
+                    None => Phase1Verdict::Promote,
+                    Some(filter) => {
+                        warn!(
+                            issue = candidate.number,
+                            filter,
+                            "auto_pull: le dernier grooming de ce ticket interdit de le \
+                             promouvoir ; la phase descend le classement (mika#3117)"
+                        );
+                        self.ledger
+                            .record(ExclusionPhase::Phase1Pull, candidate.number, filter);
+                        Phase1Verdict::TryNext
+                    }
+                },
                 // Un refus a escaladé : le ticket porte [`REFUSAL_LABEL`], un
                 // opérateur a un geste à faire, et le tick s'arrête comme il
                 // s'arrêtait avant ce vol.
@@ -13624,8 +13678,8 @@ This ticket has been GROOMED and is ready.
     #[serial_test::serial]
     async fn mika3117_un_ticket_escalade_nest_pas_resecouru() {
         let n = 990_120u64;
-        let t = tick_pret_a_dispatcher_avec_verdict(n, mika3117_groom_halt_exclusion::ESCALATED)
-            .await;
+        let t =
+            tick_pret_a_dispatcher_avec_verdict(n, mika3117_groom_halt_exclusion::ESCALATED).await;
         crate::gh_process::set_canned_stdout_for(
             crate::gh_process::GhSubject::Issue(n),
             "issue view",
@@ -13650,11 +13704,9 @@ This ticket has been GROOMED and is ready.
 
         assert_eq!(rescued, 0, "un ticket escaladé n'est pas secouru");
         assert!(
-            ledger.entries.contains(&(
-                ExclusionPhase::Phase2StuckReady,
-                n,
-                FILTER_GROOM_ESCALATED
-            )),
+            ledger
+                .entries
+                .contains(&(ExclusionPhase::Phase2StuckReady, n, FILTER_GROOM_ESCALATED)),
             "l'exclusion porte le nom du verdict, pas celui d'une tenue par \
              label : ledger = {:?}",
             ledger.entries
@@ -13814,11 +13866,333 @@ This ticket has been GROOMED and is ready.
             .filter(|(_, _, reason)| *reason == FILTER_GROOM_ESCALATED)
             .count();
         assert_eq!(
-            lectures, MAX_STUCK_RESCUE_PER_TICK,
+            lectures,
+            MAX_STUCK_RESCUE_PER_TICK,
             "exactement {MAX_STUCK_RESCUE_PER_TICK} lectures, pas {} : la garde \
              est placée après `attempted += 1`, donc le budget du dispatch la \
              borne. Ledger = {:?}",
             candidats.len(),
+            ledger.entries
+        );
+    }
+
+    // ── mika#3117 : les phases 1 et 0 lisent le verdict du dernier grooming ──
+
+    /// Le vivier que les phases 0 et 1 reçoivent : des tickets **groomés** et
+    /// **sans `ready`**, chacun avec le `result` de son dernier callback de groom
+    /// laissé au choix de l'appelant.
+    struct CandidatsGroomes {
+        db: AsyncDatabase,
+        issues: Vec<Issue>,
+        auth: mika_common::label_write::LabelWriteToken,
+    }
+
+    /// Sème un candidat par entrée `(numéro, `result` du groom, `updated_at`)`.
+    ///
+    /// Le corps est [`GROOMED_BODY`] pour **tous**, y compris les escaladés, et
+    /// ce n'est pas une commodité de fixture : c'est le cas du 2026-11-16. Un
+    /// ticket sans callout `GROOMED` n'est candidat ni pour la phase 0 ni pour la
+    /// phase 1 — `is_groomed` lit le corps de l'issue et l'écarte en amont. Donc
+    /// tout ticket qu'une de ces deux phases peut réengager porte, par
+    /// construction, un callout de grooming satisfait ; et un ESCALATE postérieur
+    /// ne touche pas ce corps. « Un vieux `GROOMED` masque une escalade récente »
+    /// est l'état **nominal** de cette population, pas un cas limite, et c'est
+    /// pourquoi aucun test séparé ne le monte : chaque fixture escaladée d'ici en
+    /// est une.
+    ///
+    /// La parente de groom est **terminée** : sinon la sonde en vol de la phase 0
+    /// (`find_active_self_dev_task_for_issue`) écarterait le candidat, et la porte
+    /// file-vide de la phase 1 (`count_active_self_dev_tasks`) la ferait rendre
+    /// `None` — dans les deux cas le test serait vert sans avoir rien lu.
+    ///
+    /// Les labels de priorité sont écrits **nus** (`"p1"`), ce que
+    /// [`priority_rank`] matche — voir `mika3058_lordre_des_candidats_est_celui_de_max_by`.
+    async fn candidats_groomes(entrees: &[(u64, &str, &str)]) -> CandidatsGroomes {
+        let sync_db = crate::db::Database::open_in_memory().expect("open in-memory DB");
+        let mut issues = Vec::new();
+        for &(n, verdict_du_groom, updated_at) in entrees {
+            crate::gh_process::assert_fixture_issue(n);
+            let url = format!("https://github.com/{DEFAULT_REPO}/issues/{n}");
+            // Le chemin d'écriture de production (mika#2310), jamais un `INSERT`
+            // brut : c'est la même row que la garde lit.
+            let (parente_de_groom, _) =
+                crate::db::tests::completed_groom_pair(&sync_db, "mika", &url, verdict_du_groom);
+            assert!(
+                sync_db
+                    .update_task_completed(&parente_de_groom, "mika", None)
+                    .expect("terminer la parente de groom"),
+                "la parente de groom doit être terminée, sinon la phase 0 voit le \
+                 candidat en vol et la phase 1 voit sa file non vide"
+            );
+            issues.push(make_issue(n, GROOMED_BODY, &["p1"], updated_at));
+        }
+        CandidatsGroomes {
+            db: AsyncDatabase::new_with_agent(sync_db, "mika"),
+            issues,
+            auth: fake_label_auth(),
+        }
+    }
+
+    /// Les deux exclusions de ce vol, vues au ledger pour un ticket.
+    fn exclusions_3117_pour(ledger: &ExclusionLedger, n: u64) -> Vec<&'static str> {
+        ledger
+            .entries
+            .iter()
+            .filter(|(_, issue, reason)| {
+                *issue == n
+                    && (*reason == FILTER_GROOM_ESCALATED
+                        || *reason == FILTER_GROOM_VERDICT_UNREADABLE)
+            })
+            .map(|(_, _, reason)| *reason)
+            .collect()
+    }
+
+    /// **La phase 1 ne promeut pas un ticket dont le dernier grooming a escaladé.**
+    ///
+    /// L'observable est double : la phase ne rend rien, et aucune écriture forge
+    /// n'a touché le ticket — donc pas de `ready` posé, donc pas de webhook, donc
+    /// pas de pilote. Un seul candidat ici : c'est l'AC de refus, le parcours du
+    /// classement est l'objet du test suivant.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_un_ticket_escalade_nest_pas_promu_par_la_phase_1() {
+        let n = 990_140u64;
+        let t = candidats_groomes(&[(
+            n,
+            mika3117_groom_halt_exclusion::ESCALATED,
+            "2026-11-01T00:00:00Z",
+        )])
+        .await;
+
+        let mut ledger = ExclusionLedger::default();
+        let promu = phase1_promote_groomed(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-phase1",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(promu, None, "un ticket escaladé n'est pas promu");
+        assert_eq!(
+            exclusions_3117_pour(&ledger, n),
+            vec![FILTER_GROOM_ESCALATED],
+            "l'exclusion porte le nom du verdict, une fois : ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture : `ready` n'est pas posé, donc aucun webhook de \
+             dispatch ne part"
+        );
+    }
+
+    /// **La propriété centrale du vol côté phase 1 : l'escalade fait descendre le
+    /// classement, elle n'arrête pas le tick.**
+    ///
+    /// C'est la raison pour laquelle la garde vit dans la sonde et non au site du
+    /// label : rendre `None` sur un refus figerait la phase sur exactement la
+    /// population que ce vol vise — un ticket escaladé reste groomé, sans `ready`
+    /// et sans marqueur, donc il revient en tête à chaque tick, et plus rien ne
+    /// serait jamais promu. C'est le défaut que l'AC3 de mika#3058 a dû fermer
+    /// pour le déclin ; le réintroduire ici sous un autre nom ne le rendrait pas
+    /// neuf.
+    ///
+    /// A est classé devant B par son `updated_at` plus ancien, à priorité égale.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_la_phase_1_descend_le_classement_derriere_une_escalade() {
+        let escalade = 990_141u64;
+        let sain = 990_142u64;
+        let t = candidats_groomes(&[
+            (
+                escalade,
+                mika3117_groom_halt_exclusion::ESCALATED,
+                "2026-01-01T00:00:00Z",
+            ),
+            (
+                sain,
+                crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED,
+                "2026-06-01T00:00:00Z",
+            ),
+        ])
+        .await;
+        assert_eq!(
+            select_candidates_ranked_recording(
+                t.issues.clone(),
+                &HashSet::new(),
+                &mut ExclusionLedger::default()
+            )
+            .first()
+            .map(|i| i.number),
+            Some(escalade),
+            "épingle du classement : si l'escaladé n'est pas en tête, le test ne \
+             mesure aucune descente"
+        );
+
+        let mut ledger = ExclusionLedger::default();
+        let promu = phase1_promote_groomed(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-descente",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(
+            promu,
+            Some(sain),
+            "le candidat sain derrière l'escaladé est promu dans le MÊME tick"
+        );
+        assert_eq!(
+            exclusions_3117_pour(&ledger, escalade),
+            vec![FILTER_GROOM_ESCALATED],
+            "l'escaladé est compté sous son nom : ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            ecritures_forge_pour(escalade),
+            Vec::<String>::new(),
+            "rien n'est écrit sur l'escaladé — en particulier pas d'`add-label`"
+        );
+    }
+
+    /// Le contrôle de bonne foi de la phase 1 : une retenue d'attestation d'ancrage
+    /// (mika#3027) rend les mêmes octets de disposition qu'un ESCALATE
+    /// d'architecte et doit **traverser**. Sans lui, une garde qui refuserait les
+    /// deux serait verte sur les deux tests précédents.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_une_retenue_dancrage_traverse_la_phase_1() {
+        let n = 990_143u64;
+        let t = candidats_groomes(&[(
+            n,
+            mika3117_groom_halt_exclusion::WITHHELD,
+            "2026-11-01T00:00:00Z",
+        )])
+        .await;
+
+        let mut ledger = ExclusionLedger::default();
+        let promu = phase1_promote_groomed(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-phase1-withheld",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(
+            promu,
+            Some(n),
+            "une retenue d'ancrage n'est pas un jugement d'architecte : le ticket \
+             traverse. Ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            exclusions_3117_pour(&ledger, n),
+            Vec::<&str>::new(),
+            "aucune des deux exclusions de ce vol : ledger = {:?}",
+            ledger.entries
+        );
+    }
+
+    /// **La mesure du 2026-11-17 rejouée.** Un `ready` retiré à la main à 13:04Z
+    /// a été reposé par le feeder à 13:10:32Z, six minutes plus tard, sur un
+    /// ticket dont le grooming avait escaladé. Le feeder ne lisait aucun verdict :
+    /// pour lui le ticket était groomé, sans `ready`, donc à pousser.
+    ///
+    /// L'observable est triple : rien de promu, l'exclusion sous son nom, et
+    /// aucune écriture forge — c'est ce dernier tiers qui dit que le geste humain
+    /// tient, parce que c'est exactement ce que la mesure a vu défaire.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_un_ticket_escalade_nest_pas_pousse_par_le_feeder() {
+        let n = 990_150u64;
+        let t = candidats_groomes(&[(
+            n,
+            mika3117_groom_halt_exclusion::ESCALATED,
+            "2026-11-01T00:00:00Z",
+        )])
+        .await;
+
+        let mut ledger = ExclusionLedger::default();
+        let promus = phase0_feed_ready_pool(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-phase0",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(promus, 0, "le feeder ne repose pas `ready` sur un escaladé");
+        assert_eq!(
+            exclusions_3117_pour(&ledger, n),
+            vec![FILTER_GROOM_ESCALATED],
+            "l'exclusion porte le nom du verdict : ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            ecritures_forge_pour(n),
+            Vec::<String>::new(),
+            "aucune écriture : le retrait humain de 13:04Z reste la dernière \
+             décision sur ce label"
+        );
+    }
+
+    /// Le contrôle de bonne foi de la phase 0, pendant exact de celui de la phase
+    /// 1 : sans
+    /// lui, un feeder qui refuserait toute escalade serait vert ci-dessus tout en
+    /// garant une population qui se débloque seule.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_une_retenue_dancrage_traverse_la_phase_0() {
+        let n = 990_151u64;
+        let t = candidats_groomes(&[(
+            n,
+            mika3117_groom_halt_exclusion::WITHHELD,
+            "2026-11-01T00:00:00Z",
+        )])
+        .await;
+
+        let mut ledger = ExclusionLedger::default();
+        let promus = phase0_feed_ready_pool(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-phase0-withheld",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(
+            promus, 1,
+            "une retenue d'ancrage traverse le feeder. Ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            exclusions_3117_pour(&ledger, n),
+            Vec::<&str>::new(),
+            "aucune des deux exclusions de ce vol : ledger = {:?}",
             ledger.entries
         );
     }
