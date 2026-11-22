@@ -5605,6 +5605,14 @@ async fn autofire_consent_at_dispatch(token: &str, repo: &str, issue: u64) -> Au
 ///     that required an end anchor would refuse every real proof.
 ///   - parent task has a parseable `reference_url` of shape
 ///     `https://github.com/<owner>/<repo>/issues/<n>`
+///   - **le consentement de l'opérateur tient encore à la forge** (mika#3118) —
+///     le ticket parent est relu à l'instant du dispatch et doit être *ouvert*
+///     et porter `ready`. Aucune valeur en base ne tient lieu de réponse : c'est
+///     dans la dizaine de minutes qui sépare la mise en file du groom de sa
+///     convergence qu'un opérateur retire un label. Trois refus nommés, jamais
+///     fondus : [`GROOM_PILOT_READY_ABSENT_VALUE`],
+///     [`GROOM_PILOT_ISSUE_CLOSED_VALUE`] et — fail-closed —
+///     [`GROOM_PILOT_CONSENT_UNREADABLE_VALUE`].
 ///
 /// Dispatch is **engine-side and direct** (mika#1614): the function resolves the
 /// `run_claude_pilot` tool from the `SkillRegistry`, **reuses the groom parent
@@ -5628,7 +5636,9 @@ async fn autofire_consent_at_dispatch(token: &str, repo: &str, issue: u64) -> Au
 /// Audit event written under [`GROOM_PILOT_DISPATCHER_TOOL`] with
 /// `after_value=`[`GROOM_PILOT_DISPATCHED_VALUE`] for traceability — and, since
 /// mika#2498, [`GROOM_PILOT_STOPPED_VALUE`] on the branch where the loop's
-/// dispatch brake refused the auto-fire.
+/// dispatch brake refused the auto-fire — et depuis mika#3118 les trois valeurs
+/// de la garde de consentement, de sorte qu'un `GROUP BY after_value` sépare les
+/// six issues sans qu'aucune ne s'infère par soustraction.
 async fn try_dispatch_pilot_after_groom_success(
     db: &AsyncDatabase,
     task: &Task,
@@ -5755,6 +5765,127 @@ async fn try_dispatch_pilot_after_groom_success(
             callback_task_id = %task.id,
             "engine: groom-pilot auto-fire skipped — no GitHub token configured"
         );
+        return;
+    }
+
+    // 4bis. Le consentement de l'opérateur, relu à la forge (mika#3118).
+    //
+    //    **Ce que les cinq préconditions d'avant ne lisaient pas : le ticket.**
+    //    Classe de dispatch, marqueur de convergence, `reference_url` parsable,
+    //    frein STOP, jeton — aucune ne consultait l'état courant du ticket à la
+    //    forge. L'auto-fire de mika#1614 a été ouvert pour *court-circuiter* le
+    //    `gh issue edit --add-label ready` → webhook → tour de LLM (vulnérable à
+    //    la fabrication, mesurée sur mika#1609) ; en retirant le détour il a
+    //    retiré la **lecture** du consentement avec lui.
+    //
+    //    **Placement, et chacune des trois contraintes est mesurable.**
+    //
+    //    1. **Après le frein STOP de l'étape 3bis** (mika#2498) : le STOP est un
+    //       geste global d'opérateur, et sa ligne `groom_pilot_autofire_stopped`
+    //       doit continuer de compter les dispatches *qu'il* a refusés — un refus
+    //       de consentement qui mordrait avant viderait sa population sans le
+    //       dire (classe mika#2205).
+    //    2. **Après l'étape 4** : la relecture exige le jeton, et un `no_token`
+    //       déjà nommé reste nommé sous son nom.
+    //    3. **Impérativement avant l'étape 5c**, qui bascule le `dispatch_class`
+    //       du parent groom→implement : un refus posé après laisserait une
+    //       parente étiquetée `implement` sans implement en vol, et le slot
+    //       serait mal compté (#1001) — la doctrine que le commentaire du frein
+    //       de l'étape 3bis énonce déjà à son propre sujet.
+    //
+    //    L'ordre est pin par un scan de source dans `canonical_tokens.rs`, parce
+    //    qu'une garde glissée d'un cran ne rend fausse aucune des décisions
+    //    couvertes par les tests de comportement.
+    //
+    //    **Ce que la garde ne fait pas.** Elle ne pose aucun label — le moteur
+    //    qui se poserait à lui-même le consentement de l'opérateur serait
+    //    mika#841 / mika#2772 inversés (voir le doc-comment de cette fonction).
+    //    Elle ne touche pas au grooming : le groom reste convergé, son callout
+    //    reste écrit, la preuve `Outcome: PLAN_GROOMED — <plan>` reste intacte ;
+    //    le refus porte sur le lancement du **pilote d'implémentation**, pas sur
+    //    la validité du plan. Et elle n'avertit pas l'opérateur hors audit : un
+    //    commentaire sur le ticket serait un second canal à maintenir.
+    //
+    //    Le jeton est présent et non vide — l'étape 4 vient de l'établir. Le
+    //    `unwrap_or_default` n'est donc pas un défaut silencieux mais une branche
+    //    inatteignable, et le préférer à un `expect` évite un panic sur un chemin
+    //    fire-and-forget.
+    let consent =
+        autofire_consent_at_dispatch(github_token.unwrap_or_default(), &repo, issue_num).await;
+
+    //    La sonde a un dénominateur : elle est émise à **chaque** passage,
+    //    branche saine comprise (R5). Motif `kg_budget_resolved` (mika#1833) /
+    //    `team_stop_topic_inheritance` (mika#1926), et rappel explicite du frère
+    //    mika#3050 : un recensement qui ne compte que les anomalies n'a pas de
+    //    dénominateur. `repo` et `issue` sont ici toujours présents — l'étape 3
+    //    les a parsés — donc ce sont des valeurs et non des `Option` ; `reason`,
+    //    qui peut manquer, en est un (mika#2331 : une absence n'est pas un `""`).
+    info!(
+        event = "groom_autofire_consent_checked",
+        verdict = consent.verdict(),
+        reason = consent.reason(),
+        repo = %repo,
+        issue = issue_num,
+        parent_task_id = %parent_id,
+        callback_task_id = %task.id,
+        "engine: groom-pilot auto-fire consent re-read at dispatch (mika#3118)"
+    );
+
+    //    Le `match` est exhaustif et sans bras `_` (R6) : une cinquième variante
+    //    d'`AutofireConsent` devra être décidée à la compilation plutôt que
+    //    tomber dans un défaut muet. Un scan de `canonical_tokens.rs` refuse
+    //    qu'un joker y revienne — précédent exact : la garde du `match` de
+    //    `GroomVerdictState`.
+    let refusal = match &consent {
+        AutofireConsent::Held => None,
+        AutofireConsent::ReadyAbsent => Some(GROOM_PILOT_READY_ABSENT_VALUE),
+        AutofireConsent::IssueClosed => Some(GROOM_PILOT_ISSUE_CLOSED_VALUE),
+        AutofireConsent::Unreadable(_) => Some(GROOM_PILOT_CONSENT_UNREADABLE_VALUE),
+    };
+    if let Some(after_value) = refusal {
+        //    Depuis mika#2995, rien en aval n'attrape l'échec de cette fonction :
+        //    un refus n'a aucun chemin de remontée autre que ses propres traces.
+        //    D'où l'audit nommé, à côté des deux existantes — c'est la table sur
+        //    laquelle l'opérateur fait ses `GROUP BY after_value`. Un refus muet
+        //    serait indistinguable d'un groom qui n'a jamais convergé.
+        let trace_id = mika_common::trace::generate_trace_id();
+        warn!(
+            event = "groom_pilot_autofire_consent_refused",
+            verdict = consent.verdict(),
+            reason = consent.reason(),
+            after_value,
+            parent_task_id = %parent_id,
+            callback_task_id = %task.id,
+            repo = %repo,
+            issue = issue_num,
+            trace_id = %trace_id,
+            "engine: groom-pilot auto-fire refused — the operator's consent does not \
+             hold at dispatch (mika#3118); the groom is kept, nothing was dispatched"
+        );
+
+        let system_session = format!("system-{}", parent.agent_id);
+        let reason = match consent.reason() {
+            Some(detail) => format!("{after_value} (issue: {repo}#{issue_num}): {detail}"),
+            None => format!("{after_value} (issue: {repo}#{issue_num})"),
+        };
+        if let Err(e) = db
+            .log_audit_event(
+                &system_session,
+                GROOM_PILOT_DISPATCHER_TOOL,
+                &parent_id,
+                Some(GROOM_PILOT_BEFORE_VALUE),
+                Some(after_value),
+                Some(&reason),
+                Some(&trace_id),
+            )
+            .await
+        {
+            warn!(
+                parent_task_id = %parent_id,
+                error = %e,
+                "engine: failed to write groom-pilot-dispatcher consent audit event"
+            );
+        }
         return;
     }
 
