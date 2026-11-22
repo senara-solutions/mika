@@ -9800,32 +9800,28 @@ This ticket has been GROOMED and is ready.
             )
         }
 
-        const PROBE_SAINE: &str = "\
-    fn probe(&mut self) -> Verdict {
+        const PROBE_SAINE: &str = r#"fn probe(&mut self) -> Verdict {
         match groom_halt_exclusion(self.db, candidate.number).await {
             None => Phase1Verdict::Promote,
             Some(_) => Phase1Verdict::TryNext,
         }
-    }";
+    }"#;
 
-        const PHASE0: &str = "\
-async fn phase0_feed_ready_pool(db: &Db) {
+        const PHASE0: &str = r#"async fn phase0_feed_ready_pool(db: &Db) {
     for n in candidates {
         if let Some(filter) = groom_halt_exclusion(db, n).await {
             continue;
         }
         let outcome = apply_ready_label(db, n).await;
     }
-}";
+}"#;
 
-        const PHASE1: &str = "\
-async fn phase1_promote_groomed(db: &Db) {
+        const PHASE1: &str = r#"async fn phase1_promote_groomed(db: &Db) {
     let candidate = phase1_first_promotable(ranked, &mut probe).await?;
     let outcome = apply_ready_label(db, candidate.number).await;
-}";
+}"#;
 
-        const PHASE2: &str = "\
-async fn phase2_reconcile_stuck_ready(db: &Db) {
+        const PHASE2: &str = r#"async fn phase2_reconcile_stuck_ready(db: &Db) {
     for n in selected {
         if let Some(filter) = groom_halt_exclusion(db, n).await {
             continue;
@@ -9833,7 +9829,7 @@ async fn phase2_reconcile_stuck_ready(db: &Db) {
         dispatch_rescued_ticket_in_process(db, n).await;
         let outcome = apply_ready_label(db, n).await;
     }
-}";
+}"#;
 
         let saine = format!("{PHASE0}\n{PHASE1}\n{PHASE2}");
 
@@ -9844,12 +9840,11 @@ async fn phase2_reconcile_stuck_ready(db: &Db) {
 
         // 1 — une quatrième porte, non gardée. Le cas de mika#3117 lui-même,
         // rejoué sur une phase qui n'existe pas encore.
-        const PHASE3: &str = "\
-async fn phase3_une_porte_neuve(db: &Db) {
+        const PHASE3: &str = r#"async fn phase3_une_porte_neuve(db: &Db) {
     for n in candidates {
         let outcome = apply_ready_label(db, n).await;
     }
-}";
+}"#;
         assert!(
             scan_engagement_sites_read_the_verdict(&fixture(
                 PROBE_SAINE,
@@ -9872,12 +9867,11 @@ async fn phase3_une_porte_neuve(db: &Db) {
         );
 
         // 3 — la garde retirée d'une des trois.
-        const PHASE0_SANS_GARDE: &str = "\
-async fn phase0_feed_ready_pool(db: &Db) {
+        const PHASE0_SANS_GARDE: &str = r#"async fn phase0_feed_ready_pool(db: &Db) {
     for n in candidates {
         let outcome = apply_ready_label(db, n).await;
     }
-}";
+}"#;
         assert!(
             scan_engagement_sites_read_the_verdict(&fixture(
                 PROBE_SAINE,
@@ -9889,15 +9883,14 @@ async fn phase0_feed_ready_pool(db: &Db) {
 
         // 4 — la garde DÉPLACÉE après l'engagement : même compte, même appel,
         // ordre inversé. Aucune assertion de présence ne voit ça.
-        const PHASE2_GARDE_TARDIVE: &str = "\
-async fn phase2_reconcile_stuck_ready(db: &Db) {
+        const PHASE2_GARDE_TARDIVE: &str = r#"async fn phase2_reconcile_stuck_ready(db: &Db) {
     for n in selected {
         dispatch_rescued_ticket_in_process(db, n).await;
         if let Some(filter) = groom_halt_exclusion(db, n).await {
             continue;
         }
     }
-}";
+}"#;
         assert!(
             scan_engagement_sites_read_the_verdict(&fixture(
                 PROBE_SAINE,
@@ -9910,10 +9903,9 @@ async fn phase2_reconcile_stuck_ready(db: &Db) {
         // 5 — morceau (i) de la phase 1 : la sonde de production ne lit plus le
         // verdict. Les trois sites sont là, la phase 1 reste conforme au
         // morceau (ii), et pourtant elle promeut un ticket escaladé.
-        const PROBE_AVEUGLE: &str = "\
-    fn probe(&mut self) -> Verdict {
+        const PROBE_AVEUGLE: &str = r#"fn probe(&mut self) -> Verdict {
         Phase1Verdict::Promote
-    }";
+    }"#;
         assert!(
             scan_engagement_sites_read_the_verdict(&fixture(PROBE_AVEUGLE, &saine)).is_err(),
             "une sonde de production qui ne lit pas le verdict doit faire rougir le scan"
@@ -9922,11 +9914,10 @@ async fn phase2_reconcile_stuck_ready(db: &Db) {
         // 6 — morceau (ii) de la phase 1 : le label posé sur un candidat qui
         // n'est pas passé par la descente. La sonde reste conforme au morceau
         // (i), donc seule cette seconde moitié peut le voir.
-        const PHASE1_HORS_DESCENTE: &str = "\
-async fn phase1_promote_groomed(db: &Db) {
+        const PHASE1_HORS_DESCENTE: &str = r#"async fn phase1_promote_groomed(db: &Db) {
     let outcome = apply_ready_label(db, ranked[0].number).await;
     let candidate = phase1_first_promotable(ranked, &mut probe).await?;
-}";
+}"#;
         assert!(
             scan_engagement_sites_read_the_verdict(&fixture(
                 PROBE_SAINE,
