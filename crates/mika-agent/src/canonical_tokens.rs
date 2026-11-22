@@ -7934,4 +7934,233 @@ And `run_gh(\"issue create --title t -l ready,urgent\")` creates it promoted.
             "retirer `ready` n'est pas se donner le consentement"
         );
     }
+
+    // ---- mika#3118 : la garde de consentement de l'auto-fire ----------------
+
+    /// Le dispatcheur du task engine, tronqué à son module de test par
+    /// [`production_sources`] — la source que les trois scans de mika#3118
+    /// lisent.
+    fn mika3118_dispatcher_production() -> String {
+        let owner = "crates/mika-agent/src/task_engine/dispatcher.rs";
+        production_sources()
+            .into_iter()
+            .find(|(rel, _)| rel == owner)
+            .map(|(_, c)| c)
+            .unwrap_or_else(|| panic!("mika#3118 — {owner} introuvable : le scan ne lit rien"))
+    }
+
+    /// Les numéros de ligne (1-indexés, dans la production du dispatcheur) qui
+    /// **engagent** `autofire_consent_at_dispatch` : ni sa définition, ni un
+    /// commentaire qui la nomme. Même prédicat que
+    /// `engine::tests::lignes_dappel_en_production` (mika#2993).
+    fn mika3118_lignes_dengagement(production: &str) -> Vec<usize> {
+        production
+            .lines()
+            .enumerate()
+            .filter(|(_, ligne)| {
+                let t = ligne.trim_start();
+                !t.starts_with("//")
+                    && !t.starts_with("async fn ")
+                    && t.contains("autofire_consent_at_dispatch(")
+            })
+            .map(|(i, _)| i + 1)
+            .collect()
+    }
+
+    /// **V8 / AC8 — un seul site engage la garde, et c'est celui-là.**
+    ///
+    /// Le nom que le commentaire de production cite : si ce test disparaît, la
+    /// doc de `autofire_consent_at_dispatch` nomme un garde-fou mort.
+    ///
+    /// Un second site serait soit un doublon (deux lectures réseau pour un vol,
+    /// deux rows d'audit pour un refus), soit — bien pire — une relecture
+    /// placée ailleurs dans l'ordre des préconditions, que V6 ne borne pas. Le
+    /// compteur est auto-nettoyant **dans les deux sens** : il rougit si un
+    /// site s'ajoute, et il rougit aussi si le dernier disparaît, auquel cas la
+    /// garde entière a été retirée sans que rien d'autre ne le dise.
+    #[test]
+    fn mika3118_le_site_dengagement_du_consentement_est_unique() {
+        /// Un. L'étape 4bis de `try_dispatch_pilot_after_groom_success`.
+        const EXPECTED_AUTOFIRE_CONSENT_SITES: usize = 1;
+
+        let production = mika3118_dispatcher_production();
+        let sites = mika3118_lignes_dengagement(&production);
+
+        assert_eq!(
+            sites.len(),
+            EXPECTED_AUTOFIRE_CONSENT_SITES,
+            "mika#3118 — {} site(s) engagent `autofire_consent_at_dispatch` \
+             (lignes {sites:?}), attendu {EXPECTED_AUTOFIRE_CONSENT_SITES}. \
+             RÉSOLUTION : si un site s'ajoute, vérifier qu'il tombe au bon rang \
+             dans l'ordre des préconditions (garde V6) avant de rehausser ce \
+             nombre. S'il n'en reste aucun, la garde de consentement a été \
+             retirée : l'auto-fire mika#1614 relance un pilote sur un ticket \
+             que l'opérateur a fermé ou démoté.",
+            sites.len()
+        );
+    }
+
+    /// **V6 / AC6 — l'ordre des préconditions, et il est porteur.**
+    ///
+    /// Les trois contraintes du § 4 du plan, qu'aucun test comportemental ne
+    /// peut tenir : une garde déplacée reste fonctionnellement correcte sur les
+    /// quatre issues de V1-V4, et casse pourtant trois lectures.
+    ///
+    /// - **Après le frein du STOP** (mika#2498) : le geste de l'opérateur doit
+    ///   produire SA ligne d'audit, y compris quand le consentement ne tient
+    ///   plus — sinon le STOP devient invisible dès qu'une autre cause coexiste.
+    /// - **Après la résolution du jeton** : la relecture a besoin du jeton, et
+    ///   sans lui elle ne pourrait que rendre « illisible », ce qui attribuerait
+    ///   un fait d'environnement à la forge.
+    /// - **Impérativement avant la bascule `groom`→`implement`** (#1001) : un
+    ///   refus survenu après laisserait un parent étiqueté `implement` sans
+    ///   aucun implement en vol, et le prochain dispatch légitime serait compté
+    ///   sur le mauvais slot.
+    #[test]
+    fn mika3118_la_garde_de_consentement_tombe_au_bon_rang() {
+        let production = mika3118_dispatcher_production();
+
+        let debut_fn = production
+            .find("async fn try_dispatch_pilot_after_groom_success(")
+            .unwrap_or_else(|| {
+                panic!(
+                    "mika#3118 — `try_dispatch_pilot_after_groom_success` est introuvable : \
+                     ce scan vise une forme morte"
+                )
+            });
+        let corps = &production[debut_fn..];
+
+        // Les quatre ancres, composées à l'exécution pour que ce fichier ne
+        // porte pas une copie du code qu'il surveille.
+        let ancres = [
+            (
+                "frein du STOP (mika#2498)",
+                format!(
+                    "if crate::auto_pull_stop::is_stopped(global_home, {}",
+                    "crate::auto_pull_stop::AUTO_PULL_SCAN)"
+                ),
+            ),
+            (
+                "résolution du jeton",
+                format!("if github_token.is_none_or({}", "str::is_empty)"),
+            ),
+            (
+                "garde de consentement (mika#3118)",
+                format!("{}(github_token", "autofire_consent_at_dispatch"),
+            ),
+            (
+                "bascule du dispatch_class (#1001)",
+                format!(
+                    "update_task_dispatch_class(&parent_id, {})",
+                    "\"implement\""
+                ),
+            ),
+        ];
+
+        let mut rangs = Vec::new();
+        for (nom, ancre) in &ancres {
+            let occurrences = corps.matches(ancre.as_str()).count();
+            assert_eq!(
+                occurrences, 1,
+                "bonne foi : l'ancre « {nom} » doit apparaître exactement une fois \
+                 dans le corps de la fonction, trouvée {occurrences} fois. Un scan \
+                 qui ne reconnaît plus sa forme serait vert pour rien."
+            );
+            rangs.push((nom, corps.find(ancre.as_str()).unwrap()));
+        }
+
+        for paire in rangs.windows(2) {
+            let (avant, rang_avant) = paire[0];
+            let (apres, rang_apres) = paire[1];
+            assert!(
+                rang_avant < rang_apres,
+                "mika#3118 — l'ordre des préconditions est rompu : « {avant} » doit \
+                 précéder « {apres} ». RÉSOLUTION : replacer la garde de \
+                 consentement entre la résolution du jeton et la bascule du \
+                 `dispatch_class`, jamais ailleurs."
+            );
+        }
+    }
+
+    /// **V7 / AC7 — aucun des deux `match` n'a de bras joker.**
+    ///
+    /// Motif mika#2545 : un cinquième verdict du consentement doit être décidé
+    /// par le compilateur, jamais absorbé par un `_ =>`. Le sens du défaut est
+    /// ce qui rend l'enjeu asymétrique — un joker du côté « laisser passer »
+    /// fait repartir un pilote sur un ticket fermé, exactement l'incident que
+    /// mika#3118 ferme.
+    ///
+    /// Scan de source plutôt que test comportemental : un joker ajouté ne rend
+    /// fausse aucune des quatre décisions couvertes par V1-V4.
+    #[test]
+    fn mika3118_les_deux_match_du_consentement_nont_aucun_bras_joker() {
+        let production = mika3118_dispatcher_production();
+
+        // Fenêtres bornées sur la hauteur de chaque `match`. Elles ne doivent
+        // PAS être élargies à l'aveugle : plus larges que le `match`, elles
+        // liraient le code d'après et un `_ =>` étranger passerait pour un
+        // joker. C'est l'assertion de bonne foi qui dit quand les rehausser.
+        let fenetres = [
+            (
+                "traduction du verdict de la forge",
+                format!(
+                    "match crate::ready_label::reread_issue_consent_via_gh({}",
+                    "token, repo, issue).await {"
+                ),
+                8_usize,
+                vec![
+                    "RearmConsent::Held",
+                    "RearmConsent::ReadyAbsent",
+                    "RearmConsent::Closed",
+                    "Err(",
+                ],
+            ),
+            (
+                "choix de la valeur d'audit du refus",
+                format!("let refusal = match {}", "&consent {"),
+                7_usize,
+                vec![
+                    "AutofireConsent::Held",
+                    "AutofireConsent::ReadyAbsent",
+                    "AutofireConsent::IssueClosed",
+                    "AutofireConsent::Unreadable(",
+                ],
+            ),
+        ];
+
+        for (nom, ouvreur, hauteur, bras) in &fenetres {
+            let debut = production.find(ouvreur.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "mika#3118 — le `match` « {nom} » est introuvable dans le \
+                     dispatcheur : ce scan vise une forme morte"
+                )
+            });
+            let corps: String = production[debut..]
+                .lines()
+                .take(*hauteur)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for attendu in bras {
+                assert!(
+                    corps.contains(attendu),
+                    "bonne foi : la plage extraite du `match` « {nom} » doit porter \
+                     le bras `{attendu}` — si elle ne le porte plus, le `match` a \
+                     grandi et la hauteur de fenêtre ({hauteur}) doit être \
+                     rehaussée. Trouvé :\n{corps}"
+                );
+            }
+
+            for joker in ["_ =>", "_=>"] {
+                assert!(
+                    !corps.contains(joker),
+                    "mika#3118 — le `match` « {nom} » porte un bras joker \
+                     (`{joker}`) : un cinquième verdict du consentement y \
+                     tomberait sans décision, et du côté « laisser passer » il \
+                     relancerait un pilote sur un ticket démoté. RÉSOLUTION : \
+                     énumérer le verdict, ne pas l'absorber."
+                );
+            }
+        }
+    }
 }
