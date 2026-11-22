@@ -16489,15 +16489,25 @@ Harness ticket.
         // course entière ouverte (défaut fondateur : PR #2643).
         //
         // La population est close par **lecture**, pas par prudence : le
-        // callsite vit dans `groom_verdict_state`, dont l'unique appelant est le
-        // terme 3 de `validate_dispatch_readiness`, atteint seulement quand
-        // `originating_message` est absent ET que la compétence dérive en
-        // `groom` (seul `dev-groom`, cf. `derive_dispatch_class`) ET que le
-        // prompt porte une référence lisible. Six tests de ce module satisfont
-        // les trois, plus `test_open_pr_guard_bypasses_dev_groom_skill` dans le
-        // module parent — annoté là-bas pour cette raison. Tous les autres
-        // appelants du gate passent un `originating_message` (dont
+        // callsite vit dans `groom_verdict_state`, et ses appelants se comptent.
+        //
+        // Ici, c'est le terme 3 de `validate_dispatch_readiness`, atteint
+        // seulement quand `originating_message` est absent ET que la compétence
+        // dérive en `groom` (seul `dev-groom`, cf. `derive_dispatch_class`) ET
+        // que le prompt porte une référence lisible. Six tests de ce module
+        // satisfont les trois, plus `test_open_pr_guard_bypasses_dev_groom_skill`
+        // dans le module parent — annoté là-bas pour cette raison. Tous les
+        // autres appelants du gate passent un `originating_message` (dont
         // `ready_label_handler`) ou refusent avant (le frein mika#2634).
+        //
+        // **Depuis mika#3117 il y a un second appelant, hors de ce module :**
+        // `auto_pull::groom_halt_exclusion`, que les trois phases de l'auto-pull
+        // interrogent avant d'engager un ticket. Le callsite est donc partagé
+        // entre deux modules, ce qui ne change rien à la doctrine mais en élargit
+        // la portée : la fermeture de la population est la même obligation
+        // **là-bas**, et c'est pour ça que les tests mika#3117 de `auto_pull`
+        // portent tous `#[serial_test::serial]`. Un `#[serial]` oublié dans l'un
+        // des deux modules éteint le callsite pour l'autre.
 
         type CapturedEvents =
             std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>;
