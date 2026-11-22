@@ -14589,6 +14589,62 @@ async fn phase1_promote_groomed(db: &Db) {
         );
     }
 
+    /// Non-régression : la population **nominale** traverse le feeder inchangée.
+    ///
+    /// Les deux contrôles de bonne foi ci-dessus portent sur `AnchorWithheld` —
+    /// un état que la garde doit laisser passer parce qu'il converge seul. Celui-ci
+    /// porte sur `GROOMED`, c'est-à-dire sur la quasi-totalité du trafic de cette
+    /// phase : si ce vol avait coûté un refus à un ticket sainement groomé, le
+    /// feeder cesserait de remplir le vivier et rien ailleurs ne le dirait.
+    ///
+    /// Il asserte aussi la **seule écriture forge** — l'ajout de `ready`. La garde
+    /// ne lit que la base, donc elle ne doit ajouter aucun appel à la forge sur le
+    /// chemin nominal ; un appel de plus par candidat et par tick serait un coût
+    /// que personne n'a demandé.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3117_un_ticket_sainement_groome_traverse_le_feeder_sans_surcout() {
+        let n = 990_152u64;
+        let t = candidats_groomes(&[(
+            n,
+            crate::db::tests::GROOM_CALLBACK_PLAN_GROOMED,
+            "2026-11-01T00:00:00Z",
+        )])
+        .await;
+
+        let mut ledger = ExclusionLedger::default();
+        let promus = phase0_feed_ready_pool(
+            &t.db,
+            "fake-token",
+            &t.auth,
+            &t.issues,
+            &HashSet::new(),
+            "trace",
+            "auto-pull-3117-phase0-groomed",
+            &mut ledger,
+        )
+        .await;
+
+        assert_eq!(
+            promus, 1,
+            "un ticket sainement groomé traverse le feeder. Ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            exclusions_3117_pour(&ledger, n),
+            Vec::<&str>::new(),
+            "aucune des deux exclusions de ce vol : ledger = {:?}",
+            ledger.entries
+        );
+        assert_eq!(
+            ecritures_forge_pour(n).len(),
+            1,
+            "le chemin nominal garde son unique écriture forge — la garde lit la base, \
+             pas la forge : {:?}",
+            ecritures_forge_pour(n)
+        );
+    }
+
     // ── mika#2839 : le callout d'une branche morte est réécrit ──
 
     /// Le corps d'un ticket dont la branche a été supprimée par le merge de sa
