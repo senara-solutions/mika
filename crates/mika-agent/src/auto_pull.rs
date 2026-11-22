@@ -9563,6 +9563,398 @@ This ticket has been GROOMED and is ready.
         );
     }
 
+    // ── mika#3117 : tout site d'engagement lit le verdict du grooming ──
+
+    /// Les deux appels par lesquels l'auto-pull **engage** un ticket : poser
+    /// `ready` (ce qui déclenche le dispatch par webhook) et dispatcher en
+    /// direct.
+    ///
+    /// Le prédicat est sur l'**acte**, pas sur la phase. Une quatrième phase
+    /// écrite demain ne porterait aucune des trois signatures d'aujourd'hui,
+    /// mais elle devra bien engager par l'une de ces deux portes — sinon elle
+    /// n'engage rien.
+    const ENGAGEMENT_CALLS: &[&str] =
+        &["apply_ready_label(", "dispatch_rescued_ticket_in_process("];
+
+    /// Le nombre de fonctions de production qui engagent un ticket, mesuré le
+    /// 2026-11-22 : `phase0_feed_ready_pool`, `phase1_promote_groomed`,
+    /// `phase2_reconcile_stuck_ready`.
+    ///
+    /// **Exactement trois, jamais « au moins trois ».** Un `>=` laisserait
+    /// passer une quatrième phase non conforme ; un `<=` laisserait passer la
+    /// suppression d'une des trois, c'est-à-dire un correctif désarmé que le
+    /// scan lirait comme un arbre propre. L'assertion rougit donc dans les deux
+    /// sens, et c'est ce qui la rend informative : le jour où une quatrième
+    /// porte s'ouvre, c'est ce test qui pose la question, pas une mesure de
+    /// production six jours plus tard.
+    const EXPECTED_ENGAGEMENT_SITES: usize = 3;
+
+    /// La garde que tout site d'engagement doit avoir franchie.
+    const HALT_GUARD_CALL: &str = "groom_halt_exclusion(";
+
+    /// La phase 1 ne peut pas se prouver d'un seul morceau : sa garde vit dans
+    /// la **sonde** et non dans la fonction qui pose le label, parce que seul
+    /// `Phase1Verdict::TryNext` fait descendre le classement (voir le bras
+    /// `GateOutcome::Allowed` de [`GateProbe::probe`]). Elle se prouve donc en
+    /// deux morceaux greppables, et les deux sont nécessaires : (i) l'unique
+    /// implémentation de production de [`Phase1Probe`] lit le verdict, et
+    /// (ii) la fonction qui pose le label n'obtient son candidat que par la
+    /// descente, donc ne peut pas en engager un qui n'est pas passé par (i).
+    const PHASE1_LABEL_FN: &str = "phase1_promote_groomed";
+    const PHASE1_DESCENT_CALL: &str = "phase1_first_promotable(";
+    const PHASE1_PROBE_IMPL: &str = "impl Phase1Probe for ";
+
+    /// Sites d'engagement qu'on ne sait pas rendre conformes.
+    ///
+    /// **Livrée vide, et une entrée NOMME le ticket qui la retirera.** Quand ce
+    /// scan tire sur une quatrième porte, la résolution est d'y appeler
+    /// `groom_halt_exclusion` — pas de relâcher l'assertion, et pas de la
+    /// re-keyer sur `>=`. Une entrée ici est une dette nommée, dans la lignée
+    /// de `senara-solutions/mika#2983` ; même contrat que
+    /// `TICK_COPY_READERS_ALLOWED` ci-dessus (doctrine mika#2201 / mika#2309).
+    /// La première colonne de chaque entrée est le nom de la fonction exemptée.
+    const ENGAGEMENT_SITES_UNCONFORMABLE: &[&str] = &[];
+
+    /// Le scan entier, en `Result` pour que son contrôle de bonne foi puisse le
+    /// montrer rougir sur des sources synthétiques.
+    ///
+    /// **Pourquoi une garde structurelle et pas seulement les cinq tests de
+    /// comportement.** Les tests de comportement couvrent les trois phases qui
+    /// existent. Une quatrième porte, écrite dans six mois par quelqu'un qui
+    /// n'aura jamais lu ce ticket, serait verte sur les trois : elle ne casse
+    /// rien, elle ouvre juste un chemin que personne n'a fermé. C'est exactement
+    /// la classe de mika#3117 — le feeder du 2026-11-17 n'était pas un bug
+    /// d'écriture, c'était un site qu'aucun invariant ne couvrait.
+    fn scan_engagement_sites_read_the_verdict(src: &str) -> Result<(), String> {
+        let prod = crate::source_scan::production_half(src);
+
+        // Les corps des deux porteurs eux-mêmes ne sont pas des sites : leur
+        // définition n'engage personne, elle est l'acte. Exclus par **nom**,
+        // pour qu'un renommage de l'un rougisse plutôt que de disparaître.
+        let carriers: Vec<&str> = ENGAGEMENT_CALLS
+            .iter()
+            .map(|c| c.trim_end_matches('('))
+            .collect();
+
+        let mut engaging: Vec<(String, String, usize)> = Vec::new();
+        for (name, body) in crate::source_scan::fn_bodies(prod) {
+            if carriers.contains(&name.as_str()) {
+                continue;
+            }
+            if let Some(at) = ENGAGEMENT_CALLS.iter().filter_map(|c| body.find(c)).min() {
+                engaging.push((name, body, at));
+            }
+        }
+
+        let noms: Vec<&str> = engaging.iter().map(|(n, _, _)| n.as_str()).collect();
+        if engaging.len() != EXPECTED_ENGAGEMENT_SITES {
+            return Err(format!(
+                "{} fonction(s) de production engagent un ticket, attendu \
+                 {EXPECTED_ENGAGEMENT_SITES} : {noms:?}\n\
+                 PLUS : une nouvelle porte d'engagement s'est ouverte — elle doit appeler \
+                 `groom_halt_exclusion` avant d'engager, jamais être ajoutée à \
+                 ENGAGEMENT_SITES_UNCONFORMABLE sans un ticket qui la retirera.\n\
+                 MOINS : une porte a disparu, ou son appel a été renommé — ce scan est alors \
+                 orphelin, et son vert ne dit plus rien.",
+                engaging.len()
+            ));
+        }
+
+        for (name, body, first) in &engaging {
+            if ENGAGEMENT_SITES_UNCONFORMABLE
+                .iter()
+                .any(|e| e.split_whitespace().next() == Some(name.as_str()))
+            {
+                continue;
+            }
+
+            if name == PHASE1_LABEL_FN {
+                // Morceau (ii) : le candidat ne vient que de la descente. Sans
+                // cette assertion, un second chemin d'engagement dans cette même
+                // fonction — sur un candidat choisi autrement — serait invisible,
+                // puisque le morceau (i) ne parle que de la sonde.
+                let descent = body.find(PHASE1_DESCENT_CALL).ok_or_else(|| {
+                    format!(
+                        "`{PHASE1_LABEL_FN}` n'obtient plus son candidat par \
+                         `{PHASE1_DESCENT_CALL}` : la garde de la phase 1 vit dans la sonde, \
+                         donc un candidat qui ne passe pas par la descente n'est lu par rien \
+                         (mika#3117)"
+                    )
+                })?;
+                for call in ENGAGEMENT_CALLS {
+                    for (at, _) in body.match_indices(call) {
+                        if at < descent {
+                            return Err(format!(
+                                "`{PHASE1_LABEL_FN}` engage un ticket (`{call}`) AVANT \
+                                 `{PHASE1_DESCENT_CALL}` : ce candidat n'est passé par aucune \
+                                 sonde, donc son verdict de grooming n'est lu par rien \
+                                 (mika#3117)"
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            match body.find(HALT_GUARD_CALL) {
+                None => {
+                    return Err(format!(
+                        "`{name}` engage un ticket sans appeler `{HALT_GUARD_CALL}` dans la même \
+                         fonction : un ticket dont le dernier grooming a ESCALADÉ y serait \
+                         réengagé (mika#3117)\n\
+                         RÉSOLUTION : appeler `groom_halt_exclusion` avant d'engager, et \
+                         enregistrer le refus au grand livre des exclusions."
+                    ));
+                }
+                Some(guard) if guard > *first => {
+                    return Err(format!(
+                        "`{name}` appelle `{HALT_GUARD_CALL}` APRÈS avoir engagé le ticket : \
+                         l'engagement est déjà parti quand le verdict est lu (mika#3117)"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+
+        if !noms.contains(&PHASE1_LABEL_FN) {
+            return Err(format!(
+                "`{PHASE1_LABEL_FN}` n'engage plus rien : la preuve en deux morceaux de la \
+                 phase 1 est orpheline et son vert ne dit plus rien (mika#3117)"
+            ));
+        }
+
+        // Morceau (i) : l'unique implémentation de production de `Phase1Probe`
+        // lit le verdict. **Une seule**, parce qu'une seconde sonde de production
+        // serait un chemin de promotion que ce morceau ne couvre pas — et le
+        // morceau (ii) ne la verrait pas non plus, puisqu'il ne parle que de la
+        // provenance du candidat.
+        let impls: Vec<usize> = prod
+            .match_indices(PHASE1_PROBE_IMPL)
+            .map(|(at, _)| at)
+            .collect();
+        if impls.len() != 1 {
+            return Err(format!(
+                "{} implémentation(s) de production de `Phase1Probe`, attendu exactement 1 : \
+                 une seconde sonde est un chemin de promotion dont le verdict de grooming \
+                 n'est lu par rien (mika#3117)",
+                impls.len()
+            ));
+        }
+        // La borne du bloc est le `\n}\n` suivant : dans une source formatée par
+        // `cargo fmt` — ce que la CI impose — les accolades internes d'un `impl`
+        // sont indentées, donc le premier `}` en colonne 0 est le sien. Prémisse
+        // nommée plutôt que découverte.
+        let start = impls[0];
+        let end = prod[start..]
+            .find("\n}\n")
+            .map_or(prod.len(), |i| start + i);
+        let block = crate::source_scan::strip_comment_lines(&prod[start..end]);
+        if !block.contains(HALT_GUARD_CALL) {
+            return Err(format!(
+                "l'unique implémentation de production de `Phase1Probe` n'appelle pas \
+                 `{HALT_GUARD_CALL}` : la phase 1 promouvrait un ticket escaladé, et aucun test \
+                 de comportement d'une autre phase ne le verrait (mika#3117)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Tout site d'engagement de l'auto-pull a lu le verdict du dernier
+    /// grooming avant d'engager.
+    #[test]
+    fn mika3117_tout_site_dengagement_lit_le_verdict_du_grooming() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/auto_pull.rs"),
+        )
+        .expect("read auto_pull.rs");
+        if let Err(e) = scan_engagement_sites_read_the_verdict(&src) {
+            panic!("INVARIANT VIOLÉ (mika#3117) — {e}");
+        }
+    }
+
+    /// Le contrôle de bonne foi : le scan ci-dessus pourrait être vert parce
+    /// qu'il ne regarde rien. On le montre donc **rougir** sur six sources
+    /// synthétiques, une par propriété, et passer sur la forme saine.
+    ///
+    /// Frère de `mika3047_le_scan_de_lecteur_unique_rougit_sur_un_second_lecteur`
+    /// sur un autre objet.
+    #[test]
+    fn mika3117_le_scan_des_sites_dengagement_rougit_sur_une_porte_non_gardee() {
+        /// Enveloppe des fonctions synthétiques dans une source de la bonne
+        /// forme : les deux porteurs, une sonde de production, les sites, puis
+        /// un `mod tests` pour que `production_half` ait où couper.
+        fn fixture(probe_body: &str, sites: &str) -> String {
+            format!(
+                "async fn apply_ready_label(db: &Db) {{\n\
+                 \x20   let _ = db;\n\
+                 \x20}}\n\
+                 async fn dispatch_rescued_ticket_in_process(db: &Db) {{\n\
+                 \x20   let _ = db;\n\
+                 \x20}}\n\
+                 impl Phase1Probe for GateProbe<'_> {{\n\
+                 {probe_body}\n\
+                 }}\n\
+                 {sites}\n\
+                 #[cfg(test)]\n\
+                 mod tests {{}}\n"
+            )
+        }
+
+        const PROBE_SAINE: &str = "\
+    fn probe(&mut self) -> Verdict {
+        match groom_halt_exclusion(self.db, candidate.number).await {
+            None => Phase1Verdict::Promote,
+            Some(_) => Phase1Verdict::TryNext,
+        }
+    }";
+
+        const PHASE0: &str = "\
+async fn phase0_feed_ready_pool(db: &Db) {
+    for n in candidates {
+        if let Some(filter) = groom_halt_exclusion(db, n).await {
+            continue;
+        }
+        let outcome = apply_ready_label(db, n).await;
+    }
+}";
+
+        const PHASE1: &str = "\
+async fn phase1_promote_groomed(db: &Db) {
+    let candidate = phase1_first_promotable(ranked, &mut probe).await?;
+    let outcome = apply_ready_label(db, candidate.number).await;
+}";
+
+        const PHASE2: &str = "\
+async fn phase2_reconcile_stuck_ready(db: &Db) {
+    for n in selected {
+        if let Some(filter) = groom_halt_exclusion(db, n).await {
+            continue;
+        }
+        dispatch_rescued_ticket_in_process(db, n).await;
+        let outcome = apply_ready_label(db, n).await;
+    }
+}";
+
+        let saine = format!("{PHASE0}\n{PHASE1}\n{PHASE2}");
+
+        // Contrôle positif. Sans lui, les six rouges ci-dessous seraient
+        // compatibles avec un scan qui rougit sur tout.
+        scan_engagement_sites_read_the_verdict(&fixture(PROBE_SAINE, &saine))
+            .expect("la forme saine doit passer, sinon le scan rougit sur tout");
+
+        // 1 — une quatrième porte, non gardée. Le cas de mika#3117 lui-même,
+        // rejoué sur une phase qui n'existe pas encore.
+        const PHASE3: &str = "\
+async fn phase3_une_porte_neuve(db: &Db) {
+    for n in candidates {
+        let outcome = apply_ready_label(db, n).await;
+    }
+}";
+        assert!(
+            scan_engagement_sites_read_the_verdict(&fixture(
+                PROBE_SAINE,
+                &format!("{saine}\n{PHASE3}")
+            ))
+            .is_err(),
+            "une quatrième porte d'engagement doit faire rougir le scan"
+        );
+
+        // 2 — une porte en MOINS. L'autre sens de l'assertion de compte : un
+        // scan qui ne regarderait que « au moins trois » lirait un correctif
+        // désarmé comme un arbre propre.
+        assert!(
+            scan_engagement_sites_read_the_verdict(&fixture(
+                PROBE_SAINE,
+                &format!("{PHASE0}\n{PHASE1}")
+            ))
+            .is_err(),
+            "la disparition d'une porte doit faire rougir le scan, pas le laisser vert"
+        );
+
+        // 3 — la garde retirée d'une des trois.
+        const PHASE0_SANS_GARDE: &str = "\
+async fn phase0_feed_ready_pool(db: &Db) {
+    for n in candidates {
+        let outcome = apply_ready_label(db, n).await;
+    }
+}";
+        assert!(
+            scan_engagement_sites_read_the_verdict(&fixture(
+                PROBE_SAINE,
+                &format!("{PHASE0_SANS_GARDE}\n{PHASE1}\n{PHASE2}")
+            ))
+            .is_err(),
+            "un site d'engagement sans appel à la garde doit faire rougir le scan"
+        );
+
+        // 4 — la garde DÉPLACÉE après l'engagement : même compte, même appel,
+        // ordre inversé. Aucune assertion de présence ne voit ça.
+        const PHASE2_GARDE_TARDIVE: &str = "\
+async fn phase2_reconcile_stuck_ready(db: &Db) {
+    for n in selected {
+        dispatch_rescued_ticket_in_process(db, n).await;
+        if let Some(filter) = groom_halt_exclusion(db, n).await {
+            continue;
+        }
+    }
+}";
+        assert!(
+            scan_engagement_sites_read_the_verdict(&fixture(
+                PROBE_SAINE,
+                &format!("{PHASE0}\n{PHASE1}\n{PHASE2_GARDE_TARDIVE}")
+            ))
+            .is_err(),
+            "une garde posée après l'engagement doit faire rougir le scan"
+        );
+
+        // 5 — morceau (i) de la phase 1 : la sonde de production ne lit plus le
+        // verdict. Les trois sites sont là, la phase 1 reste conforme au
+        // morceau (ii), et pourtant elle promeut un ticket escaladé.
+        const PROBE_AVEUGLE: &str = "\
+    fn probe(&mut self) -> Verdict {
+        Phase1Verdict::Promote
+    }";
+        assert!(
+            scan_engagement_sites_read_the_verdict(&fixture(PROBE_AVEUGLE, &saine)).is_err(),
+            "une sonde de production qui ne lit pas le verdict doit faire rougir le scan"
+        );
+
+        // 6 — morceau (ii) de la phase 1 : le label posé sur un candidat qui
+        // n'est pas passé par la descente. La sonde reste conforme au morceau
+        // (i), donc seule cette seconde moitié peut le voir.
+        const PHASE1_HORS_DESCENTE: &str = "\
+async fn phase1_promote_groomed(db: &Db) {
+    let outcome = apply_ready_label(db, ranked[0].number).await;
+    let candidate = phase1_first_promotable(ranked, &mut probe).await?;
+}";
+        assert!(
+            scan_engagement_sites_read_the_verdict(&fixture(
+                PROBE_SAINE,
+                &format!("{PHASE0}\n{PHASE1_HORS_DESCENTE}\n{PHASE2}")
+            ))
+            .is_err(),
+            "un candidat engagé hors de la descente doit faire rougir le scan"
+        );
+    }
+
+    /// L'allowlist du scan ci-dessus est **vide**, et sa vacuité est assertée.
+    #[test]
+    fn mika3117_lallowlist_des_sites_dengagement_est_vide() {
+        for entry in ENGAGEMENT_SITES_UNCONFORMABLE {
+            assert!(
+                entry.contains("mika#"),
+                "toute entrée de ENGAGEMENT_SITES_UNCONFORMABLE doit nommer le ticket qui la \
+                 retirera : {entry:?}"
+            );
+        }
+        assert!(
+            ENGAGEMENT_SITES_UNCONFORMABLE.is_empty(),
+            "l'allowlist des sites d'engagement doit rester vide : quand le scan tire, on appelle \
+             `groom_halt_exclusion` à la nouvelle porte, on ne relâche pas l'assertion \
+             (doctrine mika#2201)."
+        );
+    }
+
     /// T8 — Option A's predicate, pure (third-pass mika-arch): the churn is
     /// moot only when the direct call did **not** dispatch **and** the engine
     /// holds the ticket. Term by term, so neutralising either does not pass.
