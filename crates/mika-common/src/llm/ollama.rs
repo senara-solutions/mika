@@ -634,6 +634,9 @@ impl OllamaProvider {
         let request_bytes = request.payload_bytes() as u64;
 
         let mut last_error = None;
+        // mika#3126 — see the twin comment in `openai.rs`: the flag travels
+        // beside the error because the variant cannot carry it.
+        let mut last_cap_exhausted = false;
 
         // AC3-b (mika#2189) — see the twin comment in `openai.rs` for the full
         // reasoning. Deadline-gated for the same reason: without an envelope
@@ -669,7 +672,7 @@ impl OllamaProvider {
                     // mika#3126 — see the twin comment in `openai.rs`.
                     let transport_concession = transport_concession_applies(
                         last_error.as_ref().map(|e: &LlmError| e as &dyn RetryClass),
-                        false,
+                        last_cap_exhausted,
                     );
                     if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
                         deadline_verdict(Some(remaining), transport_concession, &thresholds)
@@ -678,7 +681,10 @@ impl OllamaProvider {
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
                             threshold_secs,
-                            last_was_transport = transport_concession,
+                            // mika#3126 — the decision and the measurement, two
+                            // fields; see the twin comment in `openai.rs`.
+                            transport_concession,
+                            last_cap_exhausted,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         // mika#2331 AC2 — see the twin comment in `openai.rs`.
@@ -741,7 +747,9 @@ impl OllamaProvider {
                     attempt,
                     max_attempts,
                     Some(e),
-                    false,
+                    // mika#3126: **this** attempt's flag — see the twin comment
+                    // in `openai.rs`.
+                    attempt_cap_exhausted,
                     deadline_remaining_ms.map(Duration::from_millis),
                     &thresholds,
                 )),
@@ -784,6 +792,9 @@ impl OllamaProvider {
                     if attempt + 1 < max_attempts && e.is_retryable() {
                         warn!(attempt, max_attempts, error = %e, "transient Ollama API error");
                         last_error = Some(e);
+                        // mika#3126 — retained beside the error; see the twin
+                        // comment in `openai.rs`.
+                        last_cap_exhausted = attempt_cap_exhausted;
                         continue;
                     }
                     return Err(e);
@@ -795,8 +806,12 @@ impl OllamaProvider {
         // see the twin comment in `openai.rs`: the agreement with the guard is
         // structural now, not a copy, while the margin is still measured at
         // this later instant.
-        let transport_concession =
-            transport_concession_applies(last_error.as_ref().map(|e| e as &dyn RetryClass), false);
+        // mika#3126 — the same pair as the guard; see the twin comment in
+        // `openai.rs`.
+        let transport_concession = transport_concession_applies(
+            last_error.as_ref().map(|e| e as &dyn RetryClass),
+            last_cap_exhausted,
+        );
         let deadline_aborted = deadline_verdict(
             deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
             transport_concession,
