@@ -300,10 +300,16 @@ assert_contains "Overrides ENTRY_COMMAND to /ce-work" '/ce-work' "$PLAN_FUNC"
 # Verify the function is called in dispatch_claude_pilot after _set_up_worktree
 # and before _handle_dry_run
 DISPATCH_BODY=$(sed -n '/^dispatch_claude_pilot()/,/^}/p' "$DISPATCH_LIB")
-# Extract the call sequence: _set_up_worktree, _detect_plan_on_branch, _handle_dry_run
-CALL_SEQUENCE=$(printf '%s\n' "$DISPATCH_BODY" | grep -E '^\s+_(set_up_worktree|detect_plan_on_branch|handle_dry_run)' | tr -s ' ' | sed 's/^ //')
-EXPECTED_SEQUENCE=$(printf '%s\n' "_set_up_worktree" "_detect_plan_on_branch" "_handle_dry_run")
-assert_eq "Call ordering: _set_up_worktree -> _detect_plan_on_branch -> _handle_dry_run" "$EXPECTED_SEQUENCE" "$CALL_SEQUENCE"
+# Extract the call sequence. QUATRE termes depuis mika#3121 (V7), et la position
+# du quatrième porte sa conséquence : une porte de lancement placée AVANT
+# `_handle_dry_run` refuserait un dry-run (qui n'allait jamais partir) ; placée
+# APRÈS `_run_claude_pilot`, elle ne refuserait rien — le tour de pilote serait
+# déjà consommé. Le `awk` ne garde que le premier champ, parce que le quatrième
+# site porte son `|| exit 1` sur la même ligne : c'est `RESULT` posé plus la
+# sortie du processus qui font remonter la bannière au callback.
+CALL_SEQUENCE=$(printf '%s\n' "$DISPATCH_BODY" | grep -E '^\s+_(set_up_worktree|detect_plan_on_branch|handle_dry_run|confront_launch_plan)\b' | tr -s ' ' | sed 's/^ //' | awk '{print $1}')
+EXPECTED_SEQUENCE=$(printf '%s\n' "_set_up_worktree" "_detect_plan_on_branch" "_handle_dry_run" "_confront_launch_plan")
+assert_eq "Call ordering: _set_up_worktree -> _detect_plan_on_branch -> _handle_dry_run -> _confront_launch_plan (mika#3121 V7)" "$EXPECTED_SEQUENCE" "$CALL_SEQUENCE"
 
 # Verify the case switch maps both skills correctly. As of mika#1271 sub-PR 8
 # (referenced in dispatch-lib.sh around line 1685) the case block is now
@@ -334,6 +340,26 @@ assert_not_contains "Case block is multi-line (no inlined dev-groom mapping to /
 # raison écrite fait rougir ce test, ce qui est son objet.
 NON_COMMENT_RETURNS=$(printf '%s\n' "$PLAN_FUNC" | grep -v '^\s*#' | grep -c 'return 0' || true)
 assert_eq "Has 5 guard return statements (skill, body, worktree, unreadable, no-callout)" "5" "$NON_COMMENT_RETURNS"
+
+# --- mika#3121 V8 : les deux globales, une fois chacune, dans la MÊME branche ---
+#
+# `_LAUNCHED_PLAN_PATH` ne vaut comme réponse à « un plan est-il servi ? » que si
+# elle est posée là où la fonction réécrit `ENTRY_COMMAND`, et nulle part
+# ailleurs : posée plus haut, elle armerait la porte sur un plan que la fonction
+# va finalement refuser ; posée deux fois, l'une des deux poserait le mauvais
+# chemin. Le compte est donc de UN, et le voisinage est l'assertion qui porte le
+# reste — rien entre les deux affectations ne ferme ni ne détourne la branche.
+LAUNCHED_SETS=$(printf '%s\n' "$PLAN_FUNC" | grep -v '^\s*#' | grep -c '^\s*_LAUNCHED_PLAN_PATH=' || true)
+assert_eq "mika#3121 V8: _LAUNCHED_PLAN_PATH is set exactly once in _detect_plan_on_branch" "1" "$LAUNCHED_SETS"
+SIZE_PATH_SETS=$(printf '%s\n' "$PLAN_FUNC" | grep -v '^\s*#' | grep -c '^\s*_PLAN_SIZE_PLAN_PATH=' || true)
+assert_eq "mika#3121 V8: _PLAN_SIZE_PLAN_PATH is set exactly once in _detect_plan_on_branch" "1" "$SIZE_PATH_SETS"
+# Entre les deux affectations, aucune fermeture ni dérivation de branche : la
+# globale de la PORTE est posée dans la même branche que celle de la LIGNE DE
+# TAILLE, qui est la branche où `ENTRY_COMMAND` est réécrit.
+GLOBALS_SPAN=$(printf '%s\n' "$PLAN_FUNC" | sed -n '/^\s*_PLAN_SIZE_PLAN_PATH=/,/^\s*_LAUNCHED_PLAN_PATH=/p' | grep -v '^\s*#')
+assert_not_contains "mika#3121 V8: no branch close between the two globals (fi)" 'fi' "$GLOBALS_SPAN"
+assert_not_contains "mika#3121 V8: no branch fork between the two globals (else)" 'else' "$GLOBALS_SPAN"
+assert_contains "mika#3121 V8: both globals sit in the ENTRY_COMMAND-override branch" '_LAUNCHED_PLAN_PATH=' "$GLOBALS_SPAN"
 
 # --- Test 7: Plan callout regex extraction (mika#1074) ---
 
@@ -17986,6 +18012,324 @@ assert_eq "mika#3030 AC4: aucun cp d'un settings.local.json dans dispatch-lib.sh
 # fichiers distincts ET clés disjointes » ; ici on l'épingle du côté qui compte.
 assert_eq "mika#3030 AC1: le settings.json tracké (source project) ne porte aucune permission" \
     "null" "$(jq -r '.permissions // "null"' "$REPO_ROOT/.claude/settings.json" 2>/dev/null)"
+
+# ============================================================================
+# mika#3121 — la porte de lancement : les cinq issues, sur de vraies fixtures
+# ============================================================================
+
+echo ""
+echo "Test mika#3121: porte de lancement (_confront_launch_plan, V1–V6)"
+echo "------------------------------------------------------------------"
+
+# Chaque cas monte un couple bare + clone local, y fabrique la forme exacte
+# qu'on veut mesurer, puis appelle la fonction de PRODUCTION. Un test qui
+# recopierait la table des issues au lieu de l'appeler ne garderait rien : c'est
+# la leçon que le test 7 de ce fichier porte déjà dans son commentaire.
+#
+# Les globales sont posées directement, jamais en préfixe `VAR=val func` : la
+# porte écrit `RESULT`, et un préfixe d'affectation ne ramène pas au-dehors ce
+# qu'une fonction a posé. Le relevé part sur stderr, donc il est détourné vers un
+# fichier DANS la fixture au lieu d'une substitution de commande — un `$(...)`
+# ferait tourner l'appel dans un sous-shell et le `RESULT` posé serait perdu avec
+# lui, ce qui rendrait les assertions de bannière vertes pour rien.
+
+T3121_PLAN_REL='docs/plans/2026-11-23-001-fix-3121-dispatch-le-plan-lanc-n-est-confront-ni-plan.md'
+T3121_BRANCH='fix/3121/dispatch-le-plan-lanc-n-est-confront-ni'
+
+# Écrit le plan dans le worktree de la fixture. `$2` sert à en faire varier le
+# contenu, donc le blob, donc `W`.
+_t3121_write_plan() {
+    local plan_rel="$1" marker="$2"
+    mkdir -p "$FIXTURE_CLONE/$(dirname "$plan_rel")"
+    {
+        printf -- '---\n'
+        printf 'issue: senara-solutions/mika#3121\n'
+        printf -- '---\n\n'
+        printf '# Plan — %s\n' "$marker"
+    } > "$FIXTURE_CLONE/$plan_rel"
+}
+
+# Arme la porte sur la fixture et l'appelle. Dépose le relevé dans
+# `$T3121_CENSUS` et le code de retour dans `$T3121_RC`; `RESULT` reste lisible.
+_t3121_run_gate() {
+    local plan="$1"
+    WORKTREE_DIR="$FIXTURE_CLONE"
+    BRANCH="$T3121_BRANCH"
+    REPO="mika"
+    ISSUE_NUM=3121
+    _LAUNCHED_PLAN_PATH="$plan"
+    RESULT=""
+    T3121_RC=0
+    _confront_launch_plan 2>"$FIXTURE_CLONE/census.log" || T3121_RC=$?
+    T3121_CENSUS=$(cat "$FIXTURE_CLONE/census.log")
+}
+
+# --- V1 : nominal — le plan servi EST celui qu'origin porte sur la branche ----
+# Le relevé est émis sur cette branche aussi : c'est le dénominateur, et son
+# absence voudrait dire un binaire antérieur au vol, jamais une absence de
+# divergence (mika#2293/#3050 ; mika#2340).
+test_3121_nominal() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$T3121_BRANCH"
+    _t3121_write_plan "$T3121_PLAN_REL" "rev 2, poussé"
+    git -C "$FIXTURE_CLONE" add "$T3121_PLAN_REL"
+    git -C "$FIXTURE_CLONE" commit -q -m "plan on branch"
+    git -C "$FIXTURE_CLONE" push -q origin "$T3121_BRANCH"
+
+    _t3121_run_gate "$T3121_PLAN_REL"
+    local census="$T3121_CENSUS" rc="$T3121_RC" result="$RESULT"
+    _fixture_cleanup
+
+    if [ "$rc" -ne 0 ]; then
+        echo "FAIL: the gate refused a plan origin carries verbatim (rc=$rc); census: $census"
+    elif [ -n "$result" ]; then
+        echo "FAIL: nominal must leave RESULT untouched, got: $result"
+    elif ! grep -q -- 'launch_plan_gate:' <<<"$census"; then
+        echo "FAIL: no census line on the nominal branch — the denominator is missing; got: $census"
+    elif ! grep -q -- 'verdict=nominal' <<<"$census"; then
+        echo "FAIL: census line does not carry verdict=nominal; got: $census"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- V2 : launch_plan_not_pushed — la forme du 17/11 -------------------------
+# Le plan est poussé, puis réécrit dans le worktree : `W != Bb`. C'est l'incident
+# où la seconde passe a jugé un plan rev 2 non committé tandis qu'origin portait
+# un plan en HALTE.
+test_3121_not_pushed() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$T3121_BRANCH"
+    _t3121_write_plan "$T3121_PLAN_REL" "rev 1, celle qu'origin porte"
+    git -C "$FIXTURE_CLONE" add "$T3121_PLAN_REL"
+    git -C "$FIXTURE_CLONE" commit -q -m "plan rev 1"
+    git -C "$FIXTURE_CLONE" push -q origin "$T3121_BRANCH"
+    _t3121_write_plan "$T3121_PLAN_REL" "rev 2, jamais committée"
+
+    _t3121_run_gate "$T3121_PLAN_REL"
+    local census="$T3121_CENSUS" rc="$T3121_RC" result="$RESULT"
+    _fixture_cleanup
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: an uncommitted plan revision passed the gate — this is the 17/11 shape"
+    elif ! grep -q -- 'verdict=launch_plan_not_pushed' <<<"$census"; then
+        echo "FAIL: census names the wrong issue; got: $census"
+    elif [ "$(head -n 1 <<<"$result")" != "STATUS=LAUNCH_PLAN_DIVERGED" ]; then
+        echo "FAIL: the halt token must be alone on the first line of RESULT; got: $(head -n 1 <<<"$result")"
+    elif ! grep -q -- 'push' <<<"$result"; then
+        echo "FAIL: the refusal carries no return route; got: $result"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- V3a : launch_plan_absent_on_origin — la branche elle-même est absente ---
+test_3121_absent_branch_never_pushed() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$T3121_BRANCH"
+    _t3121_write_plan "$T3121_PLAN_REL" "committé localement, jamais poussé"
+    git -C "$FIXTURE_CLONE" add "$T3121_PLAN_REL"
+    git -C "$FIXTURE_CLONE" commit -q -m "plan, local only"
+
+    _t3121_run_gate "$T3121_PLAN_REL"
+    local census="$T3121_CENSUS" rc="$T3121_RC" result="$RESULT"
+    _fixture_cleanup
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: a branch origin does not carry at all passed the gate"
+    elif ! grep -q -- 'verdict=launch_plan_absent_on_origin' <<<"$census"; then
+        echo "FAIL: census names the wrong issue; got: $census"
+    elif [ "$(head -n 1 <<<"$result")" != "STATUS=LAUNCH_PLAN_DIVERGED" ]; then
+        echo "FAIL: the halt token must be alone on the first line of RESULT; got: $(head -n 1 <<<"$result")"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- V3b : launch_plan_absent_on_origin — la branche existe, le chemin non ---
+# Sans ce second cas, V3a serait satisfait par une porte qui ne sait refuser que
+# l'absence de branche.
+test_3121_absent_path_not_committed() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$T3121_BRANCH"
+    echo "code" > "$FIXTURE_CLONE/src.txt"
+    git -C "$FIXTURE_CLONE" add src.txt
+    git -C "$FIXTURE_CLONE" commit -q -m "work, no plan committed"
+    git -C "$FIXTURE_CLONE" push -q origin "$T3121_BRANCH"
+    _t3121_write_plan "$T3121_PLAN_REL" "jamais ajouté à l'index"
+
+    _t3121_run_gate "$T3121_PLAN_REL"
+    local census="$T3121_CENSUS" rc="$T3121_RC"
+    _fixture_cleanup
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: a plan origin carries nowhere on the branch passed the gate"
+    elif ! grep -q -- 'verdict=launch_plan_absent_on_origin' <<<"$census"; then
+        echo "FAIL: census names the wrong issue; got: $census"
+    elif ! grep -q -- 'bb=none' <<<"$census"; then
+        echo "FAIL: census must say Bb was absent rather than print an empty field; got: $census"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- V4 : launch_plan_inherited_from_main — la forme du 09/11 ----------------
+# Le plan vit sur `main`, la branche ne fait que l'hériter : `W == Bb == Bm`. La
+# fixture est celle de la porte de grooming — un plan sur main, une branche
+# au-dessus qui n'ajoute rien — parce que c'est exactement cette forme.
+test_3121_inherited_from_main() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    _fixture_foreign_plan_on_main "$T3121_PLAN_REL" 2983 "$T3121_BRANCH"
+
+    _t3121_run_gate "$T3121_PLAN_REL"
+    local census="$T3121_CENSUS" rc="$T3121_RC" result="$RESULT"
+    _fixture_cleanup
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: a plan merely inherited from main passed the gate — this is the 09/11 shape"
+    elif ! grep -q -- 'verdict=launch_plan_inherited_from_main' <<<"$census"; then
+        echo "FAIL: census names the wrong issue; got: $census"
+    elif ! grep -q -- 're-groom' <<<"$result"; then
+        echo "FAIL: the refusal must route back to re-grooming, which rewrites the callout; got: $result"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- V5 : launch_plan_unmeasured, classé À PART de l'absence ----------------
+# « Je n'ai pas pu regarder » n'est pas « tout va bien », et ce n'est pas non
+# plus « origin ne porte pas ce plan » : la forge muette et le plan absent
+# demandent deux gestes différents (mika#2981). Le discriminant est le code de
+# retour de `git ls-remote`, et l'assertion de distinction est ce qui le tient.
+test_3121_unmeasured_is_not_absent() {
+    _fixture_setup
+    _assert_fixture_is_local || return 1
+
+    git -C "$FIXTURE_CLONE" checkout -q -b "$T3121_BRANCH"
+    _t3121_write_plan "$T3121_PLAN_REL" "poussé, mais la forge ne répond plus"
+    git -C "$FIXTURE_CLONE" add "$T3121_PLAN_REL"
+    git -C "$FIXTURE_CLONE" commit -q -m "plan on branch"
+    git -C "$FIXTURE_CLONE" push -q origin "$T3121_BRANCH"
+    # Toujours local — la garde de sécurité de la fixture tient — mais injoignable.
+    git -C "$FIXTURE_CLONE" remote set-url origin "file://$FIXTURE_BARE-disparu"
+
+    _t3121_run_gate "$T3121_PLAN_REL"
+    local census="$T3121_CENSUS" rc="$T3121_RC" result="$RESULT"
+    _fixture_cleanup
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: an unmeasurable launch passed the gate — refuse-by-default on the unmeasurable (mika#2981)"
+    elif grep -q -- 'verdict=launch_plan_absent_on_origin' <<<"$census"; then
+        echo "FAIL: a mute forge was reported as an absent plan — two populations under one name; got: $census"
+    elif ! grep -q -- 'verdict=launch_plan_unmeasured' <<<"$census"; then
+        echo "FAIL: census names the wrong issue; got: $census"
+    elif ! grep -q -- 're-dispatch' <<<"$result"; then
+        echo "FAIL: the refusal must say there is nothing to fix in the repository; got: $result"
+    else
+        echo "PASS"
+    fi
+}
+
+# --- V6 : le contrôle positif — aucun plan servi, la porte est MUETTE -------
+# `dev-groom`, le repli `/mika` et le dispatch de révision passent tous par ici
+# sans servir de plan. La porte doit alors ne rien mesurer, ne rien refuser et
+# ne rien relever : un relevé émis là deviendrait du bruit sur chaque dispatch
+# de grooming, et un refus y arrêterait des vols qui n'ont pas de plan à
+# confronter.
+test_3121_no_plan_served_is_a_silent_noop() {
+    local rc=0 census
+    WORKTREE_DIR="/nonexistent-should-never-be-touched"
+    BRANCH="$T3121_BRANCH"
+    REPO="mika"
+    ISSUE_NUM=3121
+    _LAUNCHED_PLAN_PATH=""
+    RESULT=""
+    census=$(_confront_launch_plan 2>&1) || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        echo "FAIL: the gate refused a dispatch that serves no plan (rc=$rc)"
+    elif [ -n "$RESULT" ]; then
+        echo "FAIL: the gate set RESULT with no plan served, got: $RESULT"
+    elif [ -n "$census" ]; then
+        echo "FAIL: the gate emitted a census line with no plan served, got: $census"
+    else
+        echo "PASS"
+    fi
+}
+
+for _t3121_case in \
+    "test_3121_nominal|Nominal: origin carries the served plan verbatim (V1)" \
+    "test_3121_not_pushed|launch_plan_not_pushed: the 17/11 shape (V2)" \
+    "test_3121_absent_branch_never_pushed|launch_plan_absent_on_origin: branch absent (V3a)" \
+    "test_3121_absent_path_not_committed|launch_plan_absent_on_origin: path absent (V3b)" \
+    "test_3121_inherited_from_main|launch_plan_inherited_from_main: the 09/11 shape (V4)" \
+    "test_3121_unmeasured_is_not_absent|launch_plan_unmeasured: classed apart from absent (V5)" \
+    "test_3121_no_plan_served_is_a_silent_noop|No plan served: silent no-op (V6)" \
+; do
+    _t3121_fn="${_t3121_case%%|*}"
+    _t3121_label="${_t3121_case#*|}"
+    _t3121_out=$("$_t3121_fn" 2>/dev/null)
+    if [ "$_t3121_out" = "PASS" ]; then
+        PASS=$((PASS + 1)); echo "  ✓ $_t3121_label"
+    else
+        FAIL=$((FAIL + 1)); echo "  ✗ $_t3121_label: $_t3121_out"
+    fi
+done
+
+# --- AC7 : cinq noms, une occurrence chacun dans la source non commentée ----
+#
+# Deux populations sous un même nom ne sont pas soustractibles (mika#2205), donc
+# chaque issue porte un nom distinctement greppable. Et la cardinalité est ce qui
+# tient le reste : le nom de l'issue ET sa route de retour sont posés dans la
+# MÊME branche du `if`, ce qui est la seule forme où un refus sans remède se fait
+# désarmer. Un `case "$verdict"` qui recomposerait les remèdes ailleurs
+# dupliquerait chaque nom — et ferait rougir ici.
+#
+# Le compte porte sur les lignes NON commentées : la prose qui explique les deux
+# incidents nomme les issues, et c'est son travail.
+GATE_FUNC=$(sed -n '/^_confront_launch_plan()/,/^}/p' "$DISPATCH_LIB")
+assert_contains "mika#3121: _confront_launch_plan exists" "_confront_launch_plan()" "$GATE_FUNC"
+GATE_CODE=$(printf '%s\n' "$GATE_FUNC" | grep -v '^\s*#')
+for _t3121_issue in \
+    launch_plan_not_pushed \
+    launch_plan_absent_on_origin \
+    launch_plan_inherited_from_main \
+    launch_plan_unmeasured \
+; do
+    _t3121_n=$(printf '%s\n' "$GATE_CODE" | grep -c -- "$_t3121_issue" || true)
+    assert_eq "mika#3121 AC7: issue \`$_t3121_issue\` named exactly once in the gate's code" \
+        "1" "$_t3121_n"
+done
+
+# `nominal` en porte DEUX, et c'est sa nature qui l'exige : les quatre autres
+# n'ont qu'une affectation, celle-ci a son affectation plus l'unique LECTURE qui
+# fait passer le vol. Le compte est épinglé à 2 plutôt qu'élargi en `>= 1`, pour
+# qu'un troisième site — un second test de passage, donc un second endroit où la
+# porte peut se laisser désarmer — fasse rougir ici.
+_t3121_nominal_n=$(printf '%s\n' "$GATE_CODE" | grep -c -- 'nominal' || true)
+assert_eq "mika#3121 AC7: \`nominal\` is named twice — one assignment, one pass test" \
+    "2" "$_t3121_nominal_n"
+
+# Le refus est une HALTE, jamais un `auto_skipped` : la tâche parente doit se
+# lire `failed`, et c'est le jeton seul sur la PREMIÈRE ligne de `RESULT` que le
+# lecteur Rust exige (`parse_dispatch_halt_status`). Épinglé ici sur la source,
+# parce que les cas ci-dessus ne couvrent que quatre des branches de refus.
+assert_contains "mika#3121: the refusal composes the halt banner token" \
+    'RESULT="STATUS=LAUNCH_PLAN_DIVERGED' "$GATE_FUNC"
+assert_contains "mika#3121: the launch gate uses its OWN ref namespace" \
+    'refs/dispatch-launch/' "$GATE_FUNC"
+assert_not_contains "mika#3121: the launch gate never writes the grooming gate's namespace" \
+    'refs/dispatch-gate/' "$GATE_FUNC"
 
 # --- Summary ---
 
