@@ -8105,7 +8105,7 @@ And `run_gh(\"issue create --title t -l ready,urgent\")` creates it promoted.
                 "traduction du verdict de la forge",
                 format!(
                     "match crate::ready_label::reread_issue_consent_via_gh({}",
-                    "token, repo, issue).await {"
+                    "token, owner_repo, issue).await {"
                 ),
                 8_usize,
                 vec![
