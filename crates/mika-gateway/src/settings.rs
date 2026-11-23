@@ -181,8 +181,13 @@ pub struct GatewaySettings {
     pub gateway_admin_read_token: Option<SecretString>,
 }
 
+/// Le port d'écoute par défaut, lu au site que le client lit aussi.
+///
+/// Écrire `8080` ici serait une seconde déclaration du même port : le client
+/// composait son adresse par défaut sur un littéral de son côté, et c'est
+/// comment `3001` a pu y vivre sans que rien ne rougisse (mika#3125).
 fn default_port() -> u16 {
-    8080
+    mika_common::gateway_endpoint::DEFAULT_GATEWAY_PORT
 }
 
 fn default_log_level() -> String {
@@ -653,6 +658,33 @@ pub fn orchestrator_inbox_is_enabled(raw: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Un gateway qui ne déclare aucun port écoute sur le défaut partagé.
+    ///
+    /// L'assertion porte sur la **désérialisation** d'une charge figée, pas sur
+    /// `default_port()` : comparer la constante à elle-même serait vert par
+    /// construction, et laisserait passer un `#[serde(default = "…")]`
+    /// débranché — c'est-à-dire exactement la panne où le serveur n'applique
+    /// plus le défaut que le client lit. Seuls `database_url` et
+    /// `internal_token` n'ont pas de défaut serde, d'où ces deux champs et
+    /// aucun autre.
+    #[test]
+    fn mika3125_un_gateway_sans_port_declare_ecoute_sur_le_defaut_partage() {
+        const FROZEN: &str = r#"{
+            "database_url": "postgres://user:pass@localhost/db",
+            "internal_token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }"#;
+
+        let settings: GatewaySettings =
+            serde_json::from_str(FROZEN).expect("la charge figée doit se désérialiser");
+
+        assert_eq!(
+            settings.gateway_port,
+            mika_common::gateway_endpoint::DEFAULT_GATEWAY_PORT,
+            "le port qu'un gateway sans configuration applique est celui que le \
+             client compose dans son adresse par défaut"
+        );
+    }
 
     #[test]
     fn test_validate_agent_base_url_accepts_http_localhost() {
