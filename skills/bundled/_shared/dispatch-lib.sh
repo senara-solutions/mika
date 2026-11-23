@@ -6496,10 +6496,22 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # a pas, et `_pilot_max_turns` est le lecteur unique de leur table
         # (mika#2542 AC5) : la résolution se fait donc à CE site, sur la même
         # invocation logique que sa lecture, et le résultat part en texte.
+        #
+        # mika#3122 — l'interdit de trancher une décision réservée à l'opérateur
+        # part EN DERNIER, et ce n'est pas un choix de confort : le défaut qu'il
+        # ferme a été produit PAR LA LECTURE des deux règles juste au-dessus
+        # (journal de révision du 17/11, qui les cite). Une qualification placée
+        # avant ce qu'elle qualifie ne se lit que comme une nuance ; placée
+        # après, elle est la dernière chose lue avant l'écriture du plan. Même
+        # condition et même raison que ses deux voisines — elle s'adresse à qui
+        # ÉCRIT un plan, et l'injecter pour `dev-pilot` serait du bruit. L'ordre
+        # est épinglé par OR2, de sorte qu'un futur ajout qui la déplacerait
+        # rougisse au lieu de la désarmer en silence.
         if [ "$SKILL" = "dev-groom" ]; then
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
             _pilot_max_turns "${LABELS:-}"; _plan_size_rule "$_PILOT_MAX_TURNS"
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PLAN_SIZE_RULE")
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_OPERATOR_RESERVED_RULE")
         fi
 
         # Save pre-run HEAD SHA for post-flight diff check
@@ -11842,7 +11854,25 @@ no architect retry; the architect was not asked again"
             mkdir -p "$findings_dir" 2>/dev/null || {
                 _groom_warn "cannot create $findings_dir"; return 1; }
             local findings_file="$findings_dir/findings-1.md"
-            printf '%s\n' "$content1" > "$findings_file" || {
+            # mika#3122 — la règle de décision réservée est APPENDUE ICI, après
+            # le contenu architecte, parce que CE FICHIER EST LE PROMPT du pilote
+            # de révision : `_launch_revise_pilot` le lance avec `-- "@…"` et
+            # rien d'autre (:10521). Poser la garde ailleurs la poserait sur le
+            # canal du donneur d'ordre et non sur celui de l'exécutant — ce que
+            # mesure `docs/solutions/prompt-engineering/2026-09-07-une-garde-de-`
+            # `prompt-doit-vivre-sur-le-canal-que-lexecutant-lit.md`. Le canal
+            # sert déjà à prescrire au réviseur : les deux rattrapages y écrivent
+            # des findings synthétiques (:10709, :10844).
+            #
+            # CE QUE LA RÈGLE N'ÉCRIT PAS est la condition de ce site : ce
+            # fichier est grep par les termes 1 de
+            # `_fd_retry_if_section_still_missing` (:10675) et de
+            # `_plan_size_retry_if_section_still_missing` (:10806), chacun sur le
+            # TITRE de la section qu'il réclame. `_OPERATOR_RESERVED_RULE`
+            # n'orthographie ni l'un ni l'autre — ses voisines y sont citées par
+            # numéro — faute de quoi les deux rattrapages tireraient à chaque
+            # ITERATE avec un finding synthétique faux. Tenu par OR5.
+            printf '%s\n\n%s\n' "$content1" "$_OPERATOR_RESERVED_RULE" > "$findings_file" || {
                 _groom_warn "cannot write $findings_file"; return 1; }
 
             # Launch revise pilot with the findings as @-file payload. Pilot
