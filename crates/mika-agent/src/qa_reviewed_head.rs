@@ -84,6 +84,15 @@
 //!    `skill.toml` ne déclare pas l'outil en `required_tools` (un `required_tools`
 //!    non résolu est un échec **terminal**, donc une revue perdue là où une
 //!    écriture manquée ne coûte qu'un tour).
+//! 5. **Un `stop_*` est attesté par la RÉPONSE de l'outil, pas par son appel**
+//!    (mika#3124). Jusque-là la preuve n'inspectait que l'`input_summary` : un
+//!    tour qui avait posé la question et reçu « zéro revue » satisfaisait la
+//!    garde. Mesuré sur #3070, tête `24e1f25b2`, le 2026-11-10 —
+//!    `qa_head_reviews` répond zéro revue à 17:01:47Z, le registre reçoit
+//!    `stop_already_reviewed_sha` à 17:02:06Z, la check_suite verte de cette
+//!    tête est écartée à 17:16:51Z pour trente jours, et la revue est faite à la
+//!    main à 18:00:26Z. La preuve lit désormais la sortie du même résumé, par
+//!    [`HEAD_EVIDENCE_RULED_ON`], et refuse les trois autres cas.
 //!
 //! # L'interrupteur ne vit pas ici
 //!
@@ -234,12 +243,97 @@ pub(crate) const QA_HEAD_REVIEWS_TOOL: &str = "qa_head_reviews";
 /// soixante autres outils, ou d'en singulariser un sans raison.
 pub(crate) const RECORD_REVIEWED_HEAD_TOOL: &str = "record_reviewed_head";
 
+/// La graphie qu'émet le handler quand au moins une revue a jugé la tête.
+///
+/// Source de vérité du nom : le handler
+/// `skills/bundled/qa-review-webhook-success/handlers/qa_head_reviews.sh`, qui
+/// place `head_evidence` en **première** clé de son objet. Même idiome que
+/// [`QA_HEAD_REVIEWS_TOOL`], dont la source est `tools.json` : un littéral
+/// partagé entre le shell et le Rust se déclare une fois de ce côté-ci, et
+/// `scripts/test-qa-head-reviews-handler.sh` compare les deux déclarations à
+/// chaque exécution du CI. Une divergence de graphie désarmerait la preuve en
+/// silence, avec tout le reste vert (classe mika#2158).
+///
+/// Les deux graphies sont **lexicalement disjointes** — ni l'une n'est une
+/// sous-chaîne de l'autre — et c'est ce qui permet au prédicat d'être
+/// **positif** : il cherche la présence de l'attestation, jamais son absence.
+/// Un prédicat négatif serait satisfait par une sortie tronquée, c'est-à-dire
+/// par exactement le cas qu'il doit refuser.
+pub(crate) const HEAD_EVIDENCE_RULED_ON: &str = "head_was_ruled_on";
+
+/// La graphie qu'émet le handler quand **aucune** revue n'a jugé la tête —
+/// y compris quand des revues existaient mais que toutes antidatent la tête.
+///
+/// Voir [`HEAD_EVIDENCE_RULED_ON`] pour la source de vérité et la disjonction.
+pub(crate) const HEAD_EVIDENCE_NEVER_RULED_ON: &str = "head_never_ruled_on";
+
+/// Le littéral tel qu'il apparaît dans la sortie JSON : entre guillemets.
+///
+/// Cherché **cité** et non nu, pour que seule une *valeur* JSON satisfasse la
+/// preuve. Une sortie qui ne fait que mentionner la graphie — un message
+/// d'erreur du handler, un en-tête recopié, une liste de valeurs possibles —
+/// n'atteste rien, et le tour qui la porte n'a rien établi.
+///
+/// Construit sans `format!` : une garde de ce module refuse ce macro dans la
+/// moitié de production, parce que c'est par lui que la grammaire de clé se
+/// retape (point 4 du § *Ce que ce module est*).
+fn cite(valeur: &str) -> String {
+    let mut aiguille = String::with_capacity(valeur.len() + 2);
+    aiguille.push('"');
+    aiguille.push_str(valeur);
+    aiguille.push('"');
+    aiguille
+}
+
+/// Ce que ce tour a établi — ou pas — sur **cette** tête, lu dans la sortie de
+/// son propre appel à [`QA_HEAD_REVIEWS_TOOL`] (mika#3124).
+///
+/// La preuve est lue **par résumé**, jamais par champ : elle exige un **seul**
+/// [`ToolCallSummary`] qui nomme la tête dans son entrée *et* porte
+/// l'attestation dans sa sortie. Deux résumés ne se composent pas — un appel
+/// sur une autre tête qui revient `head_was_ruled_on` n'atteste rien sur
+/// celle-ci, et c'est précisément la propriété que `reviewDecision` n'avait pas.
+///
+/// L'ordre de déclaration des variantes **est** leur précédence : un tour qui
+/// appelle l'outil deux fois sur la même tête retient le `max`. `Jugee`
+/// l'emporte donc sur tout — un appel qui a vu une revue ne peut pas être
+/// annulé par un second —, et entre les trois refus le plus informatif gagne,
+/// pour que le message rendu au modèle nomme le vrai défaut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AttestationDeTete {
+    /// Aucun appel réussi ne nomme cette tête dans ce tour.
+    ///
+    /// Le refus de mika#2934, inchangé : la tête n'a pas été lue du tout.
+    Absente,
+    /// Un appel réussi nomme la tête, mais sa sortie ne porte **ni**
+    /// [`HEAD_EVIDENCE_RULED_ON`] **ni** [`HEAD_EVIDENCE_NEVER_RULED_ON`].
+    ///
+    /// Un handler plus ancien que le moteur qui le lit, une sortie vide, une
+    /// troncature hors contrat. Le tour n'a rien attesté : on refuse.
+    Illisible,
+    /// Un appel réussi nomme la tête et sa sortie porte
+    /// [`HEAD_EVIDENCE_NEVER_RULED_ON`] : l'outil a répondu, et il a répondu
+    /// « personne n'a jugé cette tête ».
+    ///
+    /// Le défaut de mika#3124, n=1 : #3070@`24e1f25b2`, le 2026-11-10 à
+    /// 17:02:06Z. C'est le seul des quatre cas où le modèle a fait tout ce
+    /// qu'on lui demandait et a quand même conclu l'inverse de la réponse.
+    JamaisJugee,
+    /// Un appel réussi nomme la tête et sa sortie porte
+    /// [`HEAD_EVIDENCE_RULED_ON`] : au moins une revue a jugé cette tête.
+    ///
+    /// Le seul des quatre cas qui autorise un `stop_*`.
+    Jugee,
+}
+
 /// Ce que ce tour n'a pas fait, et qui interdit la ligne qu'il demande.
 ///
-/// Les deux variantes sont les deux défauts mesurés le 2026-10-27 (mika#2934),
-/// et elles ne se recouvrent pas : la première dit qu'un verdict a été attesté
-/// avant d'être posté, la seconde qu'une tête a été déclarée conclue sur une
-/// preuve qui n'est pas la sienne.
+/// Les quatre variantes ne se recouvrent pas : la première dit qu'un verdict a
+/// été attesté avant d'être posté, les trois autres qu'une tête a été déclarée
+/// conclue sur une preuve qui n'est pas la sienne — et elles distinguent
+/// **comment**, parce qu'un message de refus qui se trompe de reproche fait
+/// rejouer au modèle un appel qu'il avait déjà fait, pour un tour payé et le
+/// même refus au bout (mika#3124).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreuveManquante {
     /// `verdict_posted` sans `run_gh pr review` réussi dans ce tour.
@@ -248,12 +342,28 @@ pub(crate) enum PreuveManquante {
     /// écrit `verdict_posted` sur `#2931@1f649bf1` alors qu'elle venait de
     /// lancer un build et attendait son callback.
     VerdictSansPost,
-    /// Un `stop_*` sans lecture head-matched des revues de CETTE tête.
+    /// Un `stop_*` sans aucune lecture head-matched des revues de CETTE tête —
+    /// [`AttestationDeTete::Absente`].
     ///
-    /// Le défaut 1, n=3/3 : trois têtes fraîchement poussées déclarées déjà
-    /// jugées sur la foi d'un `reviewDecision: APPROVED` porté par la tête
-    /// précédente — un état de PR qui survit au force-push.
+    /// Le défaut 1 de mika#2934, n=3/3 : trois têtes fraîchement poussées
+    /// déclarées déjà jugées sur la foi d'un `reviewDecision: APPROVED` porté
+    /// par la tête précédente — un état de PR qui survit au force-push.
     StopSansLectureDeTete,
+    /// Un `stop_*` sur une tête que l'outil a dite jamais jugée —
+    /// [`AttestationDeTete::JamaisJugee`].
+    ///
+    /// Le défaut de mika#3124. La lecture **a eu lieu** : le refus ne doit donc
+    /// pas enjoindre de la refaire.
+    StopSurTeteJamaisJugee,
+    /// Un `stop_*` dont la lecture de tête ne porte aucune attestation lisible —
+    /// [`AttestationDeTete::Illisible`].
+    ///
+    /// La fenêtre de transition de mika#3124 : un moteur qui lit `head_evidence`
+    /// et un handler qui ne l'émet pas encore (chaîne de déploiement mika#2340 —
+    /// `skills/bundled/` n'atteint un agent que par `make deploy`). Tous les
+    /// `stop_*` tombent ici et sont refusés : un tour payé par événement, jamais
+    /// une revue perdue.
+    StopSansAttestationLisible,
 }
 
 /// La preuve que cette `outcome` exige, est-elle **absente de ce tour** ?
@@ -264,10 +374,10 @@ pub(crate) enum PreuveManquante {
 /// | `outcome` | preuve exigée dans ce tour |
 /// |---|---|
 /// | `verdict_posted` | un `run_gh pr review` réussi |
-/// | `stop_already_reviewed_sha` | un [`QA_HEAD_REVIEWS_TOOL`] réussi nommant `head_sha` |
+/// | `stop_already_reviewed_sha` | un [`QA_HEAD_REVIEWS_TOOL`] réussi nommant `head_sha` **et revenu [`HEAD_EVIDENCE_RULED_ON`]** |
 /// | `stop_verdict_recorded` | idem |
 ///
-/// Trois propriétés, chacune parce que son contraire était un défaut :
+/// Quatre propriétés, chacune parce que son contraire était un défaut :
 ///
 /// - **Un `outcome` hors vocabulaire rend `None`.** Le refus de valeur
 ///   appartient à [`reviewed_head_outcome`] et au schéma de l'outil ; ce
@@ -280,6 +390,13 @@ pub(crate) enum PreuveManquante {
 ///   de 40 caractères dans un objet à trois champs y tient très largement ; si
 ///   une évolution de cette borne le mettait en danger, c'est un test qui doit
 ///   rougir, pas une troncature silencieuse.
+/// - **L'attestation passe par l'`output_summary` du MÊME résumé** (mika#3124).
+///   Un appel suffisait jusque-là ; or l'appel est une question, pas une
+///   réponse. Le prédicat lit maintenant ce que l'outil a répondu, par
+///   [`attestation_de_tete_dans_le_tour`], et seule [`AttestationDeTete::Jugee`]
+///   autorise la ligne. La sortie est tronquée à
+///   `crate::planning::policy::OUTPUT_SUMMARY_MAX`, d'où la clé en première
+///   position côté handler ; la batterie hors-ligne tient cette borne.
 ///
 /// **Pure**, et sans autorité : elle dit ce qui manque, le site (`dispatch.rs`)
 /// décide quoi en faire.
@@ -300,12 +417,16 @@ pub(crate) fn preuve_du_tour_manquante(
         // lecture de tête, jamais écrite sans preuve. C'est le fail-safe du
         // module (point 4 du § *La perte de revue*) : une ligne manquante coûte
         // un tour payé, une ligne fausse coûte une revue.
-        _ if lecture_de_tete_dans_le_tour(head_sha, deja_execute) => None,
-        _ => Some(PreuveManquante::StopSansLectureDeTete),
+        _ => match attestation_de_tete_dans_le_tour(head_sha, deja_execute) {
+            AttestationDeTete::Jugee => None,
+            AttestationDeTete::JamaisJugee => Some(PreuveManquante::StopSurTeteJamaisJugee),
+            AttestationDeTete::Illisible => Some(PreuveManquante::StopSansAttestationLisible),
+            AttestationDeTete::Absente => Some(PreuveManquante::StopSansLectureDeTete),
+        },
     }
 }
 
-/// Ce tour a-t-il lu les revues de **cette** tête, avec succès ?
+/// Ce tour a-t-il lu les revues de **cette** tête, et qu'a-t-il appris ?
 ///
 /// La tête est comparée en ASCII minuscule : le handler n'accepte que 40
 /// caractères hex minuscules, mais une graphie majuscule venue du modèle doit
@@ -314,16 +435,47 @@ pub(crate) fn preuve_du_tour_manquante(
 /// Une tête vide ne satisfait **aucune** preuve — `contains("")` est vrai de
 /// toute chaîne, et une tête non nommée serait alors attestée par n'importe
 /// quel appel. L'outil refuse déjà ce cas en amont ; le prédicat ne s'y fie pas.
-fn lecture_de_tete_dans_le_tour(head_sha: &str, deja_execute: &[ToolCallSummary]) -> bool {
+///
+/// Le test porte sur un **résumé entier** : même entrée, même sortie. Scinder
+/// la condition en deux `any` ferait d'un appel sur la tête A et d'un retour
+/// `head_was_ruled_on` sur la tête B une preuve sur A — la recomposition que ce
+/// ticket existe pour interdire.
+fn attestation_de_tete_dans_le_tour(
+    head_sha: &str,
+    deja_execute: &[ToolCallSummary],
+) -> AttestationDeTete {
     let tete = head_sha.trim().to_ascii_lowercase();
     if tete.is_empty() {
-        return false;
+        return AttestationDeTete::Absente;
     }
-    deja_execute.iter().any(|resume| {
-        resume.name == QA_HEAD_REVIEWS_TOOL
-            && resume.success
-            && resume.input_summary.to_ascii_lowercase().contains(&tete)
-    })
+    let jugee = cite(HEAD_EVIDENCE_RULED_ON);
+    let jamais = cite(HEAD_EVIDENCE_NEVER_RULED_ON);
+    let mut atteste = AttestationDeTete::Absente;
+    for resume in deja_execute {
+        if resume.name != QA_HEAD_REVIEWS_TOOL
+            || !resume.success
+            || !resume.input_summary.to_ascii_lowercase().contains(&tete)
+        {
+            continue;
+        }
+        let sortie = resume.output_summary.to_ascii_lowercase();
+        // Positif dans les deux branches, et `Illisible` par défaut : tout ce
+        // qui n'est pas une attestation reconnue refuse. Une sortie vide, un
+        // handler d'avant mika#3124 et une troncature hors contrat se lisent
+        // tous ainsi — sans qu'aucun d'eux ait à être énuméré.
+        let lu = if sortie.contains(&jugee) {
+            AttestationDeTete::Jugee
+        } else if sortie.contains(&jamais) {
+            AttestationDeTete::JamaisJugee
+        } else {
+            AttestationDeTete::Illisible
+        };
+        atteste = atteste.max(lu);
+        if atteste == AttestationDeTete::Jugee {
+            break;
+        }
+    }
+    atteste
 }
 
 // ---- L'inscription du tour de callback (mika#2948, L1) -------------------
@@ -1540,9 +1692,43 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         )
     }
 
-    /// L'appel de l'étape 3, sur la tête donnée.
-    fn pas_de_letape_3(step: u32, tete: &str, success: bool) -> ToolCallSummary {
-        resume(
+    /// La sortie du handler `qa_head_reviews`, dans l'ordre où il l'émet :
+    /// `head_evidence` en **première** clé, puis `revues` entrées dans
+    /// `reviews`, puis le reste — et le tout borné comme le moteur le borne.
+    ///
+    /// Construite à la main, et non par `serde_json::json!`, dont la `Map` est
+    /// triée par clé : l'attestation y tomberait en quatrième position, et la
+    /// propriété de position passerait à vide sur tout objet assez court.
+    ///
+    /// `revues` est le levier d'AC2 : à zéro la sortie tient entière, à huit
+    /// elle dépasse `OUTPUT_SUMMARY_MAX` et `truncate_summary` coupe **après**
+    /// l'attestation — ce qui est exactement ce que la clé en tête achète.
+    fn sortie_de_letape_3(tete: &str, attestation: &str, revues: usize) -> String {
+        let mut brut = format!(
+            "{{\n  \"head_evidence\": \"{attestation}\",\n  \"head_sha\": \"{tete}\",\n  \
+             \"head_first_seen_at\": \"2026-10-27T12:44:36Z\",\n  \"reviews\": [\n"
+        );
+        for _ in 0..revues {
+            brut.push_str(
+                "    {\n      \"author\": \"mika-platform-qa\",\n      \"state\": \"APPROVED\",\n \
+                 \"submitted_at\": \"2026-10-27T12:55:57Z\",\n      \
+                 \"carries_verdict_line\": true\n    },\n",
+            );
+        }
+        brut.push_str("  ],\n  \"dropped_predating_head\": 0\n}");
+        crate::tool_execution::truncate_summary(&brut, crate::planning::policy::OUTPUT_SUMMARY_MAX)
+    }
+
+    /// L'appel de l'étape 3, sur la tête donnée, avec l'attestation que le
+    /// handler a rendue dans sa sortie.
+    fn pas_de_letape_3_atteste(
+        step: u32,
+        tete: &str,
+        success: bool,
+        attestation: &str,
+        revues: usize,
+    ) -> ToolCallSummary {
+        let mut pas = resume(
             step,
             QA_HEAD_REVIEWS_TOOL,
             serde_json::json!({
@@ -1552,7 +1738,34 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
             })
             .to_string(),
             success,
-        )
+        );
+        pas.output_summary = sortie_de_letape_3(tete, attestation, revues);
+        pas
+    }
+
+    /// L'appel de l'étape 3 **nominal** : l'outil a répondu, et une revue avait
+    /// jugé cette tête.
+    ///
+    /// Depuis mika#3124 la sortie porte l'attestation : avant, ce fixture
+    /// laissait `output_summary` vide, ce qui est littéralement la trace du tour
+    /// fautif de #3070. Un contrôle positif bâti sur la sortie du défaut ne
+    /// contrôle rien.
+    fn pas_de_letape_3(step: u32, tete: &str, success: bool) -> ToolCallSummary {
+        pas_de_letape_3_atteste(step, tete, success, HEAD_EVIDENCE_RULED_ON, 1)
+    }
+
+    /// L'appel de l'étape 3 de l'incident de mika#3124 : l'outil a répondu, et
+    /// il a répondu « personne n'a jugé cette tête ».
+    fn pas_de_letape_3_sans_revue(step: u32, tete: &str) -> ToolCallSummary {
+        pas_de_letape_3_atteste(step, tete, true, HEAD_EVIDENCE_NEVER_RULED_ON, 0)
+    }
+
+    /// L'appel de l'étape 3 d'un handler **d'avant** mika#3124 : la sortie que
+    /// le tour de #3070 portait réellement, `"[]"` ou rien.
+    fn pas_de_letape_3_muette(step: u32, tete: &str, sortie: &str) -> ToolCallSummary {
+        let mut pas = pas_de_letape_3(step, tete, true);
+        pas.output_summary = sortie.to_string();
+        pas
     }
 
     /// **AC3, test 1 et son contrôle négatif.** La reproduction littérale de la
@@ -1636,6 +1849,10 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
         for stop in ["stop_verdict_recorded", "stop_already_reviewed_sha"] {
             assert_eq!(
                 preuve_du_tour_manquante(stop, TETE_NOUVELLE_2931, &seule_la_liste),
+                // `Absente` et non l'un des deux refus de mika#3124 : aucun
+                // appel ne nomme cette tête, donc il n'y a aucune sortie à
+                // lire. C'est bien ce contrôle négatif-là que le site traduit
+                // par « appelle-le d'abord (étape 3) ».
                 Some(PreuveManquante::StopSansLectureDeTete),
                 "{stop} sans lecture de tête est refusé : la liste de PR ne dit \
                  sur quelle tête aucune revue a statué"
@@ -1720,6 +1937,186 @@ let args = [\"pr\", \"view\"];\n    run_gh_subprocess(&args, token).await\n}\n";
             Some(PreuveManquante::StopSansLectureDeTete),
             "une tête vide n'est pas satisfaite par n'importe quel appel"
         );
+    }
+
+    // ---- mika#3124 : la preuve lit la RÉPONSE, pas l'appel ----------------
+
+    /// La tête poussée sur #3070 le 2026-11-10 vers 17:01Z — le commit vide
+    /// portant `Pipeline-Exempt`, abrégé `24e1f25b2` par le ticket. Complétée
+    /// ici pour la même raison que les têtes de #2931 : le prédicat compare des
+    /// chaînes, et la longueur réelle est ce que le test doit lui présenter.
+    const TETE_3070: &str = "24e1f25b2c7a0d4e8f3b6a1c9d5e7f2b0a4c8d61";
+
+    /// **AC1, et le défaut littéral.** Le tour `21949859` du 2026-11-10 : il
+    /// appelle `qa_head_reviews` sur `24e1f25b2` à 17:01:47Z, l'outil rend zéro
+    /// revue, et à 17:02:06Z le registre reçoit `stop_already_reviewed_sha`.
+    ///
+    /// L'ancien prédicat passait : l'appel **était** dans la trace. Celui-ci lit
+    /// la sortie du même résumé, et il distingue le refus — `JamaisJugee` et non
+    /// `Absente` — parce que le message rendu au modèle n'est pas le même : lui
+    /// enjoindre d'appeler l'outil le ferait rejouer un appel déjà fait, pour un
+    /// tour payé et le même refus au bout.
+    ///
+    /// Le contrôle positif est dans le même test : la **même** trace, avec
+    /// l'attestation inverse, passe. Sans lui, « le prédicat refuse » serait
+    /// indistinguable de « le prédicat refuse tout ».
+    #[test]
+    fn mika3124_ac1_un_stop_sur_une_tete_jamais_jugee_est_refuse() {
+        let tour_de_lincident = vec![pas_de_letape_1(), pas_de_letape_3_sans_revue(3, TETE_3070)];
+
+        // AC8 : les deux `stop_*` ensemble. Le bras large de
+        // `preuve_du_tour_manquante` ne distingue pas les deux issues, et c'est
+        // délibéré — elles attestent le même fait sur la même tête.
+        for stop in ["stop_already_reviewed_sha", "stop_verdict_recorded"] {
+            assert_eq!(
+                preuve_du_tour_manquante(stop, TETE_3070, &tour_de_lincident),
+                Some(PreuveManquante::StopSurTeteJamaisJugee),
+                "{stop} sur une tête que l'outil dit jamais jugée est refusé — \
+                 c'est la ligne fausse du 2026-11-10 à 17:02:06Z"
+            );
+        }
+
+        // Contrôle positif : la même trace, attestation inverse.
+        let tour_legitime = vec![pas_de_letape_1(), pas_de_letape_3(3, TETE_3070, true)];
+        for stop in ["stop_already_reviewed_sha", "stop_verdict_recorded"] {
+            assert_eq!(
+                preuve_du_tour_manquante(stop, TETE_3070, &tour_legitime),
+                None,
+                "contrôle positif : {stop} sur une tête réellement jugée passe"
+            );
+        }
+
+        // AC9 : le bras `verdict_posted` ne lit pas l'attestation. Un tour qui a
+        // posté son verdict sur une tête que personne n'avait jugée est le cas
+        // **nominal** de `qa-review` — c'en est même la raison d'être.
+        let mut verdict_sur_tete_vierge = tour_de_lincident.clone();
+        verdict_sur_tete_vierge.push(pas_du_post_2948(5, true));
+        assert_eq!(
+            preuve_du_tour_manquante("verdict_posted", TETE_3070, &verdict_sur_tete_vierge),
+            None,
+            "AC9 : `verdict_posted` ne dépend que du post, jamais de \
+             l'attestation de tête"
+        );
+    }
+
+    /// **AC4.** Une sortie qui ne porte **aucune** des deux graphies refuse.
+    ///
+    /// Trois formes, et les deux premières sont des traces réelles : `"[]"` est
+    /// ce que le fixture de mika#2934 portait, la chaîne vide ce que `resume`
+    /// rendait. La troisième est la fenêtre de transition de la chaîne de
+    /// déploiement mika#2340 — un moteur qui lit `head_evidence` et un handler
+    /// qui ne l'émet pas encore. Toutes trois sont refusées : le prédicat est
+    /// **positif**, donc tout ce qui n'est pas une attestation reconnue tombe
+    /// ici sans avoir à être énuméré.
+    #[test]
+    fn mika3124_ac4_une_sortie_sans_attestation_lisible_est_refusee() {
+        for sortie in [
+            "[]",
+            "",
+            "{\n  \"head_sha\": \"24e1f25b2\",\n  \"reviews\": []\n}",
+        ] {
+            let tour = vec![pas_de_letape_3_muette(3, TETE_3070, sortie)];
+            assert_eq!(
+                preuve_du_tour_manquante("stop_already_reviewed_sha", TETE_3070, &tour),
+                Some(PreuveManquante::StopSansAttestationLisible),
+                "une sortie « {sortie} » n'atteste rien"
+            );
+        }
+
+        // Et la graphie **nue**, sans guillemets, n'atteste pas davantage : la
+        // preuve cherche une VALEUR JSON. Une sortie qui ne fait que mentionner
+        // le mot — un message d'erreur, une liste de valeurs possibles — serait
+        // sinon une attestation.
+        let mention = vec![pas_de_letape_3_muette(
+            3,
+            TETE_3070,
+            "ERROR: head_evidence must be head_was_ruled_on or head_never_ruled_on",
+        )];
+        assert_eq!(
+            preuve_du_tour_manquante("stop_already_reviewed_sha", TETE_3070, &mention),
+            Some(PreuveManquante::StopSansAttestationLisible),
+            "la graphie nue est une mention, pas une attestation"
+        );
+    }
+
+    /// **AC5.** La preuve ne se **recompose pas** entre deux résumés.
+    ///
+    /// Un `head_was_ruled_on` rendu par un appel sur une **autre** tête
+    /// n'atteste rien sur celle-ci. C'est la même propriété que
+    /// `reviewDecision` n'avait pas, une marche plus bas : la preuve exige un
+    /// seul résumé qui nomme la tête dans son entrée **et** porte l'attestation
+    /// dans sa sortie. Scinder la condition en deux `any` ferait de ces deux
+    /// résumés-là une preuve.
+    #[test]
+    fn mika3124_ac5_la_preuve_ne_se_recompose_pas_entre_deux_resumes() {
+        let deux_tetes = vec![
+            // La tête demandée : lue, et jamais jugée.
+            pas_de_letape_3_sans_revue(3, TETE_3070),
+            // Une autre tête : lue, et jugée. C'est elle qui porte la graphie.
+            pas_de_letape_3(4, TETE_NOUVELLE_2931, true),
+        ];
+        assert_eq!(
+            preuve_du_tour_manquante("stop_already_reviewed_sha", TETE_3070, &deux_tetes),
+            Some(PreuveManquante::StopSurTeteJamaisJugee),
+            "AC5 : l'attestation de {TETE_NOUVELLE_2931} ne conclut rien sur \
+             {TETE_3070}"
+        );
+
+        // Contrôle positif : la même trace satisfait la ligne demandée sur la
+        // tête que le résumé attesté nomme, lui.
+        assert_eq!(
+            preuve_du_tour_manquante("stop_already_reviewed_sha", TETE_NOUVELLE_2931, &deux_tetes),
+            None,
+            "contrôle positif : sur sa propre tête, l'attestation est la preuve"
+        );
+    }
+
+    /// **AC2.** L'attestation survit à la troncature, et `Jugee` l'emporte.
+    ///
+    /// Première moitié : une sortie de huit revues dépasse
+    /// `OUTPUT_SUMMARY_MAX`, donc elle est tronquée — et la preuve tient quand
+    /// même, parce que le handler émet `head_evidence` en première clé. C'est
+    /// toute la raison de cette position ; sans l'anti-vacuité qui suit, le test
+    /// pourrait passer sur une sortie qui n'a jamais été coupée.
+    ///
+    /// Seconde moitié : un tour qui appelle l'outil deux fois sur la même tête
+    /// retient la meilleure attestation. Un second appel muet ne peut pas
+    /// annuler un premier appel qui avait vu une revue.
+    #[test]
+    fn mika3124_ac2_une_attestation_tronquee_satisfait_encore_la_preuve() {
+        let longue = pas_de_letape_3_atteste(3, TETE_3070, true, HEAD_EVIDENCE_RULED_ON, 8);
+
+        // Anti-vacuité : la sortie a bien été coupée par la borne du moteur.
+        assert!(
+            longue.output_summary.ends_with("..."),
+            "la sortie de huit revues doit dépasser la borne de {} octets, sinon \
+             ce test ne mesure pas la troncature ; lu : {}",
+            crate::planning::policy::OUTPUT_SUMMARY_MAX,
+            longue.output_summary
+        );
+        assert!(
+            longue.output_summary.len() <= crate::planning::policy::OUTPUT_SUMMARY_MAX,
+            "la sortie doit être bornée comme le moteur la borne"
+        );
+
+        let tour = vec![longue.clone()];
+        assert_eq!(
+            preuve_du_tour_manquante("stop_already_reviewed_sha", TETE_3070, &tour),
+            None,
+            "AC2 : l'attestation en première clé survit à la troncature"
+        );
+
+        // `Jugee` l'emporte, dans les deux ordres d'appel.
+        let apres = vec![longue.clone(), pas_de_letape_3_muette(4, TETE_3070, "[]")];
+        let avant = vec![pas_de_letape_3_muette(3, TETE_3070, "[]"), longue];
+        for (ordre, trace) in [("après", &apres), ("avant", &avant)] {
+            assert_eq!(
+                preuve_du_tour_manquante("stop_already_reviewed_sha", TETE_3070, trace),
+                None,
+                "un appel muet {ordre} l'appel attesté ne peut pas annuler ce que \
+                 celui-ci a établi"
+            );
+        }
     }
 
     // ---- mika#2948 : la garde de l'inscription ---------------------------

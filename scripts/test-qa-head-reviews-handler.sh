@@ -495,7 +495,69 @@ else
 fi
 echo
 
-# -- 11. Le contrôle de rougeur -------------------------------------------------
+# -- 11. La concordance interlangue --------------------------------------------
+#
+# Le vocabulaire de `head_evidence` est écrit DEUX fois : ici, en jq, par le
+# handler qui l'émet ; et en Rust, par les constantes que la preuve du tour
+# cherche dans `output_summary`. Rien dans un compilateur ne relie les deux. Une
+# faute de frappe d'un côté rend le handler toujours vert, la preuve toujours
+# rouge, et le symptôme — « tous les `stop_*` sont refusés » — ne ressemble pas
+# à sa cause (classe mika#2158).
+#
+# Les deux valeurs sont donc LUES dans la source Rust et comparées à ce que le
+# handler émet réellement. Jamais recopiées : une recopie est un troisième
+# exemplaire du même littéral, c'est-à-dire le défaut qu'on cherche à empêcher.
+
+echo "11. concordance interlangue — le handler émet le vocabulaire que le Rust cherche"
+PREUVE_SRC="$REPO_ROOT/crates/mika-agent/src/qa_reviewed_head.rs"
+RUST_JUGEE="$(sed -n 's/^pub(crate) const HEAD_EVIDENCE_RULED_ON: &str = "\([a-z_]*\)";.*/\1/p' \
+    "$PREUVE_SRC" | head -1)"
+RUST_JAMAIS="$(sed -n 's/^pub(crate) const HEAD_EVIDENCE_NEVER_RULED_ON: &str = "\([a-z_]*\)";.*/\1/p' \
+    "$PREUVE_SRC" | head -1)"
+
+if [[ -z "$RUST_JUGEE" || -z "$RUST_JAMAIS" ]]; then
+    echo "  FAIL  anti-vacuité : les constantes du moteur sont introuvables dans"
+    echo "        $PREUVE_SRC — lues « $RUST_JUGEE » et"
+    echo "        « $RUST_JAMAIS ». Elles ont changé de nom ou de forme, donc"
+    echo "        cette concordance ne mesure plus rien"
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS  le moteur déclare « $RUST_JUGEE » et « $RUST_JAMAIS »"
+    PASS=$((PASS + 1))
+
+    # La disjonction lexicale, du côté où elle est portante : la preuve cherche
+    # une sous-chaîne, donc si l'une des deux valeurs contenait l'autre, trouver
+    # la première ne distinguerait plus les deux réponses.
+    if [[ "$RUST_JUGEE" == *"$RUST_JAMAIS"* || "$RUST_JAMAIS" == *"$RUST_JUGEE"* ]]; then
+        echo "  FAIL  les deux valeurs ne sont pas lexicalement disjointes : la preuve"
+        echo "        cherche une sous-chaîne, donc elle confondrait les deux réponses"
+        FAIL=$((FAIL + 1))
+    else
+        echo "  PASS  les deux valeurs sont lexicalement disjointes"
+        PASS=$((PASS + 1))
+    fi
+
+    # (a) Une revue conforme : le handler doit émettre le littéral du moteur.
+    reset_fixtures
+    write_suites "$FIRST_SEEN"
+    write_reviews "5667400001|mika-platform-qa|APPROVED|$CASE_HEAD|$APRES_LE_PUSH|pass"
+    run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+    check "le handler réussit" 0 "$rc"
+    check_json "la tête jugée porte EXACTEMENT la constante du moteur" \
+        '.head_evidence' "$RUST_JUGEE"
+
+    # (b) Aucune revue : l'autre moitié du vocabulaire fermé.
+    reset_fixtures
+    write_suites "$FIRST_SEEN"
+    write_reviews
+    run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+    check "le handler réussit" 0 "$rc"
+    check_json "la tête jamais jugée porte EXACTEMENT l'autre constante" \
+        '.head_evidence' "$RUST_JAMAIS"
+fi
+echo
+
+# -- 12. Le contrôle de rougeur -------------------------------------------------
 #
 # « Supprime ce que le test protège ; vérifie qu'il rougit. » Sans cette case,
 # le harnais ci-dessus serait indiscernable d'un test sur la FORME de l'objet :
@@ -511,7 +573,7 @@ echo
 # La copie désarmée est écrite ici, depuis l'arbre, et n'est jamais commitée :
 # un handler cassé qui vit dans le dépôt est un handler que quelqu'un déploiera.
 
-echo "11. contrôle de rougeur — le handler privé de son terme temporel rejoue le défaut"
+echo "12. contrôle de rougeur — le handler privé de son terme temporel rejoue le défaut"
 DESARME="$TMPROOT/qa_head_reviews_desarme.sh"
 sed 's/map(select((\.submitted_at \/\/ "") >= \$first_seen))/map(select(true))/' \
     "$HANDLER" >"$DESARME"
