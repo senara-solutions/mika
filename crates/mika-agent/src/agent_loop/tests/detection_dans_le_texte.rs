@@ -405,6 +405,164 @@ fn mika3123_completed_at_ne_matche_pas_et_ne_demande_aucun_masquage() {
     assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
 }
 
+// -- guard.completion_claim_code_quoted : la sonde du rétrécissement (mika#3123) --
+//
+// AC7. La sonde n'est émise que quand le masquage a **réellement** changé l'issue
+// du tour : les deux portes franchies, et le mot-clé introuvable hors code. Sans
+// elle, « la garde ne tire plus sur les citations » et « aucun tour n'a atteint
+// cette garde dans la fenêtre » rendent zéro tous les deux (classe mika#2205) —
+// et la cible du vol *est* zéro rejet. L'absence de la ligne, elle, veut dire
+// « binaire antérieur au vol » et jamais « aucune citation » (motif mika#2340).
+//
+// Les deux tests ci-dessous sont annotés `#[serial_test::serial]` : ils sont les
+// seuls à atteindre ce callsite, et c'est la sérialisation des **voisins** autant
+// que du capturant qui porte le dispositif (mika#2646).
+
+/// Un abonné qui écrit dans un tampon mémoire, pour lire la ligne plutôt que de
+/// la supposer. Motif copié de `compaction_handsoff.rs`.
+fn capturing_subscriber() -> (
+    impl tracing::Subscriber + Send + Sync,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = buf.clone();
+
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(move || WriterHandle(writer.clone()))
+        .with_ansi(false)
+        .with_target(true);
+
+    (tracing_subscriber::registry().with(layer), buf)
+}
+
+struct WriterHandle(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for WriterHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Une base portant **une** tâche `pending` : la seconde porte de la garde est
+/// franchie, donc sans mika#3123 le tour partait en rejet.
+async fn db_avec_une_tache_active() -> AsyncDatabase {
+    let db = test_async_db();
+    db.create_task(crate::db::NewTask {
+        agent_id: "mika".to_string(),
+        team_run_id: None,
+        parent_task_id: None,
+        depth: 0,
+        label: "mika#3123".to_string(),
+        trigger_type: "manual".to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: "none".to_string(),
+        action_config: "{}".to_string(),
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: None,
+        metadata: None,
+        r#type: None,
+        dispatch_class: None,
+    })
+    .await
+    .unwrap();
+    db
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mika3123_un_mot_clef_cite_emet_la_sonde_et_laisse_passer_le_tour() {
+    let db = db_avec_une_tache_active().await;
+    let tools = make_registry_with_tool("update_task_status");
+    let (subscriber, buf) = capturing_subscriber();
+
+    let decision = {
+        let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        evaluate_completion_claim(
+            "La colonne passe à `completed` quand la tâche est terminée.",
+            &HashSet::new(),
+            &tools,
+            &db,
+            7,
+            &LoopMode::Conversation,
+        )
+        .await
+    };
+
+    assert!(
+        matches!(decision, GuardDecision::Pass),
+        "une citation n'est pas une déclaration : le tour doit être honoré"
+    );
+
+    let binding = buf.lock().unwrap();
+    let sortie = String::from_utf8_lossy(&binding);
+    assert!(
+        sortie.contains("guard.completion_claim_code_quoted"),
+        "la ligne doit porter son nom d'événement : {sortie}"
+    );
+    assert!(
+        sortie.contains("masked_regions=1"),
+        "sans le compte de régions, la ligne ne dit pas ce qui a été masqué : {sortie}"
+    );
+    assert!(
+        sortie.contains("completed"),
+        "la ligne doit nommer le mot-clé retenu : {sortie}"
+    );
+    assert!(
+        sortie.contains("step=7"),
+        "la ligne doit situer le tour : {sortie}"
+    );
+}
+
+/// Contrôle négatif — sans lui le test ci-dessus passerait sur une sonde
+/// inconditionnelle, qui compterait les tours atteints et non les rejets évités.
+#[tokio::test]
+#[serial_test::serial]
+async fn mika3123_une_declaration_nue_rejette_sans_emettre_la_sonde() {
+    let db = db_avec_une_tache_active().await;
+    let tools = make_registry_with_tool("update_task_status");
+    let (subscriber, buf) = capturing_subscriber();
+
+    let decision = {
+        let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        evaluate_completion_claim(
+            "PR merged successfully.",
+            &HashSet::new(),
+            &tools,
+            &db,
+            7,
+            &LoopMode::Conversation,
+        )
+        .await
+    };
+
+    assert!(
+        matches!(decision, GuardDecision::RejectEndTurn { .. }),
+        "une déclaration nue doit toujours être rejetée — le vol rétrécit, il ne désarme pas"
+    );
+
+    let binding = buf.lock().unwrap();
+    let sortie = String::from_utf8_lossy(&binding);
+    assert!(
+        !sortie.contains("guard.completion_claim_code_quoted"),
+        "la sonde ne compte que les tours dont le masquage a changé l'issue : {sortie}"
+    );
+}
+
 // -- detect_milestone_close_claim_without_patch tests (#797, #1207) --
 
 /// Helper: build a ToolCallSummary for run_gh with the given input.

@@ -11788,13 +11788,31 @@ async fn evaluate_completion_claim(
 
     // Les deux portes sont franchies : sans mika#3123 ce tour partait en rejet.
     // C'est ici, et seulement ici, que la distinction déclaration / citation
-    // décide de l'issue — d'où la place du `match`, après les portes et non avant.
-    let keyword = match scan.hit {
+    // décide de l'issue — d'où la place du `match`, après les portes et non avant,
+    // et d'où la place de la sonde : elle n'est émise que quand le rétrécissement
+    // a RÉELLEMENT changé l'issue du tour (précédent `guard.resume_scope_stood_down`,
+    // mika#3002). Une ligne par tour masqué, pas une par masquage, sinon le compte
+    // mesure les citations et non les rejets évités.
+    let keyword = match (scan.hit, scan.withheld) {
         // Une déclaration hors région de code, même accompagnée de citations.
-        Some(keyword) => keyword,
+        (Some(keyword), _) => keyword,
         // Le mot-clé n'existe qu'à l'intérieur d'une région de code : une
         // citation, pas une déclaration. `EndTurn` est honoré.
-        None => return GuardDecision::Pass,
+        (None, Some((withheld, masked_regions))) => {
+            info!(
+                target: "mika::otel",
+                event = "guard.completion_claim_code_quoted",
+                keyword = withheld.as_str(),
+                masked_regions,
+                label = mode.label(),
+                step,
+                "Completion keyword appears only inside code regions — EndTurn allowed"
+            );
+            return GuardDecision::Pass;
+        }
+        // Inatteignable : la porte d'entrée sort déjà sur ce couple. Un `Pass` plutôt
+        // qu'un `unreachable!` — une garde d'hygiène de tâches ne vaut pas une panique.
+        (None, None) => return GuardDecision::Pass,
     };
 
     warn!(
