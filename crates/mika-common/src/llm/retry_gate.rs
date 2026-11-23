@@ -35,9 +35,11 @@
 //!
 //! [`RetryThresholds`] (the **only** place the non-transport threshold's sum is
 //! written), [`RetryClass`] (the two error predicates the decision reads),
-//! [`next_attempt_verdict`] (budget + retryability + deadline), and
-//! [`deadline_verdict`] (the deadline half alone, for the post-loop site which
-//! measures at a different instant and has no attempt index).
+//! [`transport_concession_applies`] (the **only** place membership in the
+//! mika#1744 concession is decided), [`next_attempt_verdict`] (budget +
+//! retryability + deadline), and [`deadline_verdict`] (the deadline half alone,
+//! for the post-loop site which measures at a different instant and has no
+//! attempt index).
 //!
 //! Everything here is pure: no clock, no I/O. `remaining` is passed in, which
 //! is what preserves the fact that the three sites measure it at three
@@ -104,9 +106,14 @@ impl RetryThresholds {
         Self::from_budget(&LlmTimeoutBudget::default())
     }
 
-    /// The threshold that applies to the last error's class.
-    pub fn for_class(&self, last_was_transport: bool) -> u64 {
-        if last_was_transport {
+    /// The threshold that applies, given whether the mika#1744 concession holds.
+    ///
+    /// The parameter is the **verdict** of
+    /// [`transport_concession_applies`], not an `is_transport` read on its own
+    /// (mika#3126): on a cut at the plafond the error is transport and the
+    /// concession does not hold, so the two answers differ.
+    pub fn for_class(&self, transport_concession: bool) -> u64 {
+        if transport_concession {
             self.transport_secs
         } else {
             self.default_secs
@@ -182,6 +189,50 @@ impl RetryClass for LlmError {
     }
 }
 
+/// Does the last failure belong to the class the mika#1744 concession was
+/// granted to?
+///
+/// The concession is the smaller `0.50 × cap` threshold, and mika#1744 granted
+/// it with its reason written down: *"DNS, refused connections and TLS
+/// handshakes resolve in seconds, not in a full cap"*. It is therefore an
+/// exception for a failure class **identified as fast**, never a property of the
+/// `Transport` variant as such.
+///
+/// An attempt **cut at its own plafond** has just refuted that membership for
+/// the next one: it consumed the entire cap. It is still an
+/// `LlmError::Transport` and still retryable — mika#2280 deliberately left the
+/// variant, the class and the retryability intact (D2/AC6), because mika#2015
+/// measured that making them terminal cost a whole pilot cycle on every
+/// mid-body network hiccup. So `is_transport()` answers `true` on a guillotine,
+/// and reading it alone granted the fast-retry threshold to the one failure we
+/// *know* will be slow. Measured 2026-11-16: three turns cut in
+/// `llm_call_cap_exhausted` under a `300/660` geometry, each retried with 290 to
+/// 345 s of margin under a 300 s cap, the envelope abandoned at 660 s for
+/// 4.82 USD with not one usable byte returned — and nothing left for the
+/// mika#2289 error-verdict net to report why (mika#3126).
+///
+/// **This is a withdrawal of an exception, not a third threshold.** When it
+/// answers `false` the fallback is the default threshold that already exists
+/// (`1.0 × cap`, "one whole call plus a reserve"), so no new fraction is
+/// derived and no geometry whose envelope carries two whole calls changes
+/// behaviour.
+///
+/// `cap_exhausted` is the per-attempt measurement
+/// [`super::budget::LlmTimeoutBudget::is_cap_exhaustion`] produces, carried
+/// **beside** the error as mika#2280 requires. It dominates the error class:
+/// the cut is a fact about the attempt that just ran, the class only a fact
+/// about how it surfaced.
+///
+/// **The single site.** The three sites per rail that ask the retry question
+/// used to read `is_some_and(LlmError::is_transport)` each at home. Adding
+/// `&& !cap_exhausted` in nine places would be copying a predicate — the exact
+/// drift this module exists to close, and one already paid for twice
+/// (mika#2331 §3.3: mika#1744's threshold was never ported to the ollama rail,
+/// silently, across two tickets).
+pub fn transport_concession_applies(error: Option<&dyn RetryClass>, cap_exhausted: bool) -> bool {
+    !cap_exhausted && error.is_some_and(RetryClass::is_transport)
+}
+
 /// Will attempt `attempt + 1` run, given how attempt `attempt` ended?
 ///
 /// The whole decision, in the order that makes each refusal report its true
@@ -202,10 +253,21 @@ impl RetryClass for LlmError {
 /// and the non-transport threshold applies, which is the conservative reading:
 /// the smaller transport threshold is a concession granted to a failure class
 /// we have *identified*, never a default.
+///
+/// `cap_exhausted` is the per-attempt measurement
+/// [`super::budget::LlmTimeoutBudget::is_cap_exhaustion`] produces for the
+/// attempt that just failed, carried beside the error as mika#2280 requires.
+/// It is routed through [`transport_concession_applies`], which is the **only**
+/// thing it does here: it never makes a retryable error terminal, never changes
+/// the budget arithmetic of step 2, and only ever moves step 3's threshold from
+/// the mika#1744 concession back to the default (mika#3126). A rail that cannot
+/// measure it passes `false` — the honest answer for an unmeasured attempt,
+/// which keeps the pre-mika#3126 behaviour.
 pub fn next_attempt_verdict(
     attempt: u32,
     max_attempts: u32,
     error: Option<&dyn RetryClass>,
+    cap_exhausted: bool,
     remaining: Option<Duration>,
     thresholds: &RetryThresholds,
 ) -> RetryVerdict {
@@ -219,7 +281,7 @@ pub fn next_attempt_verdict(
     }
     deadline_verdict(
         remaining,
-        error.is_some_and(RetryClass::is_transport),
+        transport_concession_applies(error, cap_exhausted),
         thresholds,
     )
 }
@@ -233,15 +295,22 @@ pub fn next_attempt_verdict(
 ///
 /// Returns [`RetryVerdict::Retry`] or [`RetryVerdict::DeadlineInsufficient`],
 /// never [`RetryVerdict::BudgetSpent`] — it is not asked about the budget.
+///
+/// `transport_concession` must come from [`transport_concession_applies`] and
+/// never from an `is_transport` read on its own: the two answers differ exactly
+/// on the case mika#3126 was filed for, an attempt cut at its plafond, where the
+/// error is transport-class and the concession does not hold. The parameter was
+/// called `last_was_transport` until mika#3126 — a name that described the
+/// measurement, and invited that very read.
 pub fn deadline_verdict(
     remaining: Option<Duration>,
-    last_was_transport: bool,
+    transport_concession: bool,
     thresholds: &RetryThresholds,
 ) -> RetryVerdict {
     let Some(remaining) = remaining else {
         return RetryVerdict::Retry;
     };
-    let threshold_secs = thresholds.for_class(last_was_transport);
+    let threshold_secs = thresholds.for_class(transport_concession);
     if remaining < Duration::from_secs(threshold_secs) {
         RetryVerdict::DeadlineInsufficient {
             remaining_ms: remaining.as_millis() as u64,
@@ -327,6 +396,7 @@ mod tests {
             0,
             2,
             Some(&err),
+            false,
             // 40 − 20 = 20, minus the ε any real call consumes.
             Some(Duration::from_millis(20_000 - 5)),
             &incident_thresholds(),
@@ -347,6 +417,7 @@ mod tests {
             0,
             2,
             Some(&err),
+            false,
             Some(Duration::from_secs(180)),
             &fleet_thresholds(),
         );
@@ -365,6 +436,7 @@ mod tests {
             0,
             2,
             Some(&err),
+            false,
             Some(Duration::from_millis(20_000 - 5)),
             &incident_thresholds(),
         );
@@ -383,6 +455,7 @@ mod tests {
                 0,
                 4,
                 Some(&err),
+                false,
                 Some(Duration::from_secs(10_000)),
                 &fleet_thresholds()
             ),
@@ -398,6 +471,7 @@ mod tests {
                 1,
                 2,
                 Some(&err),
+                false,
                 Some(Duration::from_secs(10_000)),
                 &fleet_thresholds()
             ),
@@ -411,7 +485,7 @@ mod tests {
     fn without_a_deadline_the_budget_alone_decides() {
         let err = http(500, true);
         assert_eq!(
-            next_attempt_verdict(0, 2, Some(&err), None, &fleet_thresholds()),
+            next_attempt_verdict(0, 2, Some(&err), false, None, &fleet_thresholds()),
             RetryVerdict::Retry
         );
         assert_eq!(
@@ -428,6 +502,7 @@ mod tests {
             0,
             2,
             None,
+            false,
             Some(Duration::from_secs(90)),
             &fleet_thresholds(),
         );

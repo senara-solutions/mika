@@ -9,7 +9,10 @@ use serde_json::Value;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::error::{LlmError, blank_response_body};
-use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
+use super::retry_gate::{
+    RetryClass, RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict,
+    transport_concession_applies,
+};
 use super::types::*;
 use super::{LlmProvider, ProviderKind};
 
@@ -509,9 +512,12 @@ impl OpenAiCompatibleProvider {
                 // fast-failing transport retry.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    let last_was_transport = last_error
-                        .as_ref()
-                        .is_some_and(super::error::LlmError::is_transport);
+                    // mika#3126: membership in the mika#1744 concession is
+                    // decided at one site, never by an `is_transport` read here.
+                    let transport_concession = transport_concession_applies(
+                        last_error.as_ref().map(|e: &LlmError| e as &dyn RetryClass),
+                        false,
+                    );
                     // mika#2189 D3: derived from the effective plafond, not
                     // from literals calibrated against a 120 s one. At the
                     // default plafond these reproduce 60 and 90+30 exactly.
@@ -520,13 +526,13 @@ impl OpenAiCompatibleProvider {
                     // used to be two, and the outcome line ignored the deadline
                     // entirely.
                     if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
-                        deadline_verdict(Some(remaining), last_was_transport, &thresholds)
+                        deadline_verdict(Some(remaining), transport_concession, &thresholds)
                     {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
                             threshold_secs,
-                            last_was_transport,
+                            last_was_transport = transport_concession,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         // mika#2331 AC2: the attempt that did NOT happen is
@@ -609,6 +615,7 @@ impl OpenAiCompatibleProvider {
                     attempt,
                     max_attempts,
                     Some(e),
+                    false,
                     deadline_remaining_ms.map(Duration::from_millis),
                     &thresholds,
                 )),
@@ -670,12 +677,11 @@ impl OpenAiCompatibleProvider {
         // predicate, so the agreement is structural. The margin is still
         // measured *here* rather than reused from the guard: this site runs at
         // a later instant, and its verdict may legitimately differ.
-        let last_was_transport = last_error
-            .as_ref()
-            .is_some_and(super::error::LlmError::is_transport);
+        let transport_concession =
+            transport_concession_applies(last_error.as_ref().map(|e| e as &dyn RetryClass), false);
         let deadline_aborted = deadline_verdict(
             deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
-            last_was_transport,
+            transport_concession,
             &thresholds,
         )
         .is_deadline_insufficient();
