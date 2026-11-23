@@ -5285,12 +5285,19 @@ async fn try_resolve_parent_on_dispatch_refusal(db: &AsyncDatabase, task: &Task)
 ///
 /// # Une table CLOSE, lue sur la PREMIÈRE LIGNE
 ///
-/// `dispatch-lib.sh` pose ces deux bannières lui-même, comme première ligne du
+/// `dispatch-lib.sh` pose ces bannières lui-même, comme première ligne du
 /// `RESULT` qu'il délivre : `_branch_reuse_gate` pour
-/// `STATUS=BRANCH_HAS_UNMERGED_WORK` (mika#2976 vol 1) et la porte de rebase
-/// pour `STATUS=REBASE_CONFLICT` (mika#1727, mika#2968 deux fois). Le prédicat
-/// est donc l'égalité de la première ligne, après `trim_end`, avec l'une de
-/// **deux** valeurs nommées.
+/// `STATUS=BRANCH_HAS_UNMERGED_WORK` (mika#2976 vol 1), la porte de rebase
+/// pour `STATUS=REBASE_CONFLICT` (mika#1727, mika#2968 deux fois) et
+/// `_confront_launch_plan` pour `STATUS=LAUNCH_PLAN_DIVERGED` (mika#3121). Le
+/// prédicat est donc l'égalité de la première ligne, après `trim_end`, avec
+/// l'une de **trois** valeurs nommées.
+///
+/// `LAUNCH_PLAN_DIVERGED` est une halte et non un `auto_skipped` par décision
+/// (mika#3121 R5) : un `auto_skipped` résout la parente en `completed` parce
+/// que là-bas le refus EST un résultat correct — le ticket est groomé. Ici le
+/// ticket n'est **pas** implémenté, et le marquer `completed` le retirerait du
+/// compte des vraies pannes.
 ///
 /// Les deux bornes du prédicat sont load-bearing, et chacune ferme une
 /// mauvaise lecture :
@@ -5305,13 +5312,14 @@ async fn try_resolve_parent_on_dispatch_refusal(db: &AsyncDatabase, task: &Task)
 ///   opérateur avec une branche inreprenable, et rendrait les deux populations
 ///   non soustractibles (mika#2205).
 ///
-/// Les deux jetons sont déclarés classe B dans `scripts/canonical-tokens.tsv`,
+/// Les trois jetons sont déclarés classe B dans `scripts/canonical-tokens.tsv`,
 /// avec ce site : une bannière reformulée côté shell ferait retomber la parente
 /// en zombie, en silence.
 fn parse_dispatch_halt_status(result: &str) -> Option<&'static str> {
     match result.lines().next()?.trim_end() {
         "STATUS=REBASE_CONFLICT" => Some("REBASE_CONFLICT"),
         "STATUS=BRANCH_HAS_UNMERGED_WORK" => Some("BRANCH_HAS_UNMERGED_WORK"),
+        "STATUS=LAUNCH_PLAN_DIVERGED" => Some("LAUNCH_PLAN_DIVERGED"),
         _ => None,
     }
 }
@@ -9696,6 +9704,15 @@ mod tests {
          origin/main by patch-id, while its PRs are all terminal (#2975 MERGED).\n\
          Nothing was reset, nothing was removed, nothing was stashed.";
 
+    /// La bannière de `_confront_launch_plan` (mika#3121 D7), dans la forme
+    /// exacte que la porte compose : le jeton seul sur la première ligne, puis
+    /// le nom de l'issue, les trois mesures et la route de retour.
+    const LAUNCH_PLAN_DIVERGED_RESULT: &str = "STATUS=LAUNCH_PLAN_DIVERGED\n\
+         issue=launch_plan_not_pushed\n\
+         plan=docs/plans/2026-11-23-001-some-plan.md branch=fix/3121/some-branch\n\
+         W=9c9d0b67 Bb=59c94bb1 Bm=(absent)\n\
+         Commit and push the plan on the branch, then re-dispatch.";
+
     /// Les transitions écrites sous `dispatch_halt_resolver` pour cette
     /// parente, sous la forme `<avant>→<après> (<motif>)`. L'absence
     /// d'événement est une information : c'est ce qui sépare « la garde n'a pas
@@ -9726,6 +9743,25 @@ mod tests {
         assert_eq!(
             parse_dispatch_halt_status(UNMERGED_WORK_RESULT),
             Some("BRANCH_HAS_UNMERGED_WORK")
+        );
+        // mika#3121 V9 — la troisième bannière, sur la première ligne.
+        assert_eq!(
+            parse_dispatch_halt_status(LAUNCH_PLAN_DIVERGED_RESULT),
+            Some("LAUNCH_PLAN_DIVERGED")
+        );
+        // Citée en deuxième ligne, elle n'est pas la halte : pas de `contains`.
+        assert_eq!(
+            parse_dispatch_halt_status(
+                "Plan gate report:\nSTATUS=LAUNCH_PLAN_DIVERGED\nnothing refused"
+            ),
+            None
+        );
+        // Citée en prose non plus.
+        assert_eq!(
+            parse_dispatch_halt_status(
+                "La porte aurait posé STATUS=LAUNCH_PLAN_DIVERGED si le plan avait divergé."
+            ),
+            None
         );
         // Une ligne terminée par un retour chariot reste la même bannière :
         // `trim_end` est dans le prédicat, pas dans l'espoir.
@@ -9799,6 +9835,39 @@ mod tests {
             parent.result.as_deref(),
             Some("dispatch_halt_BRANCH_HAS_UNMERGED_WORK"),
             "les deux haltes restent soustractibles l'une de l'autre, pas seulement du reste"
+        );
+    }
+
+    /// mika#3121 AC6 — le refus rend la parente `failed`, pas `completed`.
+    ///
+    /// C'est la moitié qu'un `auto_skipped` n'aurait pas donnée : là-bas la
+    /// parente part en `completed` parce que le refus EST le résultat attendu.
+    /// Ici le ticket n'est pas implémenté, donc il doit rester dans le compte
+    /// des pannes réelles — et son motif le nomme, séparément des deux autres
+    /// haltes (mika#2205).
+    #[tokio::test]
+    async fn mika3121_une_divergence_de_plan_lance_rend_la_parente_failed() {
+        let db = test_db();
+        let (parent_id, callback_id) =
+            create_refusal_callback_pair(&db, LAUNCH_PLAN_DIVERGED_RESULT).await;
+        let callback = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+        try_terminate_parent_on_dispatch_halt(&db, &callback).await;
+
+        let parent = db.get_task_unscoped(&parent_id).await.unwrap().unwrap();
+        assert_eq!(
+            parent.status, "failed",
+            "un plan lancé divergent est une panne réelle, pas un `auto_skipped` \
+             qui résoudrait la parente en `completed`"
+        );
+        assert_eq!(
+            parent.result.as_deref(),
+            Some("dispatch_halt_LAUNCH_PLAN_DIVERGED"),
+            "les trois haltes restent soustractibles l'une de l'autre"
+        );
+        assert_eq!(
+            dispatch_halt_audit_values(&db, &parent_id).await,
+            vec!["in_progress→failed (dispatch_halt_LAUNCH_PLAN_DIVERGED)".to_string()],
         );
     }
 
