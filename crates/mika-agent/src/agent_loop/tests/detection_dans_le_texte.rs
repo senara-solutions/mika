@@ -146,24 +146,33 @@ fn test_detect_prose_tool_call_underscores_and_digits() {
 }
 
 // -- detect_completion_claim tests (#483) --
+//
+// Ces assertions sont le contrôle positif de mika#3123 : le masquage des régions
+// de code RÉTRÉCIT le détecteur, donc toute déclaration nue doit continuer d'être
+// vue. Leur rougissement signale un désarmement de la garde. Le prédicat rend une
+// `String` depuis mika#3123 — le texte masqué étant une valeur locale — d'où le
+// `.as_deref()` : la propriété observée est inchangée.
 
 #[test]
 fn test_detect_completion_claim_merged() {
     assert_eq!(
-        detect_completion_claim("PR merged successfully"),
+        detect_completion_claim("PR merged successfully").as_deref(),
         Some("merged")
     );
 }
 
 #[test]
 fn test_detect_completion_claim_completed() {
-    assert_eq!(detect_completion_claim("Task completed"), Some("completed"));
+    assert_eq!(
+        detect_completion_claim("Task completed").as_deref(),
+        Some("completed")
+    );
 }
 
 #[test]
 fn test_detect_completion_claim_complete() {
     assert_eq!(
-        detect_completion_claim("The migration is complete"),
+        detect_completion_claim("The migration is complete").as_deref(),
         Some("complete")
     );
 }
@@ -171,7 +180,7 @@ fn test_detect_completion_claim_complete() {
 #[test]
 fn test_detect_completion_claim_deployed() {
     assert_eq!(
-        detect_completion_claim("Successfully deployed to production"),
+        detect_completion_claim("Successfully deployed to production").as_deref(),
         Some("deployed")
     );
 }
@@ -179,16 +188,19 @@ fn test_detect_completion_claim_deployed() {
 #[test]
 fn test_detect_completion_claim_shipped() {
     assert_eq!(
-        detect_completion_claim("Feature shipped in v2.1"),
+        detect_completion_claim("Feature shipped in v2.1").as_deref(),
         Some("shipped")
     );
 }
 
 #[test]
 fn test_detect_completion_claim_case_insensitive() {
-    assert_eq!(detect_completion_claim("MERGED the PR"), Some("MERGED"));
     assert_eq!(
-        detect_completion_claim("Successfully Deployed"),
+        detect_completion_claim("MERGED the PR").as_deref(),
+        Some("MERGED")
+    );
+    assert_eq!(
+        detect_completion_claim("Successfully Deployed").as_deref(),
         Some("Deployed")
     );
 }
@@ -239,8 +251,315 @@ fn test_detect_completion_claim_word_boundary_redeployed() {
 #[test]
 fn test_detect_completion_claim_in_sentence() {
     assert_eq!(
-        detect_completion_claim("I've merged the PR and synced main. Everything looks good."),
+        detect_completion_claim("I've merged the PR and synced main. Everything looks good.")
+            .as_deref(),
         Some("merged")
+    );
+}
+
+// -- scan_completion_claim : ce que le scan coûte, et ce qu'il rend (mika#3123) --
+
+#[test]
+fn mika3123_un_texte_sans_mot_clef_sort_par_le_chemin_rapide() {
+    assert_eq!(
+        scan_completion_claim("Here is the analysis result"),
+        ClaimScan::default()
+    );
+}
+
+#[test]
+fn mika3123_relationship_seul_ne_declenche_aucun_masquage() {
+    // `relationship` passe le chemin rapide sur son `contains("ship")`, mais le
+    // test sur le texte BRUT sort avant `code_masked`. La propriété observable est
+    // que `withheld` reste `None` : si le masquage avait eu lieu, il aurait compté
+    // la région que ce texte porte, et le scan l'aurait rendue.
+    let text = "La `relationship` entre les deux tables est bidirectionnelle.";
+    assert!(
+        text.contains('`'),
+        "le texte doit porter une région de code"
+    );
+    assert_eq!(scan_completion_claim(text), ClaimScan::default());
+}
+
+#[test]
+fn mika3123_un_mot_clef_cite_sort_en_withheld_avec_son_compte_de_regions() {
+    let scan = scan_completion_claim("Le statut passe à `completed`.");
+    assert_eq!(scan.hit, None);
+    assert_eq!(scan.withheld, Some(("completed".to_string(), 1)));
+}
+
+#[test]
+fn mika3123_une_declaration_nue_sort_en_hit_sans_withheld() {
+    let scan = scan_completion_claim("J'ai mis `completed` dans la colonne, et le PR est merged.");
+    assert_eq!(scan.hit.as_deref(), Some("merged"));
+    assert_eq!(scan.withheld, None);
+}
+
+// -- code_masked : table de vérité du masquage des régions de code (mika#3123) --
+//
+// Dix cas, un par ligne de la grammaire documentée au site. Chaque cas dit deux
+// choses : combien de régions le masquage a reconnues, et ce que la regex de la
+// garde voit du texte masqué — c'est cette seconde moitié qui porte la correction.
+
+#[test]
+fn mika3123_span_simple_masque_le_mot_clef() {
+    let (masked, regions) = code_masked("Le statut passe à `completed`.");
+    assert_eq!(regions, 1);
+    // Les onze caractères de `` `completed` `` deviennent onze espaces.
+    assert_eq!(
+        masked,
+        format!("Le statut passe à {}.", " ".repeat("`completed`".len()))
+    );
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_span_a_n_backticks_masque_jusqua_la_fermeture_de_meme_largeur() {
+    // Run d'ouverture de deux backticks : seul un run de EXACTEMENT deux ferme,
+    // donc les backticks simples intérieurs n'arrêtent pas la région.
+    let (masked, regions) = code_masked("Écris ``le `completed` littéral`` ici.");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+    assert!(masked.starts_with("Écris "));
+    assert!(masked.ends_with(" ici."));
+}
+
+#[test]
+fn mika3123_span_non_termine_ne_masque_rien() {
+    // Décision de bord : un run non apparié est littéral (CommonMark), et c'est le
+    // choix anti-contournement — un backtick solitaire ne neutralise pas la ligne.
+    let text = "Le statut passe à `completed.";
+    let (masked, regions) = code_masked(text);
+    assert_eq!(regions, 0);
+    assert_eq!(masked, text);
+    assert_eq!(
+        COMPLETION_CLAIM_RE.find(&masked).map(|m| m.as_str()),
+        Some("completed")
+    );
+}
+
+#[test]
+fn mika3123_accents_et_tiret_cadratin_autour_dune_region_ne_paniquent_pas() {
+    // Sûreté UTF-8 : le masquage n'indexe jamais par octet, donc le nombre de
+    // caractères est préservé à l'identique, accents et em-dash compris.
+    let text = "Résumé — l'état `completed` est écrit à côté d'un tiret cadratin — fin.";
+    let (masked, regions) = code_masked(text);
+    assert_eq!(regions, 1);
+    assert_eq!(masked.chars().count(), text.chars().count());
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_fence_cloturee_masque_son_contenu() {
+    let (masked, regions) = code_masked("Extrait :\n```\nstatus = completed\n```\nFin.");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+    assert!(masked.starts_with("Extrait :\n"));
+    assert!(masked.ends_with("\nFin."));
+}
+
+#[test]
+fn mika3123_fence_non_terminee_masque_jusqua_la_fin_du_texte() {
+    // Décision de bord : sémantique CommonMark, et le cas fréquent qui compte —
+    // une réponse coupée au plafond de tokens en plein bloc de code.
+    let (masked, regions) = code_masked("Extrait :\n```json\n{\"status\": \"completed\"}");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_fence_imbriquant_des_backticks_simples_reste_une_seule_region() {
+    let (masked, regions) = code_masked("Exemple :\n```\nun `completed` cité\n```\nFin.");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_citation_et_declaration_dans_le_meme_texte_laissent_la_declaration() {
+    // Le contrôle positif de R2 : masquer ne désarme pas la garde, il la rétrécit.
+    let (masked, regions) =
+        code_masked("J'ai mis `completed` dans la colonne, et le PR est merged.");
+    assert_eq!(regions, 1);
+    assert_eq!(
+        COMPLETION_CLAIM_RE.find(&masked).map(|m| m.as_str()),
+        Some("merged")
+    );
+}
+
+#[test]
+fn mika3123_le_masquage_ne_soude_pas_les_bords_dune_region() {
+    // R3 : supprimer la région aurait fabriqué `completed` — un faux positif créé
+    // par le correctif. L'espace préserve la frontière de mot.
+    let (masked, regions) = code_masked("com`x`pleted");
+    assert_eq!(regions, 1);
+    assert_eq!(masked, "com   pleted");
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_completed_at_ne_matche_pas_et_ne_demande_aucun_masquage() {
+    let text = "La colonne completed_at vaut NULL.";
+    let (masked, regions) = code_masked(text);
+    assert_eq!(regions, 0);
+    assert_eq!(masked, text);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+// -- guard.completion_claim_code_quoted : la sonde du rétrécissement (mika#3123) --
+//
+// AC7. La sonde n'est émise que quand le masquage a **réellement** changé l'issue
+// du tour : les deux portes franchies, et le mot-clé introuvable hors code. Sans
+// elle, « la garde ne tire plus sur les citations » et « aucun tour n'a atteint
+// cette garde dans la fenêtre » rendent zéro tous les deux (classe mika#2205) —
+// et la cible du vol *est* zéro rejet. L'absence de la ligne, elle, veut dire
+// « binaire antérieur au vol » et jamais « aucune citation » (motif mika#2340).
+//
+// Les deux tests ci-dessous sont annotés `#[serial_test::serial]` : ils sont les
+// seuls à atteindre ce callsite, et c'est la sérialisation des **voisins** autant
+// que du capturant qui porte le dispositif (mika#2646).
+
+/// Un abonné qui écrit dans un tampon mémoire, pour lire la ligne plutôt que de
+/// la supposer. Motif copié de `compaction_handsoff.rs`.
+fn capturing_subscriber() -> (
+    impl tracing::Subscriber + Send + Sync,
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = buf.clone();
+
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(move || WriterHandle(writer.clone()))
+        .with_ansi(false)
+        .with_target(true);
+
+    (tracing_subscriber::registry().with(layer), buf)
+}
+
+struct WriterHandle(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for WriterHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Une base portant **une** tâche `pending` : la seconde porte de la garde est
+/// franchie, donc sans mika#3123 le tour partait en rejet.
+async fn db_avec_une_tache_active() -> AsyncDatabase {
+    let db = test_async_db();
+    db.create_task(crate::db::NewTask {
+        agent_id: "mika".to_string(),
+        team_run_id: None,
+        parent_task_id: None,
+        depth: 0,
+        label: "mika#3123".to_string(),
+        trigger_type: "manual".to_string(),
+        cron_expr: None,
+        event_source: None,
+        event_offset_secs: None,
+        condition_expr: None,
+        next_fire_at: None,
+        timeout_at: None,
+        action_type: "none".to_string(),
+        action_config: "{}".to_string(),
+        input_context: None,
+        created_by_session: None,
+        created_trace_id: None,
+        reference_url: None,
+        source: None,
+        metadata: None,
+        r#type: None,
+        dispatch_class: None,
+    })
+    .await
+    .unwrap();
+    db
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn mika3123_un_mot_clef_cite_emet_la_sonde_et_laisse_passer_le_tour() {
+    let db = db_avec_une_tache_active().await;
+    let tools = make_registry_with_tool("update_task_status");
+    let (subscriber, buf) = capturing_subscriber();
+
+    let decision = {
+        let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        evaluate_completion_claim(
+            "La colonne passe à `completed` quand la tâche est terminée.",
+            &HashSet::new(),
+            &tools,
+            &db,
+            7,
+            &LoopMode::Conversation,
+        )
+        .await
+    };
+
+    assert!(
+        matches!(decision, GuardDecision::Pass),
+        "une citation n'est pas une déclaration : le tour doit être honoré"
+    );
+
+    let binding = buf.lock().unwrap();
+    let sortie = String::from_utf8_lossy(&binding);
+    assert!(
+        sortie.contains("guard.completion_claim_code_quoted"),
+        "la ligne doit porter son nom d'événement : {sortie}"
+    );
+    assert!(
+        sortie.contains("masked_regions=1"),
+        "sans le compte de régions, la ligne ne dit pas ce qui a été masqué : {sortie}"
+    );
+    assert!(
+        sortie.contains("completed"),
+        "la ligne doit nommer le mot-clé retenu : {sortie}"
+    );
+    assert!(
+        sortie.contains("step=7"),
+        "la ligne doit situer le tour : {sortie}"
+    );
+}
+
+/// Contrôle négatif — sans lui le test ci-dessus passerait sur une sonde
+/// inconditionnelle, qui compterait les tours atteints et non les rejets évités.
+#[tokio::test]
+#[serial_test::serial]
+async fn mika3123_une_declaration_nue_rejette_sans_emettre_la_sonde() {
+    let db = db_avec_une_tache_active().await;
+    let tools = make_registry_with_tool("update_task_status");
+    let (subscriber, buf) = capturing_subscriber();
+
+    let decision = {
+        let _garde = crate::test_utils::test_helpers::install_capturing_subscriber(subscriber);
+        evaluate_completion_claim(
+            "PR merged successfully.",
+            &HashSet::new(),
+            &tools,
+            &db,
+            7,
+            &LoopMode::Conversation,
+        )
+        .await
+    };
+
+    assert!(
+        matches!(decision, GuardDecision::RejectEndTurn { .. }),
+        "une déclaration nue doit toujours être rejetée — le vol rétrécit, il ne désarme pas"
+    );
+
+    let binding = buf.lock().unwrap();
+    let sortie = String::from_utf8_lossy(&binding);
+    assert!(
+        !sortie.contains("guard.completion_claim_code_quoted"),
+        "la sonde ne compte que les tours dont le masquage a changé l'issue : {sortie}"
     );
 }
 

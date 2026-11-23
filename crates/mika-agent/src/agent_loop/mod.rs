@@ -11521,11 +11521,178 @@ static COMPLETION_CLAIM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
         .expect("completion claim regex must compile")
 });
 
-/// Detects whether assistant text contains a completion claim.
+/// Rend `text` avec chaque caractère d'une région de code Markdown remplacé par un
+/// espace, et le nombre de régions masquées (mika#3123).
 ///
-/// Returns the matched keyword for logging, or `None`. Uses a fast-path
-/// substring check before running the regex (same pattern as `strip_internal_tags`).
-fn detect_completion_claim(text: &str) -> Option<&str> {
+/// **Pourquoi remplacer par des espaces et non supprimer.** Supprimer souderait les
+/// deux bords de la région : `` com`x`pleted `` deviendrait `completed`, un faux
+/// positif *créé* par le correctif. L'espace préserve la longueur en caractères, la
+/// structure des lignes, et surtout les frontières de mot — la regex voit
+/// `com pleted`, qui ne matche pas.
+///
+/// **Aucun indexage par octet.** L'implémentation itère sur les caractères et pousse
+/// soit le caractère, soit `' '`. La sûreté UTF-8 est donc tenue par construction, et
+/// non par une entrée d'allowlist de `scripts/check-byte-slices.sh` — une entrée y
+/// serait l'aveu du contraire.
+///
+/// Grammaire des régions, et ses trois décisions de bord :
+///
+/// | forme | ouverture | fermeture | décision de bord |
+/// |---|---|---|---|
+/// | bloc clôturé | ≥ 3 backticks en début de ligne (espaces admis) | ligne de ≥ autant de backticks, backticks seuls | **non terminé ⇒ masque jusqu'à la fin du texte** |
+/// | span inline | N backticks (N < 3, ou N quelconque hors début de ligne) | exactement N backticks, **même ligne** | **non terminé ⇒ ne masque rien** |
+/// | bloc indenté de 4 espaces | — | — | **hors périmètre** |
+///
+/// - **Fence non terminée ⇒ masque jusqu'à la fin.** C'est la sémantique CommonMark,
+///   et c'est aussi le cas fréquent qui compte : une réponse coupée au plafond de
+///   tokens en plein bloc de code. La traiter comme du texte nu rejetterait un tour
+///   qui n'a rien déclaré. Le coût est nommé : un tour pourrait ouvrir une fence
+///   qu'il ne ferme pas et déclarer ensuite ce qu'il veut. Il reste détectable — la
+///   fence ouverte est visible dans le texte — et le contournement était déjà ouvert
+///   sans cela par les trois mots que la garde exclut volontairement (`done`,
+///   `built`, `finished`).
+/// - **Span non terminé ⇒ ne masque rien.** CommonMark traite un run de backticks non
+///   apparié comme littéral, et c'est le choix anti-contournement : un backtick
+///   solitaire ne doit pas neutraliser la fin d'une ligne.
+/// - **Bloc indenté de quatre espaces : hors périmètre**, nommé plutôt que tu. Le
+///   projet n'en produit pas — les fences sont la forme universelle de ses prompts et
+///   de ses rapports — et le reconnaître demanderait de distinguer l'indentation
+///   d'une continuation de liste de celle d'un bloc, un coût sans population mesurée.
+fn code_masked(text: &str) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut regions = 0usize;
+    // Nombre de backticks de la fence ouverte, s'il y en a une.
+    let mut open_fence: Option<usize> = None;
+
+    // `split_inclusive` garde le `\n` terminal : la structure des lignes survit au
+    // masquage, et le texte rendu a exactement le même nombre de caractères.
+    for line in text.split_inclusive('\n') {
+        match open_fence {
+            Some(need) => {
+                // Dans un bloc : tout est masqué, ligne de clôture comprise.
+                mask_line(line, &mut out);
+                if is_bare_backtick_line(line) && leading_backtick_run(line) >= need {
+                    open_fence = None;
+                }
+            }
+            None => {
+                let run = leading_backtick_run(line);
+                if run >= 3 {
+                    open_fence = Some(run);
+                    regions += 1;
+                    mask_line(line, &mut out);
+                } else {
+                    mask_inline_spans(line, &mut out, &mut regions);
+                }
+            }
+        }
+    }
+
+    (out, regions)
+}
+
+/// Longueur du run de backticks ouvrant la ligne, espaces de tête admis.
+fn leading_backtick_run(line: &str) -> usize {
+    line.trim_start().chars().take_while(|c| *c == '`').count()
+}
+
+/// Vrai quand la ligne ne porte, hors espaces, que des backticks : la forme d'une
+/// fence de clôture (CommonMark interdit l'info-string à la clôture).
+fn is_bare_backtick_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c == '`')
+}
+
+/// Masque une ligne entière, en préservant ses fins de ligne.
+fn mask_line(line: &str, out: &mut String) {
+    for c in line.chars() {
+        out.push(if c == '\n' || c == '\r' { c } else { ' ' });
+    }
+}
+
+/// Masque les spans inline d'une ligne hors bloc clôturé.
+///
+/// Un run de N backticks ouvre un span fermé par un run de **exactement** N
+/// backticks sur la même ligne. Sans fermeture, le run est littéral et le balayage
+/// reprend juste après lui — un backtick solitaire ne masque donc rien.
+fn mask_inline_spans(line: &str, out: &mut String, regions: &mut usize) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let open = i;
+        while i < chars.len() && chars[i] == '`' {
+            i += 1;
+        }
+        let width = i - open;
+
+        // Cherche le premier run de longueur exactement `width` après l'ouverture.
+        let mut j = i;
+        let mut close_end: Option<usize> = None;
+        while j < chars.len() {
+            if chars[j] != '`' {
+                j += 1;
+                continue;
+            }
+            let run_start = j;
+            while j < chars.len() && chars[j] == '`' {
+                j += 1;
+            }
+            if j - run_start == width {
+                close_end = Some(j);
+                break;
+            }
+        }
+
+        match close_end {
+            Some(end) => {
+                // Région : de l'ouverture à la fermeture incluse.
+                for _ in open..end {
+                    out.push(' ');
+                }
+                *regions += 1;
+                i = end;
+            }
+            None => {
+                // Run non apparié : littéral, et le balayage continue après lui.
+                for _ in open..i {
+                    out.push('`');
+                }
+            }
+        }
+    }
+}
+
+/// Ce qu'un seul passage de la regex apprend sur un texte (mika#3123).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaimScan {
+    /// Le mot-clé trouvé hors région de code : la déclaration.
+    hit: Option<String>,
+    /// Le mot-clé que le masquage a retenu, et le nombre de régions masquées.
+    /// `Some` seulement quand `hit` est `None` : le masquage a changé l'issue.
+    withheld: Option<(String, usize)>,
+}
+
+/// Lit le texte une seule fois et rend les deux informations dont la garde a
+/// besoin : le mot-clé déclaré hors code, et — quand le masquage a changé l'issue
+/// — le mot-clé retenu avec le nombre de régions masquées.
+///
+/// L'ordre interne est ce qui borne le coût :
+///
+/// 1. chemin rapide inchangé sur `to_lowercase()` — aucun mot-clé plausible ⇒
+///    `ClaimScan::default()`, sans masquage ni regex ;
+/// 2. `find` sur le texte **brut**. S'il ne matche pas, le masqué ne peut pas
+///    matcher non plus — masquer ne retire que des occurrences — donc on sort.
+///    C'est ce qui évite de masquer pour `relationship`, que le chemin rapide
+///    laisse passer sur son `contains("ship")` ;
+/// 3. `code_masked` puis `find` sur le masqué. Match ⇒ `hit`. Pas de match ⇒
+///    `withheld`, avec le mot du brut et le compte de régions.
+fn scan_completion_claim(text: &str) -> ClaimScan {
     // Fast path: skip regex if no likely substrings present.
     let lower = text.to_lowercase();
     if !lower.contains("merge")
@@ -11533,9 +11700,47 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
         && !lower.contains("complete")
         && !lower.contains("ship")
     {
-        return None;
+        return ClaimScan::default();
     }
-    COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
+
+    let raw = match COMPLETION_CLAIM_RE.find(text) {
+        Some(m) => m.as_str().to_string(),
+        // Pas de mot-clé sur le brut : le masqué, qui en a au plus autant, n'en
+        // aura pas davantage. Rien à masquer.
+        None => return ClaimScan::default(),
+    };
+
+    let (masked, regions) = code_masked(text);
+    match COMPLETION_CLAIM_RE.find(&masked) {
+        Some(m) => ClaimScan {
+            hit: Some(m.as_str().to_string()),
+            withheld: None,
+        },
+        None => ClaimScan {
+            hit: None,
+            withheld: Some((raw, regions)),
+        },
+    }
+}
+
+/// Detects whether assistant text contains a completion claim.
+///
+/// Returns the matched keyword for logging, or `None`. Depuis mika#3123 un
+/// mot-clé qui n'apparaît qu'à l'intérieur d'une région de code Markdown n'est
+/// plus une déclaration : c'est une citation, et ce prédicat rend `None`.
+///
+/// **`#[cfg(test)]` depuis mika#3123**, et c'est une propriété, pas une
+/// commodité : la garde a besoin des deux moitiés de `ClaimScan` — le mot
+/// déclaré *et* le mot retenu — donc elle appelle `scan_completion_claim`
+/// directement et ce raccourci n'a plus de lecteur en production. Le garder
+/// hors `cfg(test)` donnerait un second prédicat « y a-t-il une déclaration ? »
+/// qu'un futur site pourrait consulter en perdant la branche `withheld` et sa
+/// sonde, sans qu'aucune assertion ne rougisse (classe mika#2201). Ses ~15
+/// appelants sont le **contrôle positif** du vol : ce vol rétrécit un
+/// détecteur, donc une déclaration nue doit continuer d'être vue.
+#[cfg(test)]
+fn detect_completion_claim(text: &str) -> Option<String> {
+    scan_completion_claim(text).hit
 }
 
 /// Evaluate the completion-claim post-condition guard (#483, #771).
@@ -11550,10 +11755,13 @@ async fn evaluate_completion_claim(
     step: usize,
     mode: &LoopMode,
 ) -> GuardDecision {
-    let keyword = match detect_completion_claim(text) {
-        Some(kw) => kw.to_string(),
-        None => return GuardDecision::Pass,
-    };
+    // Entrée élargie à « déclaré OU retenu » (mika#3123). Le cas dominant — aucun
+    // mot-clé plausible — sort ici, exactement comme avant : le chemin rapide de
+    // `scan_completion_claim` n'a ni masqué ni lancé la regex.
+    let scan = scan_completion_claim(text);
+    if scan.hit.is_none() && scan.withheld.is_none() {
+        return GuardDecision::Pass;
+    }
 
     // Only enforce if the agent has the tool available.
     // Delegates and team agents legitimately lack update_task_status (they
@@ -11577,6 +11785,35 @@ async fn evaluate_completion_claim(
     if active_items.is_empty() {
         return GuardDecision::Pass;
     }
+
+    // Les deux portes sont franchies : sans mika#3123 ce tour partait en rejet.
+    // C'est ici, et seulement ici, que la distinction déclaration / citation
+    // décide de l'issue — d'où la place du `match`, après les portes et non avant,
+    // et d'où la place de la sonde : elle n'est émise que quand le rétrécissement
+    // a RÉELLEMENT changé l'issue du tour (précédent `guard.resume_scope_stood_down`,
+    // mika#3002). Une ligne par tour masqué, pas une par masquage, sinon le compte
+    // mesure les citations et non les rejets évités.
+    let keyword = match (scan.hit, scan.withheld) {
+        // Une déclaration hors région de code, même accompagnée de citations.
+        (Some(keyword), _) => keyword,
+        // Le mot-clé n'existe qu'à l'intérieur d'une région de code : une
+        // citation, pas une déclaration. `EndTurn` est honoré.
+        (None, Some((withheld, masked_regions))) => {
+            info!(
+                target: "mika::otel",
+                event = "guard.completion_claim_code_quoted",
+                keyword = withheld.as_str(),
+                masked_regions,
+                label = mode.label(),
+                step,
+                "Completion keyword appears only inside code regions — EndTurn allowed"
+            );
+            return GuardDecision::Pass;
+        }
+        // Inatteignable : la porte d'entrée sort déjà sur ce couple. Un `Pass` plutôt
+        // qu'un `unreachable!` — une garde d'hygiène de tâches ne vaut pas une panique.
+        (None, None) => return GuardDecision::Pass,
+    };
 
     warn!(
         step,
