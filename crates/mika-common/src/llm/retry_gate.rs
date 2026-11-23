@@ -512,6 +512,118 @@ mod tests {
         );
     }
 
+    // ── mika#3126: a cut at the plafond withdraws the concession ──────────
+
+    /// The mika#3126 incident, as a unit, at its real geometry.
+    ///
+    /// 2026-11-16, `300/660`: a transport-class failure with 290 s of margin.
+    /// Cut at the plafond, the concession is withdrawn and the default
+    /// threshold applies — `1.0 × 300 = 300 > 290`, refused, and the line says
+    /// `exhausted`.
+    ///
+    /// The positive control sits in the same test **at the same margin**: the
+    /// only variable between the two halves is the cut. Without it a predicate
+    /// refusing every 290 s margin would pass, and the probe would be asserting
+    /// the geometry rather than the fix.
+    #[test]
+    fn mika3126_une_coupure_au_plafond_perd_la_concession_de_relance_rapide() {
+        let budget = LlmTimeoutBudget::new(300, 660).expect("300 < 660");
+        let thresholds = RetryThresholds::from_budget(&budget);
+        let err = transport();
+        let margin = Some(Duration::from_secs(290));
+
+        let refused = next_attempt_verdict(0, 2, Some(&err), true, margin, &thresholds);
+        assert!(
+            matches!(
+                refused,
+                RetryVerdict::DeadlineInsufficient {
+                    threshold_secs: 300,
+                    ..
+                }
+            ),
+            "a cut at the plafond must be held to a whole call, got {refused:?}"
+        );
+        assert_eq!(attempt_outcome::outcome_for(&refused), "exhausted");
+
+        let allowed = next_attempt_verdict(0, 2, Some(&err), false, margin, &thresholds);
+        assert_eq!(
+            allowed,
+            RetryVerdict::Retry,
+            "the same transport failure NOT cut at the plafond keeps the \
+             mika#1744 concession (0.50 × 300 = 150 < 290)"
+        );
+    }
+
+    /// R1's other half: the withdrawal is a fallback onto the existing default
+    /// threshold, so a geometry whose envelope carries two whole calls does not
+    /// change behaviour.
+    ///
+    /// The fleet (`120/300`) and mika-arch (`240/900`) both still retry after a
+    /// guillotine. This is the probe that would go red if the fix had shipped a
+    /// third, larger threshold instead.
+    #[test]
+    fn mika3126_la_geometrie_de_la_flotte_relance_toujours_apres_une_coupure() {
+        let err = transport();
+
+        let fleet = next_attempt_verdict(
+            0,
+            2,
+            Some(&err),
+            true,
+            Some(Duration::from_secs(180)),
+            &fleet_thresholds(),
+        );
+        assert_eq!(
+            fleet,
+            RetryVerdict::Retry,
+            "120/300: the margin after one whole call is 180 > 120"
+        );
+
+        let arch_budget = LlmTimeoutBudget::new(240, 900).expect("240 < 900");
+        let arch = next_attempt_verdict(
+            0,
+            3,
+            Some(&err),
+            true,
+            Some(Duration::from_secs(660)),
+            &RetryThresholds::from_budget(&arch_budget),
+        );
+        assert_eq!(
+            arch,
+            RetryVerdict::Retry,
+            "240/900: the margin after one whole call is 660 > 240"
+        );
+    }
+
+    /// R2: the four combinations, read off the one site that decides them.
+    ///
+    /// `(transport, cut)` is the incident; `(transport, not cut)` is the
+    /// mika#1744 population the concession exists for; `(non-transport, cut)`
+    /// never had it; `(None, _)` is the unclassified failure, which is never
+    /// defaulted into it.
+    #[test]
+    fn mika3126_l_appartenance_a_la_concession_se_decide_en_un_site() {
+        let transport = transport();
+        let http = http(429, true);
+
+        assert!(
+            !transport_concession_applies(Some(&transport as &dyn RetryClass), true),
+            "a transport failure cut at its plafond has refuted the concession"
+        );
+        assert!(
+            transport_concession_applies(Some(&transport as &dyn RetryClass), false),
+            "a transport failure that was not cut keeps it"
+        );
+        assert!(
+            !transport_concession_applies(Some(&http as &dyn RetryClass), true),
+            "a non-transport failure never had it"
+        );
+        assert!(
+            !transport_concession_applies(None, false),
+            "an unclassified failure is not defaulted into it"
+        );
+    }
+
     // ── D5: no rail may recompute the threshold inline ────────────────────
 
     /// Does this source line write the non-transport threshold sum?
