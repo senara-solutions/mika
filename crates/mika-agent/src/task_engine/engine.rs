@@ -545,6 +545,29 @@ pub(crate) const PILOT_TRANSCRIPT_EXPECTED_KEY: &str = "pilot_transcript_expecte
 /// absence of proof.
 pub(crate) const DISPATCH_WORKTREE_FILE_KEY: &str = "dispatch_worktree_file";
 
+/// The worktree path this dispatch declared, or `None` when nothing
+/// readable declares one (mika#2249 terms 3–4, unchanged by mika#2277).
+///
+/// Free function rather than a method on [`TaskEngine`] since mika#3120: the
+/// reading of [`DISPATCH_WORKTREE_FILE_KEY`] is a property of the key, not of
+/// the engine instance, and a second reader now needs it —
+/// [`crate::live_pilot`], which holds no `TaskEngine`. Same body, same
+/// "absence is not evidence" contract: no stamp, an unreadable declaration
+/// file, or an empty one all answer `None`.
+pub(crate) fn declared_worktree(
+    metadata: Option<&serde_json::Value>,
+) -> Option<std::path::PathBuf> {
+    let declaration_file = metadata
+        .and_then(|v| v.get(DISPATCH_WORKTREE_FILE_KEY)?.as_str())
+        .map(std::path::PathBuf::from)?;
+    let declared = std::fs::read_to_string(&declaration_file).ok()?;
+    let trimmed = declared.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
 /// Task-metadata key stamped by the detector once it has reported a dispatch
 /// (mika#2040 AC7). Read back in SQL by
 /// [`crate::db::Database::find_dispatches_expecting_transcripts`] so a reported
@@ -3359,7 +3382,7 @@ impl TaskEngine {
 
             // Term 5: the declared worktree. Every failure below is "not a
             // candidate", never "stale".
-            let worktree = Self::declared_worktree(metadata.as_ref());
+            let worktree = declared_worktree(metadata.as_ref());
             let worktree_signal = LivenessSignal::from_age(
                 worktree
                     .as_deref()
@@ -3430,20 +3453,6 @@ impl TaskEngine {
             )
             .await;
         }
-    }
-
-    /// The worktree path this dispatch declared, or `None` when nothing
-    /// readable declares one (mika#2249 terms 3–4, unchanged by mika#2277).
-    fn declared_worktree(metadata: Option<&serde_json::Value>) -> Option<std::path::PathBuf> {
-        let declaration_file = metadata
-            .and_then(|v| v.get(DISPATCH_WORKTREE_FILE_KEY)?.as_str())
-            .map(std::path::PathBuf::from)?;
-        let declared = std::fs::read_to_string(&declaration_file).ok()?;
-        let trimmed = declared.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(std::path::PathBuf::from(trimmed))
     }
 
     /// Term 3 — the pilot transcript's activity (mika#2277).

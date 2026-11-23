@@ -212,6 +212,37 @@ async fn guard_skips_on_no_keywords() {
     assert_exact_steps(&trace, 1);
 }
 
+/// Guard does NOT fire when the keyword appears only inside a Markdown code
+/// region (mika#3123).
+///
+/// The founding defect, end to end: `COMPLETION_CLAIM_RE` is `\b`-anchored and a
+/// backtick is not a word character, so `` `completed` `` matched exactly like a
+/// bare `completed`. Every gate the guard has is deliberately open here — the
+/// tool is registered, it was not called, and an active task exists — so before
+/// the fix this turn was rejected and re-prompted, and the rejected text was
+/// discarded. One step is the whole assertion: the turn is honoured.
+#[tokio::test]
+async fn guard_skips_on_code_quoted_state_name() {
+    let harness = EvalHarness::builder()
+        .responses(vec![text_response(
+            "The column flips to `completed` once the work lands. Nothing has run yet.",
+        )])
+        .tools(tools_with_update_task_status())
+        .build()
+        .await
+        .unwrap();
+
+    seed_task(&harness, "Explain the schema").await;
+
+    let trace = harness.run("What does that column hold?").await.unwrap();
+
+    assert_has_output(&trace);
+    assert_output_contains(&trace, "column");
+    // One step: no re-prompt. Two would mean the quoted state name was still
+    // read as a declaration.
+    assert_exact_steps(&trace, 1);
+}
+
 /// Guard fires only once — if the retry also fabricates, it passes through.
 #[tokio::test]
 async fn guard_fires_once_only() {

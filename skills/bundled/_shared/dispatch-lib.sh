@@ -13720,10 +13720,171 @@ _detect_plan_on_branch() {
         # un plan à mesurer.
         _PLAN_SIZE_PLAN_PATH="$PLAN_PATH"
         _PLAN_SIZE_TOTAL=$(_plan_size_total_loc "$WORKTREE_DIR/$PLAN_PATH")
+        # mika#3121 (R1/D1) — LE PLAN SERVI EST UN FAIT PUBLIÉ PAR SON PRODUCTEUR.
+        # Ce site est le seul qui DÉCIDE quel plan un pilote exécute ; il publie
+        # donc ce chemin, au lieu de laisser un lecteur en aval le reconstruire.
+        # Globale par le même précédent exact que ses deux voisines ci-dessus
+        # (`PLAN_PATH` est `local` ici). Vide = « aucun plan n'est servi », qui
+        # est le cas nominal de `dev-groom` et du repli `/mika`.
+        #
+        # Ce n'est PAS une lecture de `_PLAN_SIZE_PLAN_PATH`, bien que les deux
+        # vaillent la même chaîne : ce voisin est le discriminant d'émission de
+        # la LIGNE DE TAILLE, lue après le vol, tandis que celle-ci est le
+        # discriminant d'une PORTE (`_confront_launch_plan`), lue avant. Les
+        # fusionner ferait du désarmement de la porte un effet de bord de
+        # l'édition de l'estimation.
+        _LAUNCHED_PLAN_PATH="$PLAN_PATH"
         echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
     fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _confront_launch_plan — le plan lancé vs ce qu'`origin` porte (mika#3121)
+#
+# `_detect_plan_on_branch` ci-dessus décide quel plan un pilote exécute sur la
+# seule condition `-f "$WORKTREE_DIR/$PLAN_PATH"`. Cette condition mesure
+# l'existence d'un fichier dans un worktree ; elle ne mesure RIEN de ce
+# qu'`origin` porte. Deux incidents sont passés par ce trou, et ce ne sont pas
+# la même confrontation manquante :
+#
+#   * 17/11 (mika#1727 V3c-2b) — le pilote est parti sur le plan rev 2 NON
+#     COMMITTÉ du worktree, hérité de la boucle de révision ; `origin` portait
+#     le plan de HALTE. Confrontation A : le plan lancé vs le plan poussé.
+#   * 09/11 (mika#1727 après V2b-1b) — le callout nommait le plan d'une tranche
+#     DÉJÀ LIVRÉE, fondue dans `main`, et le pilote est parti dessus sur la
+#     branche d'une tranche neuve. Confrontation B : le plan lancé vs la
+#     tranche de la branche nommée.
+#
+# TROIS MESURES, et c'est tout ce que cette fonction écrit de neuf — le motif
+# `fetch refs/heads/<b>:refs/<ns>/<b>` puis `rev-parse <ref>:<path>` tourne déjà
+# en production dans `_committed_plan_on_branch` (:5020) et la comparaison
+# branche-vs-main dans `_plan_provenance` (:4949).
+#
+#   W  — le contenu SERVI : `hash-object` du fichier du worktree.
+#   Bb — ce que la BRANCHE NOMMÉE porte sur `origin`, au même chemin.
+#   Bm — ce qu'`origin/main` porte au même chemin.
+#
+# UN ESPACE DE REFS DÉDIÉ, `refs/dispatch-launch/<branch>`, et non celui de la
+# porte de grooming : un dispatch `groom` et un dispatch `implement` tournent en
+# parallèle sur un même agent depuis mika#1001, donc partager la ref rendrait la
+# mesure de l'un attribuable à l'autre. Deux espaces, deux populations. Le
+# `--force` est requis — la ref est réécrite à chaque vol.
+#
+# POURQUOI `_plan_provenance` NE PEUT PAS SERVIR ICI, bien qu'elle mesure déjà
+# le discriminant de B : son doc-comment déclare « Describes, never decides.
+# Deliberately NOT a gate condition », et ce refus est JUSTE pour la porte de
+# grooming qu'elle sert (y bloquer sur l'héritage re-échouerait les tickets,
+# KTD1). Le discriminant existait ; aucun site ne l'appliquait à la porte de
+# LANCEMENT.
+#
+# LE REFUS EST UNE HALTE, JAMAIS UN `auto_skipped`. Un `auto_skipped` résout la
+# parente en `completed` parce que là-bas le refus EST un résultat correct — le
+# ticket est groomé. Ici le ticket n'est PAS implémenté, et le marquer
+# `completed` le retirerait du compte des vraies pannes. D'où la bannière de
+# halte déjà en service (`_branch_reuse_gate`, la porte de rebase), lue par
+# `parse_dispatch_halt_status`, qui rend la parente `failed`.
+#
+# Rend 0 quand le vol peut partir, non-zéro sinon avec `RESULT` posé. L'appelant
+# fait `exit 1` — voir le site d'appel.
+_confront_launch_plan() {
+    # Un seul point d'étranglement, et il est MUET quand la question n'a pas de
+    # sens. La globale posée par son producteur couvre d'un seul terme
+    # `dev-groom` (qui ne sert aucun plan), le repli `/mika` (callout illisible
+    # ou fichier absent du worktree) et le dispatch de révision. Pas de test sur
+    # `$SKILL` : la question est « un plan est-il servi ? », et la globale EST
+    # cette réponse.
+    [ -n "${_LAUNCHED_PLAN_PATH:-}" ] || return 0
+
+    local plan="$_LAUNCHED_PLAN_PATH"
+    local branch="${BRANCH:-}" repo="${REPO:-}" ticket="${ISSUE_NUM:-}"
+    local launch_ref="refs/dispatch-launch/${branch}"
+    local w="" bb="" bm="" heads="" verdict="" remedy=""
+    local ls_rc=0 fetch_rc=0
+
+    # Le fetch tourne dans `$WORKTREE_DIR` : le worktree partage le `common-dir`
+    # du sous-dépôt (`git worktree add` depuis `$SUB_REPO_DIR`), donc la ref
+    # écrite y est visible et `origin/main` y est déjà résolu par
+    # `_set_up_worktree`. Aucune seconde racine à passer.
+    w=$(git -C "$WORKTREE_DIR" hash-object "$plan" 2>/dev/null)
+
+    # « Je n'ai pas pu regarder » n'est pas « tout va bien » : une branche
+    # ABSENTE d'`origin` est une mesure, une forge INJOIGNABLE n'en est pas une,
+    # et c'est le code de sortie de `ls-remote` qui les sépare. Sans cette
+    # séparation les deux populations ne seraient pas soustrayables (mika#2205),
+    # et le taux de refus ne se lirait plus.
+    heads=$(git -C "$WORKTREE_DIR" ls-remote --heads origin "$branch" 2>/dev/null) || ls_rc=$?
+
+    if [ "$ls_rc" -eq 0 ] && [ -n "$heads" ]; then
+        git -C "$WORKTREE_DIR" fetch --quiet --force origin \
+            "refs/heads/${branch}:${launch_ref}" 2>/dev/null || fetch_rc=$?
+        if [ "$fetch_rc" -eq 0 ]; then
+            bb=$(git -C "$WORKTREE_DIR" rev-parse --quiet --verify "${launch_ref}:${plan}" 2>/dev/null)
+            bm=$(git -C "$WORKTREE_DIR" rev-parse --quiet --verify "origin/main:${plan}" 2>/dev/null)
+        fi
+    fi
+
+    # --- La table des issues, et l'ordre dans lequel elle est évaluée --------
+    #
+    # L'ordre importe, parce que deux conditions peuvent être vraies ensemble.
+    # Le nom de l'issue ET sa route de retour sont posés dans la MÊME branche :
+    # un refus sans remède se fait désarmer, et chaque nom n'apparaît ainsi
+    # qu'une fois dans le corps — ce que la cardinalité du test épingle.
+    if [ "$ls_rc" -ne 0 ] || [ "$fetch_rc" -ne 0 ] || [ -z "$w" ]; then
+        # PREMIER, parce que toute mesure en aval serait un vide interprété
+        # comme une absence. Un `w` vide y est rangé pour la même raison : le
+        # fichier a été validé présent par le producteur, donc ne pas pouvoir le
+        # hacher est une non-mesure, pas une divergence.
+        verdict="launch_plan_unmeasured"
+        remedy="Return route: nothing to fix in the repository — re-dispatch ${repo}#${ticket} when the forge answers."
+    elif [ -z "$heads" ] || [ -z "$bb" ]; then
+        # `ls-remote` a répondu et ne rend rien (la branche n'est pas sur
+        # `origin`), ou la branche y est et le chemin n'est pas dans son arbre.
+        verdict="launch_plan_absent_on_origin"
+        remedy="Return route: re-groom (re-apply the \`ready\` label) so the body callout names a plan that origin carries on ${branch}, then re-dispatch ${repo}#${ticket}."
+    elif [ "$w" != "$bb" ]; then
+        # CONFRONTATION A — la forme du 17/11.
+        verdict="launch_plan_not_pushed"
+        remedy="Return route: the plan that was judged is not the one origin carries — commit and push ${plan} on ${branch}, then re-dispatch ${repo}#${ticket}."
+    elif [ "$bb" = "$bm" ]; then
+        # CONFRONTATION B — la forme du 09/11 : `W == Bb == Bm`, donc le plan
+        # servi n'est pas une production de cette branche, il est hérité de
+        # `main`. Équivalent mesurable : `git log origin/main..<branch> --
+        # <plan>` est vide. Le faux positif à l'esprit — « plan fondu dans
+        # `main` par une PR Refs, ticket re-dispatché sur une branche neuve » —
+        # n'est pas une exception à excepter : le callout y pointe un plan
+        # LIVRÉ, donc le refus est le bon comportement, et c'est exactement
+        # l'incident du 09/11.
+        verdict="launch_plan_inherited_from_main"
+        remedy="Return route: the body callout names a plan already merged into main — re-groom (re-apply the \`ready\` label), which rewrites the callout, then re-dispatch ${repo}#${ticket}."
+    else
+        verdict="nominal"
+    fi
+
+    # LE RELEVÉ A UN DÉNOMINATEUR. Émise sur TOUTES les branches, `nominal`
+    # comprise : sans elle, « aucun vol n'a été refusé » et « la garde ne tourne
+    # pas » rendent les mêmes octets (mika#2293 / mika#3050 / mika#2205). Son
+    # ABSENCE signifie un binaire antérieur à ce vol (mika#2340) — rien de
+    # `skills/bundled/` n'est lu au runtime, donc l'instrument n'est pas vivant
+    # avant `make deploy` — jamais une absence de divergence.
+    echo "[dispatch-lib] launch_plan_gate: repo=${repo} ticket=${ticket} branch=${branch} plan=${plan} verdict=${verdict} w=${w:-none} bb=${bb:-none} bm=${bm:-none}" >&2
+
+    [ "$verdict" = "nominal" ] && return 0
+
+    # `STATUS=LAUNCH_PLAN_DIVERGED` SEULE sur la première ligne : c'est là que
+    # `parse_dispatch_halt_status` la lit, par égalité et non par `contains`.
+    # Le trap `EXIT` n'emballe en `HANDLER CRASH` que quand `RESULT` est vide ;
+    # avec `RESULT` posé, la bannière remonte verbatim.
+    RESULT="STATUS=LAUNCH_PLAN_DIVERGED
+The plan this dispatch would have executed is not what origin carries on the named branch (${verdict}).
+plan=${plan} branch=${branch}
+W  (served, from the worktree)   = ${w:-unmeasured}
+Bb (origin/${branch} at that path) = ${bb:-absent}
+Bm (origin/main at that path)    = ${bm:-absent}
+${remedy}
+Nothing was committed, nothing was pushed, and no pilot turn was consumed."
+    return 1
 }
 
 # =============================================================================
@@ -14047,6 +14208,13 @@ dispatch_claude_pilot() {
     # ferme, réintroduit par le haut.
     GROOM_CALLOUT_PLAN=""
 
+    # mika#3121 (D1) — le plan servi par CE dispatch, remis à vide ici pour la
+    # même raison exactement : la porte `_confront_launch_plan` lit la globale
+    # comme la réponse à « un plan est-il servi ? ». Une valeur héritée de
+    # l'environnement d'un dispatch antérieur ferait confronter le plan d'un
+    # AUTRE vol — ou armerait la porte sur un `dev-groom` qui ne sert rien.
+    _LAUNCHED_PLAN_PATH=""
+
     # The claude-pilot venv smoke test (mika#1200) used to sit HERE, and that
     # placement is the whole of mika#2634. It now runs AFTER the EXIT trap is
     # armed — see `_launcher_smoke_test` below, called a few lines down.
@@ -14287,6 +14455,18 @@ Outcome: LAUNCHER_DEAD"
     _set_up_worktree
     _detect_plan_on_branch
     _handle_dry_run
+    # mika#3121 (D6) — la porte de lancement, ENTRE le dry-run et le pilote, et
+    # aucune autre position n'achète les deux propriétés : `_handle_dry_run`
+    # RETIRE le worktree puis `exit 0`, donc être APRÈS lui dispense la porte de
+    # connaître la sémantique du dry-run et lui évite de refuser un dispatch qui
+    # n'allait jamais partir ; être AVANT `_run_claude_pilot` est ce qui fait de
+    # l'arrêt un pré-vol — aucun tour de pilote n'est consommé.
+    #
+    # `exit 1` et non `return 1`, comme `_branch_reuse_gate` et la porte de
+    # rebase : `RESULT` est posé, et c'est la sortie du processus qui le fait
+    # remonter au callback. Le siège de ticket réclamé par `_set_up_worktree`
+    # (mika#2155) est rendu par le trap `EXIT`, qui tourne aussi sur `exit 1`.
+    _confront_launch_plan || exit 1
     _run_claude_pilot "$ENTRY_COMMAND"
 
     # mika#1318 — pilot push guard (defense-in-depth). Called unconditionally;
