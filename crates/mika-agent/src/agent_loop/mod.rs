@@ -11668,11 +11668,31 @@ fn mask_inline_spans(line: &str, out: &mut String, regions: &mut usize) {
     }
 }
 
-/// Detects whether assistant text contains a completion claim.
+/// Ce qu'un seul passage de la regex apprend sur un texte (mika#3123).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaimScan {
+    /// Le mot-clé trouvé hors région de code : la déclaration.
+    hit: Option<String>,
+    /// Le mot-clé que le masquage a retenu, et le nombre de régions masquées.
+    /// `Some` seulement quand `hit` est `None` : le masquage a changé l'issue.
+    withheld: Option<(String, usize)>,
+}
+
+/// Lit le texte une seule fois et rend les deux informations dont la garde a
+/// besoin : le mot-clé déclaré hors code, et — quand le masquage a changé l'issue
+/// — le mot-clé retenu avec le nombre de régions masquées.
 ///
-/// Returns the matched keyword for logging, or `None`. Uses a fast-path
-/// substring check before running the regex (same pattern as `strip_internal_tags`).
-fn detect_completion_claim(text: &str) -> Option<&str> {
+/// L'ordre interne est ce qui borne le coût :
+///
+/// 1. chemin rapide inchangé sur `to_lowercase()` — aucun mot-clé plausible ⇒
+///    `ClaimScan::default()`, sans masquage ni regex ;
+/// 2. `find` sur le texte **brut**. S'il ne matche pas, le masqué ne peut pas
+///    matcher non plus — masquer ne retire que des occurrences — donc on sort.
+///    C'est ce qui évite de masquer pour `relationship`, que le chemin rapide
+///    laisse passer sur son `contains("ship")` ;
+/// 3. `code_masked` puis `find` sur le masqué. Match ⇒ `hit`. Pas de match ⇒
+///    `withheld`, avec le mot du brut et le compte de régions.
+fn scan_completion_claim(text: &str) -> ClaimScan {
     // Fast path: skip regex if no likely substrings present.
     let lower = text.to_lowercase();
     if !lower.contains("merge")
@@ -11680,9 +11700,36 @@ fn detect_completion_claim(text: &str) -> Option<&str> {
         && !lower.contains("complete")
         && !lower.contains("ship")
     {
-        return None;
+        return ClaimScan::default();
     }
-    COMPLETION_CLAIM_RE.find(text).map(|m| m.as_str())
+
+    let raw = match COMPLETION_CLAIM_RE.find(text) {
+        Some(m) => m.as_str().to_string(),
+        // Pas de mot-clé sur le brut : le masqué, qui en a au plus autant, n'en
+        // aura pas davantage. Rien à masquer.
+        None => return ClaimScan::default(),
+    };
+
+    let (masked, regions) = code_masked(text);
+    match COMPLETION_CLAIM_RE.find(&masked) {
+        Some(m) => ClaimScan {
+            hit: Some(m.as_str().to_string()),
+            withheld: None,
+        },
+        None => ClaimScan {
+            hit: None,
+            withheld: Some((raw, regions)),
+        },
+    }
+}
+
+/// Detects whether assistant text contains a completion claim.
+///
+/// Returns the matched keyword for logging, or `None`. Depuis mika#3123 un
+/// mot-clé qui n'apparaît qu'à l'intérieur d'une région de code Markdown n'est
+/// plus une déclaration : c'est une citation, et ce prédicat rend `None`.
+fn detect_completion_claim(text: &str) -> Option<String> {
+    scan_completion_claim(text).hit
 }
 
 /// Evaluate the completion-claim post-condition guard (#483, #771).
@@ -11698,7 +11745,7 @@ async fn evaluate_completion_claim(
     mode: &LoopMode,
 ) -> GuardDecision {
     let keyword = match detect_completion_claim(text) {
-        Some(kw) => kw.to_string(),
+        Some(kw) => kw,
         None => return GuardDecision::Pass,
     };
 

@@ -146,24 +146,33 @@ fn test_detect_prose_tool_call_underscores_and_digits() {
 }
 
 // -- detect_completion_claim tests (#483) --
+//
+// Ces assertions sont le contrôle positif de mika#3123 : le masquage des régions
+// de code RÉTRÉCIT le détecteur, donc toute déclaration nue doit continuer d'être
+// vue. Leur rougissement signale un désarmement de la garde. Le prédicat rend une
+// `String` depuis mika#3123 — le texte masqué étant une valeur locale — d'où le
+// `.as_deref()` : la propriété observée est inchangée.
 
 #[test]
 fn test_detect_completion_claim_merged() {
     assert_eq!(
-        detect_completion_claim("PR merged successfully"),
+        detect_completion_claim("PR merged successfully").as_deref(),
         Some("merged")
     );
 }
 
 #[test]
 fn test_detect_completion_claim_completed() {
-    assert_eq!(detect_completion_claim("Task completed"), Some("completed"));
+    assert_eq!(
+        detect_completion_claim("Task completed").as_deref(),
+        Some("completed")
+    );
 }
 
 #[test]
 fn test_detect_completion_claim_complete() {
     assert_eq!(
-        detect_completion_claim("The migration is complete"),
+        detect_completion_claim("The migration is complete").as_deref(),
         Some("complete")
     );
 }
@@ -171,7 +180,7 @@ fn test_detect_completion_claim_complete() {
 #[test]
 fn test_detect_completion_claim_deployed() {
     assert_eq!(
-        detect_completion_claim("Successfully deployed to production"),
+        detect_completion_claim("Successfully deployed to production").as_deref(),
         Some("deployed")
     );
 }
@@ -179,16 +188,19 @@ fn test_detect_completion_claim_deployed() {
 #[test]
 fn test_detect_completion_claim_shipped() {
     assert_eq!(
-        detect_completion_claim("Feature shipped in v2.1"),
+        detect_completion_claim("Feature shipped in v2.1").as_deref(),
         Some("shipped")
     );
 }
 
 #[test]
 fn test_detect_completion_claim_case_insensitive() {
-    assert_eq!(detect_completion_claim("MERGED the PR"), Some("MERGED"));
     assert_eq!(
-        detect_completion_claim("Successfully Deployed"),
+        detect_completion_claim("MERGED the PR").as_deref(),
+        Some("MERGED")
+    );
+    assert_eq!(
+        detect_completion_claim("Successfully Deployed").as_deref(),
         Some("Deployed")
     );
 }
@@ -239,9 +251,48 @@ fn test_detect_completion_claim_word_boundary_redeployed() {
 #[test]
 fn test_detect_completion_claim_in_sentence() {
     assert_eq!(
-        detect_completion_claim("I've merged the PR and synced main. Everything looks good."),
+        detect_completion_claim("I've merged the PR and synced main. Everything looks good.")
+            .as_deref(),
         Some("merged")
     );
+}
+
+// -- scan_completion_claim : ce que le scan coûte, et ce qu'il rend (mika#3123) --
+
+#[test]
+fn mika3123_un_texte_sans_mot_clef_sort_par_le_chemin_rapide() {
+    assert_eq!(
+        scan_completion_claim("Here is the analysis result"),
+        ClaimScan::default()
+    );
+}
+
+#[test]
+fn mika3123_relationship_seul_ne_declenche_aucun_masquage() {
+    // `relationship` passe le chemin rapide sur son `contains("ship")`, mais le
+    // test sur le texte BRUT sort avant `code_masked`. La propriété observable est
+    // que `withheld` reste `None` : si le masquage avait eu lieu, il aurait compté
+    // la région que ce texte porte, et le scan l'aurait rendue.
+    let text = "La `relationship` entre les deux tables est bidirectionnelle.";
+    assert!(
+        text.contains('`'),
+        "le texte doit porter une région de code"
+    );
+    assert_eq!(scan_completion_claim(text), ClaimScan::default());
+}
+
+#[test]
+fn mika3123_un_mot_clef_cite_sort_en_withheld_avec_son_compte_de_regions() {
+    let scan = scan_completion_claim("Le statut passe à `completed`.");
+    assert_eq!(scan.hit, None);
+    assert_eq!(scan.withheld, Some(("completed".to_string(), 1)));
+}
+
+#[test]
+fn mika3123_une_declaration_nue_sort_en_hit_sans_withheld() {
+    let scan = scan_completion_claim("J'ai mis `completed` dans la colonne, et le PR est merged.");
+    assert_eq!(scan.hit.as_deref(), Some("merged"));
+    assert_eq!(scan.withheld, None);
 }
 
 // -- code_masked : table de vérité du masquage des régions de code (mika#3123) --
