@@ -158,7 +158,7 @@ url = "2"
 # NE PAS poser `default-features = false` : ça retire `use_pem`, donc
 # `EncodingKey::from_rsa_pem`, appelé à trois sites de PRODUCTION
 # (github_app.rs:95, :131, mika-cli/src/commands/doctor.rs:536).
-jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12", features = ["aws_lc_rs"] }
 
 # Process management (Linux)
 libc = "0.2"
