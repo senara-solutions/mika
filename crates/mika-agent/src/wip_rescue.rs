@@ -119,6 +119,7 @@ use crate::perimeter::{self, Classification};
 use crate::tools::pr_merge_with_gate::run_gh_subprocess;
 use mika_common::label_write::LabelWriteToken;
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -863,6 +864,101 @@ async fn notify_if_bailed(
             "recovery_runbook_notified"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Le recensement des pilotes vivants (mika#3120)
+// ---------------------------------------------------------------------------
+
+/// Les branches sur lesquelles un pilote de dispatch écrit en ce moment, ou
+/// `None` quand le recensement n'a pas pu être lu (mika#3120).
+///
+/// # Pourquoi `None` abandonne le tick
+///
+/// Le défaut que ce chemin ferme : un brouillon `wip-rescue` sortait du
+/// brouillon sans qu'on demande si quelqu'un écrivait encore dessus. Un
+/// recensement illisible ne permet pas de poser la question — et *un signal
+/// qu'on ne peut pas lire n'est jamais un terme satisfait*. Rendre un ensemble
+/// vide serait affirmer « personne n'écrit » sur la foi d'une erreur de
+/// lecture, c'est-à-dire reproduire l'incident exactement les jours où la base
+/// est en difficulté. L'unique appelant en fait donc un `let … else` qui rend
+/// la main : aucune reprise ce tick, une ligne WARN nommée, et le tick suivant
+/// réessaie trente secondes plus tard.
+///
+/// L'asymétrie est dirigée : ceci est le recensement **global**, dont l'échec
+/// coûte un tick. L'échec d'un **candidat** (worktree disparu, `git` en échec,
+/// `HEAD` détaché) n'exclut rien et ne coûte rien — il est compté par la sonde.
+async fn live_pilot_branches(db: &AsyncDatabase, trace_id: &str) -> Option<BTreeSet<String>> {
+    match crate::live_pilot::live_pilot_worktrees(db).await {
+        Ok(census) => Some(live_pilot_branches_of(census, trace_id).await),
+        Err(e) => {
+            warn!(
+                event = "wip_rescue_live_pilot_unreadable",
+                error = %e,
+                trace_id,
+                "wip_rescue: le recensement des pilotes vivants est illisible — \
+                 aucune reprise sur ce tick"
+            );
+            None
+        }
+    }
+}
+
+/// L'attribution worktree → branche, et la sonde de recensement du tick.
+///
+/// La question « quel processus est vivant ? » appartient à
+/// [`crate::live_pilot`] et y reste ; celle-ci — « quelle branche ce worktree
+/// a-t-il en tête ? » — est un `git rev-parse` borné en temps, et elle vit ici
+/// parce que c'est ici qu'on possède déjà [`git`] et son budget.
+///
+/// # La sonde est émise même quand elle ne trouve rien
+///
+/// Sa cible nominale **est** zéro : la plupart des ticks n'ont aucun pilote en
+/// vol. Sans la branche saine, « aucun pilote vivant » et « la sonde n'a jamais
+/// tourné » rendent zéro tous les deux (mika#2205). Les quatre champs sont
+/// quatre populations distinctes et ne sont **jamais sommés** : `live_pilots`
+/// (pilotes vivants recensés), `branches` (branches attribuées, donc
+/// exclusives), `undeclared` (pilote vivant sans worktree déclaré lisible),
+/// `unresolved` (worktree déclaré dont la branche n'est pas lisible). Et
+/// l'absence de la ligne elle-même ne dit pas « pas de pilote » mais « binaire
+/// antérieur au vol » (mika#2340) : l'instrument n'est pas vivant avant
+/// `make deploy`.
+async fn live_pilot_branches_of(
+    census: crate::live_pilot::LiveWorktrees,
+    trace_id: &str,
+) -> BTreeSet<String> {
+    let mut branches = BTreeSet::new();
+    let mut unresolved = 0usize;
+
+    for worktree in &census.worktrees {
+        match git(
+            worktree,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            GIT_TIMEOUT,
+        )
+        .await
+        {
+            // `HEAD` est ce que `--abbrev-ref` rend sur une tête détachée : il
+            // ne nomme aucune branche, et l'ajouter à l'ensemble ferait
+            // correspondre un `head_ref` littéralement nommé `HEAD`.
+            Ok(out) if !out.trim().is_empty() && out.trim() != "HEAD" => {
+                branches.insert(out.trim().to_string());
+            }
+            _ => unresolved += 1,
+        }
+    }
+
+    info!(
+        event = "wip_rescue_live_pilot_census",
+        live_pilots = census.live_pilots(),
+        branches = branches.len(),
+        undeclared = census.undeclared,
+        unresolved,
+        trace_id,
+        "wip_rescue: recensement des pilotes vivants"
+    );
+
+    branches
 }
 
 /// Scan open `wip-rescue` draft PRs and resume the oldest eligible one.
@@ -3992,5 +4088,108 @@ mod tests {
             Err(anyhow::anyhow!("chat_id resolution failed")),
             p0
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // mika#3120 — un brouillon sur lequel un pilote écrit encore ne sort pas
+    // du brouillon.
+    // -----------------------------------------------------------------------
+
+    /// Les lignes de journal qu'émet `f`, capturées par le site d'installation
+    /// unique du crate (mika#2646). Même motif que [`journal_de`], pour les
+    /// sondes de recensement.
+    async fn journal_du_recensement<F, Fut, T>(f: F) -> (T, String)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        let tampon = TamponPartage::default();
+        let souscripteur = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(tampon.clone())
+                .with_ansi(false)
+                .without_time(),
+        );
+        let rendu = {
+            let _garde =
+                crate::test_utils::test_helpers::install_capturing_subscriber(souscripteur);
+            f().await
+        };
+        let octets = tampon.inner.lock().unwrap().clone();
+        (rendu, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    /// La sonde de recensement est émise **sur la branche à zéro pilote**, et
+    /// l'assertion porte sur la ligne, pas sur son absence.
+    ///
+    /// C'est la branche nominale : la plupart des ticks n'ont aucun pilote en
+    /// vol. Sans cette ligne, « aucun pilote vivant » et « la sonde n'a jamais
+    /// tourné » rendent zéro tous les deux et l'opérateur ne peut pas les
+    /// séparer (mika#2205). Les quatre champs sont vérifiés un par un parce
+    /// qu'ils comptent quatre populations distinctes : les sommer en un seul
+    /// nombre est précisément la lecture que la sonde interdit.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3120_la_sonde_de_recensement_est_emise_a_zero_pilote() {
+        let (branches, journal) = journal_du_recensement(|| {
+            live_pilot_branches_of(crate::live_pilot::LiveWorktrees::default(), TRACE)
+        })
+        .await;
+
+        assert!(branches.is_empty(), "aucun pilote vivant, aucune branche");
+        assert!(
+            journal.contains("wip_rescue_live_pilot_census"),
+            "la sonde doit être émise même à zéro pilote ; journal : {journal:?}"
+        );
+        for champ in [
+            "live_pilots=0",
+            "branches=0",
+            "undeclared=0",
+            "unresolved=0",
+        ] {
+            assert!(
+                journal.contains(champ),
+                "la sonde doit porter `{champ}` comme champ distinct ; \
+                 journal : {journal:?}"
+            );
+        }
+    }
+
+    /// Un recensement illisible abandonne le tick, et le dit.
+    ///
+    /// Une base fermée est la façon la moins coûteuse de faire échouer la
+    /// lecture pour de vrai plutôt que de simuler l'échec — le motif que
+    /// `an_unreadable_audit_trail_excludes_the_draft` emploie déjà plus haut.
+    /// Les deux assertions de journal sont le couple qui compte : la ligne WARN
+    /// est présente, **et** la sonde de recensement est absente — un ensemble
+    /// vide rapporté comme un recensement sain serait l'affirmation « personne
+    /// n'écrit » tirée d'une erreur de lecture.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3120_un_recensement_illisible_abandonne_le_tick() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        db.shutdown();
+
+        let (verdict, journal) = journal_du_recensement(|| live_pilot_branches(&db, TRACE)).await;
+
+        assert!(
+            verdict.is_none(),
+            "un recensement illisible doit rendre `None` — c'est ce `None` que \
+             l'appelant lit comme « aucune reprise ce tick »"
+        );
+        assert!(
+            journal.contains("wip_rescue_live_pilot_unreadable"),
+            "le tick abandonné doit être nommé ; journal : {journal:?}"
+        );
+        assert!(
+            journal.contains("WARN"),
+            "l'abandon du tick est un WARN, pas un DEBUG ; journal : {journal:?}"
+        );
+        assert!(
+            !journal.contains("wip_rescue_live_pilot_census"),
+            "une erreur de lecture ne doit pas rendre un recensement sain ; \
+             journal : {journal:?}"
+        );
     }
 }
