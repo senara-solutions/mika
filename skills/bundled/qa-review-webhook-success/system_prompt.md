@@ -27,12 +27,13 @@ You've received a GitHub webhook event for `check_suite.completed` with `conclus
    ```
    qa_head_reviews(repo: "<owner/repo>", pr: <n>, head_sha: "<the check_suite's head SHA>")
    ```
-   It returns one object. Its `reviews` field carries the reviews of this head **that could have seen it** — a review qualifies only when its `commit_id` is exactly this head *and* it was submitted at or after `head_first_seen_at`, and the tool applies both halves itself. An empty `reviews` means no review has ever ruled on this head, and that is an answer, not a failure. **Keep that object:** steps 3 and 4 both read its `reviews` field, and nothing else answers either question. If an entry is authored by you (`mika-platform-qa`), skip — you already ruled on this SHA. Prevents duplicate reviews on repeated check_suite events.
+   It returns one object. Its `reviews` field carries the reviews of this head **that could have seen it** — a review qualifies only when its `commit_id` is exactly this head *and* it was submitted at or after `head_first_seen_at`, and the tool applies both halves itself. An empty `reviews` means no review has ever ruled on this head, and that is an answer, not a failure. The object's **first** field, `head_evidence`, states that same fact in one word — `head_was_ruled_on` or `head_never_ruled_on` — and it is the field the engine itself reads (§ *Record the head you concluded on*). **Keep that object:** steps 3 and 4 both read its `reviews` field, and nothing else answers either question. If an entry is authored by you (`mika-platform-qa`), skip — you already ruled on this SHA. Prevents duplicate reviews on repeated check_suite events.
 
 4. **Skip if verdict is already recorded.** In the `reviews` field of the **object already in hand**, if an entry has `carries_verdict_line: true` — its body carries `VERDICT: pass` or `VERDICT: block[*]` — then an authoritative verdict is recorded on this head: skip. The verdict handler will drive merge or block state.
 
    - **Never judge this step on `mergeStateStatus`, on an approval count, nor on any other PR-level state: they survive a force-push.** An approval earned by an older head stays on the PR after a rebase, and reading it is how three freshly-pushed heads were declared already ruled on — 9 to 17 minutes before the first verdict on each (2026-10-27, mika#2934). A review's `commit_id` **alone** does not name the head it ruled on either: a force-push can rewrite it, and on #2920 a review submitted at 07:16:49Z came back carrying a `commit_id` created five hours later (mika#2939). What names the head a review ruled on is `commit_id` **plus** a submission not predating the arrival of that head — and `qa_head_reviews` is the only read that applies both.
    - **`dropped_predating_head` is an instrument, never a reason to skip.** It counts the reviews the tool refused because they predate this head. A non-zero count is the force-push case (mika#2939): it means the evidence is *absent*, so you do **not** skip — you review.
+   - **`head_never_ruled_on` forbids BOTH stops (mika#3124).** The object's `head_evidence` field attests what this answer established about *this* head. When it reads `head_never_ruled_on`, nobody has ruled on this head — so neither `stop_already_reviewed_sha` (step 3) nor `stop_verdict_recorded` (step 4) is a true conclusion, whatever the PR looks like otherwise. You go to step 5 and review. This is measured, not hypothetical: on 2026-11-10 the registry took a `stop_already_reviewed_sha` on #3070's head `24e1f25b2` nineteen seconds after `qa_head_reviews` had answered zero reviews on it; the false row then discarded that head's green check_suite for thirty days, and the review had to be run by hand an hour later.
    - **Do not call `qa_head_reviews` a second time:** step 3 already called it, and its result is in your context.
 
 5. **Dispatch the review.** Call the `qa-review` skill on the PR. This is the standard qa-review flow — the skill's own prompt owns the diff analysis, plan-AC verification, build verification, and verdict emission.
@@ -85,6 +86,14 @@ Two details that make the line readable rather than decorative:
 - `stop_no_open_pr` (step 1) and `stop_out_of_scope` (step 2) — there is no PR, or none of yours, so there is no head to name.
 - `review` (step 5) — you dispatched a review; you did not rule on the head. See the paragraph above.
 - `review_failed` (step 6) — the review did **not** conclude on this head. Recording it would suppress a future review that still has to happen.
+
+**Precondition, enforced by the engine (mika#3124).** Both rows above are refused unless **this** turn's `qa_head_reviews` call on **this** head came back `head_evidence: "head_was_ruled_on"`. The engine suppresses the write before it runs and names which half is missing. Three ways to get there, one answer to each:
+
+- the head came back `head_never_ruled_on` — your outcome is wrong, not your bookkeeping: go review (step 5), and attest that outcome;
+- you never called `qa_head_reviews` on this head — call it (step 3), then conclude;
+- the answer carries no `head_evidence` at all — the handler is older than the engine reading it; record nothing and let the next `check_suite` pay one turn.
+
+Retrying the suppressed call unchanged accomplishes nothing: the turn's tool history is what it reads, and that does not change between two attempts.
 
 **If the call fails.** Do not retry it, do not escalate it, and do not change the turn's outcome. A missing row costs one paid turn on the next `check_suite` for this head — which is exactly today's regime. An escalation, by contrast, would turn a bookkeeping miss into an operator interrupt.
 

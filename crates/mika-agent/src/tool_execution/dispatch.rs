@@ -234,7 +234,8 @@ pub(crate) async fn process_tool_calls(
                 continue;
             }
 
-            // Garde de preuve du tour sur `record_reviewed_head` (mika#2934).
+            // Garde de preuve du tour sur `record_reviewed_head` (mika#2934,
+            // élargie par mika#3124).
             //
             // Le registre `qa_reviewed_head` dit sur quelles têtes mika-qa a
             // **statué**. Le 2026-10-27, trois têtes y ont été déclarées
@@ -242,6 +243,14 @@ pub(crate) async fn process_tool_calls(
             // une quatrième ligne a attesté un verdict qu'un tour n'avait pas
             // encore posté : dans les quatre cas le tour demandait une ligne que
             // sa propre trace d'outils ne portait pas.
+            //
+            // mika#3124 est le même défaut une marche plus bas : le 2026-11-10,
+            // #3070@`24e1f25b2` a reçu un `stop_already_reviewed_sha` dix-neuf
+            // secondes après que `qa_head_reviews` ait répondu zéro revue sur
+            // cette tête. La trace portait bien l'appel — et la garde ne lisait
+            // que l'appel. Elle lit désormais sa réponse, d'où quatre variantes
+            // au lieu de deux : un refus qui se trompe de reproche fait rejouer
+            // au modèle un appel déjà fait, pour un tour payé et le même refus.
             //
             // Le refus est **en amont de l'exécution** : aucune ligne n'est
             // écrite, et ce n'est pas un `field_error` de l'outil — un refus de
@@ -296,6 +305,35 @@ pub(crate) async fn process_tool_calls(
                                  of THAT head's reviews. No successful `qa_head_reviews` call for \
                                  `{head_sha}` appears in this turn's tool history. Call it first \
                                  (step 3), then conclude."
+                            ),
+                        ),
+                        // Le seul des quatre refus où le modèle a fait ce qu'on
+                        // lui demandait : il a appelé l'outil, et il a conclu
+                        // l'inverse de la réponse. Lui enjoindre d'appeler
+                        // l'outil serait faux — et lui ferait rejouer un appel
+                        // dont la réponse ne changera pas (AC3 de mika#3124).
+                        crate::qa_reviewed_head::PreuveManquante::StopSurTeteJamaisJugee => (
+                            "stop_sur_tete_jamais_jugee",
+                            format!(
+                                "a `stop_*` outcome attests a head whose own reviews ruled it \
+                                 out. `qa_head_reviews` already answered on `{head_sha}` in this \
+                                 turn, and its answer was `head_never_ruled_on`: no review has \
+                                 ever ruled on this head (mika#3124). The answer will not change \
+                                 — what has to change is the conclusion. Go to step 5, dispatch \
+                                 the review, and attest `review`."
+                            ),
+                        ),
+                        crate::qa_reviewed_head::PreuveManquante::StopSansAttestationLisible => (
+                            "stop_sans_attestation_lisible",
+                            format!(
+                                "a `stop_*` outcome is attested by what `qa_head_reviews` \
+                                 ANSWERED, and the call for `{head_sha}` in this turn carries \
+                                 neither `head_was_ruled_on` nor `head_never_ruled_on` in its \
+                                 output (mika#3124). That is an engine newer than the handler \
+                                 answering it \
+                                 (mika#2340: a change under `skills/bundled/` reaches an agent \
+                                 only through a rebuild). Record nothing on this head: the next \
+                                 check_suite costs one turn, an unattested row costs a review."
                             ),
                         ),
                     };
@@ -953,24 +991,45 @@ mod tests {
         }
     }
 
-    /// Les arguments que le prompt du webhook fait émettre à l'étape 4.
-    fn appel_de_letape_4(tete: &str) -> serde_json::Value {
+    /// Les arguments que le prompt du webhook fait émettre à l'étape 3 ou 4.
+    fn appel_dinscription(tete: &str, issue: &str) -> serde_json::Value {
         serde_json::json!({
             "repo": "senara-solutions/mika",
             "pr": 2931,
             "head_sha": tete,
-            "outcome": "stop_verdict_recorded",
+            "outcome": issue,
         })
     }
 
-    /// Le résumé qu'un `qa_head_reviews` réussi laisse derrière lui, sous la
-    /// borne réelle du moteur — c'est la forme que la garde doit reconnaître.
-    fn lecture_de_tete_reussie(tete: &str) -> ToolCallSummary {
+    /// Le résumé qu'un `qa_head_reviews` laisse derrière lui, sous les **deux**
+    /// bornes réelles du moteur — c'est la forme que la garde doit reconnaître.
+    ///
+    /// La sortie est bâtie à la main et non par `json!` : l'ordre des clés est
+    /// portant depuis mika#3124 — le moteur ne garde que les
+    /// [`crate::planning::policy::OUTPUT_SUMMARY_MAX`] premiers octets — et
+    /// `serde_json::json!` les trie alphabétiquement, ce qui placerait
+    /// `head_evidence` en quatrième position et ferait mentir le fixture.
+    fn lecture_de_tete(tete: &str, attestation: &str, revues: usize) -> ToolCallSummary {
         let arguments = serde_json::json!({
             "repo": "senara-solutions/mika",
             "pr": 2931,
             "head_sha": tete,
         });
+        let mut entrees = String::new();
+        for i in 0..revues {
+            if i > 0 {
+                entrees.push(',');
+            }
+            entrees.push_str(
+                "{\"author\":\"mika-platform-qa\",\"state\":\"APPROVED\",\
+                 \"submitted_at\":\"2026-10-27T12:55:57Z\",\"carries_verdict_line\":true}",
+            );
+        }
+        let sortie = format!(
+            "{{\"head_evidence\":\"{attestation}\",\"head_sha\":\"{tete}\",\
+             \"head_first_seen_at\":\"2026-10-27T12:44:36Z\",\"reviews\":[{entrees}],\
+             \"dropped_predating_head\":0}}"
+        );
         ToolCallSummary {
             step: 3,
             name: crate::qa_reviewed_head::QA_HEAD_REVIEWS_TOOL.to_string(),
@@ -978,10 +1037,26 @@ mod tests {
                 &arguments.to_string(),
                 crate::planning::policy::INPUT_SUMMARY_MAX,
             ),
-            output_summary: "[]".to_string(),
+            output_summary: truncate_summary(&sortie, crate::planning::policy::OUTPUT_SUMMARY_MAX),
             success: true,
             non_zero_exit: false,
         }
+    }
+
+    /// Une lecture qui a trouvé une revue : la seule forme qui satisfait la
+    /// preuve depuis mika#3124.
+    fn lecture_de_tete_reussie(tete: &str) -> ToolCallSummary {
+        lecture_de_tete(tete, crate::qa_reviewed_head::HEAD_EVIDENCE_RULED_ON, 1)
+    }
+
+    /// La lecture de l'incident #3070 : l'appel a bien eu lieu, et sa réponse
+    /// dit que personne n'a jamais jugé cette tête.
+    fn lecture_de_tete_sans_revue(tete: &str) -> ToolCallSummary {
+        lecture_de_tete(
+            tete,
+            crate::qa_reviewed_head::HEAD_EVIDENCE_NEVER_RULED_ON,
+            0,
+        )
     }
 
     /// Le dernier message d'une requête : celui que `process_tool_calls` remplit
@@ -998,6 +1073,17 @@ mod tests {
     async fn un_pas_decriture(
         harness: &crate::test_utils::test_helpers::TestHarness,
         tete: &str,
+        prior_summaries: &[ToolCallSummary],
+    ) -> (Vec<ToolCallSummary>, LlmRequest) {
+        un_pas_decriture_sur(harness, tete, "stop_verdict_recorded", prior_summaries).await
+    }
+
+    /// La même chose, en nommant l'issue inscrite — l'incident de mika#3124
+    /// portait `stop_already_reviewed_sha`, celui de mika#2934 l'étape 4.
+    async fn un_pas_decriture_sur(
+        harness: &crate::test_utils::test_helpers::TestHarness,
+        tete: &str,
+        issue: &str,
         prior_summaries: &[ToolCallSummary],
     ) -> (Vec<ToolCallSummary>, LlmRequest) {
         let ctx = harness.ctx();
@@ -1019,7 +1105,7 @@ mod tests {
             vec![LlmResponseContent::ToolCall {
                 id: "toolu_2934".to_string(),
                 name: crate::qa_reviewed_head::RECORD_REVIEWED_HEAD_TOOL.to_string(),
-                arguments: appel_de_letape_4(tete),
+                arguments: appel_dinscription(tete, issue),
             }],
             &tools,
             &skill_tools,
@@ -1201,6 +1287,138 @@ mod tests {
             ),
             None,
             "sous la borne réelle, une lecture faite doit satisfaire la preuve"
+        );
+    }
+
+    // ---- mika#3124 : la garde lit la réponse, pas l'appel -------------------
+
+    /// La tête de #3070, même valeur qu'`qa_reviewed_head.rs` : les deux
+    /// moitiés rejouent le même tour du 2026-11-10.
+    const TETE_3070: &str = "24e1f25b2c7a0d4e8f3b6a1c9d5e7f2b0a4c8d61";
+
+    /// **AC1, moitié site.** Le tour qui a produit la ligne fausse : l'appel de
+    /// l'étape 3 est dans la trace, et sa réponse dit zéro revue. Le registre ne
+    /// doit rien recevoir.
+    ///
+    /// L'assertion centrale est le compte de lignes, pas le résumé en échec : un
+    /// `record_reviewed_head` qui aurait tourné et refusé son entrée laisserait
+    /// exactement le même résumé. Le registre réel est enregistré dans
+    /// `un_pas_decriture_sur`, donc sans la garde l'appel aboutirait — c'est ce
+    /// qui rend le zéro falsifiable.
+    #[tokio::test]
+    async fn mika3124_le_site_supprime_un_stop_sur_une_tete_jamais_jugee() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+
+        let (summaries, request) = un_pas_decriture_sur(
+            &harness,
+            TETE_3070,
+            "stop_already_reviewed_sha",
+            &[lecture_de_tete_sans_revue(TETE_3070)],
+        )
+        .await;
+
+        assert!(
+            !summaries[0].success,
+            "un `head_never_ruled_on` ne satisfait aucun `stop_*` ; sortie : {}",
+            summaries[0].output_summary
+        );
+        match &resultats_doutils(&request)[0] {
+            LlmContentBlock::ToolResult { is_error, .. } => {
+                assert!(*is_error, "la suppression est un `tool_result` en erreur")
+            }
+            autre => panic!("le bloc doit être un `tool_result`, pas {autre:?}"),
+        }
+        let lignes = harness
+            .db
+            .count_audit_events_by_tool_name(crate::qa_reviewed_head::QA_REVIEWED_HEAD_TOOL)
+            .await
+            .expect("lecture du registre");
+        assert_eq!(
+            lignes, 0,
+            "la ligne du 2026-11-10 à 17:02:06Z ne doit plus pouvoir s'écrire"
+        );
+
+        // Contrôle positif, même tête et même issue : seule l'attestation
+        // change. Sans lui, un site qui refuserait tout `stop_already_reviewed_sha`
+        // serait vert ici et aurait désarmé la moitié du registre.
+        let (summaries, _) = un_pas_decriture_sur(
+            &harness,
+            TETE_3070,
+            "stop_already_reviewed_sha",
+            &[lecture_de_tete_reussie(TETE_3070)],
+        )
+        .await;
+        assert!(
+            summaries[0].success,
+            "avec `head_was_ruled_on`, le même appel doit aboutir ; sortie : {}",
+            summaries[0].output_summary
+        );
+        let lignes = harness
+            .db
+            .count_audit_events_by_tool_name(crate::qa_reviewed_head::QA_REVIEWED_HEAD_TOOL)
+            .await
+            .expect("lecture du registre");
+        assert_eq!(lignes, 1, "l'appel attesté écrit sa ligne, et une seule");
+    }
+
+    /// **AC3.** Le message du refus doit porter l'instruction **utile**.
+    ///
+    /// Les deux refus de mika#3124 ne se distinguent du refus de mika#2934 que
+    /// par ce qu'ils demandent. Sur une tête jamais jugée, l'appel a déjà eu
+    /// lieu : enjoindre de l'appeler ferait rejouer un appel fait, pour un tour
+    /// payé et le même refus au bout. Ce test est donc pour moitié une
+    /// assertion d'**absence** — et son contrôle est le refus voisin, qui dit
+    /// précisément la phrase interdite ici, sur la même tête et la même issue.
+    #[tokio::test]
+    async fn mika3124_ac3_le_refus_sur_tete_jamais_jugee_nenjoint_pas_de_rappeler_loutil() {
+        let harness = crate::test_utils::test_helpers::TestHarness::new();
+
+        let texte_du_refus = |request: &LlmRequest| -> String {
+            match &resultats_doutils(request)[0] {
+                LlmContentBlock::ToolResult { content, .. } => match content {
+                    LlmToolResultContent::Text(texte) => texte.clone(),
+                    autre => panic!("le refus doit être du texte, pas {autre:?}"),
+                },
+                autre => panic!("le bloc doit être un `tool_result`, pas {autre:?}"),
+            }
+        };
+
+        let (_, request) = un_pas_decriture_sur(
+            &harness,
+            TETE_3070,
+            "stop_already_reviewed_sha",
+            &[lecture_de_tete_sans_revue(TETE_3070)],
+        )
+        .await;
+        let jamais_jugee = texte_du_refus(&request);
+
+        assert!(
+            jamais_jugee.contains("mika#3124") && jamais_jugee.contains(TETE_3070),
+            "le refus doit se nommer ET nommer la tête ; lu : {jamais_jugee}"
+        );
+        assert!(
+            jamais_jugee.contains("head_never_ruled_on"),
+            "le refus doit citer l'attestation qu'il a lue ; lu : {jamais_jugee}"
+        );
+        assert!(
+            !jamais_jugee.contains("Call it first"),
+            "l'appel a déjà eu lieu : le rejouer ne change rien ; lu : {jamais_jugee}"
+        );
+
+        // Contrôle : le refus de mika#2934, lui, DOIT dire cette phrase — aucun
+        // appel ne nomme la tête, donc il n'y a rien d'autre à demander. Sans
+        // cette moitié, l'assertion d'absence ci-dessus serait vraie d'un
+        // moteur qui n'écrit jamais cette phrase nulle part.
+        let (_, request) =
+            un_pas_decriture_sur(&harness, TETE_3070, "stop_already_reviewed_sha", &[]).await;
+        let sans_lecture = texte_du_refus(&request);
+        assert!(
+            sans_lecture.contains("Call it first"),
+            "sans aucun appel, le refus doit bien enjoindre d'appeler ; lu : {sans_lecture}"
+        );
+        assert_ne!(
+            jamais_jugee, sans_lecture,
+            "les deux refus doivent porter deux instructions distinctes"
         );
     }
 }

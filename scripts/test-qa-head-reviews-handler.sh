@@ -396,18 +396,184 @@ check_stderr "le message de la SHA est intact" \
 check_stdout_vide "rien sur stdout pour une SHA invalide"
 echo
 
-# -- 9. Le contrôle de rougeur --------------------------------------------------
+# -- 9. `head_evidence` : le fait que le moteur lit (mika#3124) ---------------
+#
+# La clé est un CONTRAT, pas une commodité : `preuve_du_tour_manquante` refuse
+# un `stop_*` sur une tête dont l'attestation de CE tour ne dit pas
+# `head_was_ruled_on`. Trois valeurs à épingler, et la troisième est l'incident
+# du 2026-11-10 sur #3070 — une tête dont les seules revues sont écartées par
+# `dropped_predating_head` n'a été jugée par personne, et c'est elle qui a reçu
+# un `stop_already_reviewed_sha`.
+
+echo "9. head_evidence — la clé que le moteur lit, dérivée du même \$kept que reviews"
+reset_fixtures
+write_suites "$FIRST_SEEN"
+write_reviews "5667360863|mika-platform-qa|APPROVED|$CASE_HEAD|$APRES_LE_PUSH|pass"
+run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+check "le handler réussit" 0 "$rc"
+check_json "une revue conforme atteste la tête" '.head_evidence' "head_was_ruled_on"
+# La position compte autant que la valeur : la borne du moteur tronque la queue
+# de l'objet, donc une clé déplacée en fin de constructeur cesse d'être lue.
+check_json "et c'est la PREMIÈRE clé de l'objet" 'keys_unsorted | first' "head_evidence"
+
+reset_fixtures
+write_suites "$FIRST_SEEN"
+write_reviews
+run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+check "le handler réussit sur une PR sans aucune revue" 0 "$rc"
+check_json "aucune revue : la tête n'a jamais été jugée" '.head_evidence' "head_never_ruled_on"
+check_json "et reviews est vide, pas absent — classe mika#2205" '.reviews | length' "0"
+
+reset_fixtures
+write_suites "$FIRST_SEEN"
+write_reviews "5663460195|mika-platform-qa|APPROVED|$CASE_HEAD|$AVANT_LE_PUSH|pass"
+run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+check "le handler réussit sur l'incident de #3070" 0 "$rc"
+check_json "une revue antidatée n'atteste rien — la clé suit \$kept, pas \$on_head" \
+    '.head_evidence' "head_never_ruled_on"
+check_json "et elle est bien comptée écartée" '.dropped_predating_head' "1"
+echo
+
+# -- 10. La borne d'`output_summary`, LUE dans le moteur ----------------------
+#
+# Le moteur ne voit de la sortie que ses `OUTPUT_SUMMARY_MAX` premiers octets
+# (`planning::policy`), moins les trois points que `truncate_summary` recolle.
+# Si `head_evidence` sortait de cette fenêtre, plus aucune attestation ne serait
+# lisible et TOUS les `stop_*` seraient refusés, en silence.
+#
+# La borne est LUE dans la source Rust, jamais recopiée : une recopie cesse de
+# suivre le jour où la borne bouge, et c'est ce jour-là que ce contrôle sert.
+
+echo "10. la borne d'output_summary — head_evidence tient dans la fenêtre que le moteur lit"
+POLICY_SRC="$REPO_ROOT/crates/mika-agent/src/planning/policy.rs"
+BORNE="$(sed -n 's/^pub const OUTPUT_SUMMARY_MAX: usize = \([0-9]*\);.*/\1/p' "$POLICY_SRC" | head -1)"
+if [[ -z "$BORNE" ]]; then
+    echo "  FAIL  anti-vacuité : OUTPUT_SUMMARY_MAX est introuvable dans"
+    echo "        $POLICY_SRC — la borne a changé de forme, donc"
+    echo "        ce contrôle ne mesure plus rien"
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS  la borne est lue dans le moteur : OUTPUT_SUMMARY_MAX = $BORNE"
+    PASS=$((PASS + 1))
+
+    # Assez de revues pour que la sortie DÉPASSE la borne : sur un objet plus
+    # court que la fenêtre, l'assertion passerait à vide.
+    reset_fixtures
+    write_suites "$FIRST_SEEN"
+    specs=()
+    for i in 1 2 3 4 5 6 7 8; do
+        specs+=("56674000$i|mika-platform-qa|APPROVED|$CASE_HEAD|$APRES_LE_PUSH|pass")
+    done
+    write_reviews "${specs[@]}"
+    run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+    check "le handler réussit" 0 "$rc"
+    check_json "les huit revues sont rendues" '.reviews | length' "8"
+
+    taille=${#LAST_STDOUT}
+    if ((taille > BORNE)); then
+        echo "  PASS  la sortie dépasse la borne ($taille > $BORNE) : rien ne passe à vide"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL  anti-vacuité : la sortie fait $taille octets, sous la borne de"
+        echo "        $BORNE — l'assertion suivante passerait sans rien mesurer"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Ce que le moteur garde, exactement : `truncate_summary` coupe à
+    # `max_len - 3`, puis recolle « ... ».
+    tronque="$(printf '%s' "$LAST_STDOUT" | head -c "$((BORNE - 3))")"
+    if [[ "$tronque" == *'"head_was_ruled_on"'* ]]; then
+        echo "  PASS  l'attestation survit à la troncature du moteur"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL  l'attestation est hors des $((BORNE - 3)) premiers octets : le moteur"
+        echo "        ne la lirait plus et refuserait tous les stop_*, en silence"
+        echo "------ tronqué ------"; echo "$tronque"
+        echo "---------------------"
+        FAIL=$((FAIL + 1))
+    fi
+fi
+echo
+
+# -- 11. La concordance interlangue --------------------------------------------
+#
+# Le vocabulaire de `head_evidence` est écrit DEUX fois : ici, en jq, par le
+# handler qui l'émet ; et en Rust, par les constantes que la preuve du tour
+# cherche dans `output_summary`. Rien dans un compilateur ne relie les deux. Une
+# faute de frappe d'un côté rend le handler toujours vert, la preuve toujours
+# rouge, et le symptôme — « tous les `stop_*` sont refusés » — ne ressemble pas
+# à sa cause (classe mika#2158).
+#
+# Les deux valeurs sont donc LUES dans la source Rust et comparées à ce que le
+# handler émet réellement. Jamais recopiées : une recopie est un troisième
+# exemplaire du même littéral, c'est-à-dire le défaut qu'on cherche à empêcher.
+
+echo "11. concordance interlangue — le handler émet le vocabulaire que le Rust cherche"
+PREUVE_SRC="$REPO_ROOT/crates/mika-agent/src/qa_reviewed_head.rs"
+RUST_JUGEE="$(sed -n 's/^pub(crate) const HEAD_EVIDENCE_RULED_ON: &str = "\([a-z_]*\)";.*/\1/p' \
+    "$PREUVE_SRC" | head -1)"
+RUST_JAMAIS="$(sed -n 's/^pub(crate) const HEAD_EVIDENCE_NEVER_RULED_ON: &str = "\([a-z_]*\)";.*/\1/p' \
+    "$PREUVE_SRC" | head -1)"
+
+if [[ -z "$RUST_JUGEE" || -z "$RUST_JAMAIS" ]]; then
+    echo "  FAIL  anti-vacuité : les constantes du moteur sont introuvables dans"
+    echo "        $PREUVE_SRC — lues « $RUST_JUGEE » et"
+    echo "        « $RUST_JAMAIS ». Elles ont changé de nom ou de forme, donc"
+    echo "        cette concordance ne mesure plus rien"
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS  le moteur déclare « $RUST_JUGEE » et « $RUST_JAMAIS »"
+    PASS=$((PASS + 1))
+
+    # La disjonction lexicale, du côté où elle est portante : la preuve cherche
+    # une sous-chaîne, donc si l'une des deux valeurs contenait l'autre, trouver
+    # la première ne distinguerait plus les deux réponses.
+    if [[ "$RUST_JUGEE" == *"$RUST_JAMAIS"* || "$RUST_JAMAIS" == *"$RUST_JUGEE"* ]]; then
+        echo "  FAIL  les deux valeurs ne sont pas lexicalement disjointes : la preuve"
+        echo "        cherche une sous-chaîne, donc elle confondrait les deux réponses"
+        FAIL=$((FAIL + 1))
+    else
+        echo "  PASS  les deux valeurs sont lexicalement disjointes"
+        PASS=$((PASS + 1))
+    fi
+
+    # (a) Une revue conforme : le handler doit émettre le littéral du moteur.
+    reset_fixtures
+    write_suites "$FIRST_SEEN"
+    write_reviews "5667400001|mika-platform-qa|APPROVED|$CASE_HEAD|$APRES_LE_PUSH|pass"
+    run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+    check "le handler réussit" 0 "$rc"
+    check_json "la tête jugée porte EXACTEMENT la constante du moteur" \
+        '.head_evidence' "$RUST_JUGEE"
+
+    # (b) Aucune revue : l'autre moitié du vocabulaire fermé.
+    reset_fixtures
+    write_suites "$FIRST_SEEN"
+    write_reviews
+    run_handler "$CASE_REPO" "$CASE_PR" "$CASE_HEAD"; rc=$?
+    check "le handler réussit" 0 "$rc"
+    check_json "la tête jamais jugée porte EXACTEMENT l'autre constante" \
+        '.head_evidence' "$RUST_JAMAIS"
+fi
+echo
+
+# -- 12. Le contrôle de rougeur -------------------------------------------------
 #
 # « Supprime ce que le test protège ; vérifie qu'il rougit. » Sans cette case,
 # le harnais ci-dessus serait indiscernable d'un test sur la FORME de l'objet :
-# un handler qui rend les quatre champs et ne filtre rien passerait les cas 2,
+# un handler qui rend les cinq champs et ne filtre rien passerait les cas 2,
 # 4, 5, 6, 7 et 8, et ne rougirait qu'au cas 1 — ce que personne ne saurait
 # avant d'avoir cassé le filtre.
+#
+# Depuis mika#3124 le désarmement porte aussi sur `head_evidence` : la clé est
+# dérivée du MÊME `$kept`, donc privée du terme temporel elle doit basculer sur
+# `head_was_ruled_on` pour une tête que personne n'a jugée. C'est ce qui prouve
+# que le cas 9 mesure la dérivation, et pas la seule présence de la clé.
 #
 # La copie désarmée est écrite ici, depuis l'arbre, et n'est jamais commitée :
 # un handler cassé qui vit dans le dépôt est un handler que quelqu'un déploiera.
 
-echo "9. contrôle de rougeur — le handler privé de son terme temporel rejoue le défaut"
+echo "12. contrôle de rougeur — le handler privé de son terme temporel rejoue le défaut"
 DESARME="$TMPROOT/qa_head_reviews_desarme.sh"
 sed 's/map(select((\.submitted_at \/\/ "") >= \$first_seen))/map(select(true))/' \
     "$HANDLER" >"$DESARME"
@@ -439,10 +605,16 @@ else
         FAIL=$((FAIL + 1))
     fi
 
+    check_json "désarmé, l'attestation bascule — la clé suit bien le même \$kept" \
+        '.head_evidence' "head_was_ruled_on"
+
     # Et la forme de l'objet, elle, survit au désarmement : c'est ce qui prouve
     # qu'un test sur la seule forme n'aurait rien vu.
-    check_json "désarmé, les quatre champs sont toujours là" \
-        '[.head_sha, .head_first_seen_at, (.reviews|type), (.dropped_predating_head|type)] | length' "4"
+    # `map(select(. != null))` et non un `length` sec : un tableau de cinq
+    # expressions a cinq éléments même quand les cinq valent `null`, donc la
+    # longueur seule ne mesurerait que le filtre jq de ce test.
+    check_json "désarmé, les cinq champs sont toujours là" \
+        '[.head_evidence, .head_sha, .head_first_seen_at, (.reviews|type), (.dropped_predating_head|type)] | map(select(. != null)) | length' "5"
 fi
 echo
 

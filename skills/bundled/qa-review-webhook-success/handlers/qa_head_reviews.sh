@@ -35,7 +35,7 @@ set -euo pipefail
 #
 # Input: JSON on stdin with "repo" (owner/name), "pr" (integer), "head_sha" (40 hex)
 # Output: one JSON object on stdout:
-#   {head_sha, head_first_seen_at,
+#   {head_evidence, head_sha, head_first_seen_at,
 #    reviews: [{author, state, submitted_at, carries_verdict_line}],
 #    dropped_predating_head: <int>}
 #
@@ -43,6 +43,31 @@ set -euo pipefail
 # `reviews` is the answer "no review ever ruled on this head", and conflating
 # the two is the mika#2205 class. The review body is deliberately NOT rendered —
 # step 4 needs the fact, not the text.
+#
+# `head_evidence` is a CONTRACT READ BY THE ENGINE (mika#3124), not a
+# convenience. Closed vocabulary, exactly two values:
+#
+#     head_evidence ∈ { "head_was_ruled_on", "head_never_ruled_on" }
+#
+# `qa_reviewed_head::preuve_du_tour_manquante` searches this turn's tool history
+# for the **quoted** literal and refuses a `record_reviewed_head` write with a
+# `stop_*` outcome unless THIS head's own call came back `head_was_ruled_on`.
+# Until mika#3124 the engine only inspected the call's INPUT, so a turn that had
+# asked the question and been told "zero reviews" could still write
+# `stop_already_reviewed_sha`: measured on #3070, head `24e1f25b2`, 2026-11-10
+# at 17:02:06Z — which then discarded that head's green check_suite for 30 days.
+#
+# Three properties of the key, all three load-bearing, all three held by
+# `scripts/test-qa-head-reviews-handler.sh`:
+#   1. derived from the SAME `$kept` as `reviews` — never from `$on_head`, whose
+#      reviews may predate the head and have ruled on nothing;
+#   2. emitted FIRST, because the engine truncates the output it keeps to
+#      `planning::policy::OUTPUT_SUMMARY_MAX` bytes and the tail is lost;
+#   3. the two values are lexically disjoint — neither is a substring of the
+#      other, so searching one can never match the other.
+# Renaming a value, moving the key, or deriving it from anything else breaks the
+# engine's read in silence. Rust-side source of truth for the two spellings:
+# `HEAD_EVIDENCE_RULED_ON` / `HEAD_EVIDENCE_NEVER_RULED_ON`.
 #
 # See: docs/solutions/prompt-engineering/2026-04-08-remove-capability-not-prohibit-it.md
 
@@ -107,6 +132,10 @@ gh api "repos/${REPO}/pulls/${PR}/reviews" --paginate --jq '.[]' \
       [ .[] | select(.commit_id == $head_sha) ] as $on_head
       | ($on_head | map(select((.submitted_at // "") >= $first_seen))) as $kept
       | {
+          head_evidence: (if ($kept | length) > 0
+                          then "head_was_ruled_on"
+                          else "head_never_ruled_on"
+                          end),
           head_sha: $head_sha,
           head_first_seen_at: $first_seen,
           reviews: ($kept | map({
