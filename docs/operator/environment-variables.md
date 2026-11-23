@@ -10054,7 +10054,10 @@ Optional (telemetry — requires `--features telemetry` build):
 
 Optional (CLI -> server communication):
 - `MIKA_SPIRIT_URL` — mika-spirit base URL for CLI dashboard commands (default: `http://localhost:8080`)
-- `MIKA_GATEWAY_URL` — mika-gateway base URL for CLI webhook DLQ commands (default: `http://localhost:3001`)
+- `MIKA_GATEWAY_URL` — mika-gateway base URL for the CLI's gateway calls: `mika webhook list-dead/replay/replay-all` and `mika notify --channel telegram` (default: `http://localhost:8080`)
+- `MIKA_GATEWAY_PORT` — the gateway's own listen port (default: `8080`). When `MIKA_GATEWAY_URL` is unset, the CLI composes `http://localhost:{port}` from this variable, so a gateway moved to another port is reachable without declaring the URL twice. An unreadable value falls back to the shared default with a WARN rather than panicking.
+
+  **mika#3125 — l'ancien défaut du CLI était `http://localhost:3001`, le défaut de rien.** Le gateway n'a jamais écouté sur ce port : sans `MIKA_GATEWAY_URL`, `mika notify --channel telegram` échouait sur « gateway unreachable at http://localhost:3001 » là où le même envoi vers `:8080` rendait 200 (mesuré, commentaire 61 du parking #2983). Les deux moitiés lisent désormais une constante partagée, `mika_common::gateway_endpoint::DEFAULT_GATEWAY_PORT`, donc un changement de port ne peut plus laisser le client derrière. Et depuis le même ticket, **une livraison Telegram manquée sort non-zéro** en nommant la cause, l'adresse visée, le geste de configuration et la session où la notification est en base — avant, l'échec faisait un `eprintln!` et la commande sortait en 0, de sorte qu'aucun appelant ne pouvait distinguer *livré* de *perdu*.
 
 Optional (dashboard): See `dashboard/CLAUDE.md`.
 

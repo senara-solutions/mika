@@ -833,7 +833,7 @@ fleet-wide env var cannot give a slow reasoning agent a different geometry from 
 fast one. The shipped fleet default is 120/300; `mika-arch` ships at 240/900,
 derived from its measured latency distribution.
 | `MIKA_SPIRIT_URL` | No | mika-spirit URL for dashboard CLI commands (default: `http://localhost:8080`) |
-| `MIKA_GATEWAY_URL` | No | mika-gateway URL for webhook DLQ CLI commands (default: `http://localhost:3001`) |
+| `MIKA_GATEWAY_URL` | No | mika-gateway URL for the CLI's gateway calls — `mika webhook *` and `mika notify --channel telegram` (default: `http://localhost:8080`, the port the gateway itself listens on; `MIKA_GATEWAY_PORT` composes the same default, mika#3125) |
 | `MIKA_REMOTE_AGENT_URL` | No | Cloud Mika gateway A2A endpoint for `mika ask` remote mode (e.g., `https://gw.example.com/a2a/{customer_id}/{agent}`). When set, `mika ask` bypasses the local agent loop and proxies to the cloud agent. `--remote <URL>` flag overrides. Auth via `MIKA_INTERNAL_TOKEN`. |
 | `MIKA_INTERNAL_TOKEN` | No | Bearer token for gateway internal-token auth. Used by `mika ask --remote` and by mika-spirit↔gateway communication. |
 | `MIKA_TELEMETRY_ENABLED` | No | Enable OTel trace export (requires `--features telemetry` build) |

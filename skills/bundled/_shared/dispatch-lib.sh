@@ -1797,17 +1797,23 @@ _pilot_egress_remedy() {
 # protection, the alert is the information, and an alert that fails must never
 # hand the launch back to the pilot.
 #
-# WHAT THIS CANNOT TELL YOU: `mika notify` returns Ok(()) even when Telegram
-# delivery fails — the failure is caught, printed to its own stderr, and
-# swallowed (crates/mika-cli/src/commands/notify.rs). Only a DB write failure
-# makes it non-zero. So this call site can NEVER know whether the alert reached
-# anyone, and no amount of shell here would change that. What makes the channel
-# real is a DEPLOYMENT-TIME precondition — the `mika` agent must carry a non-null
-# `chat_id` in `customer_config` — checked in the runbook, not on the critical
-# path of every dispatch. The notification is written to the DB BEFORE the send
-# is attempted, so a dead gateway still leaves the line in session
-# 00000000-0000-0000-0000-700000710717; that is what makes halt (c) of the plan
-# decidable.
+# WHAT THIS SITE CHOOSES NOT TO READ: since mika#3125 `mika notify --channel
+# telegram` exits NON-ZERO when the delivery fails, naming the cause, the gateway
+# address it targeted and the session the notification sits in
+# (crates/mika-cli/src/commands/notify.rs). The signal exists. This call site
+# discards it on purpose — `|| true` and `>/dev/null 2>&1` stay, for the reason
+# above and unchanged: the refusal is the protection, the alert is the
+# information, and an alert that fails must never hand the launch back to the
+# pilot. So the right reading of the silence here is "nobody asked", never "there
+# is nothing to ask": an operator diagnosing a mute channel replays the same
+# command by hand and gets the cause.
+#
+# What makes the channel real is still a DEPLOYMENT-TIME precondition — the
+# `mika` agent must carry a non-null `chat_id` in `customer_config` — checked in
+# the runbook, not on the critical path of every dispatch. The notification is
+# written to the DB BEFORE the send is attempted, so a dead gateway still leaves
+# the line in session 00000000-0000-0000-0000-700000710717; that is what makes
+# halt (c) of the plan decidable.
 _pilot_egress_notify() {
     local severity="$1" text="$2"
     if ! command -v mika >/dev/null 2>&1; then
