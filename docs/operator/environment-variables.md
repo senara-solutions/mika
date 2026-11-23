@@ -3370,6 +3370,57 @@ Lire une coupure au plafond (mika#2280) :
   fige mika-dev 120/8192, mika-qa 120/16384 et mika-arch 240/32768 — tous trois
   au-dessus de leur atteignable, portés par une allowlist nommée — et rougit si
   l'un des six nombres bouge sans que l'arithmétique soit refaite.
+- **Depuis mika#3126, une coupure au plafond n'achète plus de relance rapide.**
+  Le drapeau ne fait plus que mesurer : il **retire** à la tentative suivante la
+  concession mika#1744 (`0,50 × plafond` de marge requise), qui retombe sur le
+  seuil par défaut (`1,0 × plafond`, « un appel entier plus une réserve »). Rien
+  d'autre ne bouge : variante d'erreur, `error_class`, rétryabilité,
+  `max_attempts` et `worst_case_failure_secs` sont inchangés, et le rail
+  Anthropic n'est pas concerné (il ne mesure pas le drapeau, donc la concession
+  n'y est jamais retirée).
+
+  **La règle de lecture, en une phrase :** la concession a été accordée à une
+  classe de pannes *identifiée comme rapide* (DNS, connexion refusée, poignée
+  TLS — « ça se résout en secondes, pas en un plafond entier »), et une tentative
+  coupée à son plafond vient de réfuter cette appartenance. Ce n'est donc pas un
+  troisième seuil, c'est le **retrait d'une exception**.
+
+  Ce que ça change, par géométrie — la marge à comparer est celle qui reste
+  *après* la tentative coupée :
+
+  | Géométrie (plafond / enveloppe) | Marge après un appel entier | Seuil appliqué | Relance après une guillotine |
+  |---|---|---|---|
+  | 120 / 300 (flotte : mika-dev, mika-qa) | 180 s | 120 s | **oui**, inchangé |
+  | 240 / 900 (mika-arch) | 660 s | 240 s | **oui**, inchangé |
+  | 300 / 660 (l'incident du 16/11) | 360 s au 1ᵉʳ tour, 60 s au 2ᵈ | 300 s | **non** au-delà du premier |
+
+  Seules les géométries dont l'enveloppe ne porte pas deux appels entiers après
+  la coupure changent de comportement. Le 16/11, trois tours (`dd21ea95`,
+  `c66e3814`, `fef8ca95`) ont relancé avec 290 à 345 s de marge sous un plafond
+  de 300 : la relance a consommé son plafond entier à son tour, l'enveloppe a été
+  abandonnée à 660 s pour 4,82 $, sans un octet utile.
+
+  **Ce qu'on lit dans le journal.** Le WARN de la garde porte deux champs là où
+  il portait `last_was_transport` : `transport_concession` (la **décision** dont
+  le seuil découle) et `last_cap_exhausted` (la **mesure** qui l'a éventuellement
+  retirée). La paire `transport_concession == false` avec
+  `last_cap_exhausted == true` est la signature exacte de ce refus :
+  ```bash
+  grep "aborting retry chain" $MIKA_SPIRIT_LOG_FILE \
+    | jq 'select(.last_cap_exhausted == true and .transport_concession == false)
+          | {attempt, remaining_ms, threshold_secs}'
+  ```
+  Côté `llm_call_attempt`, la tentative coupée qui n'est pas relancée dit
+  désormais `outcome = "exhausted"` là où elle disait `retrying` — même
+  déplacement de population qu'au déploiement de mika#2362, et pour la même
+  raison : la ligne décrit enfin la décision qui la gouverne.
+
+  **Non-régression à surveiller :** `select(.cap_exhausted == true)` ne doit pas
+  diminuer (le drapeau mesure toujours la même chose) et la relance d'une panne
+  transport *non* coupée au plafond ne doit pas disparaître — c'est la chaîne sur
+  laquelle le chien de garde mika#2342 est dimensionné. Si le volume de
+  `outcome == "retrying"` chute sur une géométrie de la flotte, c'est que le
+  retrait a fui hors de sa population : désarmer.
 
 ### Un tour tué par le transport n'est pas un refus du serveur (mika#2522)
 
