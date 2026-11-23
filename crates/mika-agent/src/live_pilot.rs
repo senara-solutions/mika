@@ -79,6 +79,30 @@
 //! uniformity — which is why this module exposes its traversal and not its
 //! verdict. The bound of the source scan that guards the composition is stated
 //! at [`resolve_task_pilot`].
+//!
+//! # Le registre des handles (mika#3120)
+//!
+//! | handle | clé | rend | appelant |
+//! |---|---|---|---|
+//! | [`live_pilot_for_issue`] | URL d'issue | [`LivePilotVerdict`] | gate 2c du handler `ready`, réconciliateur `auto_pull` |
+//! | [`live_pilot_for_task`] | id de tâche | [`LivePilotVerdict`] | garde de `cancel_task` |
+//! | [`resolve_task_pilot`] | id de tâche | [`TaskPilot`] (traversée nue) | `process_kill`, `mika-cli` |
+//! | [`live_pilot_worktrees`] | — (tout le parc) | [`LiveWorktrees`] | [`crate::wip_rescue`] |
+//!
+//! Le quatrième est né d'une question de forme différente : non pas *« ce
+//! ticket a-t-il un pilote ? »* mais *« quels worktrees sont en cours
+//! d'écriture, là, maintenant ? »*. `wip_rescue` sortait un brouillon
+//! `wip-rescue` du brouillon sans demander si quelqu'un écrivait encore dessus
+//! (mika#3120, incident mesuré sur la PR #3092 le 2026-11-15 : reprise à
+//! 14:51:57Z pendant que le pilote de finition committait de 14:43 à 14:58Z).
+//! Il vit **ici** et non chez son appelant pour la raison que ce module
+//! existe : *a census is not an allowlist: you add to it, you do not exempt in
+//! it* (mika#2633). Recomposer la traversée dans `wip_rescue` aurait fait un
+//! quatrième lecteur de la vivacité — exactement ce que le scan
+//! `canonical_tokens::mika2653_la_vivacite_dun_pilote_a_un_lecteur_unique`
+//! refuse, et pour la raison que mika#2158 et mika#2335 ont payée.
+
+use std::path::PathBuf;
 
 use tracing::warn;
 
@@ -446,6 +470,96 @@ pub(crate) async fn live_pilot_for_task(db: &AsyncDatabase, task_id: &str) -> Li
             LivePilotVerdict::None
         }
     }
+}
+
+/// Ce qu'un recensement des pilotes vivants a pu établir du parc (mika#3120).
+///
+/// Deux champs, deux populations, **jamais sommées** : un worktree déclaré est
+/// une piste exploitable, un pilote sans déclaration lisible est une piste
+/// perdue. Les confondre rendrait « rien à exclure » et « on n'a pas pu
+/// regarder » identiques à la lecture, la confusion que mika#2205 nomme.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LiveWorktrees {
+    /// Les worktrees déclarés par les pilotes dont le processus est vivant.
+    pub(crate) worktrees: Vec<PathBuf>,
+    /// Les pilotes vivants dont **aucune** déclaration n'est lisible.
+    ///
+    /// Compté, jamais fatal : un pilote dont la déclaration est perdue
+    /// n'exclut rien (il n'y a pas de branche à exclure) et ne doit pas pour
+    /// autant geler le tick. Il est rapporté pour que « zéro exclusion » ne
+    /// puisse pas se lire comme « parc vide ».
+    pub(crate) undeclared: usize,
+}
+
+impl LiveWorktrees {
+    /// Le nombre de pilotes vivants recensés — la somme des deux populations,
+    /// calculée **ici** et pas dans la sonde, qui les rapporte séparément.
+    pub(crate) fn live_pilots(&self) -> usize {
+        self.worktrees.len() + self.undeclared
+    }
+}
+
+/// Les worktrees déclarés des pilotes actuellement vivants (mika#3120).
+///
+/// La population est celle du faucheur de pilotes silencieux
+/// ([`crate::db::Database::get_live_dispatch_callback_tasks_with_pid`]) : les
+/// lignes `callback` en `pending` ou `in_progress` porteuses d'un
+/// `process_id`. `pending` en fait délibérément partie — un enfant de callback
+/// naît `pending` et y reste jusqu'à la livraison, et une population filtrée
+/// sur `in_progress` est **vide** par construction sur cette ligne (mesuré le
+/// 2026-09-09 : 876 `delivered`, 19 `cancelled`, 1 `failed`, 1 `pending`, zéro
+/// `in_progress`). C'est la mesure qui a fait que mika#2261 a livré et n'a
+/// jamais tiré.
+///
+/// # Ce que ce handle ne fait pas
+///
+/// Il ne touche pas `git` et n'a aucune opinion sur les branches. La question
+/// que ce module possède est *« ce processus est-il vivant ? »* ; l'attribution
+/// worktree → branche est un `git rev-parse` borné en temps qui appartient à
+/// l'appelant.
+///
+/// # Fail-close ici, fail-open par candidat
+///
+/// L'erreur DB est **propagée** plutôt qu'avalée en recensement vide : un
+/// recensement vide est une affirmation (*« personne n'écrit »*) et l'appelant
+/// en déduirait une reprise. C'est la direction fail-safe du module —
+/// `Unreadable` n'est jamais `Alive` — appliquée à l'étage où le créneau du
+/// tick se décide. En revanche un **candidat** illisible (pas de
+/// `process_start_time` utilisable, pgid hors `u32`, déclaration absente)
+/// n'exclut rien et ne tue rien : il est compté. Les deux asymétries sont
+/// voulues, et c'est la même règle lue à deux échelles.
+pub(crate) async fn live_pilot_worktrees(db: &AsyncDatabase) -> anyhow::Result<LiveWorktrees> {
+    let tasks = db.get_live_dispatch_callback_tasks_with_pid().await?;
+
+    let mut census = LiveWorktrees::default();
+    for task in tasks {
+        let metadata: Option<serde_json::Value> = task
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str(m).ok());
+
+        // Le couple (pid, start_time) identifie une *instance* de processus :
+        // sans lui, un PID recyclé se lit exactement comme le pilote. La
+        // lecture passe par le lecteur commun, qui accepte la forme chaîne et
+        // la forme entière — un `.as_str()?.parse()` à la main est la
+        // divergence que mika#2653 a payée.
+        let (Some(pid), Some(start_time)) = (
+            task.process_id.and_then(|p| u32::try_from(p).ok()),
+            crate::db::Database::process_start_time_from_metadata(task.metadata.as_deref()),
+        ) else {
+            continue;
+        };
+        if !is_same_process_alive(pid, start_time) {
+            continue;
+        }
+
+        match crate::task_engine::engine::declared_worktree(metadata.as_ref()) {
+            Some(worktree) => census.worktrees.push(worktree),
+            None => census.undeclared += 1,
+        }
+    }
+
+    Ok(census)
 }
 
 impl LivePilotVerdict {
@@ -1096,6 +1210,143 @@ mod tests {
             live_pilot_for_task(&db, &parent).await.is_alive(),
             "un frère illisible ne doit pas rendre `Unreadable` quand un pilote \
              vif est prouvé"
+        );
+    }
+
+    /// Tamponne sur la ligne la métadonnée que `declared_worktree` lit : elle
+    /// nomme un **fichier**, dont le contenu trimé est le chemin du worktree.
+    /// Le fichier est écrit par l'appelant — un test de l'absence a besoin de
+    /// pouvoir tamponner sans écrire.
+    async fn stamp_declaration(db: &AsyncDatabase, task_id: &str, declaration_file: &str) {
+        db.set_task_metadata_field(
+            task_id,
+            crate::task_engine::engine::DISPATCH_WORKTREE_FILE_KEY,
+            declaration_file,
+        )
+        .await
+        .expect("stamp worktree declaration");
+    }
+
+    /// Contrôle positif du recensement — et la graine commune du négatif
+    /// ci-dessous, dont la **seule** différence est le statut de la ligne.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn a_live_pilot_declares_its_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declaration = dir.path().join("worktree-path");
+        std::fs::write(&declaration, "/data/worktrees/fix-3120\n").expect("write declaration");
+
+        let db = test_db();
+        let (pid, st) = self_pid_and_start();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        let child = seed_child(&db, &parent, "pending", pid, Some(st)).await;
+        stamp_declaration(&db, &child, &declaration.to_string_lossy()).await;
+
+        let census = live_pilot_worktrees(&db).await.expect("census");
+        assert_eq!(
+            census.worktrees,
+            vec![std::path::PathBuf::from("/data/worktrees/fix-3120")],
+            "le contenu trimé du fichier de déclaration est le worktree recensé"
+        );
+        assert_eq!(census.undeclared, 0);
+        assert_eq!(census.live_pilots(), 1);
+    }
+
+    /// V6 — une ligne **terminale** porteuse d'un pgid vivant n'est pas un
+    /// pilote vivant.
+    ///
+    /// Le pgid d'une ligne livrée est périmé : il désigne peut-être le
+    /// recenseur lui-même, qui est vivant par construction. Lire cette ligne
+    /// comme un pilote figerait un brouillon sur une ligne qui ne décrit plus
+    /// rien — la classe de mika#2158, qu'un lecteur d'affichage a déjà payée
+    /// (mika#2670).
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn a_terminal_row_with_a_live_pgid_is_not_a_live_pilot() {
+        for status in ["delivered", "cancelled", "failed", "completed"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let declaration = dir.path().join("worktree-path");
+            std::fs::write(&declaration, "/data/worktrees/fix-3120\n").expect("write declaration");
+
+            let db = test_db();
+            let (pid, st) = self_pid_and_start();
+            let parent = seed_parent(&db, URL, "in_progress").await;
+            let child = seed_child(&db, &parent, status, pid, Some(st)).await;
+            stamp_declaration(&db, &child, &declaration.to_string_lossy()).await;
+
+            let census = live_pilot_worktrees(&db).await.expect("census");
+            assert_eq!(
+                census,
+                LiveWorktrees::default(),
+                "une ligne `{status}` porteuse d'un pgid vivant a été recensée — \
+                 son pgid est périmé et n'atteste aucun pilote"
+            );
+        }
+    }
+
+    /// V7 — un pilote vivant dont la déclaration n'est pas lisible est
+    /// **compté**, et n'exclut rien.
+    ///
+    /// Les trois formes de l'illisible, parce qu'elles arrivent toutes les
+    /// trois : aucun tampon (dispatch en texte libre, qui n'a légitimement pas
+    /// de worktree), un tampon vers un fichier disparu, un fichier vide (le
+    /// dispatch a tamponné avant que le shell n'écrive). Aucune n'est fatale,
+    /// aucune n'est muette.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn a_live_pilot_without_a_readable_declaration_is_counted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "   \n").expect("write empty declaration");
+        let missing = dir.path().join("vanished");
+
+        for declaration in [
+            None,
+            Some(missing.to_string_lossy().to_string()),
+            Some(empty.to_string_lossy().to_string()),
+        ] {
+            let db = test_db();
+            let (pid, st) = self_pid_and_start();
+            let parent = seed_parent(&db, URL, "in_progress").await;
+            let child = seed_child(&db, &parent, "pending", pid, Some(st)).await;
+            if let Some(file) = declaration.as_deref() {
+                stamp_declaration(&db, &child, file).await;
+            }
+
+            let census = live_pilot_worktrees(&db).await.expect("census");
+            assert!(
+                census.worktrees.is_empty(),
+                "déclaration {declaration:?} : aucun worktree ne peut être attribué"
+            );
+            assert_eq!(
+                census.undeclared, 1,
+                "déclaration {declaration:?} : le pilote vivant doit être compté, \
+                 sinon « zéro exclusion » et « parc vide » rendent les mêmes octets \
+                 (mika#2205)"
+            );
+        }
+    }
+
+    /// Un pilote **mort** ne tient aucun worktree, déclaration lisible ou non.
+    /// Le négatif qui sépare « la vivacité est vérifiée » de « toute ligne
+    /// `pending` porteuse d'un pgid est recensée ».
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn a_dead_pid_declares_no_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let declaration = dir.path().join("worktree-path");
+        std::fs::write(&declaration, "/data/worktrees/fix-3120\n").expect("write declaration");
+
+        let db = test_db();
+        let (_, st) = self_pid_and_start();
+        let parent = seed_parent(&db, URL, "in_progress").await;
+        // PID hors de la plage allouable : jamais vivant, jamais recyclé.
+        let child = seed_child(&db, &parent, "pending", 2_147_483_600, Some(st)).await;
+        stamp_declaration(&db, &child, &declaration.to_string_lossy()).await;
+
+        assert_eq!(
+            live_pilot_worktrees(&db).await.expect("census"),
+            LiveWorktrees::default()
         );
     }
 }
