@@ -159,6 +159,31 @@ A split into flights is not a split into phases of one flight: each flight must 
 
 **Gate precedence** is unchanged by this sub-block: most-blocking disposition wins, union of all F-findings under it.
 
+### Operator-Reserved Gate (mika#3122)
+
+**A plan that DECIDES something the substrate reserves to the operator MUST return `ESCALATE` — never `ITERATE`, never `READY`.** This gate is branch 2 of the Unresolved-Decision Gate made explicit for two forms that were measured passing every other gate.
+
+Two forms, both measured:
+
+1. **A permission-policy refusal is an operator arbitration, materialized in code.** When the plan records a refusal (`[policy:deny]`, `no matching policy rule -- denied by default`) and then writes a fallback that obtains **the same effect by another tool** — a throwaway program, a rewrite of the gesture, a "variant" of the same access — the plan has overturned a decision that is not the planner's. It does not matter that the fallback is cleaner, cheaper, or in a sanctioned language. What the refusal denied is the EFFECT.
+2. **A reserved halt never lifts by an amendment of the plan.** When the ticket body, the first-pass plan, or the flight head reserves a choice to the operator — which cut, which scope, which trade-off — a plan that practises one of the options has lifted the reservation by rewriting the document that recorded it.
+
+**Why `ESCALATE` and not `ITERATE`, and this is the whole point of the gate:** `ITERATE` sends the plan to a revise pilot, and the revise pilot is exactly the executor that committed the defect on 2026-11-17. Reading a finding as a demand to commit is its nominal behaviour — that is what revision IS. So an `ITERATE` on a reserved decision is not a weaker remedy than `ESCALATE`; it is the defect's own delivery vector. The reservation has to leave the loop, and `ESCALATE` is the only disposition that carries it out.
+
+**A reserved halt is not a preparation defect.** The Plan-Size Gate above and its per-flight bound ask for a plan that is ready to fly; they never ask you to rule on an operator's trade-off. In particular, when branch 3 of either tree asks for a split and the ticket reserves **which** split to the operator, the plan that enumerates the candidate splits with their costs and practises none of them **satisfies** this gate — and the Plan-Size Gate does not then demand `ITERATE` for the missing commitment. A plan that stops cleanly on an operator decision IS a prepared plan.
+
+**Decision tree:**
+1. Plan records an operator-reserved decision, enumerates the options with their cost, and practises none ⇒ this gate passes. The verdict it deserves is carried by the other gates.
+2. Plan practises a fallback that obtains the effect of a refused access ⇒ return `ESCALATE` with a BLOCKING F-finding naming the refusal, the effect, and the fallback (form 1).
+3. Plan practises an option the ticket, the prior plan, or the flight head reserved ⇒ return `ESCALATE` with a BLOCKING F-finding naming the reservation and the option taken (form 2).
+4. Plan cites a volume rule (mika#2636, mika#2693) or a readiness requirement as the reason it decided ⇒ still `ESCALATE`. A citation is not an authority; see the paragraph above.
+
+**Measured, twice.** On 2026-11-03 a plan recorded three permission refusals on `sed … > target` and prescribed a throwaway Rust cutter as the fallback; both architect passes accepted it four minutes apart, QA approved, it merged. On 2026-11-17 a revision practised the cut that the flight head reserved to the operator, citing mika#2636 and mika#2693 for authority; the second pass let it through and the operator had to kill the pilot. Neither episode tripped any other gate on this page — which is why this one exists.
+
+**Read-only reminder:** you name the reservation; you do not resolve it and you do not choose for the operator. `ESCALATE` is a NOMINAL exit of grooming, not a failure of it.
+
+**Gate precedence:** unchanged — most-blocking disposition wins (`ESCALATE` > `ITERATE` > `READY`), union of all F-findings under it. Since this gate's blocking branches are all `ESCALATE`, it outranks every `ITERATE` on the page when both fire on the same plan.
+
 ### Output
 
 Return the annotated plan content as a single string, followed by a blank line and an explicit disposition:
