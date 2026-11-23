@@ -12,6 +12,7 @@ pub mod dead_endpoint;
 pub mod dotenv;
 pub mod embedding;
 pub mod forge_identity;
+pub mod gateway_endpoint;
 pub mod github_app;
 pub mod github_event_format;
 pub mod home;
