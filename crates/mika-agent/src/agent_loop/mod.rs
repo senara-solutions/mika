@@ -11728,6 +11728,17 @@ fn scan_completion_claim(text: &str) -> ClaimScan {
 /// Returns the matched keyword for logging, or `None`. Depuis mika#3123 un
 /// mot-clé qui n'apparaît qu'à l'intérieur d'une région de code Markdown n'est
 /// plus une déclaration : c'est une citation, et ce prédicat rend `None`.
+///
+/// **`#[cfg(test)]` depuis mika#3123**, et c'est une propriété, pas une
+/// commodité : la garde a besoin des deux moitiés de `ClaimScan` — le mot
+/// déclaré *et* le mot retenu — donc elle appelle `scan_completion_claim`
+/// directement et ce raccourci n'a plus de lecteur en production. Le garder
+/// hors `cfg(test)` donnerait un second prédicat « y a-t-il une déclaration ? »
+/// qu'un futur site pourrait consulter en perdant la branche `withheld` et sa
+/// sonde, sans qu'aucune assertion ne rougisse (classe mika#2201). Ses ~15
+/// appelants sont le **contrôle positif** du vol : ce vol rétrécit un
+/// détecteur, donc une déclaration nue doit continuer d'être vue.
+#[cfg(test)]
 fn detect_completion_claim(text: &str) -> Option<String> {
     scan_completion_claim(text).hit
 }
@@ -11744,10 +11755,13 @@ async fn evaluate_completion_claim(
     step: usize,
     mode: &LoopMode,
 ) -> GuardDecision {
-    let keyword = match detect_completion_claim(text) {
-        Some(kw) => kw,
-        None => return GuardDecision::Pass,
-    };
+    // Entrée élargie à « déclaré OU retenu » (mika#3123). Le cas dominant — aucun
+    // mot-clé plausible — sort ici, exactement comme avant : le chemin rapide de
+    // `scan_completion_claim` n'a ni masqué ni lancé la regex.
+    let scan = scan_completion_claim(text);
+    if scan.hit.is_none() && scan.withheld.is_none() {
+        return GuardDecision::Pass;
+    }
 
     // Only enforce if the agent has the tool available.
     // Delegates and team agents legitimately lack update_task_status (they
@@ -11771,6 +11785,17 @@ async fn evaluate_completion_claim(
     if active_items.is_empty() {
         return GuardDecision::Pass;
     }
+
+    // Les deux portes sont franchies : sans mika#3123 ce tour partait en rejet.
+    // C'est ici, et seulement ici, que la distinction déclaration / citation
+    // décide de l'issue — d'où la place du `match`, après les portes et non avant.
+    let keyword = match scan.hit {
+        // Une déclaration hors région de code, même accompagnée de citations.
+        Some(keyword) => keyword,
+        // Le mot-clé n'existe qu'à l'intérieur d'une région de code : une
+        // citation, pas une déclaration. `EndTurn` est honoré.
+        None => return GuardDecision::Pass,
+    };
 
     warn!(
         step,
