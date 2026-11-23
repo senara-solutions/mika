@@ -18281,6 +18281,110 @@ assert_eq "OR5 contre-vacuité: idem pour celle de mika#2636" \
 
 Disposition: ITERATE")")"
 
+# --- OR6 / OR7 : la porte vit dans les DEUX prompts architecte -------------
+#
+# Patron S14 / V4, pour la même raison qu'eux : le jugement vit chez l'architecte,
+# dont le `system_prompt.md` est STATIQUE — aucune interpolation au dispatch. La
+# règle du substrat et la porte de l'architecte sont donc deux écritures du même
+# invariant, et rien ne les relie à l'exécution. Sans ces deux blocs, retoucher
+# l'une laisserait l'autre en place et la divergence serait MUETTE : la boucle
+# continuerait de refuser côté groomeur pendant que l'architecte ratifierait, ce
+# qui est EXACTEMENT la configuration des deux épisodes mesurés.
+#
+# Chaque assertion est sous la garde de lisibilité de la boucle, et le bras `else`
+# ASSERTE au lieu de passer en silence : un fichier renommé est l'une des quatre
+# façons dont une section de test passe en entier sans avoir rien mesuré.
+#
+# FIRE-DISPOSITION (du plan) : si l'un de ces blocs tire pour une raison AUTRE que
+# la section absente — fenêtre vide parce qu'un `###` voisin a bougé, prompt
+# déplacé — on s'arrête et on le remonte. On N'ÉLARGIT PAS l'ancre pour le
+# reverdir : une ancre élargie est une assertion qui ne mesure plus sa fenêtre.
+
+T3122_GATE_FIRST=""
+T3122_GATE_SECOND=""
+for t3122_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    t3122_pf="$SCRIPT_DIR/../$t3122_prompt/system_prompt.md"
+    if [ -r "$t3122_pf" ]; then
+        t3122_gate=$(sed -n '/^### Operator-Reserved Gate/,/^### /p' "$t3122_pf")
+        case "$t3122_prompt" in
+            mika-arch-groom-ticket)   T3122_GATE_FIRST="$t3122_gate" ;;
+            mika-arch-second-review)  T3122_GATE_SECOND="$t3122_gate" ;;
+        esac
+        assert_eq "OR6/OR7: $t3122_prompt porte un Operator-Reserved Gate" "non-vide" \
+            "$([ -n "$t3122_gate" ] && echo non-vide || echo vide)"
+        # Les deux formes, nommées par les mêmes chaînes que la règle du substrat.
+        # C'est la parité qui compte, pas la tournure : un groomeur qui reconnaît
+        # le refus dans son journal et un architecte qui lit le même refus dans le
+        # plan doivent parler du même objet.
+        assert_contains "OR6/OR7: $t3122_prompt — la porte nomme le marqueur de refus" \
+            '[policy:deny]' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — et le motif que la politique imprime" \
+            'no matching policy rule -- denied by default' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — forme 1 : le repli au même effet par un autre outil" \
+            'the same effect by another tool' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — forme 2 : la halte ne se lève pas par un amendement" \
+            'never lifts by an amendment of the plan' "$t3122_gate"
+        # Les deux voisines de volume sont citées PAR NUMÉRO, comme dans la règle,
+        # et pour y dire qu'une citation n'est pas une autorité.
+        assert_contains "OR6/OR7: $t3122_prompt — la porte cite mika#2636" \
+            'mika#2636' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — et mika#2693" \
+            'mika#2693' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — ESCALATE y est dit sortie NOMINALE" \
+            'NOMINAL exit of grooming' "$t3122_gate"
+        # LES DEUX MESURES SONT DANS LE PROMPT, par date. Une porte dont on a perdu
+        # l'épisode se relitige au premier plan qui la trouve gênante.
+        assert_contains "OR6/OR7: $t3122_prompt — l'épisode du 03/11 est daté dans la porte" \
+            '2026-11-03' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — et celui du 17/11" \
+            '2026-11-17' "$t3122_gate"
+    else
+        assert_eq "OR6/OR7: $t3122_prompt/system_prompt.md lisible" "lisible" \
+            "fichier introuvable: $t3122_pf"
+    fi
+done
+
+# OR6, propre à la première passe : la disposition est ESCALATE, et le refus
+# d'ITERATE est ÉCRIT. C'est la seule assertion de tout ce ticket qui porte sur le
+# coeur du défaut — `ITERATE` renvoie le plan au pilote de révision, l'exécutant
+# même qui a pratiqué la coupe le 17/11. Un `ITERATE` ici n'est pas un remède plus
+# doux, c'est le véhicule du défaut.
+assert_contains "OR6: la première passe refuse en ESCALATE" \
+    'MUST return `ESCALATE`' "$T3122_GATE_FIRST"
+assert_contains "OR6: et elle écrit que ce n'est JAMAIS ITERATE" \
+    'never `ITERATE`' "$T3122_GATE_FIRST"
+assert_contains "OR6: la porte se dit branche 2 de celle de mika#1244" \
+    'branch 2 of the Unresolved-Decision Gate' "$T3122_GATE_FIRST"
+assert_contains "OR6: et elle dit POURQUOI ITERATE est le véhicule du défaut" \
+    "defect's own delivery vector" "$T3122_GATE_FIRST"
+
+# OR7, propre à la seconde passe : ESCALATE, pas d'ITERATE offert du tout, et la
+# clause du cas 4 — celle dont la dernière occurrence avait besoin.
+assert_contains "OR7: la seconde passe refuse en ESCALATE" \
+    'MUST return `ESCALATE`' "$T3122_GATE_SECOND"
+assert_not_contains "OR7: et elle n'offre PAS d'ITERATE (limite des deux passes)" \
+    'return `ITERATE`' "$T3122_GATE_SECOND"
+assert_contains "OR7: le cas 4 du Plan-Size Gate ne ratifie pas une coupe décidée par la révision" \
+    'does not ratify a split the revision itself decided' "$T3122_GATE_SECOND"
+assert_contains "OR7: on y lit la PROVENANCE de la coupe, pas son arithmétique" \
+    'provenance of the split' "$T3122_GATE_SECOND"
+assert_contains "OR7: une citation n'est pas une autorité" \
+    'citation is not an authority' "$T3122_GATE_SECOND"
+assert_contains "OR7: et cette passe est dite SANS RECOURS" \
+    'This pass has no recourse' "$T3122_GATE_SECOND"
+
+# CONTRE-VACUITÉ de tout OR6/OR7, et c'est la moitié qui compte : les deux
+# fenêtres sont lues NON VIDES avant qu'on conclue quoi que ce soit de leur
+# contenu, et les deux fichiers sont lus LISIBLES et non absents. Sans ces quatre
+# assertions, un prompt renommé rendrait les vingt-six ci-dessus vertes sur la
+# chaîne vide — `assert_not_contains` en tête.
+assert_eq "OR6/OR7 contre-vacuité: les deux fenêtres de porte sont lues non vides" "oui|oui" \
+    "$([ -n "$T3122_GATE_FIRST" ] && printf 'oui' || printf 'non')|$([ -n "$T3122_GATE_SECOND" ] && printf 'oui' || printf 'non')"
+for t3122_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    assert_eq "OR6/OR7 contre-vacuité: $t3122_prompt/system_prompt.md est LISIBLE, pas absent" "lisible" \
+        "$([ -r "$SCRIPT_DIR/../$t3122_prompt/system_prompt.md" ] && echo lisible || echo absent)"
+done
+
 # --- Summary ---
 
 echo ""
