@@ -13621,6 +13621,20 @@ _detect_plan_on_branch() {
         # un plan à mesurer.
         _PLAN_SIZE_PLAN_PATH="$PLAN_PATH"
         _PLAN_SIZE_TOTAL=$(_plan_size_total_loc "$WORKTREE_DIR/$PLAN_PATH")
+        # mika#3121 (R1/D1) — LE PLAN SERVI EST UN FAIT PUBLIÉ PAR SON PRODUCTEUR.
+        # Ce site est le seul qui DÉCIDE quel plan un pilote exécute ; il publie
+        # donc ce chemin, au lieu de laisser un lecteur en aval le reconstruire.
+        # Globale par le même précédent exact que ses deux voisines ci-dessus
+        # (`PLAN_PATH` est `local` ici). Vide = « aucun plan n'est servi », qui
+        # est le cas nominal de `dev-groom` et du repli `/mika`.
+        #
+        # Ce n'est PAS une lecture de `_PLAN_SIZE_PLAN_PATH`, bien que les deux
+        # vaillent la même chaîne : ce voisin est le discriminant d'émission de
+        # la LIGNE DE TAILLE, lue après le vol, tandis que celle-ci est le
+        # discriminant d'une PORTE (`_confront_launch_plan`), lue avant. Les
+        # fusionner ferait du désarmement de la porte un effet de bord de
+        # l'édition de l'estimation.
+        _LAUNCHED_PLAN_PATH="$PLAN_PATH"
         echo "Plan-on-branch detected: overriding entry command to '/ce-work $PLAN_PATH'" >&2
     else
         echo "Plan-on-branch callout found but file not in worktree: $WORKTREE_DIR/$PLAN_PATH — falling back to /mika" >&2
@@ -13947,6 +13961,13 @@ dispatch_claude_pilot() {
     # une preuve le plan d'un AUTRE vol — exactement le défaut que mika#2981
     # ferme, réintroduit par le haut.
     GROOM_CALLOUT_PLAN=""
+
+    # mika#3121 (D1) — le plan servi par CE dispatch, remis à vide ici pour la
+    # même raison exactement : la porte `_confront_launch_plan` lit la globale
+    # comme la réponse à « un plan est-il servi ? ». Une valeur héritée de
+    # l'environnement d'un dispatch antérieur ferait confronter le plan d'un
+    # AUTRE vol — ou armerait la porte sur un `dev-groom` qui ne sert rien.
+    _LAUNCHED_PLAN_PATH=""
 
     # The claude-pilot venv smoke test (mika#1200) used to sit HERE, and that
     # placement is the whole of mika#2634. It now runs AFTER the EXIT trap is
