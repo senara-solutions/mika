@@ -991,10 +991,17 @@ pub async fn auto_resume_wip_rescue_drafts(
     let threshold = min_age_secs();
     let now = crate::timestamp::now();
 
+    // Le recensement est fait **une fois par tick**, avant la sélection, et son
+    // illisibilité abandonne le tick (mika#3120). C'est l'unique site du
+    // fail-close : le paramètre que reçoit `select_eligible` est donc déjà
+    // résolu, et la boucle de sélection n'a pas de troisième état à gérer.
+    let live_branches = live_pilot_branches(db, trace_id).await?;
+
     let selected = select_eligible(
         drafts,
         &now,
         threshold,
+        &live_branches,
         |pr_number| has_bailed_marker(db, pr_number, trace_id),
         |pr_number| has_parked_marker(db, pr_number, trace_id),
         |pr_number| hold_verdict(db, github_token, pr_number, trace_id, session_id),
@@ -1104,10 +1111,39 @@ pub async fn auto_resume_wip_rescue_drafts(
 /// behind it — a hold draft is old by nature, so it stays the oldest candidate
 /// for ever. That is exactly the livelock shape mika#2199 measured and mika#2286
 /// had to close a second time.
+///
+/// **Brouillons sous un pilote vivant (mika#3120).** Un quatrième terme écarte
+/// le brouillon dont la branche de tête est celle d'un worktree de dispatch à
+/// pilote vivant : quelqu'un écrit encore dessus, et le sortir du brouillon
+/// soumet à la revue une tête en vol (mesuré sur la PR #3092 le 2026-11-15 —
+/// reprise à 14:51:57Z pendant que le pilote de finition committait de 14:43 à
+/// 14:58Z).
+///
+/// Il arrive **quatrième et non premier**, délibérément : les trois termes
+/// au-dessus sont des lectures de marqueurs durables, bon marché et décisives,
+/// alors que celui-ci a coûté un `git` par worktree vivant en amont. Le mettre
+/// en tête ferait payer ce coût à des brouillons qu'un marqueur de bail écarte
+/// gratuitement.
+///
+/// Il reçoit un **ensemble** et non un quatrième prédicat injecté, pour trois
+/// raisons dans cet ordre : le recensement est global au tick (un prédicat par
+/// candidat paierait N traversées DB et N `git` là où une seule suffit) ; le
+/// fail-close de lecture remonte ainsi à son bon étage, chez l'appelant qui
+/// possède le créneau, ce qui rend ce paramètre **infaillible par
+/// construction** — un `contains`, pas de troisième état dans la boucle ; et
+/// les tests restent sans base de données, un `BTreeSet` littéral étant encore
+/// plus direct que les fermetures `never_bailed` / `never_parked` /
+/// `never_held`.
+///
+/// L'exclusion est **auto-levante** : rien n'est écrit, aucun marqueur, aucun
+/// label. À la mort du pilote, le recensement du tick suivant ne porte plus sa
+/// branche et le brouillon redevient éligible sans geste humain. C'est ce qui
+/// la distingue du bail et du park, qui sont durables par nécessité.
 async fn select_eligible<F, Fut, G, GFut, H, HFut>(
     drafts: Vec<DraftPr>,
     now: &str,
     threshold: i64,
+    live_branches: &BTreeSet<String>,
     is_bailed: F,
     is_parked: G,
     is_held: H,
@@ -1153,6 +1189,24 @@ where
         // regime. Its two excluding states are reported by the predicate itself,
         // at a collected level, so no `debug!` here would be read (mika#2131).
         if is_held(pr.number).await.excludes() {
+            continue;
+        }
+        if live_branches.contains(&pr.head_ref) {
+            info!(
+                event = "wip_rescue_live_pilot_skipped",
+                pr_number = pr.number,
+                branch = %pr.head_ref,
+                age_secs = age,
+                "wip_rescue: un pilote écrit encore sur cette branche — \
+                 brouillon laissé en brouillon"
+            );
+            // `continue` et non `return` : le créneau du tick n'est pas
+            // consommé. Un brouillon sous pilote vivant est vieux par nature,
+            // donc il reste le plus ancien candidat pour toute la durée du
+            // vol ; lui laisser prendre le créneau affamerait la file entière,
+            // la forme de livelock que mika#2199 a mesurée (14 bails sur une
+            // PR en six heures) et que mika#2286 puis mika#2597 ont dû
+            // refermer deux fois de plus.
             continue;
         }
         return Some((age, pr));
@@ -2480,6 +2534,13 @@ mod tests {
     async fn never_held(_pr_number: u64) -> HoldVerdict {
         HoldVerdict::NotHeld
     }
+    /// L'axe mika#3120 au repos : aucun pilote n'écrit. Le pendant des trois
+    /// fermetures ci-dessus, en ensemble littéral — c'est tout ce que la
+    /// sélection demande, le recensement étant global au tick et résolu chez
+    /// l'appelant.
+    fn nobody_writing() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
 
     /// The queue of the incident: two `wip-rescue` drafts, neither carrying
     /// `human-review-required` — because the label write never succeeded.
@@ -2500,6 +2561,7 @@ mod tests {
             incident_queue(),
             NOW,
             900,
+            &nobody_writing(),
             |n| async move { n == OLDEST },
             never_parked,
             never_held,
@@ -2526,6 +2588,7 @@ mod tests {
                 incident_queue(),
                 NOW,
                 900,
+                &nobody_writing(),
                 never_bailed,
                 never_parked,
                 never_held,
@@ -2548,6 +2611,7 @@ mod tests {
             incident_queue(),
             NOW,
             900,
+            &nobody_writing(),
             |_| async { true },
             never_parked,
             never_held,
@@ -2567,25 +2631,49 @@ mod tests {
             &[WIP_RESCUE_LABEL, HUMAN_REVIEW_LABEL],
         )];
         assert!(
-            select_eligible(parked, NOW, 900, never_bailed, never_parked, never_held)
-                .await
-                .is_none()
+            select_eligible(
+                parked,
+                NOW,
+                900,
+                &nobody_writing(),
+                never_bailed,
+                never_parked,
+                never_held
+            )
+            .await
+            .is_none()
         );
 
         // Not a wip-rescue draft → never a candidate.
         let unrelated = vec![draft(OLDEST, OLDEST_CREATED, &["p1-important"])];
         assert!(
-            select_eligible(unrelated, NOW, 900, never_bailed, never_parked, never_held)
-                .await
-                .is_none()
+            select_eligible(
+                unrelated,
+                NOW,
+                900,
+                &nobody_writing(),
+                never_bailed,
+                never_parked,
+                never_held
+            )
+            .await
+            .is_none()
         );
 
         // Younger than the threshold → waits.
         let fresh = vec![draft(NEXT, "2026-09-05T15:59:00Z", &[WIP_RESCUE_LABEL])];
         assert!(
-            select_eligible(fresh, NOW, 900, never_bailed, never_parked, never_held)
-                .await
-                .is_none()
+            select_eligible(
+                fresh,
+                NOW,
+                900,
+                &nobody_writing(),
+                never_bailed,
+                never_parked,
+                never_held
+            )
+            .await
+            .is_none()
         );
     }
 
@@ -2819,6 +2907,7 @@ mod tests {
             incident_queue(),
             NOW,
             900,
+            &nobody_writing(),
             |n| has_bailed_marker(&db, n, TRACE),
             never_parked,
             never_held,
@@ -3047,6 +3136,7 @@ mod tests {
             park_queue(),
             PARK_NOW,
             900,
+            &nobody_writing(),
             never_bailed,
             |n| async move { n == PARKED_PR },
             never_held,
@@ -3064,6 +3154,7 @@ mod tests {
                 park_queue(),
                 PARK_NOW,
                 900,
+                &nobody_writing(),
                 never_bailed,
                 never_parked,
                 never_held,
@@ -3096,6 +3187,7 @@ mod tests {
                 still_no,
                 PARK_NOW,
                 900,
+                &nobody_writing(),
                 never_bailed,
                 parked_pred,
                 never_held
@@ -3118,6 +3210,7 @@ mod tests {
                 now_yes,
                 PARK_NOW,
                 900,
+                &nobody_writing(),
                 never_bailed,
                 parked_pred,
                 never_held
@@ -3259,9 +3352,15 @@ mod tests {
     async fn mika2597_un_brouillon_tenu_nest_pas_selectionne() {
         let only_held = vec![draft(HELD_PR, HELD_CREATED, &[WIP_RESCUE_LABEL])];
         assert!(
-            select_eligible(only_held, HOLD_NOW, 900, never_bailed, never_parked, |_| {
-                async { held() }
-            })
+            select_eligible(
+                only_held,
+                HOLD_NOW,
+                900,
+                &nobody_writing(),
+                never_bailed,
+                never_parked,
+                |_| { async { held() } }
+            )
             .await
             .is_none(),
             "a draft somebody put back into draft is a hold, and the daemon does \
@@ -3280,6 +3379,7 @@ mod tests {
             hold_queue(),
             HOLD_NOW,
             900,
+            &nobody_writing(),
             never_bailed,
             never_parked,
             |n| async move {
@@ -3309,6 +3409,7 @@ mod tests {
             hold_queue(),
             HOLD_NOW,
             900,
+            &nobody_writing(),
             never_bailed,
             never_parked,
             |_| async { HoldVerdict::NotHeld },
@@ -3328,9 +3429,15 @@ mod tests {
     async fn mika2597_une_timeline_illisible_exclut() {
         let only_held = vec![draft(HELD_PR, HELD_CREATED, &[WIP_RESCUE_LABEL])];
         assert!(
-            select_eligible(only_held, HOLD_NOW, 900, never_bailed, never_parked, |_| {
-                async { unreadable() }
-            })
+            select_eligible(
+                only_held,
+                HOLD_NOW,
+                900,
+                &nobody_writing(),
+                never_bailed,
+                never_parked,
+                |_| { async { unreadable() } }
+            )
             .await
             .is_none(),
             "a false « held » makes a rescue draft wait for an operator gesture; \
@@ -3360,6 +3467,7 @@ mod tests {
             queue,
             HOLD_NOW,
             900,
+            &nobody_writing(),
             |n| async move { n == BAILED },
             |n| async move { n == PARKED },
             |n| async move {
@@ -4118,6 +4226,183 @@ mod tests {
         };
         let octets = tampon.inner.lock().unwrap().clone();
         (rendu, String::from_utf8_lossy(&octets).into_owned())
+    }
+
+    /// Le recensement du tick, nommant les branches de tête de ces PR.
+    ///
+    /// Les noms sont lus sur les brouillons eux-mêmes plutôt que réécrits :
+    /// l'exclusion compare l'ensemble au `head_ref`, et deux formats qui
+    /// divergeraient rendraient le test vert sur une exclusion qui ne mord
+    /// plus.
+    fn writing_on(pr_numbers: &[u64]) -> BTreeSet<String> {
+        pr_numbers
+            .iter()
+            .map(|n| draft(*n, OLDEST_CREATED, &[]).head_ref)
+            .collect()
+    }
+
+    /// V1 — un brouillon dont la branche de tête est sous pilote vivant n'est
+    /// pas sélectionné.
+    ///
+    /// C'est l'incident : le 2026-11-15, `wip_rescue` a sorti du brouillon la
+    /// PR #3092 à 14:51:57Z pendant que le pilote de finition committait de
+    /// 14:43 à 14:58Z. Rien dans la sélection ne demandait si quelqu'un
+    /// écrivait encore.
+    #[tokio::test]
+    async fn mika3120_un_brouillon_sous_pilote_vivant_nest_pas_selectionne() {
+        let only_live = vec![draft(OLDEST, OLDEST_CREATED, &[WIP_RESCUE_LABEL])];
+
+        assert!(
+            select_eligible(
+                only_live,
+                NOW,
+                900,
+                &writing_on(&[OLDEST]),
+                never_bailed,
+                never_parked,
+                never_held,
+            )
+            .await
+            .is_none(),
+            "un pilote écrit encore sur cette branche : sortir le brouillon \
+             soumet une tête en vol à la revue"
+        );
+    }
+
+    /// V3 — contrôle négatif de V1, **même graine** : recensement vide, le
+    /// brouillon est sélectionné.
+    ///
+    /// La paire V1/V3 est ce qui sépare « l'exclusion mord » de « la sélection
+    /// est cassée ». Sans elle, un `select_eligible` qui rendrait toujours
+    /// `None` passerait V1.
+    #[tokio::test]
+    async fn mika3120_sans_pilote_vivant_le_meme_brouillon_est_selectionne() {
+        let only_live = vec![draft(OLDEST, OLDEST_CREATED, &[WIP_RESCUE_LABEL])];
+
+        assert_eq!(
+            select_eligible(
+                only_live,
+                NOW,
+                900,
+                &nobody_writing(),
+                never_bailed,
+                never_parked,
+                never_held,
+            )
+            .await
+            .map(|(_, pr)| pr.number),
+            Some(OLDEST),
+            "la seule différence avec V1 est le recensement"
+        );
+    }
+
+    /// V2 — l'exclusion ne consomme pas le créneau du tick : le candidat
+    /// suivant par ancienneté est examiné et retourné **dans le même tick**.
+    ///
+    /// Un brouillon sous pilote vivant est vieux par nature — il reste le plus
+    /// ancien candidat pour toute la durée du vol. Lui laisser prendre le
+    /// créneau affamerait la file entière : c'est la forme de livelock que
+    /// mika#2199 a mesurée (14 bails sur une PR en six heures) et que
+    /// mika#2286 puis mika#2597 ont dû refermer deux fois de plus.
+    #[tokio::test]
+    async fn mika3120_un_brouillon_sous_pilote_vivant_ne_bloque_pas_le_suivant() {
+        let selected = select_eligible(
+            incident_queue(),
+            NOW,
+            900,
+            &writing_on(&[OLDEST]),
+            never_bailed,
+            never_parked,
+            never_held,
+        )
+        .await;
+
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(NEXT),
+            "le créneau du tick ne doit pas être consommé par l'exclusion — \
+             `continue`, pas `return`"
+        );
+    }
+
+    /// V4 — l'exclusion est **auto-levante** : ce chemin n'écrit aucun
+    /// marqueur durable.
+    ///
+    /// C'est ce qui la distingue du bail et du park. À la mort du pilote, le
+    /// recensement du tick suivant ne porte plus sa branche et le brouillon
+    /// redevient éligible : aucune ligne `audit_events`, aucun label, aucun
+    /// geste humain. L'assertion porte sur les **deux** outils de marqueur,
+    /// parce qu'un seul laisserait passer une écriture sur l'autre.
+    #[tokio::test]
+    async fn mika3120_lexclusion_necrit_aucun_marqueur_durable() {
+        let db = AsyncDatabase::new(crate::db::Database::open_in_memory().unwrap());
+        let only_live = vec![draft(OLDEST, OLDEST_CREATED, &[WIP_RESCUE_LABEL])];
+
+        assert!(
+            select_eligible(
+                only_live,
+                NOW,
+                900,
+                &writing_on(&[OLDEST]),
+                |n| has_bailed_marker(&db, n, TRACE),
+                |n| has_parked_marker(&db, n, TRACE),
+                never_held,
+            )
+            .await
+            .is_none()
+        );
+
+        assert!(
+            !has_marker(&db, BAILED_MARKER_TOOL, OLDEST, TRACE).await,
+            "un pilote vivant n'est pas un bail : écrire le marqueur rendrait \
+             l'exclusion durable et il faudrait un geste humain pour la lever"
+        );
+        assert!(
+            !has_marker(&db, PARKED_MARKER_TOOL, OLDEST, TRACE).await,
+            "un pilote vivant n'est pas un park non vérifié"
+        );
+    }
+
+    /// V5 — l'ordre des quatre termes : un brouillon bailé **et** en cours
+    /// d'écriture est écarté par le bail.
+    ///
+    /// Le bail reste le premier terme, et ce n'est pas une préférence
+    /// esthétique : les trois premiers sont des lectures de marqueurs durables,
+    /// bon marché, alors que le quatrième a coûté un `git` par worktree vivant
+    /// en amont. L'assertion est sur le journal parce que c'est la seule
+    /// surface où l'ordre est observable — les deux termes excluent, seul le
+    /// motif les sépare.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mika3120_un_brouillon_baile_est_ecarte_par_le_bail_dabord() {
+        let live = writing_on(&[OLDEST]);
+        let (selected, journal) = journal_du_recensement(|| {
+            select_eligible(
+                incident_queue(),
+                NOW,
+                900,
+                &live,
+                |n| async move { n == OLDEST },
+                never_parked,
+                never_held,
+            )
+        })
+        .await;
+
+        assert_eq!(
+            selected.map(|(_, pr)| pr.number),
+            Some(NEXT),
+            "le brouillon doublement exclu sort, le suivant est retourné"
+        );
+        assert!(
+            journal.contains("already_bailed"),
+            "le bail doit être le motif rapporté ; journal : {journal:?}"
+        );
+        assert!(
+            !journal.contains("wip_rescue_live_pilot_skipped"),
+            "le terme de pilote vivant ne doit pas avoir été atteint : il est \
+             le quatrième, et le bail l'a court-circuité ; journal : {journal:?}"
+        );
     }
 
     /// La sonde de recensement est émise **sur la branche à zéro pilote**, et
