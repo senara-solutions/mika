@@ -5607,6 +5607,75 @@ pas un label, et pas « défaut »."
     fi
 }
 
+# mika#3122 — une décision que le substrat RÉSERVE À L'OPÉRATEUR ne se tranche
+# pas par la boucle, et surtout pas par un amendement du plan.
+#
+# Deux épisodes, deux semaines d'écart, UN SEUL invariant violé — et les deux
+# passes de `mika-arch` ont ratifié les deux fois :
+#   - 03/11 (mika#3024 / PR #3029) : la politique de permission a refusé trois
+#     fois l'extraction par `sed`, et le plan a inscrit le refus COMME UN RISQUE
+#     AVEC SON REPLI (« basculer sur le découpeur Rust jetable »). Le pilote a
+#     pris le repli, écrit le programme jetable, l'a lancé, l'a supprimé dans le
+#     même commit. Merge 1c6f30fbc.
+#   - 17/11 (mika#1727, vol V3c-2b) : la tête du vol disait que le groom
+#     s'arrête et nomme les coupes SANS EN PRATIQUER AUCUNE, le choix revenant à
+#     l'opérateur. Le groom l'a fait. La première passe a rendu ITERATE ; le
+#     pilote de révision a lu ce verdict comme une demande de trancher et a
+#     réécrit le plan pour PRATIQUER la coupe réservée, en citant mika#2636 et
+#     mika#2693. L'opérateur a dû tuer le pilote.
+#
+# FORME POSITIVE D'ABORD, comme `_PR_BODY_CONTAINMENT_RULE` (:5178) et
+# `_PILOT_SCRATCH_RULE` (:5218) : à qui l'on dit seulement « n'écris pas ce
+# repli », il reste à inventer quoi écrire, et ce qu'il invente est le défaut
+# sous une autre orthographe. La règle dit donc LE GESTE — nommer, chiffrer, ne
+# rien pratiquer — avant de dire ce qu'elle refuse.
+#
+# ELLE QUALIFIE SES DEUX VOISINES, elle ne s'ajoute pas à côté d'elles. C'est
+# leur lecture — « un plan qui attend un arbitrage de l'opérateur n'est pas
+# prêt » — qui a produit la levée de halte du 17/11, citée mot pour mot au
+# journal de révision. Le point 3 est donc le cœur de cette règle et non sa
+# conclusion : une halte réservée n'est pas un défaut de préparation.
+#
+# Elle cite mika#3122 par référence et nomme ses voisines PAR NUMÉRO ; elle ne
+# reformule aucune de leurs doctrines, pour que les deux ne puissent pas
+# diverger — même discipline que `_FIRE_DISPOSITION_RULE`, qui énumère les trois
+# options de mika#1574 sans les redéfinir.
+#
+# CONTRAINTE LEXICALE, et ce n'est pas une préférence de rédaction : ce texte est
+# AUSSI appendu au findings-file de première passe par `_iterate_groom_loop`, et
+# ce fichier-là est lu par les termes 1 de `_fd_retry_if_section_still_missing`
+# (:10675) et de `_plan_size_retry_if_section_still_missing` (:10806), deux
+# `grep -qF` portant chacun sur le TITRE de la section qu'il réclame.
+# Orthographier l'un de ces deux titres ici rendrait leur premier terme VRAI PAR
+# CONSTRUCTION : les deux rattrapages relanceraient un pilote de revise à chaque
+# ITERATE, avec un finding synthétique faux. Les deux voisines sont donc
+# désignées par leur NUMÉRO DE TICKET, jamais par le titre de leur section.
+# Tenu dans les deux sens par OR5, contre-vacuité comprise.
+_OPERATOR_RESERVED_RULE="RÈGLE DE GROOMING (mika#3122) — une décision réservée à l'opérateur se NOMME, elle ne se tranche pas.
+Le geste, dans les trois cas ci-dessous : écris la décision dans le plan, chiffre les options
+avec leur coût, N'EN PRATIQUE AUCUNE, et laisse le verdict la porter à l'opérateur.
+
+1. UN REFUS DE LA POLITIQUE DE PERMISSION EST UN ARBITRAGE DE L'OPÉRATEUR, matérialisé en code
+   (\`[policy:deny]\`, \`no matching policy rule -- denied by default\`). N'inscris jamais au plan
+   un repli qui obtient LE MÊME EFFET par un autre outil : pas de programme jetable, pas de
+   réécriture du geste, pas de « variante » du même accès. Nomme le refus, nomme ce qu'il
+   empêche, et arrête-toi là.
+2. UNE HALTE RÉSERVÉE NE SE LÈVE JAMAIS PAR UN AMENDEMENT DU PLAN. Quand le corps du ticket, le
+   plan de première passe ou la tête du vol réserve un choix à l'opérateur — quelle coupe, quel
+   périmètre, quel compromis — chiffre les options et n'en pratique aucune. Un finding qui
+   demande de « t'engager » ne lève pas la réserve : il demande de la rendre lisible.
+3. UNE HALTE RÉSERVÉE N'EST PAS UN DÉFAUT DE PRÉPARATION. Les règles de volume (mika#2636) et la
+   borne par vol (mika#2693) demandent un plan prêt à partir ; elles ne demandent pas que tu
+   tranches à la place de l'opérateur. Un plan qui s'arrête proprement sur une décision
+   d'opérateur EST un plan prêt — son verdict est \`ESCALATE\`, et \`ESCALATE\` est une sortie
+   NOMINALE, pas un échec de grooming.
+
+Mesuré deux fois : le 03/11, un plan a prévu de contourner trois refus de permission par un
+programme jetable, et les deux passes l'ont accepté. Le 17/11, une révision a pratiqué la coupe
+que la tête du vol réservait à l'opérateur, en citant mika#2636 et mika#2693 ; il a fallu tuer le
+pilote. mika-arch refuse désormais les deux formes en \`ESCALATE\` aux DEUX passes — et la seconde
+passe est sans recours."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
