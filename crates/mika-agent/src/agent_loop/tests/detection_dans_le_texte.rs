@@ -244,6 +244,116 @@ fn test_detect_completion_claim_in_sentence() {
     );
 }
 
+// -- code_masked : table de vérité du masquage des régions de code (mika#3123) --
+//
+// Dix cas, un par ligne de la grammaire documentée au site. Chaque cas dit deux
+// choses : combien de régions le masquage a reconnues, et ce que la regex de la
+// garde voit du texte masqué — c'est cette seconde moitié qui porte la correction.
+
+#[test]
+fn mika3123_span_simple_masque_le_mot_clef() {
+    let (masked, regions) = code_masked("Le statut passe à `completed`.");
+    assert_eq!(regions, 1);
+    // Les onze caractères de `` `completed` `` deviennent onze espaces.
+    assert_eq!(
+        masked,
+        format!("Le statut passe à {}.", " ".repeat("`completed`".len()))
+    );
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_span_a_n_backticks_masque_jusqua_la_fermeture_de_meme_largeur() {
+    // Run d'ouverture de deux backticks : seul un run de EXACTEMENT deux ferme,
+    // donc les backticks simples intérieurs n'arrêtent pas la région.
+    let (masked, regions) = code_masked("Écris ``le `completed` littéral`` ici.");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+    assert!(masked.starts_with("Écris "));
+    assert!(masked.ends_with(" ici."));
+}
+
+#[test]
+fn mika3123_span_non_termine_ne_masque_rien() {
+    // Décision de bord : un run non apparié est littéral (CommonMark), et c'est le
+    // choix anti-contournement — un backtick solitaire ne neutralise pas la ligne.
+    let text = "Le statut passe à `completed.";
+    let (masked, regions) = code_masked(text);
+    assert_eq!(regions, 0);
+    assert_eq!(masked, text);
+    assert_eq!(
+        COMPLETION_CLAIM_RE.find(&masked).map(|m| m.as_str()),
+        Some("completed")
+    );
+}
+
+#[test]
+fn mika3123_accents_et_tiret_cadratin_autour_dune_region_ne_paniquent_pas() {
+    // Sûreté UTF-8 : le masquage n'indexe jamais par octet, donc le nombre de
+    // caractères est préservé à l'identique, accents et em-dash compris.
+    let text = "Résumé — l'état `completed` est écrit à côté d'un tiret cadratin — fin.";
+    let (masked, regions) = code_masked(text);
+    assert_eq!(regions, 1);
+    assert_eq!(masked.chars().count(), text.chars().count());
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_fence_cloturee_masque_son_contenu() {
+    let (masked, regions) = code_masked("Extrait :\n```\nstatus = completed\n```\nFin.");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+    assert!(masked.starts_with("Extrait :\n"));
+    assert!(masked.ends_with("\nFin."));
+}
+
+#[test]
+fn mika3123_fence_non_terminee_masque_jusqua_la_fin_du_texte() {
+    // Décision de bord : sémantique CommonMark, et le cas fréquent qui compte —
+    // une réponse coupée au plafond de tokens en plein bloc de code.
+    let (masked, regions) = code_masked("Extrait :\n```json\n{\"status\": \"completed\"}");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_fence_imbriquant_des_backticks_simples_reste_une_seule_region() {
+    let (masked, regions) = code_masked("Exemple :\n```\nun `completed` cité\n```\nFin.");
+    assert_eq!(regions, 1);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_citation_et_declaration_dans_le_meme_texte_laissent_la_declaration() {
+    // Le contrôle positif de R2 : masquer ne désarme pas la garde, il la rétrécit.
+    let (masked, regions) =
+        code_masked("J'ai mis `completed` dans la colonne, et le PR est merged.");
+    assert_eq!(regions, 1);
+    assert_eq!(
+        COMPLETION_CLAIM_RE.find(&masked).map(|m| m.as_str()),
+        Some("merged")
+    );
+}
+
+#[test]
+fn mika3123_le_masquage_ne_soude_pas_les_bords_dune_region() {
+    // R3 : supprimer la région aurait fabriqué `completed` — un faux positif créé
+    // par le correctif. L'espace préserve la frontière de mot.
+    let (masked, regions) = code_masked("com`x`pleted");
+    assert_eq!(regions, 1);
+    assert_eq!(masked, "com   pleted");
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
+#[test]
+fn mika3123_completed_at_ne_matche_pas_et_ne_demande_aucun_masquage() {
+    let text = "La colonne completed_at vaut NULL.";
+    let (masked, regions) = code_masked(text);
+    assert_eq!(regions, 0);
+    assert_eq!(masked, text);
+    assert!(COMPLETION_CLAIM_RE.find(&masked).is_none());
+}
+
 // -- detect_milestone_close_claim_without_patch tests (#797, #1207) --
 
 /// Helper: build a ToolCallSummary for run_gh with the given input.

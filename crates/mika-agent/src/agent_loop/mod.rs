@@ -11521,6 +11521,153 @@ static COMPLETION_CLAIM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
         .expect("completion claim regex must compile")
 });
 
+/// Rend `text` avec chaque caractère d'une région de code Markdown remplacé par un
+/// espace, et le nombre de régions masquées (mika#3123).
+///
+/// **Pourquoi remplacer par des espaces et non supprimer.** Supprimer souderait les
+/// deux bords de la région : `` com`x`pleted `` deviendrait `completed`, un faux
+/// positif *créé* par le correctif. L'espace préserve la longueur en caractères, la
+/// structure des lignes, et surtout les frontières de mot — la regex voit
+/// `com pleted`, qui ne matche pas.
+///
+/// **Aucun indexage par octet.** L'implémentation itère sur les caractères et pousse
+/// soit le caractère, soit `' '`. La sûreté UTF-8 est donc tenue par construction, et
+/// non par une entrée d'allowlist de `scripts/check-byte-slices.sh` — une entrée y
+/// serait l'aveu du contraire.
+///
+/// Grammaire des régions, et ses trois décisions de bord :
+///
+/// | forme | ouverture | fermeture | décision de bord |
+/// |---|---|---|---|
+/// | bloc clôturé | ≥ 3 backticks en début de ligne (espaces admis) | ligne de ≥ autant de backticks, backticks seuls | **non terminé ⇒ masque jusqu'à la fin du texte** |
+/// | span inline | N backticks (N < 3, ou N quelconque hors début de ligne) | exactement N backticks, **même ligne** | **non terminé ⇒ ne masque rien** |
+/// | bloc indenté de 4 espaces | — | — | **hors périmètre** |
+///
+/// - **Fence non terminée ⇒ masque jusqu'à la fin.** C'est la sémantique CommonMark,
+///   et c'est aussi le cas fréquent qui compte : une réponse coupée au plafond de
+///   tokens en plein bloc de code. La traiter comme du texte nu rejetterait un tour
+///   qui n'a rien déclaré. Le coût est nommé : un tour pourrait ouvrir une fence
+///   qu'il ne ferme pas et déclarer ensuite ce qu'il veut. Il reste détectable — la
+///   fence ouverte est visible dans le texte — et le contournement était déjà ouvert
+///   sans cela par les trois mots que la garde exclut volontairement (`done`,
+///   `built`, `finished`).
+/// - **Span non terminé ⇒ ne masque rien.** CommonMark traite un run de backticks non
+///   apparié comme littéral, et c'est le choix anti-contournement : un backtick
+///   solitaire ne doit pas neutraliser la fin d'une ligne.
+/// - **Bloc indenté de quatre espaces : hors périmètre**, nommé plutôt que tu. Le
+///   projet n'en produit pas — les fences sont la forme universelle de ses prompts et
+///   de ses rapports — et le reconnaître demanderait de distinguer l'indentation
+///   d'une continuation de liste de celle d'un bloc, un coût sans population mesurée.
+fn code_masked(text: &str) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut regions = 0usize;
+    // Nombre de backticks de la fence ouverte, s'il y en a une.
+    let mut open_fence: Option<usize> = None;
+
+    // `split_inclusive` garde le `\n` terminal : la structure des lignes survit au
+    // masquage, et le texte rendu a exactement le même nombre de caractères.
+    for line in text.split_inclusive('\n') {
+        match open_fence {
+            Some(need) => {
+                // Dans un bloc : tout est masqué, ligne de clôture comprise.
+                mask_line(line, &mut out);
+                if is_bare_backtick_line(line) && leading_backtick_run(line) >= need {
+                    open_fence = None;
+                }
+            }
+            None => {
+                let run = leading_backtick_run(line);
+                if run >= 3 {
+                    open_fence = Some(run);
+                    regions += 1;
+                    mask_line(line, &mut out);
+                } else {
+                    mask_inline_spans(line, &mut out, &mut regions);
+                }
+            }
+        }
+    }
+
+    (out, regions)
+}
+
+/// Longueur du run de backticks ouvrant la ligne, espaces de tête admis.
+fn leading_backtick_run(line: &str) -> usize {
+    line.trim_start().chars().take_while(|c| *c == '`').count()
+}
+
+/// Vrai quand la ligne ne porte, hors espaces, que des backticks : la forme d'une
+/// fence de clôture (CommonMark interdit l'info-string à la clôture).
+fn is_bare_backtick_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c == '`')
+}
+
+/// Masque une ligne entière, en préservant ses fins de ligne.
+fn mask_line(line: &str, out: &mut String) {
+    for c in line.chars() {
+        out.push(if c == '\n' || c == '\r' { c } else { ' ' });
+    }
+}
+
+/// Masque les spans inline d'une ligne hors bloc clôturé.
+///
+/// Un run de N backticks ouvre un span fermé par un run de **exactement** N
+/// backticks sur la même ligne. Sans fermeture, le run est littéral et le balayage
+/// reprend juste après lui — un backtick solitaire ne masque donc rien.
+fn mask_inline_spans(line: &str, out: &mut String, regions: &mut usize) {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let open = i;
+        while i < chars.len() && chars[i] == '`' {
+            i += 1;
+        }
+        let width = i - open;
+
+        // Cherche le premier run de longueur exactement `width` après l'ouverture.
+        let mut j = i;
+        let mut close_end: Option<usize> = None;
+        while j < chars.len() {
+            if chars[j] != '`' {
+                j += 1;
+                continue;
+            }
+            let run_start = j;
+            while j < chars.len() && chars[j] == '`' {
+                j += 1;
+            }
+            if j - run_start == width {
+                close_end = Some(j);
+                break;
+            }
+        }
+
+        match close_end {
+            Some(end) => {
+                // Région : de l'ouverture à la fermeture incluse.
+                for _ in open..end {
+                    out.push(' ');
+                }
+                *regions += 1;
+                i = end;
+            }
+            None => {
+                // Run non apparié : littéral, et le balayage continue après lui.
+                for _ in open..i {
+                    out.push('`');
+                }
+            }
+        }
+    }
+}
+
 /// Detects whether assistant text contains a completion claim.
 ///
 /// Returns the matched keyword for logging, or `None`. Uses a fast-path
