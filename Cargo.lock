@@ -2111,6 +2111,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lru"
+version = "0.19.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83be4da409554841af087163ad187608824ad8ca8713d8e124c8e0f704a2f92f"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2343,7 +2352,7 @@ dependencies = [
  "hmac 0.13.0",
  "http-body-util",
  "jsonwebtoken",
- "lru",
+ "lru 0.19.1",
  "mika-a2a",
  "mika-common",
  "rand 0.10.4",
@@ -3309,7 +3318,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "itertools",
  "kasuari",
- "lru",
+ "lru 0.18.5",
  "palette",
  "serde",
  "strum",
