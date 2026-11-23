@@ -90,14 +90,9 @@ pub async fn run(text: &str, channel: &NotifyChannel, severity: &NotifySeverity)
     Ok(())
 }
 
-/// Resolve the gateway base URL from env or default (same pattern as webhook.rs).
-fn gateway_url() -> String {
-    std::env::var("MIKA_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string())
-}
-
 /// POST the notification text to the gateway's `/send` endpoint for Telegram delivery.
 async fn send_via_gateway(ctx: &init::DbContext, text: &str) -> Result<()> {
-    let gw_url = gateway_url();
+    let gw_url = mika_common::gateway_endpoint::gateway_base_url();
 
     let internal_token: &SecretString = ctx.settings.internal_token.as_ref().ok_or_else(|| {
         anyhow::anyhow!("MIKA_INTERNAL_TOKEN not configured — cannot send via gateway")
@@ -195,5 +190,95 @@ mod tests {
 
         let formatted = format!("[escalate] {text}");
         assert_eq!(formatted, "[escalate] test message");
+    }
+
+    // --- L'adresse du gateway a un seul résolveur (mika#3125) ---
+
+    /// Les deux variables dont la lecture **est** une résolution d'adresse.
+    ///
+    /// Elles vivent ici comme littéraux de test, donc dans la région masquée par
+    /// [`mika_common::source_guard`] : c'est précisément ce que le contre-témoin
+    /// de la garde suivante atteste.
+    const AIGUILLES: &[&str] = &["MIKA_GATEWAY_URL", "MIKA_GATEWAY_PORT"];
+
+    /// Le fichier dont la production sert de témoin au balayage.
+    const SITE_TEMOIN: &str = "commands/notify.rs";
+
+    /// Balaie la moitié production du crate et rend `(chemin relatif, source)`.
+    ///
+    /// Un seul balayage pour la garde et pour ses témoins : deux balayages
+    /// seraient deux lectures libres de diverger, et c'est le témoin — celui qui
+    /// atteste que la garde a bien regardé — qui perdrait son sens.
+    fn production_du_crate() -> Vec<(String, String)> {
+        let scanner =
+            mika_common::source_guard::ProductionScanner::for_crate(env!("CARGO_MANIFEST_DIR"));
+        let mut vues = Vec::new();
+        scanner.for_each(|path, source| {
+            let rel = path
+                .strip_prefix(scanner.src_root())
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            vues.push((rel, source.to_string()));
+        });
+        vues
+    }
+
+    #[test]
+    fn mika3125_le_crate_cli_ne_resout_plus_ladresse_du_gateway() {
+        // Livrée vide, et vide par construction : quand la garde rougit, le
+        // remède est l'appel que son message nomme, jamais une entrée ici.
+        const ALLOWED: &[&str] = &[];
+        assert!(ALLOWED.is_empty(), "l'allowlist de cette garde reste vide");
+
+        let mut violations: Vec<String> = Vec::new();
+        for (rel, source) in production_du_crate() {
+            if ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            for (idx, line) in source.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if AIGUILLES.iter().any(|needle| line.contains(needle)) {
+                    violations.push(format!("{rel}:{} — {}", idx + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "mika#3125 : l'adresse du gateway se résout à un seul site \
+             (mika_common::gateway_endpoint). Site(s) supplémentaire(s) :\n{}\n\
+             Le remède est d'appeler `gateway_base_url()`, PAS d'ajouter une entrée à \
+             ALLOWED — qui doit rester vide.",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn mika3125_le_scan_a_bien_lu_la_production_et_masque_les_tests() {
+        let vues = production_du_crate();
+        let (_, production) = vues
+            .iter()
+            .find(|(rel, _)| rel == SITE_TEMOIN)
+            .unwrap_or_else(|| panic!("le balayage n'a pas visité {SITE_TEMOIN}"));
+
+        // Témoin : sans lui, une garde balayant une racine fausse serait verte
+        // **par cécité** — l'exact défaut que `ProductionScanner` existe pour
+        // refuser (mika#2398).
+        assert!(
+            production.contains("async fn send_via_gateway("),
+            "le balayage n'a pas lu la moitié production de {SITE_TEMOIN}"
+        );
+
+        // Contre-témoin : le masquage remplace les régions `#[cfg(test)]` par des
+        // lignes vides sans jamais tronquer. Sans cette assertion, les deux
+        // aiguilles citées par `AIGUILLES` juste au-dessus feraient rougir la
+        // garde, et on l'aurait « réparée » par une entrée d'allowlist.
+        assert!(
+            !production.contains("fn test_notifications_session_id_is_valid_uuid"),
+            "le balayage n'a pas masqué la moitié test de {SITE_TEMOIN}"
+        );
     }
 }
