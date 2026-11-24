@@ -8,6 +8,30 @@
 # test reports "absent" for a value that is present (a false failure), or
 # masks a real one. Any such pipeline fails the build.
 #
+# TWO CLASSES THIS GUARD DID NOT SEE UNTIL mika#3130. Both were populated in the
+# tree, and the second one went red in CI while sitting inside this scan field:
+#
+#   T1 — line continuation. The producer on one line, the `| grep -q` on the
+#        next after a `\`. A line-at-a-time matcher sees neither half. This is
+#        the shape of `test-dispatch-lib.sh`'s mika#2211 `APPENDED` assertion,
+#        which failed the `Check` job on attempt 1 of run 43079844489 (PR #3075)
+#        and passed on attempt 2 with an unchanged diff — a RE-TRIED run is the
+#        signature of this fault.
+#   T2 — intermediate link. The old middle class `[^|#]*` could cross neither an
+#        intermediate `|` (`printf … | grep -v … | grep -qE …`) nor a literal `#`
+#        inside a pipeline string (`'^[[:space:]]*#'`) nor a `|` enclosed in an
+#        expansion (`"${result#*|}"`).
+#
+# Both are closed by normalising to LOGICAL lines and removing the end-of-line
+# comment before matching a widened ERE — see `_logical_lines`,
+# `_strip_eol_comment` and `FORBIDDEN` below.
+#
+# Still OUT of scope, deliberately: the producer vocabulary stays `printf|echo`.
+# Other producers that can take SIGPIPE (`sed`, `git show`, `head`, `cat`, a
+# shell function) are a distinct and far more populated class — roughly twenty
+# sites — and sorting them needs a per-site judgement on whether the producer is
+# bounded under the pipe buffer. Tracked in senara-solutions/mika#2983.
+#
 # Root-cause writeup:
 #   docs/solutions/test-failures/bash-assert-sigpipe-and-host-coupling-before-ci-gate-2026-08-29.md
 # Prior recurrence (n=2 in days) is the argument for a structural guard over
@@ -47,6 +71,9 @@
 #   short-circuit). The ticket-citation form is enforced structurally: a bare
 #   `# sigpipe-safe` marker WITHOUT a `#<digits>` citation does NOT suppress
 #   the violation (protects against "add the marker to bypass the gate").
+#   On a T1 (continuation) violation, the marker on ANY physical line of the
+#   logical group suppresses — the exemption is read before the end-of-line
+#   comment is removed (mika#3130).
 #
 # Exit codes:
 #   0 — clean
@@ -63,11 +90,110 @@ ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 
 # The forbidden shape, as an ERE:
 #   a producer word (printf|echo), then anything up to a pipe that stays in the
-#   same pipeline segment (no `|`, no `#` comment start), then `grep` with a run
-#   of flag tokens the LAST of which carries a `q` (`-q`, `-qF`, `-qiE`, `-Fq`…).
+#   same COMMAND (no `;`, no `&` — so no `&&`, no `||`, no background), then
+#   `grep` with a run of flag tokens the LAST of which carries a `q` (`-q`,
+#   `-qF`, `-qiE`, `-Fq`…).
 # The q-flag must appear before the (quoted) pattern, so a `-q`-shaped needle
 # does not self-trigger.
-FORBIDDEN='(^|[^[:alnum:]_.])(printf|echo)[^|#]*\|[[:space:]]*grep[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*q[A-Za-z]*([[:space:]]|$)'
+#
+# mika#3130: the middle class was `[^|#]*` — the producer had to sit
+# IMMEDIATELY adjacent to the `grep -q`. That missed every pipeline with an
+# intermediate link (`printf … | grep -v … | grep -qE …`), and every one whose
+# `|` or `#` lives inside a string or an expansion (`"${result#*|}"`,
+# `grep -v '^[[:space:]]*#'`). `[^;&]*` lets those through while keeping the
+# producer and the `grep -q` in the SAME command: a `;`, a `&&`, a `||` or a
+# `&` cuts the match, so `echo "msg"; cmd | grep -q x` is not flagged.
+# Widening is only safe because the end-of-line comment is removed first — see
+# `_strip_eol_comment` below.
+FORBIDDEN='(^|[^[:alnum:]_.])(printf|echo)[^;&]*\|[[:space:]]*grep[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*q[A-Za-z]*([[:space:]]|$)'
+
+# ── Normalisation, stage 1: physical lines → LOGICAL lines (mika#3130, class T1)
+# A producer on one line and its `| grep -q` on the next, joined by a trailing
+# `\`, is ONE pipeline — but a line-at-a-time matcher sees neither half. That is
+# exactly the shape that went red on run 43079844489 (PR #3075) while living for
+# months inside this guard's own scan field.
+#
+# Emits one record per logical line, `N:<joined text>` — the same format as
+# `grep -n`, so the reading loop below is unchanged. N is the FIRST physical line
+# of the group: the line the operator must go to. The `\` becomes a space, as the
+# shell's own joining does for token purposes.
+#
+# A full-line comment is NEVER joined to the next line: in bash the comment
+# swallows a trailing `\` (`# prose \` does not continue), so joining it would
+# hide the following line from the matcher.
+#
+# The invariant that makes this stage safe the other way round: a continuation
+# requires the `\` as the LAST character of the line, so a comment can never
+# precede a continuation on the same physical line. Joining cannot glue code
+# behind a `#`.
+_logical_lines() {
+    awk '
+        function _trailing_bs(s,   n, i) {
+            n = 0
+            for (i = length(s); i >= 1; i--) {
+                if (substr(s, i, 1) == "\\") n++; else break
+            }
+            return n
+        }
+        {
+            if (buf == "") start = NR
+            if (buf == "" && $0 ~ /^[[:space:]]*#/) { print start ":" $0; next }
+            if (_trailing_bs($0) % 2 == 1) {
+                buf = buf substr($0, 1, length($0) - 1) " "
+                next
+            }
+            print start ":" buf $0
+            buf = ""
+        }
+        END { if (buf != "") print start ":" buf }
+    ' "$1"
+}
+
+# ── Normalisation, stage 2: drop the END-OF-LINE comment (mika#3130, no new FPs)
+# Quote-aware: truncates at the first `#` that is outside quotes AND preceded by
+# start-of-text or whitespace. This is what lets the ERE widen to `[^;&]*`
+# without buying a false positive on prose that merely CITES the forbidden shape
+# — while a `#` living inside a string stays visible, which the real population
+# needs (`printf … | grep -v '^[[:space:]]*#' | grep -qE …`).
+#
+# ORDER IS IMPERATIVE: the `# sigpipe-safe: #<ticket>` escape IS an end-of-line
+# comment, so the exemption filter runs BEFORE this stage (see the pipeline in
+# the scan loop). That order also gives the T1 escape for free: a marker on ANY
+# physical line of the group lands in the logical line and suppresses.
+#
+# Direction of error, said honestly: this stage only REMOVES text, so it can
+# produce a false negative, never a false positive. The residual case is a
+# MULTI-LINE string (no `\`) one of whose lines carries a `#`: the quote state,
+# computed per logical line, is wrong there. Such a false negative would be on
+# data text, not on an executed pipeline — and the pre-mika#3130 guard saw
+# nothing of that class either. No occurrence in the current tree.
+_strip_eol_comment() {
+    awk '
+        BEGIN { SQ = sprintf("%c", 39) }
+        {
+            p = index($0, ":")
+            pre = substr($0, 1, p)
+            s = substr($0, p + 1)
+            out = ""; sq = 0; dq = 0; n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (c == "\\" && !sq) {
+                    out = out c
+                    if (i < n) { i++; out = out substr(s, i, 1) }
+                    continue
+                }
+                if (c == SQ && !dq) { sq = !sq; out = out c; continue }
+                if (c == "\"" && !sq) { dq = !dq; out = out c; continue }
+                if (c == "#" && !sq && !dq) {
+                    prev = (i == 1) ? "" : substr(s, i - 1, 1)
+                    if (prev == "" || prev == " " || prev == "\t") break
+                }
+                out = out c
+            }
+            print pre out
+        }
+    '
+}
 
 # The guard and its own test embed FORBIDDEN as a string literal; never scan
 # them (they would self-match).
@@ -115,8 +241,9 @@ VIOLATIONS=0
 for f in "${FILES[@]}"; do
     is_excluded "$(basename "$f")" && continue
     should_enforce "$f" || continue
-    # Drop full-line comments before matching; keep line numbers via grep -n on
-    # the original, then filter. A correctly-cited escape suppresses the line.
+    # What enters the matcher is a LOGICAL line, not a physical one (mika#3130).
+    # Drop full-line comments before matching; the line number is the first
+    # physical line of the logical group. A correctly-cited escape suppresses it.
     while IFS= read -r hit; do
         [ -n "$hit" ] || continue
         lineno="${hit%%:*}"
@@ -130,8 +257,17 @@ for f in "${FILES[@]}"; do
         echo "       Fix: grep -q… -- PATTERN <<<\"\$DATA\"  (no pipeline, no SIGPIPE)."
         VIOLATIONS=$((VIOLATIONS + 1))
     done < <(
-        grep -nE "$FORBIDDEN" "$f" \
-            | grep -Ev '# sigpipe-safe: #[0-9]+' \
+        # Chain order is load-bearing: stage 1 → exemption → stage 2 → match.
+        # None of these links short-circuits, so the guard cannot fall into the
+        # very SIGPIPE class it denies.
+        # `-a` on both greps: a stream GNU grep decides is binary (an invalid
+        # multibyte sequence anywhere in the file is enough) would otherwise
+        # report `binary file matches` on stderr and SWALLOW the matching line —
+        # a fail-open in the one place that must not have one.
+        _logical_lines "$f" \
+            | grep -a -Ev '# sigpipe-safe: #[0-9]+' \
+            | _strip_eol_comment \
+            | grep -a -E "$FORBIDDEN" \
             || true
     )
 done

@@ -14996,8 +14996,13 @@ To publish it anyway: gh pr create --repo senara-solutions/${REPO} --head ${BRAN
         # operator/telemetry must see that the Guard-2 belt is missing.
         if [ "$RECOVERY_CLASS" = "commit-pushed-no-pr" ]; then
             _marker_at_head=1
-            if printf '%s' "$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null)" \
-                | grep -qF 'wip(mika#1383): auto-PR-create rescue'; then
+            # Le sujet de HEAD est capturé, puis LU en here-string : jamais
+            # `printf … | grep -q` (mika#2055, mika#3130) — `grep -q` ferme le tube
+            # au premier match, le producteur prend EPIPE, et sous le `pipefail`
+            # que cette lib hérite de ses appelants le 141 ferait lire FAUX sur un
+            # sujet PRÉSENT.
+            _head_subject=$(git -C "$WORKTREE_DIR" log -1 --format='%s' 2>/dev/null || true)
+            if grep -qF -- 'wip(mika#1383): auto-PR-create rescue' <<<"$_head_subject"; then
                 echo "rescue_marker.skip_commit: head already a wip(mika#1383) marker (branch=$BRANCH)" >&2
             elif ! git -C "$WORKTREE_DIR" commit --allow-empty --no-verify -m "wip(mika#1383): auto-PR-create rescue for ${REPO}#${ISSUE_NUM}
 

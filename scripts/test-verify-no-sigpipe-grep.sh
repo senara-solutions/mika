@@ -52,6 +52,22 @@ make_fixture() {
     echo "$dir"
 }
 
+# Same, but the body is EVERY argument, one per line (mika#3130). The T1 class
+# only exists across physical lines, so the single-body helper cannot express it:
+# a fixture written as one `$body` with embedded `\n` would be indistinguishable
+# from the mono-line cases the six historical assertions already cover.
+make_fixture_lines() {
+    local dir
+    dir="$(mktemp -d)"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -euo pipefail'
+        echo 'x="some haystack"'
+        printf '%s\n' "$@"
+    } > "$dir/probe.sh"
+    echo "$dir"
+}
+
 # 1. The real, swept tree is clean.
 assert_exit "$REPO_ROOT" 0 "swept repo tree is clean"
 
@@ -83,6 +99,82 @@ rm -rf "$d"
 # 5. A BARE marker (no #<digits> citation) does NOT suppress.
 d="$(make_fixture 'if echo "$x" | grep -qF "hay"; then :; fi  # sigpipe-safe')"
 assert_exit "$d" 1 "bare escape marker does not suppress"
+rm -rf "$d"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# mika#3130 — the two classes the guard did NOT see, and the two false positives
+# the widening must not buy.
+#
+# The six cases above stay exactly as they were: they are the non-regression
+# proof of the mono-line behaviour. Case 1 ("swept repo tree is clean") doubles
+# as the proof that the five measured sites really were rewritten — with the
+# extended detector, a single one left un-rewritten would make it exit 1.
+# ───────────────────────────────────────────────────────────────────────────────
+
+# 6. T1 (line continuation), on the SHAPE OF THE TICKET'S OWN SITE: the producer
+#    on one line, the `| grep -qF` on the next after a `\`. This is the form that
+#    failed `Check` on attempt 1 of run 43079844489 (PR #3075) while living
+#    inside this guard's scan field.
+d="$(make_fixture_lines \
+    'assert_eq "label" "yes" \' \
+    '    "$(if printf '"'"'%s'"'"' "$x" \' \
+    '        | grep -qF '"'"'hay'"'"'; \' \
+    '       then printf '"'"'yes'"'"'; else printf '"'"'no'"'"'; fi)"')"
+assert_exit "$d" 1 "T1: producer and 'grep -q' split by a continuation is rejected"
+rm -rf "$d"
+
+# 7. The here-string remedy, written across a continuation, is still accepted —
+#    the joining must not turn the FIX into a violation.
+d="$(make_fixture_lines \
+    'NEEDLE='"'"'hay'"'"'' \
+    'assert_eq "label" "yes" \' \
+    '    "$(if grep -qF -- "$NEEDLE" <<<"$x"; \' \
+    '       then printf '"'"'yes'"'"'; else printf '"'"'no'"'"'; fi)"')"
+assert_exit "$d" 0 "T1: here-string remedy across a continuation passes"
+rm -rf "$d"
+
+# 8. The escape hatch on a T1 group: the marker lives on the LAST physical line,
+#    the violation starts on the first — it must still suppress (the exemption is
+#    read before the end-of-line comment is removed).
+d="$(make_fixture_lines \
+    'if printf '"'"'%s'"'"' "$x" \' \
+    '    | grep -qF "hay"; then :; fi  # sigpipe-safe: #2055')"
+assert_exit "$d" 0 "T1: ticket-cited marker on any line of the group suppresses"
+rm -rf "$d"
+
+# 9. …and a BARE marker on that same group does not. The citation stays
+#    structurally required across the continuation too.
+d="$(make_fixture_lines \
+    'if printf '"'"'%s'"'"' "$x" \' \
+    '    | grep -qF "hay"; then :; fi  # sigpipe-safe')"
+assert_exit "$d" 1 "T1: bare marker on the group does not suppress"
+rm -rf "$d"
+
+# 10. T2 (intermediate link) with a literal `#` inside the middle pattern — the
+#     exact shape of test-dispatch-lib.sh's mika#2608 assertion. The old
+#     `[^|#]*` middle class could cross neither the `|` nor the `#`.
+d="$(make_fixture 'if printf '"'"'%s\n'"'"' "$x" | grep -v '"'"'^[[:space:]]*#'"'"' | grep -qE "hay"; then :; fi')"
+assert_exit "$d" 1 "T2: intermediate 'grep -v' link with a '#' in its pattern is rejected"
+rm -rf "$d"
+
+# 11. T2 with the `|` living inside a parameter expansion (`"${x#*|}"`) — the
+#     shape of test-verify-no-secret-in-setenv.sh's assert_mentions.
+d="$(make_fixture 'if printf '"'"'%s'"'"' "${x#*|}" | grep -q "hay"; then :; fi')"
+assert_exit "$d" 1 "T2: a '|' inside an expansion no longer hides the pipeline"
+rm -rf "$d"
+
+# 12. The first false positive the widening must not buy: an END-OF-LINE comment
+#     that merely CITES the forbidden shape. (Full-line prose was already
+#     filtered before mika#3130; this is the in-line case.)
+d="$(make_fixture 'grep -qF -- "hay" <<<"$x" || true  # prose: never printf "$x" | grep -q hay')"
+assert_exit "$d" 0 "no FP: an end-of-line comment citing the shape is not a violation"
+rm -rf "$d"
+
+# 13. The second: a `;` between the producer and the pipeline. `[^;&]*` must keep
+#     the producer and the `grep -q` in the SAME command — here `cat` is the real
+#     producer, and it is out of the `printf|echo` vocabulary, so this must pass.
+d="$(make_fixture 'echo "a"; cat /dev/null | grep -q "b" || true')"
+assert_exit "$d" 0 "no FP: a ';' cuts the producer off from the pipeline"
 rm -rf "$d"
 
 echo ""
