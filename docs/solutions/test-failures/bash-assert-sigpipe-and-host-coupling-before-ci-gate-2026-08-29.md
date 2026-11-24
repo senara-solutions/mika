@@ -4,11 +4,13 @@ tags: [bash, testing, sigpipe, pipefail, hermeticity, ci-gate, git-config, dispa
 problem_type: test_failure
 category: test-failures
 date: 2026-08-29
-ticket: mika#1772
+ticket: mika#1772, mika#3130
 applies_when:
   - Promoting a bash test suite that has only ever been run by hand into `make test` or CI
   - Writing or reviewing `assert_contains` / `assert_not_contains` helpers in bash
   - Chasing a bash test failure that does not reproduce on re-run
+  - Reading a CI job that went red on attempt 1 and green on attempt 2 with an unchanged diff
+  - Extending or reviewing `scripts/verify-no-sigpipe-grep.sh`
   - Adding fixtures that `git init` and commit into temp directories
 root_cause: test_isolation
 resolution_type: test_fix
@@ -40,6 +42,37 @@ if grep -qF -- "$needle" <<<"$haystack"; then
 ```
 
 The `--` matters independently: a needle beginning with `-` would otherwise be read as an option.
+
+## Ce que le lint ne voyait pas (mika#3130)
+
+La prose ci-dessus a été armée en CI par `scripts/verify-no-sigpipe-grep.sh` (mika#2055, job `sigpipe-grep-lint`). Quinze mois plus tard, la même panne a rougi le job `Check` sur une PR sans lien avec elle — sur un site qui vivait **dans le champ de scan de ce lint** depuis des mois.
+
+**La signature de la panne est un run re-tenté.** Run 43079844489, tentative 1 : étape « Dispatch-lib assertion suite » → `failure`. Même run, tentative 2, **diff inchangé** → `success`. PR #3075, mergée le 2026-11-12. Quand un job rougit, qu'une re-tentative le rend vert et que le diff n'a pas bougé, cette classe est le premier suspect — et il n'y a plus de log à lire : l'API n'en sert plus que la dernière tentative.
+
+Le site était l'assertion mika#2211 de `test-dispatch-lib.sh`, écrite ainsi :
+
+```bash
+assert_eq "…" "yes" \
+    "$(if printf '%s' "$T2211_SUW_SRC" \
+        | grep -qF 'PROMPT=$(printf …)'; \
+       then printf 'yes'; else printf 'no'; fi)"
+```
+
+45 207 octets de donnée, motif à 93 % du flux. La course est serrée mais réelle : elle dépend de l'entrelacement des `write()` et des lectures, pas d'un dépassement du tampon de pipe. **Elle n'est pas reproductible à la demande** — 200 tirages de la forme fautive sur la vraie donnée, le 2026-11-24, ont donné 0 rouge. Un vert local n'infirme donc rien, et un test qui prétendrait « reproduire » la course serait soit flaky, soit vert par accident.
+
+Deux classes échappaient à l'ERE du lint, qui était ligne-à-ligne et exigeait le producteur **immédiatement adjacent** au consommateur (`(printf|echo)[^|#]*\|[[:space:]]*grep … -q…`) :
+
+- **T1 — continuation de ligne.** Producteur sur une ligne, `| grep -q` sur la suivante après un `\`. Un matcheur ligne-à-ligne ne voit ni l'une ni l'autre. C'est exactement la forme ci-dessus.
+- **T2 — maillon intermédiaire.** `[^|#]*` ne peut traverser ni un `|` intermédiaire (`printf … | grep -v … | grep -qE …`), ni un `#` littéral dans une chaîne du pipeline (`'^[[:space:]]*#'`), ni un `|` enfermé dans une expansion (`"${result#*|}"`).
+
+Population mesurée le 2026-11-24 sur `scripts/` + `skills/bundled/` : **cinq sites**, deux en T1 et trois en T2, zéro faux positif avec l'ERE élargi. Les cinq sont réécrits en here-string par mika#3130, donc la population résiduelle est vide.
+
+Le remède côté détecteur est une **normalisation en deux étages avant le match** : jointure des continuations en lignes logiques (le numéro rapporté est celui de la **première** ligne du groupe), puis retrait du commentaire de **fin** de ligne en suivant l'état des guillemets — ce second étage est ce qui permet d'élargir la classe médiane à `[^;&]*` sans acheter de faux positif sur de la prose qui cite la forme interdite. L'ordre est contraint : le marqueur d'exemption `# sigpipe-safe: #<ticket>` **est** un commentaire de fin de ligne, donc l'exemption se lit avant l'étage 2.
+
+Deux leçons transférables :
+
+1. **Une doctrine écrite trois fois en prose et armée par un lint n'est pas tenue tant que le lint n'a pas été confronté à la forme réelle de ses propres sites.** Ici le lint et sa victime cohabitaient dans le même dépôt, l'une dans le champ de scan de l'autre.
+2. **Le `-a` de grep n'est pas cosmétique sur un détecteur.** Un flux que GNU grep juge binaire fait rapporter `binary file matches` sur stderr et **avale** la ligne — mesuré sur l'arbre réel pendant ce vol : un fichier entier sortait du scan en silence. Un fail-open dans un détecteur est pire que son absence, parce qu'il porte un vert.
 
 ## Root cause 2 — fixtures inherit the developer's global git config
 
