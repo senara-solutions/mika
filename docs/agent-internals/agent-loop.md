@@ -711,6 +711,113 @@ not by the checkout. No script ships for it — the written protocol above is AC
 does not guarantee obedience (doctrine mika#1190). The measurement is what will say whether it
 moved.
 
+### Review-anchor guard — the quote axis has three causes, and the label has several shapes (mika#3127)
+
+Everything above measures whether the model obeys the re-prompt. mika#3127 fixes the two cases
+where it could not: the guard **refused correctly and named the wrong cause**, so the corrective
+re-prompt asked for the wrong fix. Neither threshold moved — `review_anchor_min_count = 3`,
+`review_anchor_min_quote_chars = 40`, `review_anchor_min_brief_chars = 2000` are untouched on all
+three arch manifests. Only the *name* of the refusal and the *reading of the label* changed.
+
+**The three causes of the quote axis.** `find_brief_quote_range` returned `TooShort` only when the
+**whole line** was shorter than `min_quote_chars`; otherwise the 40-character window slid, found
+nothing, and the answer was `NoQuote` → `QuoteNotInBrief` — *"does not quote the brief verbatim —
+paraphrase does not satisfy the contract"* — for a quote that **was** in the brief, word for word,
+on 29 characters. Measured twice: comment 62 of mika#3127 (anchor A3, *"Une ligne ajoutée, aucun
+code"*, 29 characters, trace `4c245c23`) and comment 6 case 1 (*"Total estimé : 358 lignes"*, 25
+characters, trace `a0e82156`, session `62162fa2`). The three causes are now distinct, and each
+commands a different fix:
+
+| `miss_reason` | what the response did | what the re-prompt asks |
+|---|---|---|
+| `QuoteSpanTooShort` | quotes **this** brief, on fewer than 40 consecutive characters | **lengthen** the quoted span — do not replace the quote |
+| `QuoteTooShort` | carries nothing checkable at all: under `QUOTE_PRESENCE_PROBE_CHARS`, or short **and** absent | write a real quote |
+| `QuoteNotInBrief` | quotes at least 40 characters of *something*, not of this brief | quote **this** brief (and, since mika#3003, possibly: *"your A1 quotes what `gh_read` returned"*) |
+
+They are kept apart because `miss_reason` is a **log field**: "the quote was right but short" and
+"the line said nothing checkable" under one name stop being subtractable (mika#2205) — and that
+subtraction is exactly the count that says whether this change served.
+
+**The presence probe, and its safety property.** The distinction is drawn by a second pass at
+`QUOTE_PRESENCE_PROBE_CHARS = 16` characters, run **only when the decisional pass at
+`min_quote_chars` found nothing**, with an **empty** claimed-regions list (a region an earlier
+anchor already claimed proves presence as well as a free one). The property that makes it safe is
+structural, not a convention: **the probe can make no anchor accepted.** It never returns
+`QuoteSearch::Found`, nothing it finds is pushed into `claimed`, and `anchors_valid` never moves
+because of it. It renames a refusal; it never converts one into an acceptance
+(`mika3127_la_sonde_naccepte_aucune_ancre`, `mika3127_la_sonde_ne_rend_jamais_une_region`).
+
+16 is bounded on both sides by measurement: the two quotes to recover are 25 and 29 characters
+(ceiling), and sixteen consecutive characters of a precise brief are not a coincidence of ordinary
+French prose (floor). It is deliberately **not** `ATTRIBUTION_MIN_QUOTE_CHARS` (40) — aligning the
+two by symmetry would collapse the very distinction the probe exists to draw.
+
+Aggregation priority, when several anchors fail for several reasons, inserts the new cause between
+absence and brevity — geometry first, then the four pre-existing causes in their original relative
+order: `OverlappingRegions` → `QuoteNotInBrief` → `QuoteSpanTooShort` → `QuoteTooShort` →
+`TooFewAnchors`.
+
+**The read ledger's gate stays closed on a short quote.** `ToolReadLedger::attribute` still
+attributes **only** a `QuoteNotInBrief`. A `QuoteSpanTooShort` means the quote is in *this* brief,
+so there is nothing to attribute to a tool — naming one would be the mika#3003 instrument lying on
+a perfectly correct quote (`mika3127_la_porte_du_registre_reste_fermee_sur_une_citation_courte`).
+
+**The label shapes the guard reads.** `verify_review_anchors` looked for the prefix on
+`line.trim_start().trim_start_matches('*')`, so only **leading** `*` fell. `**A1:** "…"` was read
+(mika#2786), but `**A1** : "…"` and `**A1** (déjà acceptée, conservée) : "…"` gave
+`anchors_found: 0` → `NoAnchorLine` → a withheld pass. Measured in comment 18 (mika#3022, trace
+`f5eae27d`, session `e59ab2dc`): a **correct** quote counted as absent, the groom dead in a
+terminal `Verdict: ESCALATE` after 50 turns and $5.28, and a human hand needed to re-apply `ready`.
+
+`review_anchor::match_anchor_prefix` now consumes the declared prefix character by character and,
+**between** two of its characters, skips markup and spacing noise (`*`, backtick, `_`, space, tab)
+plus **at most one** balanced `(…)`/`[…]` group of at most `LABEL_ANNOTATION_MAX_CHARS = 64`
+characters. Regex-free, like the rest of the module (mika#864). Read: `A1:`, `**A1:**`,
+`**A1** : "…"`, `**A1** (déjà acceptée, conservée) : "…"`, `  * **A10** [conservée] : "…"`. Not
+read, each with a negative control in `mika3127_libelles`:
+
+- `(A1) : …` — no group is tolerated **before** a prefix character has matched, or every
+  parenthesis opening a line would open an anchor;
+- `**Attention** : 1 : …` — the walk is anchored at the line's head and never skips a character
+  that is neither noise nor an annotation, so it dies on the `t`;
+- an annotation past 64 characters — the line is then **not read as an anchor** rather than read
+  with a wider label. Fail-closed: a label not read costs a `NoAnchorLine` the author fixes by
+  writing a plainer label, where a label read too wide would eat a real quote.
+
+Two invariants survive intact. The annotation leaves **with** the label, so it never counts as
+quoted characters — the mika#2786 rule ("a longer prefix must not buy a shorter quote") extended,
+and measured on a 45-character verbatim fragment written inside the parenthesis
+(`mika3127_lannotation_nachete_aucune_longueur`). And the `label` in `AnchorOutcome` stays the
+**declared** prefix rather than the graphy read, so `accepted_labels` / `refused_labels` keep one
+population per label.
+
+**Post-deploy measurement protocol.** The positive is a **swap of names on the same population**,
+not a drop in refusals — the refusals were right, only their names were wrong. Read on
+`$MIKA_SPIRIT_LOG_FILE`, with `guard.review_anchor_armed` as the denominator (mika#3003):
+
+```sh
+jq -r 'select(.event | startswith("guard.review_anchor"))
+       | [.timestamp, .event, .anchors_found, .anchors_valid, .miss_reason] | @tsv' \
+  < /var/log/mika/server.log
+```
+
+Three things to read over 14 days before versus 14 days after the deploy:
+
+- **`miss_reason` swings from `QuoteNotInBrief` to `QuoteSpanTooShort`** on the population that
+  used to be misnamed. A `QuoteSpanTooShort` count that stays at zero while `QuoteNotInBrief`
+  holds its level means the probe never fires — a defect, not a success.
+- **`anchors_found: 0` must fall.** That is defect B's symptom, and the only one that shows
+  directly in a field.
+- **Then, and only then, the withhold ratio** of mika#2794 / mika#3003. It moves only if the model
+  obeys a re-prompt that now names the right fix — which is a bet on model behaviour (mika#1190),
+  not something this change can assert.
+
+**The "before" window is rebuilt offline**, as in mika#3003: `miss_reason` distributions come from
+`server.log`, but the misnamed population can only be re-derived by replaying the matcher over
+`llm_calls.response_text` (schema v31) in `~/.mika/data/mika.db`. **And the absence of these lines
+is worth nothing before `make deploy`** — the journal is written by the binary being served, not by
+the checkout (class mika#2340).
+
 ### Deterministic Context Injection
 
 Skills with `[context.*]` sections have their data pre-fetched by the engine before the LLM turn. `resolve_contexts()` dispatches to engine-owned handlers by `context_type`, deduplicates across skills, and returns `ContextBlock`s. `apply_context_replacements()` performs single-pass `{{key}}` template substitution on skill prompts (injection-safe — replaced content is never re-scanned). If a `required = true` context fails, the declaring skill is excluded from the turn; if `required = false`, a sentinel message replaces the placeholder. Known types: `gh_pr_diff`. Module: `skills/context.rs`.

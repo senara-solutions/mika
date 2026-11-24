@@ -62,8 +62,18 @@
 pub(crate) enum AnchorMissReason {
     /// No line in the message body starts with a declared anchor prefix.
     NoAnchorLine,
-    /// Anchor lines exist, but none carries a quote long enough to check.
+    /// Anchor lines exist, but none carries anything checkable at all: shorter than
+    /// [`QUOTE_PRESENCE_PROBE_CHARS`], or short **and** absent from the brief.
     QuoteTooShort,
+    /// Anchor lines DO quote the brief, but on fewer consecutive characters than the contract
+    /// requires (mika#3127).
+    ///
+    /// Kept apart from [`Self::QuoteTooShort`] on purpose, and the reason is the log rather
+    /// than the prose: `guard.review_anchor_withheld` carries `miss_reason`, and "the quote was
+    /// right but short" and "the line said nothing checkable" under one name stop being
+    /// subtractable (mika#2205) — which is exactly the count that says whether this flight
+    /// served. The corrective fix differs too: lengthen the span, do not replace the quote.
+    QuoteSpanTooShort,
     /// Anchor lines carry long-enough text, but it does not appear in the brief.
     QuoteNotInBrief,
     /// Enough anchors quote the brief, but they land on the same region of it.
@@ -82,6 +92,11 @@ impl AnchorMissReason {
             }
             Self::QuoteTooShort => {
                 "the anchor lines are too short to carry a checkable quote of the reviewed brief"
+            }
+            Self::QuoteSpanTooShort => {
+                "the anchor lines do quote the reviewed brief, but on too few consecutive \
+                 characters to be checkable — lengthen the quoted span, do not replace it with \
+                 another quote"
             }
             Self::QuoteNotInBrief => {
                 "the anchor lines do not quote the reviewed brief verbatim — paraphrase does \
@@ -252,7 +267,32 @@ const TOOL_READ_LEDGER_CHARS: usize = 200_000;
 /// the same window; the floor exists for the skill that lowers its own threshold. Lowering the
 /// bar there would buy nothing and risk naming a tool on a coincidence — and a false
 /// attribution is worse than none, because the sentence that carries it is indicative.
+///
+/// **Deliberately higher than [`QUOTE_PRESENCE_PROBE_CHARS`] (16), and not to be aligned with
+/// it by symmetry.** The two numbers back claims of different weight: this one backs an
+/// *indicative* sentence about where a line came from, so it must be worth proof; the probe
+/// only picks which of three messages is sent, and can accept nothing.
 const ATTRIBUTION_MIN_QUOTE_CHARS: usize = 40;
+
+/// Width, in normalized characters, of the presence probe that names the cause (mika#3127).
+///
+/// The probe answers one question — *does this line quote the brief at all, if only on a
+/// fragment?* — and nothing else. **It can make no anchor accepted:** it never returns
+/// [`QuoteSearch::Found`], nothing it finds is pushed into `claimed`, and `anchors_valid` never
+/// moves because of it. On every input `Satisfied` stays `Satisfied` and `Missing` stays
+/// `Missing`; only the reason changes. The cost of a probe false positive is therefore bounded
+/// at *a message less accurate than it could be*, never a forged attestation — and that is what
+/// licenses a width far below a decision's.
+///
+/// 16 is bounded on both sides by measurement. The ceiling: the two quotes to recover are 25
+/// and 29 normalized characters (mika#3127 comments 6 and 62), so the probe must sit below 25.
+/// The floor: sixteen consecutive characters of a precise brief are not a coincidence of
+/// ordinary French prose, and a line shorter than sixteen is not probeable at all.
+///
+/// **Not [`ATTRIBUTION_MIN_QUOTE_CHARS`] (40), and the difference is the point** — see its
+/// doc-comment. A future editor who aligns the two by symmetry raises the probe above the two
+/// measured quotes and reopens mika#3127.
+const QUOTE_PRESENCE_PROBE_CHARS: usize = 16;
 
 /// Normalized text of what the turn's tools returned, for anchor attribution (mika#3003).
 ///
@@ -337,10 +377,12 @@ impl ToolReadLedger {
     /// Where a refused anchor's text came from, when a verbatim search can establish it.
     ///
     /// `None` on any outcome that is not a [`AnchorMissReason::QuoteNotInBrief`] refusal: an
-    /// `OverlappingRegions` or a `QuoteTooShort` does not ask "where does this text come
-    /// from?" — the text **is** in the brief, it is its geometry or its length that failed.
-    /// Saying "you quoted another document" there would send exactly the wrong fix. This is
-    /// the gate mika#2794 already wrote at the formatting site, reused as written.
+    /// `OverlappingRegions`, a `QuoteTooShort` or a `QuoteSpanTooShort` does not ask "where
+    /// does this text come from?" — the text **is** in the brief, it is its geometry or its
+    /// length that failed. Saying "you quoted another document" there would send exactly the
+    /// wrong fix. This is the gate mika#2794 already wrote at the formatting site, reused as
+    /// written, and it is what closes the most misleading half of mika#3127: a short but
+    /// correct quote is no longer offered a tool attribution it never earned.
     ///
     /// `Tool` on the first entry the search hits, in call order; `Unknown` when nothing matched
     /// and the ledger was clipped; `AbsentFromReads` when nothing matched and it was whole — an
@@ -699,6 +741,108 @@ fn body_lines<'a>(text: &'a str, required_suffix_lines: &[String]) -> Vec<&'a st
     lines[..scan_end].to_vec()
 }
 
+/// Longest annotation, in characters, a label may carry between its own characters (mika#3127).
+///
+/// The forms measured are short — `(déjà acceptée, conservée)` is 25 characters, `(nouvelle)` is
+/// 10 — and the bound exists to keep the tolerance from swallowing a sentence. At 64 the realistic
+/// annotation fits several times over, while a parenthetical holding a 40-character quote cannot
+/// hide behind "it is only a label" for long: past the bound the line is simply **not read as an
+/// anchor** rather than read with a wider label. Fail-closed is the right side to err on here —
+/// a label not read costs a `NoAnchorLine` the reviewer can fix by writing a plainer label, where
+/// a label read too wide would eat a real quote and refuse an attestation that was correct.
+const LABEL_ANNOTATION_MAX_CHARS: usize = 64;
+
+/// Consume the declared `prefix` at the head of `line`, tolerantly, and return what follows.
+///
+/// The pre-mika#3127 reading was `line.trim_start().trim_start_matches('*')` followed by
+/// `strip_prefix`: only **leading** `*` fell, so `**A1:** "…"` was read (mika#2786) while
+/// `**A1** : "…"` and `**A1** (déjà acceptée, conservée) : "…"` were not — a correct quote
+/// counted as absent (comment 18 of mika#3022). The fix consumes the prefix character by
+/// character and, **between** two of its characters, skips what markdown and the reviewer's own
+/// habits put there:
+///
+/// - markup and spacing noise: `*`, backtick, `_`, space, tab;
+/// - **at most one** balanced `(…)` or `[…]` group of at most [`LABEL_ANNOTATION_MAX_CHARS`]
+///   characters.
+///
+/// Four bounds keep this from reading an anchor into ordinary prose, and each has a negative
+/// control in `mika3127_libelles`:
+///
+/// 1. **Anchored at the line's head.** The walk never skips a character that is neither noise nor
+///    an annotation, so `**Attention** : 1 : …` dies on the `t` and never reaches the `1 :`.
+/// 2. **No group before the first prefix character matches** (`matched > 0`), or every
+///    parenthesis opening a line would open an anchor — `(A1) : …` stays a non-anchor.
+/// 3. **One group only**, and bounded.
+/// 4. **The group leaves with the label.** It is consumed as part of the prefix, so it never
+///    enters the quote — the mika#2786 invariant ("a longer prefix must not buy a shorter quote")
+///    extended to the annotation. A 40-character verbatim fragment written *inside* the
+///    parenthesis therefore buys nothing.
+///
+/// Deliberately regex-free, like the rest of this module (mika#864: "regex is a footgun — silent
+/// failure to fire"). The returned `&str` is cut at a boundary produced by `Chars::as_str` and
+/// `str::split_once`, never by arithmetic on an index: `scripts/check-byte-slices.sh` is the floor,
+/// and a French label is multi-byte by default.
+///
+/// Nesting is not handled: `split_once` stops at the first closing character, so `(a (b) c)` ends
+/// the group early and the next character fails the walk. That is the fail-closed side of bound 3.
+fn match_anchor_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    /// Markup and spacing a reviewer may put between two characters of a label.
+    const NOISE: [char; 5] = ['*', '`', '_', ' ', '\t'];
+
+    let mut rest = line;
+    let mut matched = 0usize;
+    let mut annotation_used = false;
+    let mut expected = prefix.chars();
+    let mut want = expected.next();
+
+    while let Some(c_want) = want {
+        let mut chars = rest.chars();
+        // `as_str` yields the remainder after one character, so the cut is on a character
+        // boundary by construction.
+        let c = chars.next()?;
+        let after = chars.as_str();
+
+        if c == c_want {
+            rest = after;
+            matched += 1;
+            want = expected.next();
+            continue;
+        }
+        if NOISE.contains(&c) {
+            rest = after;
+            continue;
+        }
+        if matched > 0
+            && !annotation_used
+            && let Some(tail) = skip_label_annotation(rest)
+        {
+            rest = tail;
+            annotation_used = true;
+            continue;
+        }
+        return None;
+    }
+
+    Some(rest)
+}
+
+/// Skip one balanced `(…)` or `[…]` group at the head of `rest`, bounded by
+/// [`LABEL_ANNOTATION_MAX_CHARS`]. `None` when `rest` does not open a group, when the group is
+/// unterminated, or when it is longer than the bound.
+fn skip_label_annotation(rest: &str) -> Option<&str> {
+    let mut chars = rest.chars();
+    let closing = match chars.next()? {
+        '(' => ')',
+        '[' => ']',
+        _ => return None,
+    };
+    let (annotation, tail) = chars.as_str().split_once(closing)?;
+    if annotation.chars().count() > LABEL_ANNOTATION_MAX_CHARS {
+        return None;
+    }
+    Some(tail)
+}
+
 /// Find a span of at least `min_quote_chars` characters of `line` that occurs verbatim in
 /// `brief`, returning its byte range within `brief`.
 ///
@@ -709,6 +853,20 @@ fn body_lines<'a>(text: &'a str, required_suffix_lines: &[String]) -> Vec<&'a st
 /// Character-indexed throughout (`Vec<char>`, never byte slicing of `&str`) — a multi-byte quote
 /// is the ordinary case in this repo's French briefs, and byte slicing panics on it. See
 /// `scripts/check-byte-slices.sh`.
+///
+/// Since mika#3127 the search has two passes, and only the first one decides anything:
+///
+/// 1. at `min_quote_chars`, against the regions already claimed — the pre-mika#3127 behaviour,
+///    unchanged, and the only pass that can return [`QuoteSearch::Found`];
+/// 2. **iff** the first found nothing, at [`QUOTE_PRESENCE_PROBE_CHARS`] with an **empty**
+///    claimed list, to tell "this line quotes the brief, too briefly" from "this line does not
+///    quote the brief". A region an earlier anchor already claimed proves presence as well as a
+///    free one, so the probe ignores the claims; and `OnlyClaimedRegions` is decided *before*
+///    the probe runs, so geometry keeps priority over length.
+///
+/// The probe also runs on the short arm, where the whole line is below `min_quote_chars`: that
+/// is the measured shape of mika#3127 comment 6, and running it on both arms is what makes the
+/// two forms of the defect report the same cause.
 fn find_brief_quote_range(
     line: &str,
     brief: &str,
@@ -719,12 +877,46 @@ fn find_brief_quote_range(
         return QuoteSearch::NoQuote;
     }
     let chars: Vec<char> = line.chars().collect();
+    // Whether the line quotes the brief on a fragment shorter than the contract's window. The
+    // probe decides nothing and claims nothing; it only separates two causes that used to share
+    // the name `QuoteNotInBrief`.
+    let probe = |chars: &[char]| match scan_windows(chars, brief, QUOTE_PRESENCE_PROBE_CHARS, &[]) {
+        QuoteSearch::Found(_) => QuoteSearch::SpanTooShort,
+        _ => QuoteSearch::NoQuote,
+    };
     if chars.len() < min_quote_chars {
-        return QuoteSearch::TooShort;
+        // A line carrying nothing checkable at all stays `TooShort`; one whose whole content is
+        // in the brief is a short quote, which is a different fix.
+        return match probe(&chars) {
+            QuoteSearch::SpanTooShort => QuoteSearch::SpanTooShort,
+            _ => QuoteSearch::TooShort,
+        };
+    }
+    match scan_windows(&chars, brief, min_quote_chars, claimed) {
+        QuoteSearch::NoQuote => probe(&chars),
+        decided => decided,
+    }
+}
+
+/// Slide a `width`-character window over `chars` and look for it verbatim in `brief`.
+///
+/// Extracted from [`find_brief_quote_range`] so the presence probe can run the same scan at a
+/// narrower width. **No length check and no recursion**: a probe that called
+/// `find_brief_quote_range` back with a smaller width would loop forever, since the probe's own
+/// failure would relaunch the probe. The caller owns both the length guard and the decision of
+/// what a narrow hit means.
+fn scan_windows(
+    chars: &[char],
+    brief: &str,
+    width: usize,
+    claimed: &[std::ops::Range<usize>],
+) -> QuoteSearch {
+    if width == 0 || chars.len() < width {
+        return QuoteSearch::NoQuote;
     }
     let mut saw_quote_in_claimed_region = false;
-    for start in 0..=(chars.len() - min_quote_chars) {
-        let window: String = chars[start..start + min_quote_chars].iter().collect();
+    for start in 0..=(chars.len() - width) {
+        let window: String = chars[start..start + width].iter().collect();
         if window.trim().is_empty() {
             continue;
         }
@@ -761,8 +953,12 @@ fn overlaps_any(range: &std::ops::Range<usize>, claimed: &[std::ops::Range<usize
 enum QuoteSearch {
     /// A usable quote at this byte range of the brief.
     Found(std::ops::Range<usize>),
-    /// The anchor line is shorter than the quote threshold.
+    /// The anchor line carries nothing checkable: shorter than the quote threshold, and not
+    /// even a probe-width fragment of it occurs in the brief.
     TooShort,
+    /// The line quotes the brief, but on fewer consecutive characters than the threshold — the
+    /// presence probe found a fragment where the decisional window found nothing (mika#3127).
+    SpanTooShort,
     /// The line quotes the brief, but only in regions an earlier anchor already claimed.
     OnlyClaimedRegions,
     /// No span of this line occurs in the brief at all.
@@ -789,26 +985,30 @@ pub(crate) fn verify_review_anchors(
     // that identifies the line, never part of the quote — counting it toward
     // `min_quote_chars` would let a longer prefix buy a shorter quote.
     //
-    // Leading `*` are skipped before the prefix is looked for (mika#2786): a reviewer who
-    // writes the label in bold (`**A1:** "…"`) has still written an anchor line. Measured on
-    // mika#2762's third withheld pass (2026-10-18, session `8c9da828`): every label was bold,
-    // so the guard saw `NoAnchorLine`; replayed with the label recognized, the response
-    // carried three verbatim quotes at three disjoint regions of the brief. This tolerance is
-    // on *finding* the line only. The `**` left after the prefix goes through
-    // [`normalize_for_anchor_match`] like any other emphasis marker, so the quote is held to
-    // exactly the same verbatim test as an unbolded one.
+    // Markup around the label is skipped before the prefix is looked for — see
+    // [`match_anchor_prefix`] for the exact tolerance and its four bounds. A reviewer who writes
+    // the label in bold (`**A1:** "…"`, mika#2786), who puts the colon outside the bold
+    // (`**A1** : "…"`), or who annotates it (`**A1** (déjà acceptée, conservée) : "…"`,
+    // mika#3127) has still written an anchor line. Both were measured as `NoAnchorLine` on
+    // responses that did carry three verbatim quotes at three disjoint regions of the brief:
+    // mika#2762's third withheld pass (2026-10-18, session `8c9da828`) for the bold label,
+    // comment 18 of mika#3022 (trace `f5eae27d`) for the annotated one.
+    //
+    // This tolerance is on *finding* the line only. Whatever markup survives the prefix goes
+    // through [`normalize_for_anchor_match`] like any other emphasis marker, so the quote is held
+    // to exactly the same verbatim test as an unbolded one — and the annotation leaves *with* the
+    // label, so it can never be counted as quoted characters.
     //
     // The prefix is kept *alongside* the content, not discarded: it is the name the corrective
-    // re-prompt calls the line by (mika#2794). It still does not enter the quote.
+    // re-prompt calls the line by (mika#2794). It is the **declared** prefix rather than the
+    // graphy read, so `accepted_labels` and `refused_labels` keep one population per label. It
+    // still does not enter the quote.
     let anchor_lines: Vec<(&str, &str)> = body_lines(text, required_suffix_lines)
         .into_iter()
         .filter_map(|line| {
-            let trimmed = line.trim_start().trim_start_matches('*');
-            prefixes.iter().find_map(|p| {
-                trimmed
-                    .strip_prefix(p.as_str())
-                    .map(|rest| (p.as_str(), rest))
-            })
+            prefixes
+                .iter()
+                .find_map(|p| match_anchor_prefix(line, p.as_str()).map(|rest| (p.as_str(), rest)))
         })
         .collect();
 
@@ -834,6 +1034,7 @@ pub(crate) fn verify_review_anchors(
     }
 
     let mut too_short = 0usize;
+    let mut span_too_short = 0usize;
     let mut not_in_brief = 0usize;
     let mut overlapping = 0usize;
     let mut claimed: Vec<std::ops::Range<usize>> = Vec::new();
@@ -877,6 +1078,13 @@ pub(crate) fn verify_review_anchors(
                 too_short += 1;
                 Some(AnchorMissReason::QuoteTooShort)
             }
+            // The quote is in the brief, just not on enough consecutive characters. Telling
+            // this line it does not quote the brief sends the model to replace a correct
+            // citation; what it owes is a longer span of the same one (mika#3127).
+            QuoteSearch::SpanTooShort => {
+                span_too_short += 1;
+                Some(AnchorMissReason::QuoteSpanTooShort)
+            }
             QuoteSearch::NoQuote => {
                 not_in_brief += 1;
                 Some(AnchorMissReason::QuoteNotInBrief)
@@ -896,10 +1104,15 @@ pub(crate) fn verify_review_anchors(
 
     // Report the reason that actually blocked the response. Ordered by how far the anchors got:
     // naming "too short" when the real problem is overlap would send the model the wrong fix.
+    // mika#3127 inserts the short-span cause BETWEEN `not_in_brief` and `too_short`, the four
+    // pre-existing causes keeping their relative order: on any input that produces no
+    // `QuoteSpanTooShort`, this returns exactly the reason it returned before.
     let reason = if overlapping > 0 {
         AnchorMissReason::OverlappingRegions
     } else if not_in_brief > 0 {
         AnchorMissReason::QuoteNotInBrief
+    } else if span_too_short > 0 {
+        AnchorMissReason::QuoteSpanTooShort
     } else if too_short > 0 {
         AnchorMissReason::QuoteTooShort
     } else {
@@ -1550,6 +1763,17 @@ Disposition: READY\n";
     }
 
     /// Normalization is not a paraphrase licence: the same brief, the same words changed.
+    ///
+    /// **mika#3127 renamed the cause this fixture reports, and nothing else.** The A1 line
+    /// here drops the brief's `, lui,` and keeps everything around it, so it still shares
+    /// `est correct : kill_process_gracefully` — 37 consecutive characters — with the brief
+    /// verbatim; no 40-character window survives, which is what this test was written to pin.
+    /// Measured against the pre-mika#3127 code, `anchors_found`, `anchors_valid` and the
+    /// per-line geometry below are identical; only `QuoteNotInBrief` became
+    /// `QuoteSpanTooShort`, and on this very line that is the correct of the two — the fix it
+    /// owes is to restore the dropped words, not to go quote another document. The invariance
+    /// is asserted, not asserted-by-prose: see
+    /// `mika3127::mika3127_la_fixture_de_2338_ne_change_que_de_nom`.
     #[test]
     fn mika2338_paraphrase_of_a_markdown_brief_is_still_rejected() {
         let text = "A1: \"Le mécanisme de kill est correct : kill_process_gracefully signale le groupe\" — ok.\n\
@@ -1565,18 +1789,18 @@ Disposition: READY\n";
                 per_anchor,
             } => {
                 assert_eq!((anchors_found, anchors_valid), (3, 2));
-                assert_eq!(reason, AnchorMissReason::QuoteNotInBrief);
+                assert_eq!(reason, AnchorMissReason::QuoteSpanTooShort);
                 assert_eq!(
                     fates(&per_anchor),
                     vec![
-                        ("A1:", Some(AnchorMissReason::QuoteNotInBrief)),
+                        ("A1:", Some(AnchorMissReason::QuoteSpanTooShort)),
                         ("A2:", None),
                         ("A3:", None),
                     ],
                     "the dropped `, lui,` is on the FIRST line — the information mika#2794 adds"
                 );
             }
-            other => panic!("expected not-in-brief rejection, got {other:?}"),
+            other => panic!("expected a refusal on the quote axis, got {other:?}"),
         }
     }
 
@@ -2856,5 +3080,597 @@ mod mika3003 {
         assert_eq!(armed.sources(), "");
         assert_eq!((armed.found, armed.valid), (None, None));
         assert!(!armed.withheld);
+    }
+}
+
+/// mika#3127 — une citation courte du brief se dit courte (D1 + D2).
+///
+/// Les deux formes mesurées du défaut A : une ligne **longue** dont la seule intersection
+/// verbatim avec le brief est courte (commentaire 62, ancre A3 de 29 caractères), et une ligne
+/// **courte** dont le contenu entier est dans le brief (commentaire 6 cas 1, 25 caractères).
+/// Avant ce vol la première se disait `QuoteNotInBrief` — « vous ne citez pas le brief » — et
+/// la seconde `QuoteTooShort`. Le refus était juste dans les deux cas ; c'est le **nom** de la
+/// cause qui envoyait le mauvais correctif.
+#[cfg(test)]
+mod mika3127 {
+    use super::*;
+
+    /// Le brief de ce module. Il porte les deux phrases mesurées — celle de 29 caractères du
+    /// commentaire 62 et celle de 25 du commentaire 6 — plus trois phrases assez longues pour
+    /// qu'une attestation valide reste constructible contre le même texte.
+    const BRIEF: &str = "Le plan de ce ticket tient en un geste, et le coût en est dérisoire.\n\
+        Une ligne ajoutée, aucun code. Total estimé : 358 lignes pour le vol entier.\n\
+        La propriété de sûreté est que la sonde de présence ne peut faire accepter aucune ancre.\n\
+        La priorité d'agrégation insère la nouvelle cause entre l'absence et la brièveté.\n\
+        Le registre de lecture du tour n'ouvre sa porte que sur une citation absente du brief.\n";
+
+    /// La citation du commentaire 62, telle que l'architecte l'a écrite : 29 caractères.
+    const QUOTE_62: &str = "Une ligne ajoutée, aucun code";
+
+    /// La citation du commentaire 6, cas 1 : 25 caractères.
+    const QUOTE_6: &str = "Total estimé : 358 lignes";
+
+    /// Le croupion de mika#2037, verbatim — le contrôle négatif fondateur.
+    const STUB_2037: &str = "Préférence stockée — le pattern de re-résolution par cycle et le seuil N=3 pour mika#2013.\n\nDisposition: READY\n";
+
+    fn prefixes() -> Vec<String> {
+        (1..=10).map(|n| format!("A{n}:")).collect()
+    }
+
+    fn suffix_lines() -> Vec<String> {
+        vec![
+            "Disposition: READY".to_string(),
+            "Verdict: GROOMED".to_string(),
+        ]
+    }
+
+    /// Au seuil de production des trois manifestes arch : trois ancres, 40 caractères.
+    fn verifie(text: &str) -> AnchorVerdict {
+        verify_review_anchors(text, BRIEF, &prefixes(), &suffix_lines(), 3, 40)
+    }
+
+    fn cause(verdict: &AnchorVerdict) -> Option<AnchorMissReason> {
+        match verdict {
+            AnchorVerdict::Missing { reason, .. } => Some(*reason),
+            AnchorVerdict::Satisfied => None,
+        }
+    }
+
+    fn fates(verdict: &AnchorVerdict) -> Vec<(String, Option<AnchorMissReason>)> {
+        match verdict {
+            AnchorVerdict::Missing { per_anchor, .. } => per_anchor
+                .iter()
+                .map(|outcome| (outcome.label.clone(), outcome.refused))
+                .collect(),
+            AnchorVerdict::Satisfied => Vec::new(),
+        }
+    }
+
+    fn valides(verdict: &AnchorVerdict) -> usize {
+        match verdict {
+            AnchorVerdict::Missing { anchors_valid, .. } => *anchors_valid,
+            // Le seuil de ce module est de trois ancres, donc un `Satisfied` en vaut trois.
+            AnchorVerdict::Satisfied => 3,
+        }
+    }
+
+    /// AC1 — la forme du commentaire 62. La ligne fait plus de 40 caractères, donc la fenêtre
+    /// décisionnelle glisse et ne trouve rien ; sa seule intersection verbatim avec le brief
+    /// est la phrase de 29 caractères. La cause nommée doit être la brièveté de la citation,
+    /// jamais son absence.
+    #[test]
+    fn mika3127_une_citation_de_29_caracteres_du_brief_se_dit_courte() {
+        assert_eq!(
+            QUOTE_62.chars().count(),
+            29,
+            "la prémisse du commentaire 62"
+        );
+        let text = format!(
+            "A3: \"{QUOTE_62}\" — le plan le dit explicitement, et je le valide.\n\n\
+             Disposition: READY\n"
+        );
+
+        let verdict = verifie(&text);
+        assert_eq!(
+            cause(&verdict),
+            Some(AnchorMissReason::QuoteSpanTooShort),
+            "la citation EST dans le brief, sur moins de 40 caractères : {verdict:?}"
+        );
+        assert_eq!(
+            fates(&verdict),
+            vec![("A3:".to_string(), Some(AnchorMissReason::QuoteSpanTooShort))],
+            "l'ancre nommée porte la même cause que le verdict (mika#2794)"
+        );
+    }
+
+    /// AC2 — la forme du commentaire 6, cas 1. Ici la ligne **entière** est plus courte que
+    /// `min_quote_chars`, donc elle part sur le bras court de `find_brief_quote_range` ; la
+    /// sonde y court aussi, et c'est ce qui fait que les deux formes du défaut A rendent le
+    /// même nom.
+    #[test]
+    fn mika3127_une_ligne_plus_courte_que_le_seuil_mais_citee_se_dit_courte() {
+        assert_eq!(QUOTE_6.chars().count(), 25, "la prémisse du commentaire 6");
+        let text = format!("A3: \"{QUOTE_6}\"\n\nDisposition: READY\n");
+
+        let verdict = verifie(&text);
+        assert_eq!(
+            cause(&verdict),
+            Some(AnchorMissReason::QuoteSpanTooShort),
+            "une ligne courte mais verbatim n'est pas une ligne qui ne dit rien : {verdict:?}"
+        );
+    }
+
+    /// AC2, seconde phrase — `QuoteTooShort` garde sa population propre : une ligne plus
+    /// courte que la sonde ne porte rien de vérifiable, et c'est un autre correctif.
+    #[test]
+    fn mika3127_une_ligne_plus_courte_que_la_sonde_reste_sans_citation() {
+        let verdict = verifie("A3: ok\n\nDisposition: READY\n");
+        assert_eq!(
+            cause(&verdict),
+            Some(AnchorMissReason::QuoteTooShort),
+            "deux populations sous un nom ne se soustraient pas (mika#2205) : {verdict:?}"
+        );
+    }
+
+    /// AC3 — **le contrôle négatif le plus important.** Une ancre longue qui paraphrase le
+    /// brief sans en partager seize caractères consécutifs reste `QuoteNotInBrief` : la sonde
+    /// n'a pas avalé la classe qu'elle borde.
+    #[test]
+    fn mika3127_une_paraphrase_reste_absente_du_brief() {
+        let paraphrase = "Le document explique longuement pourquoi ce correctif demeure modeste.";
+        // La prémisse, prouvée par le code sous test plutôt qu'affirmée : aucune fenêtre de la
+        // largeur de la sonde ne figure dans le brief.
+        assert!(
+            matches!(
+                find_brief_quote_range(
+                    &normalize_for_anchor_match(paraphrase),
+                    &normalize_for_anchor_match(BRIEF),
+                    QUOTE_PRESENCE_PROBE_CHARS,
+                    &[],
+                ),
+                QuoteSearch::NoQuote
+            ),
+            "la prémisse du contrôle négatif : la paraphrase ne partage rien de sondable"
+        );
+
+        let verdict = verifie(&format!("A1: {paraphrase}\n\nDisposition: READY\n"));
+        assert_eq!(
+            cause(&verdict),
+            Some(AnchorMissReason::QuoteNotInBrief),
+            "une paraphrase ne cite pas : {verdict:?}"
+        );
+    }
+
+    /// AC3, seconde phrase — le croupion fondateur reste refusé, et sur sa cause d'origine.
+    #[test]
+    fn mika3127_le_croupion_de_2037_reste_refuse() {
+        let verdict = verifie(STUB_2037);
+        assert_eq!(
+            verdict,
+            AnchorVerdict::Missing {
+                anchors_found: 0,
+                anchors_valid: 0,
+                reason: AnchorMissReason::NoAnchorLine,
+                per_anchor: Vec::new(),
+            },
+            "l'incident fondateur ne passe pas la garde bâtie pour lui"
+        );
+    }
+
+    /// AC4 — **la sonde ne peut faire accepter aucune ancre.** La colonne `anchors_valid` est
+    /// celle du code d'avant le vol, cas par cas : la sonde ne rend jamais `Found`, ne pousse
+    /// rien dans `claimed` et n'incrémente pas le compte des valides. Seul le `reason` bouge.
+    #[test]
+    fn mika3127_la_sonde_naccepte_aucune_ancre() {
+        // `(nom, réponse, anchors_valid d'avant le vol)`.
+        let table: Vec<(&str, String, usize)> = vec![
+            ("croupion 2037", STUB_2037.to_string(), 0),
+            (
+                "citation de 29 caractères (commentaire 62)",
+                format!("A3: \"{QUOTE_62}\" — le plan le dit explicitement.\n\nDisposition: READY\n"),
+                0,
+            ),
+            (
+                "ligne courte citée (commentaire 6)",
+                format!("A3: \"{QUOTE_6}\"\n\nDisposition: READY\n"),
+                0,
+            ),
+            (
+                "ligne plus courte que la sonde",
+                "A3: ok\n\nDisposition: READY\n".to_string(),
+                0,
+            ),
+            (
+                "paraphrase",
+                "A1: Le document explique longuement pourquoi ce correctif demeure modeste.\n\n\
+                 Disposition: READY\n"
+                    .to_string(),
+                0,
+            ),
+            (
+                // Une intersection d'une vingtaine de caractères : au-dessus de la sonde, très
+                // en-dessous du seuil décisionnel. C'est la ligne qui dirait le plus volontiers
+                // « acceptée » si la sonde décidait de quelque chose.
+                "intersection d'une vingtaine de caractères",
+                "A2: la sonde de présence est un instrument, jamais un juge de validité.\n\n\
+                 Disposition: READY\n"
+                    .to_string(),
+                0,
+            ),
+            (
+                "trois citations longues et dispersées",
+                "A1: « Le plan de ce ticket tient en un geste, et le coût en est dérisoire » — noté.\n\
+                 A2: « La priorité d'agrégation insère la nouvelle cause entre l'absence et la brièveté » — correct.\n\
+                 A3: « Le registre de lecture du tour n'ouvre sa porte que sur une citation absente » — vu.\n\n\
+                 Disposition: READY\n"
+                    .to_string(),
+                3,
+            ),
+        ];
+
+        for (nom, text, attendu) in table {
+            let verdict = verifie(&text);
+            assert_eq!(
+                valides(&verdict),
+                attendu,
+                "cas « {nom} » : la sonde a changé le compte des ancres valides — {verdict:?}"
+            );
+        }
+    }
+
+    /// AC4, première phrase, prise à la source : la sonde ne rend jamais `Found`, donc aucune
+    /// région du brief ne peut être réclamée sur une intersection plus courte que le seuil.
+    #[test]
+    fn mika3127_la_sonde_ne_rend_jamais_une_region() {
+        let line = normalize_for_anchor_match(&format!(
+            "\"{QUOTE_62}\" — le plan le dit explicitement, et je le valide."
+        ));
+        let result = find_brief_quote_range(&line, &normalize_for_anchor_match(BRIEF), 40, &[]);
+        assert!(
+            !matches!(result, QuoteSearch::Found(_)),
+            "une citation de 29 caractères ne réclame aucune région au seuil de 40"
+        );
+        assert!(
+            matches!(result, QuoteSearch::SpanTooShort),
+            "…et elle est nommée pour ce qu'elle est"
+        );
+    }
+
+    /// **L'écart au plan, mesuré plutôt que masqué.** Le § *Fire-Disposition* du plan prédisait
+    /// qu'aucun test existant n'aurait à changer de valeur attendue ; il s'en trouve **un**,
+    /// `mika2338_paraphrase_of_a_markdown_brief_is_still_rejected`, et ce test-ci dit exactement
+    /// ce qui y a bougé. Sa fixture A1 supprime le `, lui,` du brief et garde tout le reste,
+    /// donc elle partage avec lui `est correct : kill_process_gracefully` — 37 caractères
+    /// consécutifs, verbatim. C'est une citation **tronquée**, pas une paraphrase : elle tombe
+    /// pile dans la population que D1 renomme. La raison d'être de la clause d'arrêt du plan —
+    /// « un test d'ancrage qui change de valeur attendue est la trace d'un seuil qui a bougé » —
+    /// est réfutée ici par la mesure, et c'est cette réfutation qui est attestée ci-dessous :
+    /// comptes, géométrie par ligne et refus sont identiques au bit près, seul le nom change.
+    #[test]
+    fn mika3127_la_fixture_de_2338_ne_change_que_de_nom() {
+        // La fixture de `mika2338_paraphrase_of_a_markdown_brief_is_still_rejected`, verbatim,
+        // et le brief contre lequel elle est vérifiée. Dupliquée plutôt que partagée : les
+        // helpers de `mod tests` sont privés à ce module-là, et un test qui nomme un écart doit
+        // porter son entrée sous les yeux du relecteur.
+        let brief = "**Le mécanisme de kill, lui, est correct** : `kill_process_gracefully` (`process_kill.rs:82`)\n";
+        let line = normalize_for_anchor_match(
+            "\"Le mécanisme de kill est correct : kill_process_gracefully signale le groupe\" — ok.",
+        );
+        let normalized_brief = normalize_for_anchor_match(brief);
+
+        // 1. La prémisse : 37 caractères consécutifs partagés, verbatim.
+        let shared = "est correct : kill_process_gracefully";
+        assert_eq!(shared.chars().count(), 37);
+        assert!(
+            normalized_brief.contains(shared) && line.contains(shared),
+            "la fixture est une citation tronquée, pas une paraphrase"
+        );
+
+        // 2. La fenêtre décisionnelle n'en trouve toujours aucune de 40 : le refus est intact,
+        //    et c'est lui que le test de mika#2338 a été écrit pour épingler.
+        assert!(
+            !matches!(
+                find_brief_quote_range(&line, &normalized_brief, 40, &[]),
+                QuoteSearch::Found(_)
+            ),
+            "aucune fenêtre de 40 ne survit à la suppression du `, lui,`"
+        );
+
+        // 3. Et ce qui a changé est le nom, rien d'autre : la sonde trouve le fragment, donc
+        //    l'issue est `SpanTooShort` au lieu de `NoQuote` — même refus, meilleur correctif.
+        assert!(
+            matches!(
+                find_brief_quote_range(&line, &normalized_brief, 40, &[]),
+                QuoteSearch::SpanTooShort
+            ),
+            "le correctif dû est « restituez les mots retirés », pas « citez un autre document »"
+        );
+    }
+
+    /// AC8 — **la porte du registre de lecture reste fermée.** Elle ne s'ouvre que sur
+    /// `QuoteNotInBrief`, donc une ancre reclassée ne reçoit ni attribution à un outil, ni la
+    /// phrase conditionnelle « cette citation vient probablement d'un document lu avec un
+    /// outil ». Elle reçoit la phrase qui dit d'allonger la citation.
+    #[test]
+    fn mika3127_la_porte_du_registre_reste_fermee_sur_une_citation_courte() {
+        let outcome = AnchorOutcome {
+            label: "A3:".to_string(),
+            excerpt: format!("\"{QUOTE_62}\" — le plan le dit explicitement"),
+            refused: Some(AnchorMissReason::QuoteSpanTooShort),
+        };
+
+        let mut ledger = ToolReadLedger::default();
+        // Le brief lui-même poussé dans le registre : si la porte s'ouvrait, l'extrait y serait
+        // retrouvé et le moteur nommerait un outil sur une citation parfaitement juste.
+        ledger.record_tool_read("gh_read", BRIEF);
+        assert_eq!(
+            ledger.attribute(&outcome, 40),
+            None,
+            "la cause n'est pas « vous citez un autre document » : rien à attribuer"
+        );
+
+        let diagnosis = format_anchor_diagnosis(std::slice::from_ref(&outcome), &[None])
+            .expect("une ancre refusée produit un diagnostic");
+        assert!(
+            !diagnosis.contains("quotes, word for word"),
+            "aucune attribution à un outil ici : {diagnosis}"
+        );
+        assert!(
+            !diagnosis.contains("absent from the brief"),
+            "la citation n'est PAS absente du brief : {diagnosis}"
+        );
+        assert!(
+            diagnosis.contains(AnchorMissReason::QuoteSpanTooShort.describe()),
+            "le correctif envoyé doit être « allongez-la » : {diagnosis}"
+        );
+        assert!(
+            AnchorMissReason::QuoteSpanTooShort
+                .describe()
+                .contains("lengthen"),
+            "le verbe du correctif est explicite dans la relance"
+        );
+    }
+}
+
+/// Le second geste de mika#3127 : le libellé en gras suivi d'une annotation reste un libellé.
+///
+/// Défaut B, mesuré au commentaire 18 (mika#3022, trace `f5eae27d`, session `e59ab2dc`) :
+/// `verify_review_anchors` cherchait le préfixe sur `line.trim_start().trim_start_matches('*')`,
+/// donc seuls les `*` **de tête** tombaient. `**A1:** "…"` passait depuis mika#2786, mais
+/// `**A1** : "…"` et `**A1** (déjà acceptée, conservée) : "…"` rendaient `anchors_found: 0`,
+/// donc `NoAnchorLine` — une citation parfaitement juste comptée comme absente, un groom mort
+/// en `Verdict: ESCALATE` au bout de 50 tours et 5,28 $, et une main humaine pour re-poser
+/// `ready`.
+#[cfg(test)]
+mod mika3127_libelles {
+    use super::*;
+
+    /// Le même brief que [`super::mika3127`] — les aides d'un module de test lui sont privées,
+    /// et `matrix` redéclare déjà les siennes.
+    const BRIEF: &str = "Le plan de ce ticket tient en un geste, et le coût en est dérisoire.\n\
+        Une ligne ajoutée, aucun code. Total estimé : 358 lignes pour le vol entier.\n\
+        La propriété de sûreté est que la sonde de présence ne peut faire accepter aucune ancre.\n\
+        La priorité d'agrégation insère la nouvelle cause entre l'absence et la brièveté.\n\
+        Le registre de lecture du tour n'ouvre sa porte que sur une citation absente du brief.\n";
+
+    /// Trois citations verbatim du brief, chacune au-delà du seuil de 40 et sur trois régions
+    /// disjointes : de quoi construire l'attestation que le commentaire 18 avait écrite.
+    const C1: &str = "Le plan de ce ticket tient en un geste, et le coût en est dérisoire";
+    const C2: &str = "La propriété de sûreté est que la sonde de présence";
+    const C3: &str = "Le registre de lecture du tour n'ouvre sa porte";
+
+    fn prefixes() -> Vec<String> {
+        (1..=10).map(|n| format!("A{n}:")).collect()
+    }
+
+    fn suffix_lines() -> Vec<String> {
+        vec![
+            "Disposition: READY".to_string(),
+            "Verdict: GROOMED".to_string(),
+        ]
+    }
+
+    /// Au seuil de production des trois manifestes arch : trois ancres, 40 caractères.
+    fn verifie(text: &str) -> AnchorVerdict {
+        verify_review_anchors(text, BRIEF, &prefixes(), &suffix_lines(), 3, 40)
+    }
+
+    /// Le même texte lu avec un seuil de comptage volontairement hors d'atteinte : le verdict
+    /// reste un `Missing`, donc `anchors_found` est exposé. C'est la seule façon de lire le
+    /// compte — un `Satisfied` ne le porte pas.
+    fn trouvees(text: &str) -> usize {
+        match verify_review_anchors(text, BRIEF, &prefixes(), &suffix_lines(), 11, 40) {
+            AnchorVerdict::Missing { anchors_found, .. } => anchors_found,
+            AnchorVerdict::Satisfied => unreachable!("onze ancres ne sont jamais atteintes ici"),
+        }
+    }
+
+    fn fates(verdict: &AnchorVerdict) -> Vec<(String, Option<AnchorMissReason>)> {
+        match verdict {
+            AnchorVerdict::Missing { per_anchor, .. } => per_anchor
+                .iter()
+                .map(|outcome| (outcome.label.clone(), outcome.refused))
+                .collect(),
+            AnchorVerdict::Satisfied => Vec::new(),
+        }
+    }
+
+    /// L'attestation du commentaire 18, dans sa forme exacte : libellé en gras, deux-points
+    /// **hors** du gras, et sur la première ancre l'annotation que l'architecte ajoute quand il
+    /// conserve une ancre d'une passe antérieure.
+    fn attestation_du_commentaire_18() -> String {
+        format!(
+            "**A1** (déjà acceptée, conservée) : \"{C1}\" — je la conserve telle quelle.\n\
+             **A2** : \"{C2}\" — la propriété de sûreté tient.\n\
+             **A3** (nouvelle) : \"{C3}\" — la porte du registre reste fermée.\n\n\
+             Disposition: READY\n"
+        )
+    }
+
+    /// AC5 — le cas mesuré, réparé. Les trois libellés sont lus, et les trois citations qu'ils
+    /// portaient depuis le début suffisent : le verdict est `Satisfied`, pas un `NoAnchorLine`.
+    #[test]
+    fn mika3127_les_trois_libelles_du_commentaire_18_sont_lus() {
+        let text = attestation_du_commentaire_18();
+        assert_eq!(
+            verifie(&text),
+            AnchorVerdict::Satisfied,
+            "trois citations verbatim à trois régions disjointes : l'attestation est valide"
+        );
+        assert_eq!(
+            trouvees(&text),
+            3,
+            "le compte mesuré au commentaire 18 était 0 ; c'est lui que ce vol déplace"
+        );
+    }
+
+    /// AC5, la table des formes. Elle est table-écrite à dessein : la borne de taille du plan
+    /// est que chaque forme nouvelle s'ajoute en une ligne, et que les deux contrôles négatifs
+    /// vivent dans le **même** tableau que les formes acceptées — une famille et son
+    /// complément séparés en deux tests, c'est la moitié qu'on oublie de relire.
+    ///
+    /// Les lignes ne citent rien du brief : ce test mesure la lecture du **libellé**, et un
+    /// `anchors_found` ne se lit que sur un `Missing`.
+    #[test]
+    fn mika3127_la_table_des_formes_de_libelle() {
+        let annotation_trop_longue = C1;
+        assert!(
+            annotation_trop_longue.chars().count() > LABEL_ANNOTATION_MAX_CHARS,
+            "la prémisse du dernier cas : {} caractères",
+            annotation_trop_longue.chars().count()
+        );
+
+        let cas: Vec<(&str, String, usize)> = vec![
+            ("le libellé nu", "A1: x".to_string(), 1),
+            // mika#2786, non-régression : la forme que ce vol ne doit pas perdre.
+            ("le libellé tout en gras", "**A1:** x".to_string(), 1),
+            // Le cas du commentaire 18 : les deux-points sortis du gras.
+            ("les deux-points hors du gras", "**A1** : x".to_string(), 1),
+            (
+                "le gras et une annotation",
+                "**A1** (déjà acceptée, conservée) : x".to_string(),
+                1,
+            ),
+            // La puce de liste et l'indentation sont du bruit comme le reste.
+            (
+                "la puce, l'indentation et le gras",
+                "  * **A10** [conservée] : x".to_string(),
+                1,
+            ),
+            // L'ordre d'essai reste l'ordre de déclaration, et reste juste : `A1:` échoue sur
+            // le `0` de `A10` — un `0` n'est ni du bruit ni un groupe — puis `A10:` apparie.
+            ("le dixième libellé", "A10: x".to_string(), 1),
+            // Contrôle négatif : aucun groupe n'est toléré AVANT qu'un caractère du préfixe
+            // ait apparié, sinon toute parenthèse de début de ligne ouvrirait une ancre.
+            ("le libellé entre parenthèses", "(A1) : x".to_string(), 0),
+            // Contrôle négatif : l'appariement est ancré au début de la ligne, donc il meurt
+            // sur le `t` d'« Attention » et ne va pas chercher le `1 :` plus loin.
+            (
+                "le faux libellé d'une phrase en gras",
+                "**Attention** : 1 : x".to_string(),
+                0,
+            ),
+            // Contrôle négatif : une annotation plus longue que la borne n'est plus une
+            // annotation. Fail-closed — le libellé n'est pas lu plutôt que lu trop large.
+            (
+                "l'annotation plus longue que la borne",
+                format!("**A1** ({annotation_trop_longue}) : x"),
+                0,
+            ),
+        ];
+
+        for (nom, ligne, attendu) in cas {
+            let text = format!("{ligne}\n\nDisposition: READY\n");
+            assert_eq!(
+                trouvees(&text),
+                attendu,
+                "{nom} : « {ligne} » devait donner {attendu} ancre(s)"
+            );
+        }
+    }
+
+    /// AC5, suite — le libellé rendu reste le préfixe **déclaré**, jamais la graphie lue.
+    /// `accepted_labels` et `refused_labels` sont des champs de log (mika#2794) : si l'annotation
+    /// ou le gras y entraient, deux graphies du même libellé deviendraient deux populations et
+    /// cesseraient d'être soustractibles (mika#2205).
+    #[test]
+    fn mika3127_le_libelle_journalise_reste_le_prefixe_declare() {
+        // Le reste est assez long pour passer le bras décisionnel et n'emprunte au brief aucune
+        // fenêtre de seize caractères : la cause est l'absence, et le libellé est ce qu'on lit.
+        let text = "**A1** (déjà acceptée, conservée) : une phrase entièrement de mon invention \
+                    qui ne figure nulle part\n\nDisposition: READY\n";
+
+        let verdict = verifie(text);
+        assert_eq!(
+            fates(&verdict),
+            vec![("A1:".to_string(), Some(AnchorMissReason::QuoteNotInBrief))],
+            "le libellé journalisé est « A1: », pas « **A1** (déjà acceptée, conservée) : »"
+        );
+    }
+
+    /// AC6 — le négatif que la table ne peut pas porter : la ligne n'est pas une ancre, donc le
+    /// verdict est `NoAnchorLine` et non une cause de l'axe citation. Les deux noms partent dans
+    /// `miss_reason` et commandent deux correctifs opposés (« écrivez des lignes d'ancrage » vs
+    /// « allongez la citation »), donc leur distinction se vérifie, pas seulement le compte.
+    #[test]
+    fn mika3127_un_faux_libelle_reste_une_absence_de_ligne_dancrage() {
+        for ligne in ["(A1) : x", "**Attention** : 1 : x"] {
+            let text = format!("{ligne}\n\nDisposition: READY\n");
+            let verdict = verifie(&text);
+            match verdict {
+                AnchorVerdict::Missing { reason, .. } => assert_eq!(
+                    reason,
+                    AnchorMissReason::NoAnchorLine,
+                    "« {ligne} » n'est pas une ligne d'ancrage du tout"
+                ),
+                AnchorVerdict::Satisfied => panic!("« {ligne} » ne vaut aucune attestation"),
+            }
+        }
+    }
+
+    /// AC7 — l'annotation n'achète aucune longueur de citation. C'est l'invariant de mika#2786
+    /// étendu : le libellé ne compte jamais dans la citation, et l'annotation part **avec** le
+    /// libellé. Ici elle porte 45 caractères verbatim du brief, au-delà du seuil de 40 : si
+    /// elle entrait dans l'extrait, l'ancre serait acceptée sur une citation que personne n'a
+    /// écrite comme citation.
+    #[test]
+    fn mika3127_lannotation_nachete_aucune_longueur() {
+        let dans_la_parenthese = "Le plan de ce ticket tient en un geste, et le";
+        let n = dans_la_parenthese.chars().count();
+        assert_eq!(n, 45, "la prémisse : au-delà du seuil de 40");
+        assert!(
+            n <= LABEL_ANNOTATION_MAX_CHARS,
+            "et en-deçà de la borne, sinon c'est le libellé qui serait refusé"
+        );
+        assert!(
+            BRIEF.contains(dans_la_parenthese),
+            "et verbatim dans le brief, sinon le test ne mesure rien"
+        );
+
+        let text = format!("**A1** ({dans_la_parenthese}) :\n\nDisposition: READY\n");
+
+        let verdict = verifie(&text);
+        assert_eq!(
+            trouvees(&text),
+            1,
+            "la ligne EST lue comme une ancre — le refus doit venir de la citation"
+        );
+        match &verdict {
+            AnchorVerdict::Missing {
+                anchors_valid,
+                per_anchor,
+                ..
+            } => {
+                assert_eq!(*anchors_valid, 0, "aucune ancre valide : {verdict:?}");
+                assert!(
+                    !per_anchor[0].excerpt.contains("tient en un geste"),
+                    "l'annotation est partie avec le libellé : {:?}",
+                    per_anchor[0].excerpt
+                );
+            }
+            AnchorVerdict::Satisfied => {
+                panic!("l'annotation aurait acheté la citation : {verdict:?}")
+            }
+        }
     }
 }

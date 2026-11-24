@@ -188,6 +188,7 @@ fn mika2338_the_finding_line_never_carries_a_declared_line_in_clear() {
     for reason in [
         review_anchor::AnchorMissReason::NoAnchorLine,
         review_anchor::AnchorMissReason::QuoteTooShort,
+        review_anchor::AnchorMissReason::QuoteSpanTooShort,
         review_anchor::AnchorMissReason::QuoteNotInBrief,
         review_anchor::AnchorMissReason::OverlappingRegions,
         review_anchor::AnchorMissReason::TooFewAnchors,
