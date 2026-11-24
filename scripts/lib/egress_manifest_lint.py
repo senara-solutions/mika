@@ -283,9 +283,132 @@ COLUMN_ZERO_ITEM_RE = re.compile(
     r"(?:fn|impl|struct|enum|trait|static|const|type)\b"
 )
 
-# Ouverture / fermeture d'une chaîne brute Rust : `r"`, `r#"`, `r##"`, …
-# Le nombre de `#` doit correspondre à la fermeture, d'où la capture.
-RAW_STRING_OPEN_RE = re.compile(r'r(#*)"')
+# --------------------------------------------------------------------------
+# Scanner lexical (mika#3134)
+# --------------------------------------------------------------------------
+
+# Ouverture d'une chaîne brute Rust : `r"`, `r#"`, `r##"`, `br"`, `cr#"`, …
+# Le nombre de `#` doit correspondre à la fermeture, d'où la capture. La
+# FRONTIÈRE DE MOT est vérifiée par l'appelant, pas par ce motif : sans elle,
+# un identifiant finissant par `r` collé à un guillemet (`four"…`) serait lu
+# comme une chaîne brute. Aucune occurrence mesurée dans l'arbre ; la garde est
+# gratuite et la direction de son absence est la mauvaise (§ `advance_lexical_state`).
+RAW_STRING_OPEN_RE = re.compile(r'(?:b|c)?r(#*)"')
+
+# Littéral de caractère Rust : exactement UN caractère, échappé ou non. Couvre
+# `'"'`, `'\''`, `'\n'`. Ce qui ne matche pas est un lifetime (`&'a str`,
+# `'static`), simplement traversé — et c'est la borne « un seul caractère » qui
+# garantit qu'un lifetime ne peut pas en apparier un autre à distance.
+CHAR_LITERAL_RE = re.compile(r"'(?:\\.|[^\\'])'")
+
+
+def _at_word_start(line: str, pos: int) -> bool:
+    """Vrai si `pos` ouvre un mot — rien d'identifiant ne le précède."""
+    if pos == 0:
+        return True
+    prev = line[pos - 1]
+    return not (prev.isalnum() or prev == "_")
+
+
+def advance_lexical_state(
+    line: str, state: tuple[str, ...] | None
+) -> tuple[str, ...] | None:
+    """Rend l'état lexical à la FIN de `line`, en partant de `state`.
+
+    Une machine à états PAR LIGNE, sans profondeur et sans pile : suivre l'état
+    d'une chaîne n'est pas compter un bloc. C'est ce qui la rend utilisable là
+    où le comptage d'accolades a été refusé sur mesure (voir
+    `production_slices` § limite).
+
+    Quatre états, et ce sont les quatre classes de région où un `fn` en colonne
+    zéro n'est pas du code :
+
+    | état              | sens                                            |
+    |-------------------|-------------------------------------------------|
+    | `None`            | code                                            |
+    | `("str",)`        | chaîne ordinaire ouverte                        |
+    | `("raw", hashes)` | chaîne brute ouverte, `hashes` = les `#` à refermer |
+    | `("block",)`      | commentaire `/* … */` ouvert                    |
+
+    En état `None`, `//` rend immédiatement `None` : le reste de la ligne est un
+    commentaire et rien n'y ouvre de région. C'est la garde
+    ANTI-SOUS-DÉTECTION, et elle porte tout le poids de la correction. Un `"`
+    non apparié en prose (`// un " seul`) ouvrirait sinon une fausse chaîne, et
+    le scanner sauterait TOUT LE RESTE DU FICHIER en silence — la direction
+    dangereuse de l'erreur, puisqu'un sink omis ne se voit pas alors qu'un sink
+    de trop se lit. La même asymétrie justifie le littéral de caractère (`'"'`
+    n'ouvre rien) et la frontière de mot de la chaîne brute.
+
+    Une chaîne ordinaire encore ouverte en fin de ligne RESTE ouverte — c'est
+    toute la classe de mika#3134, et c'est légal en Rust avec ou sans le `\\` de
+    continuation de ligne.
+
+    Les commentaires `/* */` IMBRIQUÉS (légaux en Rust) ne sont pas modélisés :
+    le premier `*/` referme. C'est un sur-rapport possible, jamais une
+    sous-détection, et zéro occurrence est mesurée dans l'arbre. La fermeture
+    lexicale de chaque fichier scanné est remesurée par le cas N15 de
+    `scripts/test-verify-egress-manifest.sh`, qui rougit le jour où un fichier
+    perd le scanner.
+    """
+    i, n = 0, len(line)
+    while i < n:
+        if state is None:
+            ch = line[i]
+            if ch == "/" and line.startswith("//", i):
+                return None
+            if ch == "/" and line.startswith("/*", i):
+                state = ("block",)
+                i += 2
+                continue
+            if ch == '"':
+                state = ("str",)
+                i += 1
+                continue
+            if ch == "'":
+                literal = CHAR_LITERAL_RE.match(line, i)
+                # Pas un littéral ⇒ un lifetime : traversé sans état.
+                i = literal.end() if literal else i + 1
+                continue
+            if ch in ("r", "b", "c") and _at_word_start(line, i):
+                opened = RAW_STRING_OPEN_RE.match(line, i)
+                if opened:
+                    state = ("raw", opened.group(1))
+                    i = opened.end()
+                    continue
+            i += 1
+            continue
+
+        if state[0] == "str":
+            ch = line[i]
+            if ch == "\\":
+                # Deux caractères d'un coup : `\"` ne ferme pas, et `\\` ne
+                # laisse pas un `\` orphelin derrière lui. Un `\` en dernière
+                # position est le `\` de continuation — la chaîne reste ouverte.
+                i += 2
+                continue
+            i += 1
+            if ch == '"':
+                state = None
+            continue
+
+        if state[0] == "raw":
+            closing = '"' + state[1]
+            at = line.find(closing, i)
+            if at < 0:
+                return state
+            state = None
+            i = at + len(closing)
+            continue
+
+        # ("block",) — un `//` n'y est pas un commentaire et un `"` n'y ouvre
+        # rien : seul `*/` en sort.
+        at = line.find("*/", i)
+        if at < 0:
+            return state
+        state = None
+        i = at + 2
+
+    return state
 
 
 def production_slices(lines: list[str]) -> tuple[list[tuple[int, str]], list[str]]:
@@ -372,48 +495,71 @@ def production_resumes_after_cut(lines: list[str]) -> int | None:
     sens de `COLUMN_ZERO_ITEM_RE` — d'où un prédicat qui ne se déclenche que
     sur la forme dangereuse : de la production redevenue frère du module.
 
-    Les régions de CHAÎNE BRUTE sont sautées, et ce n'est pas une précaution
-    théorique : six fichiers de ce dépôt embarquent des fixtures Rust dans des
-    `r#"…"#` — les scans de source (`source_scan.rs`, `source_guard.rs`,
-    `ready_label_handler.rs`, …) — et leurs `fn` de fixture sont en colonne
-    zéro. Sans ce saut, le prédicat rapporte six reprises dont aucune n'existe.
+    Les prédicats ne sont évalués que sur les lignes qui COMMENCENT hors
+    chaîne et hors commentaire de bloc — les QUATRE classes de région que
+    `advance_lexical_state` suit. Ce n'est pas une précaution théorique : des
+    fixtures Rust entières vivent dans les littéraux de ce dépôt (les scans de
+    source — `source_scan.rs`, `source_guard.rs`, `ready_label.rs`, … — mais
+    aussi `messaging.rs`, `teams/engine.rs`, `skills/assembly.rs`), et leurs
+    `fn` de fixture sont en colonne zéro.
+
+    MESURE, le 2026-11-24, sur les 417 fichiers que le lint scanne : avec le
+    seul saut des chaînes BRUTES, dix fichiers voyaient une reprise dont neuf
+    n'existaient pas ; avec les quatre classes, il en reste UNE, et c'est la
+    vraie (`crates/mika-agent/src/server/dashboard.rs`, lignes 1596-1732). La
+    dixième était `auto_pull.rs` : une fixture ouverte en `const PHASE0: &str =
+    "\\` portait un `async fn` en colonne zéro, lu comme une reprise à la ligne
+    9812, et `audit_cut_holes` rapportait derrière elle six faux sinks
+    `github.com` — N15 rouge sans qu'aucun sink réel soit en cause (mika#3134,
+    constaté sur la PR #3133).
+
+    Le balayage est UNIQUE et porte l'état lexical sans interruption, de la
+    première ligne à la dernière, avec une variable de phase (avant/après la
+    coupure). L'état est pris AU DÉBUT de la ligne, jamais à la fin : une ligne
+    qui OUVRE une chaîne est encore du code (`const F: &str = "\\`) et doit
+    rester lisible par les prédicats, tandis qu'une ligne qui en FERME une
+    (`";`) ne l'est pas. Le balayage continu donne gratuitement une propriété
+    que la version en deux passes n'avait pas : un `#[cfg(test)] mod x {` écrit
+    DANS une fixture de chaîne ne coupe plus.
+
+    Aucune accolade n'est comptée et aucune profondeur de bloc n'est modélisée
+    — c'est la contrainte que pose `production_slices` § limite, et ce
+    correctif ne la lève pas.
 
     Consommé par le cas N15 du test. Rend `None` quand rien ne reprend.
     """
-    cut = None
+    state: tuple[str, ...] | None = None
     pending = False
-    for idx, raw in enumerate(lines, start=1):
-        if CFG_TEST_RE.match(raw):
-            pending = True
-            continue
-        if pending:
-            stripped = raw.strip()
-            if not stripped or COMMENT_LINE_RE.match(raw) or stripped.startswith("#["):
-                continue
-            pending = False
-            if INLINE_TEST_MOD_RE.match(raw):
-                cut = idx
-                break
-    if cut is None:
-        return None
+    cut: int | None = None
 
-    raw_hashes: str | None = None  # `None` = hors chaîne brute
-    for idx in range(cut, len(lines)):
-        raw = lines[idx]
-        if raw_hashes is not None:
-            if f'"{raw_hashes}' in raw:
-                raw_hashes = None
+    for idx, raw in enumerate(lines, start=1):
+        at_start = state
+        state = advance_lexical_state(raw, state)
+        if at_start is not None:
+            # La ligne commence dans une région sautée : ce n'est pas du code.
             continue
-        opened = RAW_STRING_OPEN_RE.search(raw)
-        if opened:
-            closing = '"' + opened.group(1)
-            # Une chaîne brute ouverte ET fermée sur la même ligne ne masque
-            # rien ; seule celle qui reste ouverte fait entrer dans le saut.
-            if closing not in raw[opened.end() :]:
-                raw_hashes = opened.group(1)
+
+        if cut is None:
+            if CFG_TEST_RE.match(raw):
+                pending = True
                 continue
+            if pending:
+                stripped = raw.strip()
+                if (
+                    not stripped
+                    or COMMENT_LINE_RE.match(raw)
+                    or stripped.startswith("#[")
+                ):
+                    continue
+                pending = False
+                if INLINE_TEST_MOD_RE.match(raw):
+                    cut = idx
+            # La ligne de coupure elle-même n'est jamais une reprise.
+            continue
+
         if COLUMN_ZERO_ITEM_RE.match(raw):
-            return idx + 1
+            return idx
+
     return None
 
 
@@ -421,17 +567,30 @@ def audit_cut_holes(root: Path) -> list[str]:
     """Les sinks que la coupure de `production_slices` laisse hors inventaire.
 
     L'assertion porte sur la CONSÉQUENCE — un sink invisible — et non sur la
-    forme. C'est ce qui la rend utilisable : la détection de reprise
-    sur-rapporte (une fixture Rust dans une chaîne à continuation de ligne est
-    lue comme une reprise), et cette sur-détection ne coûte rien tant que la
-    région ne porte aucun sink. Une sur-détection QUI EN PORTE un est
-    exactement ce qu'on veut voir.
+    forme : c'est ce qui la rend utilisable, puisqu'une sur-détection de
+    reprise ne coûte rien tant que la région ne porte aucun sink, alors qu'une
+    sur-détection QUI EN PORTE un est exactement ce qu'on veut voir.
 
-    Mesure au moment de l'écrire : quatre fichiers voient une reprise, dont un
-    vrai (`crates/mika-agent/src/server/dashboard.rs` porte du code de
-    production après son module de test, lignes 1596-1732) — et AUCUN ne porte
-    de sink derrière. La liste rendue est donc vide, et le cas N15 du test
-    exige qu'elle le reste.
+    Elle ne coûtait rien jusqu'au jour où elle a coûté. Les fixtures Rust
+    logées dans des chaînes ORDINAIRES multi-lignes étaient lues comme du code
+    — neuf des dix reprises de l'arbre — et sur la PR #3133 l'une d'elles a
+    fini par porter six hosts `github.com` de prose de test derrière elle :
+    N15 rouge, aucun sink réel en cause, et un détour de diagnostic payé par
+    l'auteur d'un diff sans rapport. `production_resumes_after_cut` suit depuis
+    les quatre classes de région (mika#3134).
+
+    Mesure du 2026-11-24, après le correctif : sur les 417 fichiers scannés, UN
+    seul voit une reprise, et c'est la vraie
+    (`crates/mika-agent/src/server/dashboard.rs` porte du code de production
+    après son module de test, lignes 1596-1732) — et il ne porte aucun sink
+    derrière. La liste rendue est donc vide, et le cas N15 du test exige
+    qu'elle le reste. Elle l'est désormais PAR CONSTRUCTION, non plus par
+    l'absence de sink derrière neuf fausses reprises.
+
+    LIMITE assumée, et sa population est vide : la recherche de hosts derrière
+    une reprise RÉELLE ne filtre pas, elle, les régions de chaîne. La seule
+    reprise réelle de l'arbre n'en porte aucun ; le jour où elle en portera, ce
+    sera visible par un faux sink rapporté, jamais par un sink silencieux.
 
     Rend une liste de `chemin:ligne <MOTIF>`, vide en régime nominal.
     """
