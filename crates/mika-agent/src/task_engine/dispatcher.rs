@@ -5499,6 +5499,66 @@ const GROOM_PILOT_ISSUE_CLOSED_VALUE: &str = "issue_closed_at_autofire";
 /// deux populations, la seconde devant rester vide en régime sain.
 const GROOM_PILOT_CONSENT_UNREADABLE_VALUE: &str = "consent_unreadable_at_autofire";
 
+/// L'état d'où part le refus « marqueur non convergé » (mika#3140 R4) : le
+/// callback du groom est terminé, et rien de plus.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_BEFORE_VALUE`] (`"groom_delivered"`) : à cet
+/// instant le groom n'est précisément **pas** délivré — c'est ce que le refus
+/// constate. Porter l'autre valeur ferait mentir le `before_value` sur la seule
+/// branche où il importe.
+const GROOM_PILOT_CALLBACK_BEFORE_VALUE: &str = "groom_callback_completed";
+
+/// L'issue mika#3140 : le `result` du callback ne porte pas de marqueur de
+/// convergence (`PLAN_ITERATE`, enveloppe d'auto-skip, `result` absent).
+///
+/// Ce n'est **pas** un compteur de la porte de mika#2590 R5/R6, qui mesure la
+/// *position* du marqueur dans le texte : cette valeur nomme une **précondition**
+/// de l'auto-fire. Les deux populations restent séparables par la valeur, ce que
+/// mika#2205 exige (cf. le doc-comment de l'étape 2).
+const GROOM_PILOT_NOT_CONVERGED_VALUE: &str = "marker_not_converged";
+
+/// L'issue mika#3140 : le callback ne déclare aucune `parent_task_id`.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_PARENT_MISSING_VALUE`] : ici le moteur n'a
+/// jamais eu d'identifiant à chercher, là il en avait un et la ligne a disparu.
+/// Fondre les deux rendrait la seconde — la seule qui dénonce une base
+/// incohérente — invisible derrière la première.
+const GROOM_PILOT_PARENT_ID_ABSENT_VALUE: &str = "parent_task_id_absent";
+
+/// L'issue mika#3140 : la `parent_task_id` est connue mais la ligne parente est
+/// absente de `tasks`.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE`] : un `Ok(None)`
+/// est une réponse — la ligne n'existe pas — alors qu'un `Err` est une
+/// non-réponse. Une parente supprimée et une base injoignable sont deux pannes,
+/// aujourd'hui fondues par le `_ => return` du `get_task_unscoped` (mika#3140 R1).
+const GROOM_PILOT_PARENT_MISSING_VALUE: &str = "parent_task_row_missing";
+
+/// L'issue mika#3140 : la lecture de la ligne parente a rendu une erreur.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_PARENT_MISSING_VALUE`] (voir ci-dessus), et ce
+/// n'est pas une population qui doit exister en régime sain : une ligne ici
+/// nomme la base, pas le groom. C'est la seule des six préconditions à porter un
+/// `reason`.
+const GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE: &str = "parent_task_lookup_failed";
+
+/// L'issue mika#3140 : la ligne parente est lue et ne porte pas de
+/// `reference_url`. C'est le cas littéral du 2026-11-22 sur `a099d8af`.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_REF_URL_UNPARSABLE_VALUE`] : « aucune URL » et
+/// « une URL que le moteur ne sait pas lire » demandent deux gestes différents —
+/// le volet (B) de mika#3140 pour la première, un correctif de
+/// [`parse_repo_issue_from_url`] pour la seconde.
+const GROOM_PILOT_REF_URL_ABSENT_VALUE: &str = "parent_reference_url_absent";
+
+/// L'issue mika#3140 : la `reference_url` existe mais
+/// [`parse_repo_issue_from_url`] n'en tire pas de coordonnées d'issue.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_REF_URL_ABSENT_VALUE`] (voir ci-dessus), et ce
+/// n'est pas non plus un refus de consentement : le ticket n'a même pas été
+/// identifié, donc rien n'a été demandé à la forge.
+const GROOM_PILOT_REF_URL_UNPARSABLE_VALUE: &str = "parent_reference_url_unparsable";
+
 /// Ce que la relecture du consentement a trouvé à l'instant du dispatch
 /// (mika#3118 D2).
 ///
@@ -5553,6 +5613,108 @@ impl AutofireConsent {
     }
 }
 
+/// La précondition de l'auto-fire qui a échoué, nommée (mika#3140 D1).
+///
+/// **Frère exact d'[`AutofireConsent`]**, et délibérément : la forme — un
+/// vocabulaire clos, un verdict par branche, un motif porté par la seule
+/// variante qui en a un — est déjà celle que ce fichier enseigne. Ce qu'elle
+/// change ici : les six sorties des étapes 2 et 3 de
+/// [`try_dispatch_pilot_after_groom_success`] étaient six `return` nus, sans
+/// événement ni ligne d'audit. Le groom de #3119 du 2026-11-22 est sorti par la
+/// cinquième variante, en silence, et le frein STOP de l'étape 3bis n'a jamais
+/// été atteint.
+///
+/// Les six variantes ne sont **pas** interchangeables deux à deux : chacune
+/// porte sa valeur d'audit, de sorte qu'un `GROUP BY after_value` les sépare
+/// sans qu'aucune soit obtenue par soustraction (mika#2205).
+#[derive(Debug)]
+enum AutofirePrecondition {
+    /// Le `result` du callback ne porte pas de marqueur convergé. Seule des six
+    /// à être antérieure à la livraison du groom — d'où son `before_value`
+    /// propre.
+    MarkerNotConverged,
+    /// Le callback ne déclare pas de `parent_task_id`.
+    ParentIdAbsent,
+    /// La `parent_task_id` est connue, la ligne est absente de `tasks` —
+    /// `Ok(None)`, qui est une réponse.
+    ParentRowMissing,
+    /// La lecture de la ligne parente a rendu un `Err` — une non-réponse, et la
+    /// seule des six à porter un motif.
+    ParentLookupFailed(String),
+    /// La parente est lue et n'a pas de `reference_url`. Le cas du 2026-11-22.
+    ReferenceUrlAbsent,
+    /// La `reference_url` existe et [`parse_repo_issue_from_url`] n'en tire rien.
+    ReferenceUrlUnparsable,
+}
+
+impl AutofirePrecondition {
+    /// La valeur de `verdict` que la sonde
+    /// `groom_autofire_preconditions_checked` porte (mika#3140 R2).
+    ///
+    /// Six valeurs deux à deux distinctes, auxquelles la branche saine ajoute
+    /// `"held"` — c'est cette septième qui donne au recensement son
+    /// dénominateur (mika#3050).
+    fn verdict(&self) -> &'static str {
+        match self {
+            Self::MarkerNotConverged => "marker_not_converged",
+            Self::ParentIdAbsent => "parent_id_absent",
+            Self::ParentRowMissing => "parent_row_missing",
+            Self::ParentLookupFailed(_) => "parent_lookup_failed",
+            Self::ReferenceUrlAbsent => "reference_url_absent",
+            Self::ReferenceUrlUnparsable => "reference_url_unparsable",
+        }
+    }
+
+    /// Le motif d'une lecture de parente en erreur, `None` sur les cinq autres
+    /// branches.
+    ///
+    /// `None` et non `""` : le champ doit être **absent** du log, pas vide
+    /// (mika#2331), comme pour [`AutofireConsent::reason`].
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::MarkerNotConverged
+            | Self::ParentIdAbsent
+            | Self::ParentRowMissing
+            | Self::ReferenceUrlAbsent
+            | Self::ReferenceUrlUnparsable => None,
+            Self::ParentLookupFailed(reason) => Some(reason.as_str()),
+        }
+    }
+
+    /// La valeur d'audit écrite dans `audit_events.after_value` (mika#3140 R1).
+    ///
+    /// Le `match` est **exhaustif sans bras `_`** : une septième précondition ne
+    /// compile pas sans nommer sa valeur d'audit. C'est le procédé du
+    /// `match &consent` de l'étape 4bis.
+    fn audit_value(&self) -> &'static str {
+        match self {
+            Self::MarkerNotConverged => GROOM_PILOT_NOT_CONVERGED_VALUE,
+            Self::ParentIdAbsent => GROOM_PILOT_PARENT_ID_ABSENT_VALUE,
+            Self::ParentRowMissing => GROOM_PILOT_PARENT_MISSING_VALUE,
+            Self::ParentLookupFailed(_) => GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE,
+            Self::ReferenceUrlAbsent => GROOM_PILOT_REF_URL_ABSENT_VALUE,
+            Self::ReferenceUrlUnparsable => GROOM_PILOT_REF_URL_UNPARSABLE_VALUE,
+        }
+    }
+
+    /// L'état d'où part le refus, écrit dans `audit_events.before_value`
+    /// (mika#3140 R4).
+    ///
+    /// Deux valeurs et non une : les cinq refus postérieurs au marqueur partent
+    /// d'un groom délivré, celui du marqueur non convergé constate justement
+    /// qu'il ne l'est pas.
+    fn before_value(&self) -> &'static str {
+        match self {
+            Self::MarkerNotConverged => GROOM_PILOT_CALLBACK_BEFORE_VALUE,
+            Self::ParentIdAbsent
+            | Self::ParentRowMissing
+            | Self::ParentLookupFailed(_)
+            | Self::ReferenceUrlAbsent
+            | Self::ReferenceUrlUnparsable => GROOM_PILOT_BEFORE_VALUE,
+        }
+    }
+}
+
 /// Relit le consentement de l'opérateur à la forge, à l'instant du dispatch
 /// (mika#3118 R1/R2).
 ///
@@ -5589,6 +5751,127 @@ async fn autofire_consent_at_dispatch(
         Ok(crate::ready_label::RearmConsent::ReadyAbsent) => AutofireConsent::ReadyAbsent,
         Ok(crate::ready_label::RearmConsent::Closed) => AutofireConsent::IssueClosed,
         Err(reason) => AutofireConsent::Unreadable(reason),
+    }
+}
+
+/// Traverse les préconditions de l'auto-fire et rend soit le matériau de la
+/// suite, soit la précondition qui a échoué (mika#3140 D3).
+///
+/// Les étapes 2 et 3 de [`try_dispatch_pilot_after_groom_success`] vivaient dans
+/// son corps sous la forme de cinq `return` nus, dont la cinquième — parente
+/// sans `reference_url` — a fait sortir le groom de #3119 en silence le
+/// 2026-11-22, sans événement, sans ligne d'audit, et sans jamais atteindre le
+/// frein STOP de l'étape 3bis.
+///
+/// **Aucune décision ne change ici.** L'ordre des préconditions, leur prédicat
+/// et leur issue (ne pas dispatcher) sont ceux d'avant ; ce que la fonction
+/// ajoute est un `Err` qui porte un **nom** au lieu d'un `return` qui n'en porte
+/// aucun. La seule panne qui cesse d'être fondue est celle du
+/// `get_task_unscoped` : son `_ => return` confondait « la ligne n'existe pas »
+/// (`Ok(None)`, une réponse) et « je n'ai pas pu lire » (`Err`, une
+/// non-réponse), deux pannes dont une seule dénonce la base (mika#3140 R1).
+async fn check_autofire_preconditions(
+    db: &AsyncDatabase,
+    task: &Task,
+) -> Result<(String, Task, String, IssueCoordinates), AutofirePrecondition> {
+    // 2. Canonical success marker in callback result text, EN POSITION DE
+    //    VERDICT (mika#2590 R5).
+    //
+    //    C'était un `contains` : même défaut que la porte de provenance, même
+    //    remède. Ce site n'était pas atteint par l'incident mesuré sur mika#2105
+    //    — l'auto-fire ne part que sur un callback de la boucle, jamais sur une
+    //    enveloppe de saut — mais il l'aurait été par un RESULT de recovery
+    //    citant le jeton dans sa prose.
+    match &task.result {
+        Some(r) if crate::task_state::tasks::groom_result_convergence(r).is_converged() => {}
+        _ => return Err(AutofirePrecondition::MarkerNotConverged),
+    };
+
+    // 3. Parent task with parseable issue URL.
+    let parent_id = match &task.parent_task_id {
+        Some(id) => id.clone(),
+        None => return Err(AutofirePrecondition::ParentIdAbsent),
+    };
+    let parent = match db.get_task_unscoped(&parent_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err(AutofirePrecondition::ParentRowMissing),
+        Err(e) => return Err(AutofirePrecondition::ParentLookupFailed(e.to_string())),
+    };
+    let reference_url = match parent.reference_url.as_deref() {
+        Some(url) => url.to_string(),
+        None => return Err(AutofirePrecondition::ReferenceUrlAbsent),
+    };
+    let coords = match parse_repo_issue_from_url(&reference_url) {
+        Some(parsed) => parsed,
+        None => return Err(AutofirePrecondition::ReferenceUrlUnparsable),
+    };
+
+    Ok((parent_id, parent, reference_url, coords))
+}
+
+/// Le site **unique** où un refus de précondition parle (mika#3140 R5).
+///
+/// Un par branche aurait été six copies du couple (sonde, audit) : six endroits
+/// où un futur éditeur peut en oublier un, avec toutes les assertions vertes
+/// (doctrine du lecteur unique, mika#2158 / mika#2201 / mika#3049). Ici, ajouter
+/// une septième précondition ne peut pas la rendre muette — l'exhaustivité du
+/// `match` d'[`AutofirePrecondition::audit_value`] refuse de compiler avant.
+///
+/// Deux détails que le site voisin de l'étape 3bis impose :
+///
+/// - La session système y est `format!("system-{}", parent.agent_id)`. Sur trois
+///   des six branches la parente n'est pas lisible, donc elle vient ici de
+///   `task.agent_id` — le même agent par construction (un callback et sa parente
+///   ne changent pas d'agent) et la seule valeur disponible partout.
+/// - L'`entity_id` est la `parent_task_id` quand elle est connue, à défaut
+///   `task.id` ; la `reason` de la ligne d'audit **nomme toujours** le callback,
+///   afin qu'une ligne portée par l'entité « callback » reste rattachable.
+///
+/// Ni `repo` ni `issue` ne figurent sur cette ligne, et c'est exact : les six
+/// refus sont tous antérieurs à l'obtention des coordonnées. Un `0` ou un `""`
+/// y mettrait un fait qui n'existe pas (mika#2331).
+async fn refuse_on_precondition(
+    db: &AsyncDatabase,
+    task: &Task,
+    precondition: AutofirePrecondition,
+) {
+    let trace_id = mika_common::trace::generate_trace_id();
+    info!(
+        event = "groom_autofire_preconditions_checked",
+        verdict = precondition.verdict(),
+        reason = precondition.reason(),
+        parent_task_id = task.parent_task_id.as_deref(),
+        callback_task_id = %task.id,
+        trace_id = %trace_id,
+        "engine: groom-pilot auto-fire refused — a precondition did not hold \
+         (mika#3140); the groom is kept, nothing was dispatched"
+    );
+
+    let system_session = format!("system-{}", task.agent_id);
+    let entity_id = task.parent_task_id.as_deref().unwrap_or(task.id.as_str());
+    let verdict = precondition.verdict();
+    let reason = match precondition.reason() {
+        Some(detail) => format!("{verdict} (callback={}): {detail}", task.id),
+        None => format!("{verdict} (callback={})", task.id),
+    };
+    if let Err(e) = db
+        .log_audit_event(
+            &system_session,
+            GROOM_PILOT_DISPATCHER_TOOL,
+            entity_id,
+            Some(precondition.before_value()),
+            Some(precondition.audit_value()),
+            Some(&reason),
+            Some(&trace_id),
+        )
+        .await
+    {
+        warn!(
+            callback_task_id = %task.id,
+            verdict,
+            error = %e,
+            "engine: failed to write groom-pilot-dispatcher precondition audit event"
+        );
     }
 }
 
@@ -5654,8 +5937,10 @@ async fn autofire_consent_at_dispatch(
 /// `after_value=`[`GROOM_PILOT_DISPATCHED_VALUE`] for traceability — and, since
 /// mika#2498, [`GROOM_PILOT_STOPPED_VALUE`] on the branch where the loop's
 /// dispatch brake refused the auto-fire — et depuis mika#3118 les trois valeurs
-/// de la garde de consentement, de sorte qu'un `GROUP BY after_value` sépare les
-/// six issues sans qu'aucune ne s'infère par soustraction.
+/// de la garde de consentement, puis depuis mika#3140 les six valeurs des
+/// préconditions ([`AutofirePrecondition`]), de sorte qu'un
+/// `GROUP BY after_value` sépare les **onze** issues sans qu'aucune ne s'infère
+/// par soustraction (mika#2205).
 async fn try_dispatch_pilot_after_groom_success(
     db: &AsyncDatabase,
     task: &Task,
@@ -5668,45 +5953,49 @@ async fn try_dispatch_pilot_after_groom_success(
         return;
     }
 
-    // 2. Canonical success marker in callback result text, EN POSITION DE
-    //    VERDICT (mika#2590 R5).
+    // 2-3. Les préconditions du groom : marqueur de convergence, parente, URL
+    //    d'issue parsable. Elles vivent dans `check_autofire_preconditions`, et
+    //    leur refus parle à l'unique site `refuse_on_precondition`
+    //    (mika#3140 D3/R5).
     //
-    //    C'était un `contains` : même défaut que la porte de provenance, même
-    //    remède. Ce site n'était pas atteint par l'incident mesuré sur mika#2105
-    //    — l'auto-fire ne part que sur un callback de la boucle, jamais sur une
-    //    enveloppe de saut — mais il l'aurait été par un RESULT de recovery
-    //    citant le jeton dans sa prose.
+    //    **Ce que ce vol change, et ce qu'il ne change pas.** Le commentaire que
+    //    cette ligne remplace disait : *« Aucune émission ici, délibérément :
+    //    lui donner un compteur mélangerait sa population avec celle de la porte
+    //    (R6) »*. Cette contrainte est tenue, pas contournée. Ce qui est émis
+    //    n'est pas un compteur de la porte de mika#2590 R5/R6 — laquelle mesure
+    //    la **position** du marqueur dans le texte, et reste la population du
+    //    ticket de la porte — mais une sonde de **précondition**, sous un nom
+    //    d'événement distinct (`groom_autofire_preconditions_checked`, jamais
+    //    `grooming_marker_*`) et une valeur d'audit qui nomme la précondition
+    //    (`marker_not_converged`), pas la position. Les deux populations restent
+    //    séparables par la valeur, qui est très exactement ce que mika#2205
+    //    exige. Un éditeur qui lirait la contrainte d'avant déferait ce vol de
+    //    bonne foi : c'est pourquoi le commentaire bouge dans le même commit.
     //
-    //    Aucune émission ici, délibérément : ce site est un auto-fire
-    //    *fire-and-forget* dont chaque précondition échouée est déjà silencieuse,
-    //    et lui donner un compteur mélangerait sa population avec celle de la
-    //    porte (R6), qui est celle du ticket.
-    match &task.result {
-        Some(r) if crate::task_state::tasks::groom_result_convergence(r).is_converged() => {}
-        _ => return,
-    };
-
-    // 3. Parent task with parseable issue URL.
-    let parent_id = match &task.parent_task_id {
-        Some(id) => id.clone(),
-        None => return,
-    };
-    let parent = match db.get_task_unscoped(&parent_id).await {
-        Ok(Some(t)) => t,
-        _ => return,
-    };
-    let reference_url = match parent.reference_url.as_deref() {
-        Some(url) => url.to_string(),
-        None => return,
-    };
+    //    Le recensement est émis sur les deux bras — `held` ici, le verdict du
+    //    refus dans `refuse_on_precondition` — donc exactement une fois par
+    //    callback de classe `groom`, jamais zéro, jamais deux (R2).
+    let (parent_id, parent, _reference_url, coords) =
+        match check_autofire_preconditions(db, task).await {
+            Ok(ready) => ready,
+            Err(precondition) => return refuse_on_precondition(db, task, precondition).await,
+        };
+    // L'URL est le matériau que la traversée a lu et qu'aucune étape en aval ne
+    // relit : les coordonnées la remplacent dès l'étape 4bis.
+    info!(
+        event = "groom_autofire_preconditions_checked",
+        verdict = "held",
+        parent_task_id = %parent_id,
+        callback_task_id = %task.id,
+        repo = %coords.repo_short,
+        issue = coords.issue,
+        "engine: groom-pilot auto-fire preconditions hold — the dispatch path continues"
+    );
     let IssueCoordinates {
         owner_repo,
         repo_short,
         issue: issue_num,
-    } = match parse_repo_issue_from_url(&reference_url) {
-        Some(parsed) => parsed,
-        None => return,
-    };
+    } = coords;
 
     // 3bis. Le frein de dispatch de la boucle (mika#2498).
     //
@@ -11008,10 +11297,14 @@ mod tests {
         .await;
 
         let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
-        assert!(
-            outcomes.is_empty(),
-            "un groom qui n'a pas convergé n'aurait dispatché de toute façon : \
-             la garde ne doit rien écrire — trouvé {outcomes:?}"
+        assert_eq!(
+            outcomes,
+            vec![GROOM_PILOT_NOT_CONVERGED_VALUE.to_string()],
+            "un groom qui n'a pas convergé n'aurait dispatché de toute façon : la garde \
+             du frein ne doit rien écrire. Depuis mika#3140 l'instrument n'est plus \
+             l'absence mais le **nom** : la seule row attendue est celle de l'étape 2, et \
+             toute autre — `{GROOM_PILOT_STOPPED_VALUE}` au premier chef — prouverait que \
+             le prédicat de convergence a laissé passer — trouvé {outcomes:?}"
         );
     }
 
@@ -11157,10 +11450,12 @@ mod tests {
         );
 
         let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
-        assert!(
-            outcomes.is_empty(),
-            "la fonction doit sortir à l'étape 2 : ni dispatch, ni refus de frein — \
-             trouvé {outcomes:?}"
+        assert_eq!(
+            outcomes,
+            vec![GROOM_PILOT_NOT_CONVERGED_VALUE.to_string()],
+            "la fonction doit sortir à l'étape 2 : ni dispatch, ni refus de frein. Depuis \
+             mika#3140 cette sortie porte son nom — une row et une seule, celle de la \
+             précondition — là où elle était muette — trouvé {outcomes:?}"
         );
     }
 
@@ -11235,11 +11530,14 @@ mod tests {
         .await;
 
         let outcomes = groom_pilot_audit_outcomes(&db, &skipped_parent).await;
-        assert!(
-            outcomes.is_empty(),
+        assert_eq!(
+            outcomes,
+            vec![GROOM_PILOT_NOT_CONVERGED_VALUE.to_string()],
             "l'auto-skip doit sortir à l'étape 2, donc *avant* le frein : une row \
-             `{GROOM_PILOT_STOPPED_VALUE}` prouve que le prédicat de convergence l'a \
-             laissé passer — trouvé {outcomes:?}"
+             `{GROOM_PILOT_STOPPED_VALUE}` prouverait que le prédicat de convergence l'a \
+             laissé passer. Depuis mika#3140 la sortie de l'étape 2 écrit \
+             `{GROOM_PILOT_NOT_CONVERGED_VALUE}` plutôt que rien, et c'est ce nom — non \
+             plus une absence — qui situe le bras — trouvé {outcomes:?}"
         );
     }
 
@@ -12191,6 +12489,373 @@ mod tests {
             assert_eq!(
                 AutofireConsent::Unreadable("gh a échoué".to_string()).reason(),
                 Some("gh a échoué")
+            );
+        }
+    }
+
+    // ---- mika#3140 — les six sorties de précondition de l'auto-fire se nomment ----
+
+    /// Les six préconditions des étapes 2 et 3, chacune sous sa propre valeur.
+    ///
+    /// Le constat du 2026-11-22 : le groom de #3119 est sorti à l'étape 3 parce
+    /// que sa parente n'avait pas de `reference_url`, **sans événement ni ligne
+    /// d'audit**, et le frein STOP de l'étape 3bis n'a jamais été atteint. Un
+    /// `GROUP BY after_value` ne pouvait ni compter cette sortie ni la
+    /// distinguer des quatre autres.
+    ///
+    /// Les cinq branches atteignables hors ligne sont mesurées sur la ligne
+    /// d'audit ; la sixième — `parent_lookup_failed`, qui demande une base
+    /// injoignable — est attestée sur ses accesseurs par le test de vocabulaire,
+    /// avec le motif qu'elle est la seule à porter.
+    mod mika3140_preconditions_de_lautofire {
+        use super::*;
+
+        /// Les couples `(before_value, after_value)` écrits sur une entité.
+        ///
+        /// `groom_pilot_audit_outcomes` ne rend que l'`after_value`, et R4 doit
+        /// prouver l'**état de départ** : le refus « marqueur non convergé » ne
+        /// peut pas porter `groom_delivered`, puisque à cet instant le groom
+        /// n'est précisément pas délivré.
+        async fn transitions_audit(db: &AsyncDatabase, target: &str) -> Vec<(String, String)> {
+            db.get_audit_events("system-mika")
+                .await
+                .expect("la lecture des audit_events ne doit pas échouer")
+                .into_iter()
+                .filter(|e| e.tool_name == GROOM_PILOT_DISPATCHER_TOOL && e.target_key == target)
+                .map(|e| {
+                    (
+                        e.before_value.unwrap_or_else(|| "<absent>".to_string()),
+                        e.after_value.unwrap_or_else(|| "<absent>".to_string()),
+                    )
+                })
+                .collect()
+        }
+
+        /// Le socle des cinq tests de refus : la fonction est appelée sur le
+        /// `Task` fourni, frein désarmé et jeton présent, donc toute row trouvée
+        /// vient bien d'une précondition et non du frein ni de l'étape 4.
+        async fn run_sur(db: &AsyncDatabase, task: &Task) {
+            try_dispatch_pilot_after_groom_success(
+                db,
+                task,
+                Some("ghp_token"),
+                &skills_empty(),
+                no_stop_home(),
+            )
+            .await;
+        }
+
+        /// **V1 / AC1 — le cas littéral du 2026-11-22 sur `a099d8af`.**
+        ///
+        /// Une parente sans `reference_url` écrit `parent_reference_url_absent`
+        /// depuis `groom_delivered`, là où elle n'écrivait rien.
+        #[tokio::test]
+        async fn mika3140_une_reference_url_absente_ecrit_son_nom() {
+            let db = test_db();
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, true, None).await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+            run_sur(&db, &task).await;
+
+            assert_eq!(
+                transitions_audit(&db, &parent_id).await,
+                vec![(
+                    GROOM_PILOT_BEFORE_VALUE.to_string(),
+                    GROOM_PILOT_REF_URL_ABSENT_VALUE.to_string()
+                )],
+                "la sortie du 2026-11-22 doit porter son nom, et depuis un groom \
+                 délivré : c'est après la convergence que la parente est lue"
+            );
+        }
+
+        /// **V2 / V6 / AC5 — le marqueur non convergé a son propre
+        /// `before_value`.**
+        ///
+        /// La seule des six préconditions antérieure à la livraison du groom.
+        /// Lui faire porter `groom_delivered` ferait mentir la colonne sur le
+        /// seul cas où elle renseigne.
+        #[tokio::test]
+        async fn mika3140_un_marqueur_non_converge_ne_part_pas_dun_groom_delivre() {
+            let db = test_db();
+            let url = fixture_issue_url(990_140);
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, false, Some(&url)).await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+            run_sur(&db, &task).await;
+
+            assert_eq!(
+                transitions_audit(&db, &parent_id).await,
+                vec![(
+                    GROOM_PILOT_CALLBACK_BEFORE_VALUE.to_string(),
+                    GROOM_PILOT_NOT_CONVERGED_VALUE.to_string()
+                )],
+                "le groom n'est pas délivré à cet instant — c'est ce que le refus \
+                 constate, donc son `before_value` ne peut pas l'affirmer (R4)"
+            );
+        }
+
+        /// **V2 — aucune `parent_task_id` : la row se porte sur le callback.**
+        ///
+        /// Sans parente il n'y a pas d'entité « parent » à qui rattacher la
+        /// ligne. Elle est écrite sur l'identifiant du callback plutôt que
+        /// perdue, et la `reason` le nomme de toute façon, sur les six branches.
+        #[tokio::test]
+        async fn mika3140_une_parent_task_id_absente_ecrit_sur_le_callback() {
+            let db = test_db();
+            let url = fixture_issue_url(990_141);
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, true, Some(&url)).await;
+            let mut task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+            task.parent_task_id = None;
+
+            run_sur(&db, &task).await;
+
+            assert_eq!(
+                transitions_audit(&db, &callback_id).await,
+                vec![(
+                    GROOM_PILOT_BEFORE_VALUE.to_string(),
+                    GROOM_PILOT_PARENT_ID_ABSENT_VALUE.to_string()
+                )],
+                "la ligne doit exister et être rattachable, même sans parente"
+            );
+            assert!(
+                transitions_audit(&db, &parent_id).await.is_empty(),
+                "rien ne doit être écrit sur une parente que le callback ne déclare pas"
+            );
+        }
+
+        /// **V2 / V3 — « ligne parente introuvable » n'est pas « lecture en
+        /// erreur ».**
+        ///
+        /// La forme de production : la parente est fauchée entre l'écriture du
+        /// callback et la traversée (`reap_orphaned_parent_tasks`, #871), donc
+        /// le `Task` en mémoire déclare une parente que la base n'a plus. Le
+        /// `_ => return` d'avant fondait ce `Ok(None)` avec le `Err` d'une base
+        /// injoignable — une parente supprimée et une base morte demandent deux
+        /// gestes différents.
+        #[tokio::test]
+        async fn mika3140_une_ligne_parente_absente_nest_pas_une_lecture_en_erreur() {
+            let db = test_db();
+            let url = fixture_issue_url(990_142);
+            let (_parent_id, callback_id) = create_groom_callback_pair(&db, true, Some(&url)).await;
+            let mut task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+            let disparue = "parente-fauchee-990142";
+            task.parent_task_id = Some(disparue.to_string());
+
+            run_sur(&db, &task).await;
+
+            let rows = transitions_audit(&db, disparue).await;
+            assert_eq!(
+                rows,
+                vec![(
+                    GROOM_PILOT_BEFORE_VALUE.to_string(),
+                    GROOM_PILOT_PARENT_MISSING_VALUE.to_string()
+                )],
+                "un `Ok(None)` est une réponse — la ligne n'existe pas — et doit \
+                 s'écrire sous sa propre valeur"
+            );
+            assert!(
+                rows.iter()
+                    .all(|(_, after)| after != GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE),
+                "et jamais sous celle d'une non-réponse (R1)"
+            );
+        }
+
+        /// **V2 — une URL présente que le moteur ne sait pas lire.**
+        ///
+        /// Distincte de l'absence : le volet (B) de mika#3140 répondra à
+        /// l'absence, alors que celle-ci nomme un défaut de
+        /// `parse_repo_issue_from_url`, ou une parente qui référence autre chose
+        /// qu'une issue.
+        #[tokio::test]
+        async fn mika3140_une_reference_url_non_parsable_ecrit_son_nom() {
+            let db = test_db();
+            let (parent_id, callback_id) = create_groom_callback_pair(
+                &db,
+                true,
+                Some("https://github.com/senara-solutions/mika/pull/3140"),
+            )
+            .await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+            run_sur(&db, &task).await;
+
+            assert_eq!(
+                transitions_audit(&db, &parent_id).await,
+                vec![(
+                    GROOM_PILOT_BEFORE_VALUE.to_string(),
+                    GROOM_PILOT_REF_URL_UNPARSABLE_VALUE.to_string()
+                )],
+                "une URL de PR n'est pas une URL d'issue, et ce n'est pas la même \
+                 panne qu'une URL absente"
+            );
+        }
+
+        /// **V4 / V5 / AC3 — la branche saine, et une seule ligne par
+        /// callback.**
+        ///
+        /// Sans ce contrôle, une traversée qui refuserait *tout* passerait les
+        /// cinq tests ci-dessus. Le frein STOP est armé : la fonction s'arrête
+        /// donc à l'étape 3bis — un cran après la traversée, avant toute
+        /// résolution de registre et tout appel réseau — et sa row
+        /// `stopped_by_sentinel` est la mesure, déterministe et hors ligne, que
+        /// les six préconditions ont été franchies.
+        ///
+        /// Le dénominateur de R2 vit dans la sonde `tracing`, qui n'a pas de
+        /// surface d'assertion ici ; ce que la base atteste est son corollaire :
+        /// **zéro** row de la famille précondition sur le chemin franchi.
+        #[tokio::test]
+        async fn mika3140_la_branche_saine_necrit_aucun_refus_de_precondition() {
+            let db = test_db();
+            let tmp = tempfile::tempdir().unwrap();
+            arm_stop_for(tmp.path(), crate::auto_pull_stop::AUTO_PULL_SCAN);
+
+            let url = fixture_issue_url(990_143);
+            let (parent_id, callback_id) = create_groom_callback_pair(&db, true, Some(&url)).await;
+            let task = db.get_task_unscoped(&callback_id).await.unwrap().unwrap();
+
+            try_dispatch_pilot_after_groom_success(
+                &db,
+                &task,
+                Some("ghp_token"),
+                &skills_empty(),
+                tmp.path(),
+            )
+            .await;
+
+            let outcomes = groom_pilot_audit_outcomes(&db, &parent_id).await;
+            assert_eq!(
+                outcomes,
+                vec![GROOM_PILOT_STOPPED_VALUE.to_string()],
+                "une parente portant une URL parsable franchit les six préconditions \
+                 et atteint le frein — exactement une row, celle du frein — trouvé \
+                 {outcomes:?}"
+            );
+            assert!(
+                !outcomes
+                    .iter()
+                    .any(|o| VALEURS_DE_PRECONDITION.contains(&o.as_str())),
+                "aucun refus de précondition ne doit être écrit sur le chemin franchi : \
+                 une ligne par callback, jamais deux (R2/V5) — trouvé {outcomes:?}"
+            );
+        }
+
+        /// Les six valeurs d'audit de la famille précondition, nommées une fois.
+        const VALEURS_DE_PRECONDITION: [&str; 6] = [
+            GROOM_PILOT_NOT_CONVERGED_VALUE,
+            GROOM_PILOT_PARENT_ID_ABSENT_VALUE,
+            GROOM_PILOT_PARENT_MISSING_VALUE,
+            GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE,
+            GROOM_PILOT_REF_URL_ABSENT_VALUE,
+            GROOM_PILOT_REF_URL_UNPARSABLE_VALUE,
+        ];
+
+        /// **AC2 / AC4 — le vocabulaire est un format de fil, et la sixième
+        /// branche est attestée ici.**
+        ///
+        /// Frère de `mika3118_les_valeurs_du_consentement_sont_un_format_de_fil`
+        /// et même exigence : onze issues passent sous le même `tool_name`, donc
+        /// un `GROUP BY after_value` ne les sépare que si les valeurs sont deux
+        /// à deux distinctes. Les renommer casse une requête d'opérateur.
+        ///
+        /// C'est aussi le seul endroit où `parent_lookup_failed` est mesurable :
+        /// sa branche demande un `get_task_unscoped` en erreur, donc une base
+        /// injoignable, qu'aucun test hors ligne ne fabrique sans mentir sur la
+        /// panne. Ses quatre accesseurs sont lus ici — dont le motif, qu'elle est
+        /// la seule des six à porter.
+        #[test]
+        fn mika3140_les_valeurs_de_precondition_sont_un_format_de_fil() {
+            assert_eq!(
+                GROOM_PILOT_CALLBACK_BEFORE_VALUE,
+                "groom_callback_completed"
+            );
+            assert_eq!(GROOM_PILOT_NOT_CONVERGED_VALUE, "marker_not_converged");
+            assert_eq!(GROOM_PILOT_PARENT_ID_ABSENT_VALUE, "parent_task_id_absent");
+            assert_eq!(GROOM_PILOT_PARENT_MISSING_VALUE, "parent_task_row_missing");
+            assert_eq!(
+                GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE,
+                "parent_task_lookup_failed"
+            );
+            assert_eq!(
+                GROOM_PILOT_REF_URL_ABSENT_VALUE,
+                "parent_reference_url_absent"
+            );
+            assert_eq!(
+                GROOM_PILOT_REF_URL_UNPARSABLE_VALUE,
+                "parent_reference_url_unparsable"
+            );
+
+            // Les onze issues du dispatcheur, deux à deux distinctes.
+            let valeurs = [
+                GROOM_PILOT_DISPATCHED_VALUE,
+                GROOM_PILOT_STOPPED_VALUE,
+                GROOM_PILOT_READY_ABSENT_VALUE,
+                GROOM_PILOT_ISSUE_CLOSED_VALUE,
+                GROOM_PILOT_CONSENT_UNREADABLE_VALUE,
+                GROOM_PILOT_NOT_CONVERGED_VALUE,
+                GROOM_PILOT_PARENT_ID_ABSENT_VALUE,
+                GROOM_PILOT_PARENT_MISSING_VALUE,
+                GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE,
+                GROOM_PILOT_REF_URL_ABSENT_VALUE,
+                GROOM_PILOT_REF_URL_UNPARSABLE_VALUE,
+            ];
+            let uniques: std::collections::BTreeSet<&str> = valeurs.iter().copied().collect();
+            assert_eq!(
+                uniques.len(),
+                valeurs.len(),
+                "onze issues sous un `tool_name` : deux valeurs confondues et une \
+                 population s'infère par soustraction (mika#2205) — {valeurs:?}"
+            );
+
+            // Les six préconditions : une valeur d'audit chacune, et le même
+            // ordre pour les verdicts de la sonde.
+            let six = [
+                AutofirePrecondition::MarkerNotConverged,
+                AutofirePrecondition::ParentIdAbsent,
+                AutofirePrecondition::ParentRowMissing,
+                AutofirePrecondition::ParentLookupFailed("base injoignable".to_string()),
+                AutofirePrecondition::ReferenceUrlAbsent,
+                AutofirePrecondition::ReferenceUrlUnparsable,
+            ];
+            assert_eq!(
+                six.iter().map(|p| p.audit_value()).collect::<Vec<_>>(),
+                VALEURS_DE_PRECONDITION.to_vec(),
+                "l'ordre et le contenu de la famille précondition sont lus par les \
+                 requêtes d'opérateur"
+            );
+            assert_eq!(
+                six.iter().map(|p| p.verdict()).collect::<Vec<_>>(),
+                vec![
+                    "marker_not_converged",
+                    "parent_id_absent",
+                    "parent_row_missing",
+                    "parent_lookup_failed",
+                    "reference_url_absent",
+                    "reference_url_unparsable",
+                ],
+                "le vocabulaire des verdicts est lu par les requêtes de logs, et c'est \
+                 lui qui donne au recensement sa répartition"
+            );
+
+            // Deux `before_value` et non un : R4.
+            assert_eq!(
+                six.iter().map(|p| p.before_value()).collect::<Vec<_>>(),
+                vec![
+                    GROOM_PILOT_CALLBACK_BEFORE_VALUE,
+                    GROOM_PILOT_BEFORE_VALUE,
+                    GROOM_PILOT_BEFORE_VALUE,
+                    GROOM_PILOT_BEFORE_VALUE,
+                    GROOM_PILOT_BEFORE_VALUE,
+                    GROOM_PILOT_BEFORE_VALUE,
+                ],
+                "seul le marqueur non convergé ne part pas d'un groom délivré"
+            );
+
+            // Et le motif : seule la lecture en erreur en porte un (mika#2331).
+            assert_eq!(
+                six.iter().map(|p| p.reason()).collect::<Vec<_>>(),
+                vec![None, None, None, Some("base injoignable"), None, None],
+                "un champ absent n'est pas un champ vide : `reason` ne doit exister \
+                 que là où un texte existe"
             );
         }
     }
