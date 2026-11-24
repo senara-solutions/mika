@@ -658,11 +658,54 @@ async fn handle_model(app: &mut App<'_>, args: &str) -> String {
             Ok(result) => {
                 let target_provider: mika_common::llm::ProviderKind =
                     result.provider.parse().unwrap_or(app.provider);
-                // mika#1727 vol V3b-2 — `app.provider` ne bouge pas, même quand
-                // `switch_model` a changé de provider dans `config.toml` : un
+
+                if target_provider != app.provider {
+                    // mika#3129 — la cible n'est pas le provider que le fil
+                    // sert. Un `SetModel` partirait brut sous
+                    // `mika.model_override` à chaque tour, et
+                    // `resolve_model_override` le rendrait tel quel au provider
+                    // EN COURS : il ne dépréfixe que son propre nom
+                    // (`model_override.rs`, mika#1591), donc rien ne refuse et
+                    // chaque tour suivant meurt sur un 400 du provider. On
+                    // écrit, et rien de plus — la doctrine de `handle_provider`
+                    // juste en dessous.
+                    //
+                    // Le prédicat est `app.provider`, jamais
+                    // `result.provider_changed` : ce champ compare `config.toml`
+                    // avant/après, donc il vaut `false` après un `/provider`
+                    // préalable alors que le fil est cassé tout autant.
+                    //
+                    // `app.model` ne bouge pas — il nommerait un modèle que le
+                    // fil ne porte pas (motif mika#2331) — et `needs_redraw`
+                    // n'est pas posé : rien n'a changé à l'écran. Les
+                    // `result.warnings` restent rendus : ce sont les échecs
+                    // d'écriture de `config.toml`, c'est-à-dire du seul geste
+                    // que cette branche accomplit encore.
+                    let mut out = format!(
+                        "Wrote {}_model = \"{}\" to config.toml, where llm_provider is \
+                         \"{}\" ({}/{}). mika-spirit takes it at its next restart, for \
+                         every turn of the agent. This session keeps running on {}, so \
+                         no model override was sent — an override is always served by \
+                         the provider in use, which does not know {} model ids.",
+                        target_provider.config_prefix(),
+                        result.model,
+                        result.provider,
+                        result.provider,
+                        result.model,
+                        app.provider,
+                        result.provider,
+                    );
+                    for w in &result.warnings {
+                        out.push_str(&format!(" (warning: {w})"));
+                    }
+                    return out;
+                }
+
+                // mika#1727 vol V3b-2 — `app.provider` ne bouge pas : un
                 // override ne re-dispatche jamais vers un autre provider
                 // (mika#1591), donc les tours de cette TUI restent servis par
-                // celui que mika-spirit a chargé. Le modèle, lui, part bien :
+                // celui que mika-spirit a chargé. Sur cette branche la cible
+                // *est* ce provider, donc le modèle part bien :
                 // `format_worker_model` rend la valeur que le fil porte.
                 let display_id =
                     crate::commands::provider::format_display_model(target_provider, &result.model);
@@ -782,12 +825,15 @@ async fn handle_provider(app: &mut App<'_>, args: &str) -> String {
                 // mika#1727 vol V3b-2 — cette commande écrit, et rien de plus :
                 // aucun `SetModel` ne part, ni `app.provider` ni `app.model` ne
                 // bouge. Un override préfixé d'un provider que le spirit **en
-                // cours** n'a pas configuré est refusé fermement et couperait
-                // tous les tours suivants (mika#1591), et des champs qui
-                // annonceraient un provider que le fil n'atteint pas seraient
-                // une fausse provenance (motif mika#2331). La bascule atteint
-                // les tours au prochain démarrage de mika-spirit, qui relit
-                // `config.toml` — d'où une réponse qui nomme ce redémarrage.
+                // cours** n'a pas configuré n'est refusé par personne : il
+                // voyage intact et coupe tous les tours suivants sur un refus
+                // du provider en service (mika#1591, mesuré par mika#3129) —
+                // c'est donc ici qu'on s'abstient de l'envoyer. Et des champs
+                // qui annonceraient un provider que le fil n'atteint pas
+                // seraient une fausse provenance (motif mika#2331). La bascule
+                // atteint les tours au prochain démarrage de mika-spirit, qui
+                // relit `config.toml` — d'où une réponse qui nomme ce
+                // redémarrage.
                 let new_provider: ProviderKind = result.provider.parse().unwrap_or(app.provider);
 
                 // Fire-and-forget model cache warm (TUI keeps running, unlike CLI)
@@ -1902,8 +1948,23 @@ mod tests {
         assert!(output.contains("Usage: /model"));
     }
 
+    /// **Retourné par mika#3129, et c'est lui qui fixe le prédicat.**
+    ///
+    /// Ce test attestait qu'un `SetModel` `deepseek/deepseek-reasoner` partait
+    /// au worker — alors qu'`app.provider` valait toujours `Anthropic`. C'était
+    /// le mode de panne lui-même : le worker pose cette chaîne sous
+    /// `mika.model_override` à **chaque** tour suivant, le spirit en cours la
+    /// rend telle quelle au provider configuré (`model_override.rs` ne dépréfixe
+    /// que son propre nom), et Anthropic répond 400 jusqu'au prochain
+    /// redémarrage. L'inversion retire la preuve de cet envoi.
+    ///
+    /// Il porte en plus la **mesure** du prédicat : ici
+    /// `ModelSwitchResult::provider_changed` vaut `false`, parce que
+    /// `config.toml` portait déjà `deepseek` avant et après ce `/model`. Un
+    /// correctif branché sur ce champ laisserait donc ce geste-là couper le fil.
+    /// Ce qui compte est `target_provider != app.provider`.
     #[tokio::test]
-    async fn test_model_direct_name_sets_model() {
+    async fn test_model_direct_name_apres_un_provider_nenvoie_rien() {
         let (mut app, mut rx, tmp) = test_app().await;
 
         // Switch to DeepSeek first (easier to test with fake API key)
@@ -1918,16 +1979,33 @@ mod tests {
         let output = handle_model(&mut app, "deepseek-reasoner").await;
 
         assert!(
-            output.contains("Switched to deepseek/deepseek-reasoner"),
-            "should accept direct model name, got: {output}"
+            drain_requests(&mut rx).is_empty(),
+            "aucun override ne part : le fil est servi par {}, got: {output}",
+            app.provider
         );
-        assert_eq!(app.model, "deepseek/deepseek-reasoner");
+        assert_eq!(
+            app.model, "claude-sonnet-4-6",
+            "afficher le modèle cible serait une fausse provenance (mika#2331)"
+        );
+        assert_eq!(app.provider, ProviderKind::Anthropic);
 
-        // Should have sent SetModel to the worker
-        let requests = drain_requests(&mut rx);
-        assert!(requests.iter().any(
-            |r| matches!(r, AgentRequest::SetModel { model } if model == "deepseek/deepseek-reasoner")
-        ));
+        let config = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            config.contains("llm_provider = \"deepseek\""),
+            "la bascule reste écrite dans config.toml, got: {config}"
+        );
+        assert!(
+            config.contains("deepseek_model = \"deepseek-reasoner\""),
+            "le modèle cible est persisté, got: {config}"
+        );
+        assert!(
+            output.contains("next restart"),
+            "la réponse nomme ce que la persistance couvre, got: {output}"
+        );
+        assert!(
+            !output.contains("Switched to"),
+            "la réponse n'affirme pas que le modèle est en service, got: {output}"
+        );
     }
 
     // --- /provider tests ---
@@ -2347,8 +2425,19 @@ mod tests {
         );
     }
 
+    /// **Retourné par mika#3129.** Ce test attestait que l'alias
+    /// cross-provider envoyait `deepseek/deepseek-chat` au worker : le vol
+    /// V3b-2 avait retiré ce `SetModel` de `/provider` et l'avait laissé à
+    /// `/model`, sur le raisonnement que « le modèle, lui, part bien ». Il ne
+    /// part nulle part — il part chez Anthropic, qui ne le connaît pas.
+    ///
+    /// L'inversion retire la preuve de l'envoi, et avec elle l'assertion sur
+    /// `switched provider to deepseek` : la nouvelle réponse ne peut plus
+    /// annoncer un modèle appliqué, donc elle est reformulée en entier. Ce qui
+    /// reste tenu ici est le seul geste que la branche accomplit encore :
+    /// l'écriture de `config.toml`.
     #[tokio::test]
-    async fn test_model_cross_provider_alias_switches_provider() {
+    async fn test_model_cross_provider_alias_writes_config_and_sends_no_setmodel() {
         let (mut app, mut rx, tmp) = test_app().await;
 
         // Set up: start on Anthropic, switch via deepseek alias
@@ -2358,37 +2447,45 @@ mod tests {
         assert_eq!(app.provider, ProviderKind::Anthropic);
         let output = handle_model(&mut app, "deepseek").await;
 
-        // mika#1727 vol V3b-2 (critère 3) — la bascule est persistée et le
-        // modèle part sur le fil, mais `app.provider` ne bouge pas : un override
-        // ne re-dispatche jamais vers un autre provider (mika#1591).
+        assert!(
+            drain_requests(&mut rx).is_empty(),
+            "rien ne part au worker : ni SetModel, ni autre chose, got: {output}"
+        );
         assert_eq!(
             app.provider,
             ProviderKind::Anthropic,
             "le provider de l'App ne suit pas la persistance"
         );
+        assert_eq!(
+            app.model, "claude-sonnet-4-6",
+            "le modèle affiché reste celui que le fil porte (mika#2331)"
+        );
+
+        let config = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
         assert!(
-            output.contains("switched provider to deepseek"),
-            "should note provider switch, got: {output}"
+            config.contains("llm_provider = \"deepseek\""),
+            "la bascule est écrite dans config.toml, got: {config}"
         );
         assert!(
             output.contains("next restart"),
             "la réponse nomme ce que la persistance couvre, got: {output}"
         );
-
-        // Le `SetModel` porte exactement ce que `format_worker_model` rend pour
-        // le provider cible — l'alias `deepseek` résout `deepseek/deepseek-chat`.
-        let requests = drain_requests(&mut rx);
         assert!(
-            requests.iter().any(
-                |r| matches!(r, AgentRequest::SetModel { model } if model == "deepseek/deepseek-chat")
-            ),
-            "SetModel should carry the target provider's prefixed model"
+            output.contains("deepseek/deepseek-chat"),
+            "la réponse nomme le couple visé, got: {output}"
         );
     }
 
+    /// **Retourné par mika#3129** — l'assertion de sortie survit, le reste est
+    /// neuf. La forme `provider/model` tapée explicitement est le troisième
+    /// chemin vers le même défaut (après l'alias et le nom nu post-`/provider`),
+    /// et ce test ne mesurait que la chaîne rendue : il passait identiquement
+    /// avant et après le correctif, donc il ne pinnait rien. Il gagne les deux
+    /// mesures que l'inversion exige — le `SetModel` absent et `app.model`
+    /// immobile.
     #[tokio::test]
     async fn test_model_direct_with_provider_prefix() {
-        let (mut app, _rx, tmp) = test_app().await;
+        let (mut app, mut rx, tmp) = test_app().await;
 
         let env_path = tmp.path().join(".env");
         std::fs::write(&env_path, "MIKA_DEEPSEEK_API_KEY=sk-fake-key-for-test\n").unwrap();
@@ -2401,6 +2498,53 @@ mod tests {
         assert!(
             output.contains("deepseek/deepseek-reasoner"),
             "should set full model id, got: {output}"
+        );
+        assert!(
+            drain_requests(&mut rx).is_empty(),
+            "aucun override cross-provider ne part, got: {output}"
+        );
+        assert_eq!(
+            app.model, "claude-sonnet-4-6",
+            "le modèle affiché reste celui que le fil porte (mika#2331)"
+        );
+    }
+
+    /// **Le contrôle positif du prédicat (mika#3129).**
+    ///
+    /// Les trois tests retournés ci-dessus attestent une absence, et une
+    /// absence est aussi ce que rendrait un `/model` qui n'envoie plus jamais
+    /// rien. Celui-ci est la moitié qui les borne : `app.provider` vaut
+    /// `DeepSeek` — le fil *est* servi par deepseek — et le même
+    /// `/model deepseek-reasoner` qui ne part pas depuis un fil anthropic part
+    /// ici, préfixé du provider cible. Le refus est conditionnel, pas global.
+    #[tokio::test]
+    async fn mika3129_le_predicat_est_le_provider_du_fil_pas_celui_de_config() {
+        let (mut app, mut rx, tmp) = test_app().await;
+
+        // Le fil est servi par deepseek, et `config.toml` dit la même chose :
+        // aucune bascule n'est en jeu, seul le modèle change.
+        app.provider = ProviderKind::DeepSeek;
+        app.model = "deepseek/deepseek-chat".to_string();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "llm_provider = \"deepseek\"\ndeepseek_api_key = \"sk-fake-key-for-test\"\n",
+        )
+        .unwrap();
+
+        let output = handle_model(&mut app, "deepseek-reasoner").await;
+
+        let requests = drain_requests(&mut rx);
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, AgentRequest::SetModel { model } if model == "deepseek/deepseek-reasoner")
+            ),
+            "le SetModel part quand la cible est le provider du fil ({} requête(s), réponse: {output})",
+            requests.len()
+        );
+        assert_eq!(app.model, "deepseek/deepseek-reasoner");
+        assert!(
+            output.contains("Switched to deepseek/deepseek-reasoner"),
+            "ce chemin-là annonce bien un modèle appliqué, got: {output}"
         );
     }
 
