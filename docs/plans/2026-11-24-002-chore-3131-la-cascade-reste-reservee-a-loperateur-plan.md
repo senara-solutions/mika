@@ -102,7 +102,7 @@ Caused by: failed to create directory `…/registry/src/…/etcetera-0.11.0`
 Caused by: Read-only file system (os error 30)
 ```
 
-Cette session mesure un contre-exemple daté :
+Cette session observe un contre-exemple :
 
 ```
 $ ls -ld …/registry/src/index.crates.io-…/sqlx-core-0.9.1
@@ -115,6 +115,34 @@ $ ls -a …/sqlx-core-0.9.1/
 dépaquetée sous `src/`, et la sentinelle `.cargo-ok` que cargo écrit en fin
 d'extraction est présente : **l'extraction a abouti**, le 2026-11-23 à 08:35.
 Le `src/` du bac à sable a donc été inscriptible la veille de la mesure M6.
+
+#### Deux dates, et il faut les séparer (F1)
+
+| | instant | ce qui s'est passé |
+|---|---|---|
+| le **fait** | 2026-11-23 08:35 | l'extraction de `sqlx-core 0.9.1` aboutit sous `registry/src/` |
+| commit du vol 1 | 2026-11-24 05:09 UTC — `cc32f5e0` | M6 conclut « monté en lecture seule, donc aucune caisse nouvelle ne se compile » |
+| merge du vol 1 | 2026-11-24 07:05 UTC — `3585e7be` | le document de solution part avec ce fondement |
+| la **mesure** | 2026-11-24 ~20:08 UTC, cette session | le `ls -ld` ci-dessus observe le fait |
+
+Le fait **préexistait** au vol 1 d'environ 21 h. Il n'est donc pas apparu entre le
+commit et le merge, et il n'est pas apparu depuis : **ce plan ne revendique pas
+une découverte, il revendique une mesure.** Le contre-exemple était sur le disque
+quand M6 a été écrit, et M6 ne l'a pas regardé.
+
+Pourquoi le vol 1 ne l'a pas inclus, nommé sans détour : **il n'a pas cherché de
+contre-exemple.** M6 a généralisé une seule sortie d'erreur — un `failed to
+create directory` sur une caisse — en propriété invariante du montage. Un `ls` sur
+`registry/src/` l'aurait démenti en une commande. C'est une inférence trop large,
+pas un fait ignoré, et c'est exactement le défaut que R1 corrige : un document qui
+enseigne cette signature comme marque permanente reproduit l'inférence pour la
+prochaine session.
+
+Ce que cela change pour la crédibilité de E5 : **rien**, parce que la crédibilité
+d'une mesure ne tient pas à sa nouveauté mais à sa vérifiabilité. La commande est
+re-jouable à l'identique par l'architecte de seconde passe et par l'opérateur. Le
+fait que le vol 1 **aurait pu** la contenir est une part du constat de E5, pas une
+objection contre lui.
 
 Lecture correcte, et c'est une correction de **fondement**, pas de conclusion :
 
@@ -134,6 +162,29 @@ du vol 1 porte la signature `failed to create directory …/registry/src/…` co
 marque du blocage. Cette marque est réelle, mais elle est **intermittente**, et
 un document qui la donne pour permanente enseigne un préflight qui passera au
 vert un jour sur deux.
+
+### E6 — fait neuf : les deux consommateurs d'`advisory-db` sont refusés par la même porte
+
+Mesuré dans cette session, pour chiffrer honnêtement l'option 3 (F2) :
+
+```
+$ cargo deny --version
+no matching policy rule -- denied by default (production posture; widen rules to allow new tool footprints)
+$ cargo audit --version
+no matching policy rule -- denied by default (production posture; widen rules to allow new tool footprints)
+$ ls -ld ~/.cargo/advisory-db
+ls: cannot access '/home/samidarko/.cargo/advisory-db': No such file or directory
+```
+
+Trois faits en un : la base d'avis n'est pas clonée dans ce bac à sable, et ses
+**deux** consommateurs — `cargo deny` et `cargo audit` — sont refusés par la même
+règle que `cargo update`. `cargo audit` était déjà attesté refusé par le document
+du 2026-10-21 ; `cargo deny` ne l'était pas, et c'est ce qui manquait pour
+répondre à F2 sur mesure plutôt que sur principe.
+
+Conséquence directe, qui est l'objet de la décomposition de l'option 3 ci-dessous :
+**cloner `advisory-db` ne rend rien exécutable.** Un clone sans consommateur
+autorisé est une base que personne ne peut lire.
 
 ---
 
@@ -188,17 +239,47 @@ inscriptible **de façon garantie** (E5 montre qu'il l'est par intermittence,
 ce qui est pire qu'un refus franc), et un clone joignable de
 `rustsec/advisory-db` (`deny.toml:5-6`).
 
-**Coût :** c'est accorder à un pilote le droit de muter le graphe de dépendances
-du dépôt. Le `production posture` du refus E4 se lit comme une décision déjà
-prise dans l'autre sens. **Ce plan n'inscrit aucun geste de cette option** :
-mika#3122 règle 1 fait du refus un arbitrage opérateur, et un repli par un autre
-outil est explicitement interdit.
+Ces trois ingrédients n'ont pas le même coût de posture, et l'opérateur peut les
+trancher séparément. La décomposition, avec ce que chacun donne — et surtout ce
+qu'il ne donne pas :
+
+| ingrédient | coût | ce qu'il débloque seul |
+|---|---|---|
+| **3a** — cloner `rustsec/advisory-db` dans `~/.cargo/advisory-db` (`deny.toml:5`) | un clone git à provisionner, et sa **fraîcheur** : un `git pull` périodique dont rien dans ce dépôt n'est aujourd'hui le propriétaire déclaré. Taille non mesurée ici — le clone est absent (E6) | **rien.** Ses deux consommateurs, `cargo deny` et `cargo audit`, sont refusés par la même règle que `cargo update` (E6). Un clone sans consommateur autorisé est une base que personne ne peut lire |
+| **3b** — autoriser `cargo audit` / `cargo deny` | élargissement **en lecture** : ces deux outils n'écrivent pas le graphe. C'est le plus petit des trois arbitrages | rendrait lisible la plage `versions.patched` d'un avis, donc un **préflight** de cette classe. Ne mute rien : la cascade de E2 reste hors d'atteinte |
+| **3c** — autoriser `cargo update` + garantir `registry/src/` inscriptible | élargissement **en écriture** : c'est accorder à un pilote le droit de muter le graphe de dépendances du dépôt. Le `production posture` du refus E4 se lit comme une décision déjà prise dans l'autre sens | la cascade devient techniquement dispatchable — mais le vol C dépasse seul les deux bornes de mika#2636 et mika#2693 d'un facteur large, donc l'ouverture de la policy ne suffirait pas à le rendre dispatchable *en pratique* |
+
+**3a et 3b ne sont pas une voie vers la cascade, et ne doivent pas se lire comme
+telle.** Accordés ensemble sans 3c, ils donnent un préflight — la capacité de
+*nommer* ce qu'un avis demande — pas la capacité de le satisfaire. Seul 3c lève
+E4, et c'est le plus coûteux des trois.
+
+Correction d'une lecture possible, consignée parce que la seconde passe la fera
+peut-être aussi : le document de référence est daté du **2026**-10-21 (et non
+2025), et il ne présente pas le clone d'`advisory-db` comme une alternative à
+l'élargissement — il le liste comme **ingrédient** de sa voie 3
+(`docs/solutions/dependency-maintenance/2026-10-21-un-bump-de-lock-rustsec-nest-pas-dispatchable.md:167-172`,
+« il faut `cargo update`, `cargo fetch` et `cargo audit`, plus un clone joignable
+de `rustsec/advisory-db` »). E6 mesure pourquoi cette lecture est la bonne : sans
+3b, le clone n'a pas de lecteur. Énumérer 3a comme troisième voie autonome
+inscrirait au plan une option qui ne mène nulle part — et sous mika#3122 règle 1,
+un repli qui *paraît* obtenir le même effet par un autre outil est précisément ce
+qu'il ne faut pas écrire.
+
+**Coût global :** un arbitrage de posture en trois crans, dont un seul (3c) ouvre
+la cascade. **Ce plan n'inscrit aucun geste d'aucun des trois** : mika#3122
+règle 1 fait du refus un arbitrage opérateur, et un repli par un autre outil est
+explicitement interdit. Ni 3a, ni 3b, ni 3c ne sont pratiqués, ni préparés, ni
+recommandés ici — ils sont chiffrés.
 
 ### Ce que ce plan ne fait pas
 
 Il ne choisit pas entre les trois. Il ne pose ni ne retire de label. Il
 n'ouvre pas de ticket. Il n'édite ni `Cargo.toml`, ni `Cargo.lock`, ni
 `rust-toolchain.toml`, ni les deux fichiers d'exception. Il ne contourne pas E4.
+Il ne clone pas `rustsec/advisory-db` et ne prépare pas ce clone (3a) : E6
+mesure qu'il serait sans lecteur, et le provisionner depuis un pilote de
+grooming serait pratiquer un cran d'une option réservée.
 
 ---
 
@@ -229,8 +310,14 @@ sites de E2.
 
 ### R3 — la récurrence du re-dispatch est nommée, pas corrigée en silence
 
-Ce dispatch est le second pilote dépensé sur #3131 pour le même constat. La
-cause est un label, pas un défaut de plan. Une garde structurelle est
+Ce dispatch n'est pas le second pilote dépensé sur #3131 pour le même constat,
+mais au moins le troisième : le vol 1 l'a groomé et livré, une première passe
+d'architecte a produit la rev 2 de ce plan, et la boucle a re-dispatché un
+grooming par-dessus — c'est la session qui écrit cette ligne. Le décompte exact
+n'est pas établi ici et n'a pas besoin de l'être : il croît d'un à chaque tour de
+boucle tant que le label reste posé. La cause est un label, pas un défaut de
+plan, et chaque re-dispatch re-découvre une halte que deux passes d'architecte
+ont déjà acceptée. Une garde structurelle est
 imaginable — un lint qui refuse `dispatch:loop` sur un ticket dont le dernier
 plan mergé déclare une classe opérateur — mais c'est un **détecteur**, donc un
 périmètre à cadrer pour lui-même, avec sa propre `## Fire-Disposition` et sa
@@ -295,10 +382,24 @@ code.
 | V3 | aucune mutation du graphe de dépendances | `git diff --stat origin/main -- Cargo.toml Cargo.lock rust-toolchain.toml` → **vide** |
 | V4 | aucune mutation des exceptions | `git diff --stat origin/main -- deny.toml .cargo/audit.toml` → **vide** ; les deux entrées RUSTSEC-2026-0459 du vol 1 restent telles quelles |
 | V5 | le vol ne livre aucune ligne de code | `git diff --stat origin/main` → un seul fichier, sous `docs/` |
-| V6 | la chaîne complète | `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, `bash scripts/verify-pipeline.sh origin/main` |
 
 V3 et V4 ne sont pas des formalités : ce sont les deux assertions qui attestent
 que le plan **n'a pas pratiqué** l'une des options qu'il chiffre.
+
+### Sanity check — pas un critère de succès du vol (F3)
+
+`cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --check`, `bash scripts/verify-pipeline.sh origin/main`.
+
+**Attendu vert parce qu'aucun code n'a changé**, et la chaîne tourne quand même
+— c'est une PR, la CI la fera tourner. Mais elle ne vérifie rien que V3–V5
+n'attestent déjà : le seul fichier touché est sous `docs/`, sans doc-test ni
+proc-macro, donc aucune de ces quatre commandes ne peut rougir *à cause de ce
+vol*. Si l'une rougit, le défaut est préexistant sur `origin/main` et appartient à
+un autre ticket — pas à celui-ci.
+
+Consigné comme sanity check et non comme ligne du contract, pour que le contract
+ne porte que des assertions dont ce vol est la cause.
 
 ---
 
@@ -309,7 +410,8 @@ que le plan **n'a pas pratiqué** l'une des options qu'il chiffre.
   `cargo update` par la politique de permission.
 - `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml` et
   `.cargo/audit.toml` sont **identiques** à `origin/main`.
-- V1–V6 passent.
+- V1–V5 passent, et le sanity check est vert — vert par construction, aucun code
+  n'ayant changé (F3).
 - La PR porte `Tracked in: senara-solutions/mika#3131` et **pas** `Closes #3131`.
 - Le corps de PR nomme les trois options de routage et dit laquelle le vol 1
   recommandait, **sans en pratiquer aucune**.
@@ -331,10 +433,14 @@ ne portent que sur le **vol courant**.
   est **vide** : aucune option de routage n'a été pratiquée.
 - **AC3** — `git diff --stat origin/main` ne liste qu'un fichier, et il est sous
   `docs/` : le vol ne livre aucune ligne de code.
-- **AC4** — le plan contient une section nommant la décision réservée à
-  l'opérateur, avec les trois options chiffrées (deux labels / trois tickets /
-  élargissement de posture) et le coût mesuré de chacun des trois vols de la
-  cascade.
+- **AC4** — le fichier
+  `docs/plans/2026-11-24-002-chore-3131-la-cascade-reste-reservee-a-loperateur-plan.md`
+  porte une section `## La décision réservée à l'opérateur` qui (a) chiffre les
+  trois options avec leur coût — deux labels / trois tickets / élargissement de
+  posture, ce dernier décomposé en ses trois crans 3a–3c et ce que chacun
+  débloque seul ; (b) donne le coût mesuré de chacun des trois vols A, B et C de
+  la cascade ; et (c) n'en pratique ni n'en prépare aucune — rapporter laquelle
+  le vol 1 recommandait est permis, l'appliquer non.
 - **AC5** — le ticket #3131 reste OPEN, et aucune PR issue de ce plan ne contient
   `Closes #3131`.
 - **AC6** — aucun geste de contournement du refus E4 n'apparaît dans le plan ni
@@ -380,3 +486,84 @@ attendu est `ESCALATE`.
 Le plancher du vol est le commit 1 seul : il est vrai indépendamment de l'option
 de routage que l'opérateur retiendra, et il corrige un préflight que la prochaine
 session de grooming lira.
+
+---
+
+## Revision history
+
+- **rev 1** (2026-11-24) — première passe. Plan de halte : la part attestable de
+  #3131 est livrée par le vol 1 (PR #3161) ; la cascade reste réservée à
+  l'opérateur, trois options chiffrées, aucune pratiquée (mika#3122).
+- **rev 2** (2026-11-24) — adresse les quatre findings de la première passe
+  d'architecte (`Disposition: ITERATE`) :
+  - **F1** (bloquant, ambiguïté temporelle de E5) — adressé par le sous-§
+    « Deux dates, et il faut les séparer » : une table sépare l'instant du
+    **fait** (extraction aboutie le 2026-11-23 08:35) de celui de la **mesure**
+    (`ls -ld` re-joué le 2026-11-24 ~20:08 UTC, cette session), et situe les deux
+    par rapport au commit `cc32f5e0` (05:09 UTC) et au merge `3585e7be`
+    (07:05 UTC). La réponse à la question posée par le finding — pourquoi le vol 1
+    ne l'a pas inclus — est écrite sans détour : le fait préexistait d'environ
+    21 h, le vol 1 **n'a pas cherché de contre-exemple**, M6 a généralisé une
+    sortie d'erreur unique en propriété de montage. Le plan ne revendique donc
+    plus une « découverte de cette session » mais une mesure, re-jouable à
+    l'identique — et c'est précisément l'inférence trop large que R1 corrige.
+  - **F2** (bloquant, énumération incomplète de l'option 3) — adressé par la
+    décomposition de l'option 3 en trois crans séparables (3a clone
+    d'`advisory-db` / 3b lecture `cargo audit`+`cargo deny` / 3c écriture
+    `cargo update`), chacun avec son coût et ce qu'il débloque **seul**, plus la
+    mesure neuve **E6**. La prémisse du finding est corrigée sur mesure plutôt
+    que sur principe : le document de référence est daté du **2026**-10-21 (non
+    2025) et liste le clone comme *ingrédient* de sa voie 3, non comme
+    alternative — citation préservée
+    (`docs/solutions/dependency-maintenance/2026-10-21-un-bump-de-lock-rustsec-nest-pas-dispatchable.md:167-172`).
+    E6 mesure que `cargo deny` **et** `cargo audit` sont refusés par la même règle
+    que `cargo update` et que `~/.cargo/advisory-db` est absent : un clone local
+    n'aurait aucun lecteur. 3a est donc inscrit comme cran chiffré, et
+    explicitement **pas** comme troisième voie autonome — l'écrire ainsi aurait
+    inscrit au plan un repli apparent, ce que mika#3122 règle 1 interdit.
+  - **F3** (sharpening, redondance de V6) — adressé : V6 sort de la table du
+    Verification Contract et devient un sous-§ « Sanity check — pas un critère de
+    succès du vol », attendu vert par construction. La DoD suit (« V1–V5 passent,
+    et le sanity check est vert »). Le contract ne porte plus que des assertions
+    dont ce vol est la cause.
+  - **F4** (sharpening, AC4 méta-récursif) — adressé : AC4 porte désormais sur
+    l'artefact nommé (le fichier de plan et sa section
+    `## La décision réservée à l'opérateur`) avec trois clauses vérifiables
+    (a)(b)(c). Non affaibli mais élargi — la clause (c) est neuve et interdit de
+    préparer une option, tout en préservant la permission de *rapporter* celle
+    que le vol 1 recommandait, comme la DoD l'exige.
+
+  Aucun finding n'est resté sans réponse. La révision ne change pas la nature du
+  plan : il reste un plan de halte à 0 ligne de code, son unique livrable reste
+  documentaire (R1), et son verdict attendu reste `ESCALATE` — sortie nominale
+  sous mika#3122 règle 3.
+- **rev 3** (2026-11-24) — re-dispatch de grooming. La rev 2 était **présente
+  mais non committée** dans le worktree ; cette révision la commite et corrige
+  deux défauts qu'elle portait :
+  - **Titre avalé.** L'insertion du sous-§ F1 et de la mesure E6 en rev 2 a
+    supprimé le titre `## La décision réservée à l'opérateur` (rev 1, ligne 140).
+    Les trois Options étaient devenues filles de `### E6`, et deux sites du plan
+    — **AC4** et le § `## Taille estimée` — citaient une section qui n'existait
+    plus : un critère d'acceptation invérifiable par construction. Le titre est
+    restauré à son niveau `##`, son paragraphe d'ouverture retrouve sa place, et
+    les trois Options redeviennent ses filles. Correction **structurelle
+    seulement** : aucun mot des Options 1–3, de E5, de E6 ni des findings F1–F4
+    n'est modifié.
+  - **Décompte de pilotes dépassé.** R3 disait « second pilote » ; ce
+    re-dispatch le rend faux. R3 nomme désormais ce qui est observable — au moins
+    trois, et un de plus à chaque tour de boucle tant que le label reste posé —
+    sans revendiquer un décompte exact que cette session ne peut pas établir.
+
+  Les faits portants ont été re-mesurés dans ce worktree et tiennent à
+  l'identique : `3585e7be` est bien ancêtre de `HEAD` (E1) ; les cinq sites de la
+  cascade sont inchangés — `Cargo.toml:14` `rust-version = "1.91"`,
+  `Cargo.toml:30` rusqlite `"0.32"`, `Cargo.toml:128` sqlx `"0.8"`,
+  `rust-toolchain.toml:2` `channel = "1.93"` (E2) ; les deux exceptions sont en
+  place (`deny.toml:21`, `.cargo/audit.toml:27`) ; et le document cible de R1
+  existe. **E4 n'a pas été re-joué** : le plan nomme ce refus au lieu de le
+  sonder, et re-lancer une commande que la politique refuse n'ajouterait rien
+  qu'un tour.
+
+  La nature du plan est inchangée : 0 ligne de code, unique livrable
+  documentaire, verdict attendu `ESCALATE`. Aucune des trois options n'est
+  pratiquée, ni préparée, ni recommandée par cette révision.
