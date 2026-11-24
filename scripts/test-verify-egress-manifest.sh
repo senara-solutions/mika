@@ -733,8 +733,18 @@ echo "------------------------------------------------------"
 # à chaque run. Un trou mesuré en continu n'est pas un trou silencieux.
 #
 # L'assertion porte sur la CONSÉQUENCE (un sink invisible), jamais sur la
-# forme : la détection de reprise sur-rapporte, et cette sur-détection ne coûte
-# rien tant que la région ne porte pas de sink.
+# forme : une sur-détection de reprise ne coûte rien tant que la région ne
+# porte pas de sink.
+#
+# Elle ne coûtait rien jusqu'au jour où elle a coûté (mika#3134). Le prédicat
+# ne sautait qu'UNE classe de région — la chaîne brute — donc une fixture Rust
+# logée dans une chaîne ORDINAIRE multi-ligne était lue comme du code. Neuf des
+# dix reprises de l'arbre étaient de cette classe, et sur la PR #3133 l'une
+# d'elles a fini par porter six hosts `github.com` de prose de test derrière
+# elle : CE cas rouge, aucun sink réel en cause. Le prédicat suit désormais les
+# quatre classes (chaîne brute, chaîne ordinaire, commentaire de bloc, littéral
+# de caractère) ; les trois étages ci-dessous pinnent chacune d'elles, la
+# fermeture lexicale sur l'arbre, et la conséquence bout en bout.
 holes_rc=0
 holes=$(python3 -B "$ENGINE" --audit-cut-holes "$REPO_ROOT" 2>&1) || holes_rc=$?
 assert_true "N15 aucun sink derrière la coupure production/test" \
@@ -762,6 +772,251 @@ PY
 assert_true "N15 anti-vacuité — le détecteur voit encore la reprise témoin" \
     "$([ "$witness" != "None" ] && [ -n "$witness" ] && echo 1 || echo 0)" \
     "production_resumes_after_cut(dashboard.rs) a rendu '$witness' ; attendu un numéro de ligne. Si ce fichier a été réorganisé, choisir un autre témoin — mais ne pas retirer l'assertion, sinon N15 rend 0 sans rien mesurer"
+
+# --------------------------------------------------------------------------
+# N15/1 — les quatre classes de région, sur micro-fixtures (mika#3134)
+# --------------------------------------------------------------------------
+# Sept fixtures de cinq à sept lignes, chacune portant une coupure
+# `#[cfg(test)] mod tests {` puis UNE forme. Quatre prouvent qu'une région est
+# sautée ; TROIS prouvent qu'elle ne l'est pas — et ces trois-là portent le
+# poids réel, parce qu'un scanner qui entre à tort dans une chaîne saute tout
+# le reste du fichier en SILENCE, et qu'un sink omis ne se voit pas alors qu'un
+# sink de trop se lit.
+#
+# NON-VACUITÉ MESURÉE sur le moteur d'avant (07bb0378) : trois des sept
+# échouaient — `cont-string` et `cont-string-sans-reprise` rendaient la ligne de
+# la fixture au lieu de la vraie reprise (resp. 4 au lieu de 7, 4 au lieu de
+# None), `block-comment` rendait 4 au lieu de 7. Les quatre autres passaient
+# déjà : elles ne sont pas la preuve du correctif, elles sont la garde contre sa
+# régression.
+stage1=$(python3 -B - "$REPO_ROOT" <<'PY' 2>&1
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts" / "lib"))
+from egress_manifest_lint import production_resumes_after_cut
+
+# La coupure, commune aux sept : tout ce qui suit est du test.
+CUT = ["#[cfg(test)]", "mod tests {"]
+
+CASES = [
+    # La CLASSE DU TICKET : la fixture est sautée, la vraie reprise est vue.
+    ("cont-string", CUT + [
+        '    const F: &str = "\\',
+        "async fn dedans() {}",
+        '";',
+        "}",
+        "fn apres() {}",
+    ]),
+    # La même sans rien derrière : aucune reprise n'est inventée.
+    ("cont-string-sans-reprise", CUT + [
+        '    const F: &str = "\\',
+        "async fn dedans() {}",
+        '";',
+        "}",
+    ]),
+    # Non-régression : la chaîne brute était le seul saut d'avant mika#3134.
+    ("raw", CUT + [
+        '    const F: &str = r#"',
+        "fn dedans() {}",
+        '"#;',
+        "}",
+    ]),
+    # GARDE anti-sous-détection : un guillemet en prose n'ouvre pas de chaîne.
+    ("comment-quote", CUT + [
+        '    // un " seul',
+        "}",
+        "fn apres() {}",
+    ]),
+    # GARDE : le littéral de caractère non plus.
+    ("char-quote", CUT + [
+        "    let c = '\"';",
+        "}",
+        "fn apres() {}",
+    ]),
+    # Le commentaire de bloc est sauté.
+    ("block-comment", CUT + [
+        "    /* bloc",
+        "fn dedans() {}",
+        "*/",
+        "}",
+        "fn apres() {}",
+    ]),
+    # GARDE : un lifetime n'est pas un littéral de caractère.
+    ("lifetime", CUT + [
+        "    fn f<'a>(x: &'a str) {}",
+        "}",
+        "fn apres() {}",
+    ]),
+]
+
+print(f"cas={len(CASES)}")
+for name, lines in CASES:
+    print(f"{name}={production_resumes_after_cut(lines)}")
+PY
+)
+
+# ANTI-VACUITÉ par la cardinalité (classe mika#2205) : si le bloc cessait de
+# construire ses cas, chaque comparaison ci-dessous lirait une chaîne vide et
+# l'échec serait attribué au prédicat plutôt qu'à la sonde.
+stage1_cas=$(sed -n 's/^cas=//p' <<< "$stage1")
+assert_true "N15/1 anti-vacuité — les sept micro-fixtures sont construites" \
+    "$([ "${stage1_cas:-0}" -eq 7 ] && echo 1 || echo 0)" \
+    "cas=$stage1_cas ; sortie complète :
+$stage1"
+
+for expected in \
+    "cont-string=7" \
+    "cont-string-sans-reprise=None" \
+    "raw=None" \
+    "comment-quote=5" \
+    "char-quote=5" \
+    "block-comment=7" \
+    "lifetime=5"
+do
+    case_name=${expected%%=*}
+    case_want=${expected#*=}
+    case_got=$(sed -n "s/^$case_name=//p" <<< "$stage1")
+    assert_true "N15/1 $case_name -> $case_want" \
+        "$([ "$case_got" = "$case_want" ] && echo 1 || echo 0)" \
+        "obtenu '$case_got' ; sortie complète :
+$stage1"
+done
+
+# --------------------------------------------------------------------------
+# N15/2 — fermeture lexicale sur l'arbre réel (mika#3134)
+# --------------------------------------------------------------------------
+# Le seul mode de défaillance SILENCIEUX du scanner : entrer dans une région et
+# n'en jamais sortir, auquel cas tout le reste du fichier est sauté sans un mot.
+# Un fichier Rust valide finit toujours en état « code » ; cette sonde l'exige
+# pour chacun de ceux que le lint scanne, et nomme le fichier et l'état quand
+# elle échoue — c'est l'information dont l'opérateur a besoin.
+#
+# Elle imprime aussi la CARDINALITÉ des reprises. Mesure du 2026-11-24 :
+# `scannés=417 hors_code=0 reprises=1`, contre dix reprises avant le correctif
+# (neuf fausses, de la classe du ticket). L'assertion porte sur `>= 1` et sur la
+# présence du témoin, jamais sur `== 1` : une reprise réelle ajoutée demain par
+# un diff sans rapport doit rester visible sans faire rougir ce cas — c'est
+# `--audit-cut-holes` ci-dessus qui juge si elle cache un sink.
+stage2=$(python3 -B - "$REPO_ROOT" <<'PY' 2>&1
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts" / "lib"))
+from egress_manifest_lint import (
+    SCAN_ROOT,
+    advance_lexical_state,
+    is_excluded,
+    production_resumes_after_cut,
+)
+
+scanned = 0
+unclosed: list[str] = []
+resumes: list[str] = []
+
+for path in sorted((root / SCAN_ROOT).rglob("*.rs")):
+    rel = path.relative_to(root).as_posix()
+    if is_excluded(rel):
+        continue
+    scanned += 1
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    state = None
+    for line in lines:
+        state = advance_lexical_state(line, state)
+    if state is not None:
+        unclosed.append(f"{rel} (état final {state})")
+
+    at = production_resumes_after_cut(lines)
+    if at is not None:
+        resumes.append(f"{rel}:{at}")
+
+print(f"scannés={scanned} hors_code={len(unclosed)} reprises={len(resumes)}")
+print(f"fichiers={','.join(resumes)}")
+for item in unclosed:
+    print(f"  perdu: {item}")
+PY
+)
+stage2_scanned=$(sed -n 's/^scannés=\([0-9]*\) .*/\1/p' <<< "$stage2")
+stage2_unclosed=$(sed -n 's/^scannés=[0-9]* hors_code=\([0-9]*\) .*/\1/p' <<< "$stage2")
+stage2_resumes=$(sed -n 's/^scannés=[0-9]* hors_code=[0-9]* reprises=\([0-9]*\)$/\1/p' <<< "$stage2")
+
+assert_true "N15/2 anti-vacuité — la sonde voit les fichiers de l'arbre" \
+    "$([ "${stage2_scanned:-0}" -ge 300 ] && echo 1 || echo 0)" \
+    "scannés=$stage2_scanned ; sans fichiers vus, hors_code=0 se lirait comme un arbre sain (classe mika#2205). Sortie :
+$stage2"
+
+assert_true "N15/2 chaque fichier scanné finit en état « code »" \
+    "$([ "${stage2_unclosed:-1}" -eq 0 ] && echo 1 || echo 0)" \
+    "$stage2
+  -> le scanner lexical est entré dans une région et n'en est pas sorti. Tout
+     ce qui suit, dans ce fichier, a été sauté EN SILENCE — c'est la direction
+     dangereuse de l'erreur (mika#3134 R4). Corriger advance_lexical_state(),
+     jamais l'assertion."
+
+assert_true "N15/2 anti-vacuité — le prédicat voit encore au moins une reprise" \
+    "$([ "${stage2_resumes:-0}" -ge 1 ] && echo 1 || echo 0)" \
+    "reprises=$stage2_resumes ; un prédicat qui ne voit plus rien est un détecteur mort, pas un arbre propre. Sortie :
+$stage2"
+
+assert_true "N15/2 la reprise témoin est dans la liste" \
+    "$(grep -q 'crates/mika-agent/src/server/dashboard.rs:' <<< "$stage2" && echo 1 || echo 0)" \
+    "sortie :
+$stage2"
+
+# --------------------------------------------------------------------------
+# N15/3 — la CONSÉQUENCE, bout en bout (mika#3134)
+# --------------------------------------------------------------------------
+# La forme réduite de la panne de #3133, et le seul des trois étages qui
+# traverse `audit_cut_holes` plutôt que le prédicat nu : une fixture Rust en
+# `"\` dans un module de test, suivie d'un host RÉEL cité en prose de test.
+# Avant le correctif, le prédicat voyait une reprise à l'`async fn` de la
+# fixture et `api.github.com` était rapporté comme sink hors inventaire — exit
+# 1 sur un arbre sans le moindre sink. Mesuré sur le moteur d'avant (07bb0378).
+E2E="$TMPROOT/n15-e2e"
+mkdir -p "$E2E/crates/demo/src"
+cat > "$E2E/crates/demo/src/lib.rs" <<'RS'
+//! Fixture mika#3134 : production, puis test, puis une fixture dans une chaîne.
+
+pub fn production() -> u32 {
+    7
+}
+
+#[cfg(test)]
+mod tests {
+    // Une fixture Rust dans une chaîne ORDINAIRE multi-ligne. Son `async fn`
+    // tombe en colonne zéro et n'est PAS du code.
+    const FIXTURE: &str = "\
+async fn phase0_feed_ready_pool(db: &Db) {
+    for n in candidates {}
+}
+";
+
+    #[test]
+    fn la_prose_de_test_cite_un_host_reel() {
+        let endpoint = "https://api.github.com/repos/x/y/issues";
+        assert!(endpoint.contains("api.github.com"));
+        assert!(!FIXTURE.is_empty());
+    }
+}
+RS
+e2e_rc=0
+e2e_out=$(python3 -B "$ENGINE" --audit-cut-holes "$E2E" 2>&1) || e2e_rc=$?
+assert_true "N15/3 une fixture en chaîne ordinaire ne produit aucun faux sink" \
+    "$([ "$e2e_rc" -eq 0 ] && [ -z "$e2e_out" ] && echo 1 || echo 0)" \
+    "exit $e2e_rc, sortie :
+$e2e_out
+  -> 'api.github.com' est cité dans la PROSE D'UN TEST, derrière une fixture
+     Rust logée dans une chaîne. Le rapporter est le faux positif de mika#3134."
+
+# ANTI-VACUITÉ de N15/3 : la fixture doit encore porter les deux ingrédients.
+# Sans eux, exit 0 ne mesurerait rien (classe mika#2205).
+assert_true "N15/3 anti-vacuité — la fixture porte bien chaîne ouverte et host" \
+    "$(grep -q 'async fn phase0_feed_ready_pool' "$E2E/crates/demo/src/lib.rs" &&
+       grep -q 'api.github.com' "$E2E/crates/demo/src/lib.rs" && echo 1 || echo 0)" \
+    'la fixture synthétique a perdu son `async fn` en colonne zéro ou son host : N15/3 rendrait 0 sans rien mesurer'
 
 # ============================================================================
 echo ""
