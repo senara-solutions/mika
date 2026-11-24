@@ -36,7 +36,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use mika_agent::evidence::guards::{CiAbstention, QA_CI_COHERENCE_AUDIT_TOOL};
+use mika_agent::evidence::guards::{
+    CiAbstention, QA_CI_COHERENCE_AUDIT_TOOL, QA_CI_OUTCOME_REFUSED_PENDING_ATTESTED,
+};
 use mika_agent::skills::SkillRegistry;
 use mika_agent::skills::builtin_handlers;
 use mika_agent::skills::index::SkillEntry;
@@ -93,6 +95,21 @@ fn block_ac_body() -> String {
 /// A body with no `VERDICT:` line at all — a human or ad-hoc review.
 fn unclassified_body() -> String {
     "DEPTH: code-level\nLooks reasonable to me, shipping notes below.".to_string()
+}
+
+/// The mika#3137 refusal's stable identifier, distinct from [`REFUSAL`]: the two
+/// populations are not subtractable under one name (motif mika#2205), and a test
+/// that asserted the mika#2455 identifier here would go green on either.
+const REFUSAL_PENDING_ATTESTED: &str = "qa_ci_coherence_pending_attested";
+
+/// The first measured occurrence of mika#3137, verbatim in shape: PR #3133 at
+/// head `176bab64`, 2026-11-21T15:46:18Z. `pass`, and a `REASON` line asserting
+/// a `check_suite` success while `Check`, `Dashboard` and `Security` were still
+/// running — `Security` finished red eight minutes later.
+fn attesting_pass_body() -> String {
+    "VERDICT: pass \u{2705}\nDEPTH: code-level\nPIPELINE: pass (mika)\n\
+     REASON: every AC is satisfied; check_suite success on 176bab64."
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +588,140 @@ async fn a_pending_required_check_lets_the_review_through() {
     assert!(
         outcomes.contains(&"allowed_pending".to_string()),
         "the pending population must be countable apart from the green one; got {outcomes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// mika#3137 — the pending arm refuses the body that ATTESTS, and only that one.
+// ---------------------------------------------------------------------------
+
+/// The founding incident of mika#3137, replayed through the production path.
+///
+/// Same checks as the test just above — one pending required check, none red —
+/// and the same `pass`. The only difference is the body: it asserts the CI
+/// concluded. The pair is what separates "the pending arm refuses the
+/// attestation" from "the pending arm refuses again", which is the mika#2455 R6
+/// regression this change must not cause.
+#[tokio::test]
+async fn a_pass_attesting_the_ci_on_a_pending_check_is_refused_and_names_what_is_pending() {
+    let harness = harness_with(
+        vec![
+            tool_call_response(
+                "run_gh",
+                json!({
+                    "command": ["pr", "review", "3133", "--approve", "--body", attesting_pass_body()],
+                    "repo": "senara-solutions/mika"
+                }),
+            ),
+            text_response("The attestation gate refused the pass verdict."),
+        ],
+        Box::new(CiGatedRunGhTool {
+            checks: Ok(PENDING_CHECKS.to_string()),
+        }),
+    )
+    .await;
+
+    let trace = harness.run("Review PR 3133").await.unwrap();
+    let calls = trace.calls_for_tool("run_gh");
+    assert!(!calls.is_empty(), "expected the review call");
+    let output = calls[0].output.as_deref().unwrap_or("").to_string();
+
+    assert!(
+        output.contains(REFUSAL_PENDING_ATTESTED),
+        "a `pass` body attesting the CI on a pending head must be refused; got: {output}"
+    );
+    assert!(
+        output.contains("mika#3137"),
+        "the refusal must carry its doctrine reference; got: {output}"
+    );
+    // The refusal names what is pending, for the same reason mika#2455's names
+    // what is red: "the CI has not concluded" with no list gives the rewrite
+    // nothing to verify.
+    assert!(
+        output.contains("Check"),
+        "the refusal must name the pending required check; got: {output}"
+    );
+    assert!(
+        !output.contains("docker-build"),
+        "a concluded check must not appear in the pending list; got: {output}"
+    );
+    // It quotes the sentence it reproaches — the model cannot fix a line it has
+    // to guess at among four.
+    assert!(
+        output.contains("check_suite success"),
+        "the refusal must quote the attesting line; got: {output}"
+    );
+    // It must NOT prescribe `block[ci]`: nothing is red, so a CI-fix pilot would
+    // have nothing to repair and the dispatch slot would be spent on a check
+    // that had not even finished.
+    assert!(
+        !output.contains("block[ci]"),
+        "the remedy must not route a pending CI to a CI-fix pilot; got: {output}"
+    );
+    // Both exits are named, neither prescribed.
+    assert!(
+        output.contains("CI-Status:") && output.contains("hold[review]"),
+        "the remedy must name both exits; got: {output}"
+    );
+
+    let outcomes = gate_outcomes(&harness).await;
+    assert!(
+        outcomes.contains(&QA_CI_OUTCOME_REFUSED_PENDING_ATTESTED.to_string()),
+        "expected the fifth audit outcome, a tail-add and never a rename; got {outcomes:?}"
+    );
+    assert!(
+        !outcomes.contains(&"allowed_pending".to_string()),
+        "the refusal and the allowance are exclusive — a row of each would make a \
+         `GROUP BY outcome` count the same turn twice; got {outcomes:?}"
+    );
+
+    let reasonings = gate_reasonings(&harness).await;
+    assert!(
+        reasonings.iter().any(|r| r.contains("Check")),
+        "the ledger row must carry the pending names, not just the outcome; got {reasonings:?}"
+    );
+}
+
+/// The other half of the asymmetry: the same attesting body on a head whose
+/// required checks have all concluded green is **true**, and passes.
+///
+/// Without this case the gate could be keyed to the body alone — refusing every
+/// review that mentions the CI, including the honest ones — and every assertion
+/// of the test above would still be green.
+#[tokio::test]
+async fn the_same_attestation_on_a_concluded_green_head_passes() {
+    let harness = harness_with(
+        vec![
+            tool_call_response(
+                "run_gh",
+                json!({
+                    "command": ["pr", "review", "3133", "--approve", "--body", attesting_pass_body()],
+                    "repo": "senara-solutions/mika"
+                }),
+            ),
+            text_response("Approved."),
+        ],
+        Box::new(CiGatedRunGhTool {
+            checks: Ok(GREEN_CHECKS.to_string()),
+        }),
+    )
+    .await;
+
+    let trace = harness.run("Review PR 3133").await.unwrap();
+    let output = trace.calls_for_tool("run_gh")[0]
+        .output
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !output.contains(REFUSAL_PENDING_ATTESTED) && !output.contains(REFUSAL),
+        "an attestation the checks corroborate must not be refused; got: {output}"
+    );
+
+    let outcomes = gate_outcomes(&harness).await;
+    assert!(
+        outcomes.contains(&"allowed_green".to_string()),
+        "the green arm must stay reachable with an attesting body; got {outcomes:?}"
     );
 }
 

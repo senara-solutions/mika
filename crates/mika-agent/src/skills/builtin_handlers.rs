@@ -4717,7 +4717,8 @@ where
 {
     use crate::evidence::guards::pr_review_target;
     use crate::evidence::guards::{
-        CiAbstention, CiCoherenceOutcome, QA_CI_COHERENCE_AUDIT_TOOL, QA_CI_READ_TIMEOUT_SECS,
+        CiAbstention, CiCoherenceOutcome, QA_CI_COHERENCE_AUDIT_TOOL,
+        QA_CI_OUTCOME_REFUSED_PENDING_ATTESTED, QA_CI_READ_TIMEOUT_SECS, body_attests_ci_concluded,
         classify_ci_coherence, qa_ci_coherence_gate_enabled,
     };
     use crate::server::verdict::{Verdict, parse_verdict};
@@ -4852,19 +4853,81 @@ where
             .await;
             return Ok(());
         }
-        // R6/AC3: a pending check refuses nothing. The review can legitimately
-        // start before the CI has concluded — `pull_request.opened` routes to
-        // mika-qa with no CI term at all — so refusing here would refuse the
-        // nominal case.
-        CiCoherenceOutcome::AllowedPending { .. } => {
+        // R6/AC3: a pending check refuses nothing **by itself**. The review can
+        // legitimately start before the CI has concluded — `pull_request.opened`
+        // routes to mika-qa with no CI term at all — so refusing this whole
+        // population would refuse the nominal case.
+        //
+        // mika#3137 narrows the refusal to the body that **attests**. Four
+        // measured occurrences (PR #3133 twice on 2026-11-21, #3139 and #3143 on
+        // 2026-11-22): a `pass` writing « check_suite success » or « CI green »
+        // while required checks were still running on the reviewed head, the
+        // first of them with `Security` finishing red eight minutes later. The
+        // model does not read the CI (mika#2423), so it cannot attest its state.
+        // A `pass` that stays **mute** on the CI passes through bit for bit —
+        // that is mika#2455's R6 preserved, not a tolerance.
+        CiCoherenceOutcome::AllowedPending { pending } => {
+            let Some(attested) = body_attests_ci_concluded(&body) else {
+                audit(
+                    ctx,
+                    &target_key,
+                    "allowed_pending",
+                    "at least one required check is still pending, none is red",
+                )
+                .await;
+                return Ok(());
+            };
+
+            let pending_list = pending.join(", ");
+            tracing::warn!(
+                event = "qa_ci_coherence_refused_pending_attested",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                pr = pr_number,
+                pending_checks = %pending_list,
+                attested_line = %attested,
+                "mika#3137: refused a pass verdict attesting the CI concluded while a required \
+                 check is still pending on the head"
+            );
             audit(
                 ctx,
                 &target_key,
-                "allowed_pending",
-                "at least one required check is still pending, none is red",
+                QA_CI_OUTCOME_REFUSED_PENDING_ATTESTED,
+                &format!(
+                    "body attests the CI concluded; required checks still pending on the head: \
+                     {pending_list}"
+                ),
             )
             .await;
-            return Ok(());
+
+            // Same two constraints as the mika#2455 refusal just below, and for
+            // the same reasons: **no line of this body may START with
+            // `VERDICT:`**, and the remedy names the correct outputs without
+            // prescribing one. It deliberately does **not** name `block[ci]` —
+            // nothing is red here, so a CI-fix pilot would have nothing to
+            // repair, and the slot would be spent on a check that had not even
+            // finished. It names `--comment` so the rewrite does not walk into
+            // mika#2237's refusal.
+            let error_body = serde_json::json!({
+                "error": "qa_ci_coherence_pending_attested",
+                "doctrine": "mika#3137",
+                "target": target_key,
+                "pending_checks": pending,
+                "attested_line": attested,
+                "remedy": format!(
+                    "This body carries a `pass` verdict and also asserts the CI has concluded \
+                     — the line {attested:?} — while {} required check(s) are still pending on \
+                     this PR's head: {pending_list}. You do not read the CI, so you cannot \
+                     attest its state. Re-emit this call with `--comment` and one of two \
+                     fixes: keep the `pass` and replace that sentence with the canonical line \
+                     `CI-Status: pending at review time — {pending_list}`, or rewrite the \
+                     verdict line as `hold[review]` if the review needs the CI to have \
+                     concluded. Do not leave the sentence as it stands.",
+                    pending.len()
+                ),
+            });
+            return Err(ToolOutput::error(error_body.to_string()));
         }
         CiCoherenceOutcome::Refused { failing } => failing,
     };
