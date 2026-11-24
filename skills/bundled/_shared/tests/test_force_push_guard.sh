@@ -49,9 +49,13 @@ assert_eq() {
     fi
 }
 
+# Here-string, jamais `printf … | grep -q` : sous `pipefail`, le `grep -q` sort
+# au premier match et le producteur meurt sur SIGPIPE, ce qui fait rougir
+# l'assertion qui vient de RÉUSSIR (mika#2055, et `scripts/verify-no-sigpipe-grep.sh`
+# refuse la forme en pipeline).
 assert_contains() {
     local label="$1" needle="$2" haystack="$3"
-    if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+    if grep -qF -- "$needle" <<<"$haystack"; then
         PASS=$((PASS + 1))
         echo "  ✓ $label"
     else
