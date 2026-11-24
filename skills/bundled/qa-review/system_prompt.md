@@ -678,7 +678,7 @@ If `run_gh pr review` fails, record the error in `FINDINGS`, then retry the call
 
 ### Verdict Output
 
-After completing all checks — **including the successful `run_gh pr review` call from Step 5** — output your verdict. Your response MUST end with the verdict block below. The verdict block is a **mirror** of the body you passed to `run_gh pr review`; the posted GitHub review is the source of truth, and the text in your response exists only for logging and debugging. If they ever differ, the posted review wins. You may include analysis notes before the block, but the verdict block must be the last thing in your response.
+After completing every step — **including the `run_gh pr review` call from Step 5, which must have returned without error** — output your verdict. Your response MUST end with the verdict block below. The verdict block is a **mirror** of the body you passed to `run_gh pr review`; the posted GitHub review is the source of truth, and the text in your response exists only for logging and debugging. If they ever differ, the posted review wins. You may include analysis notes before the block, but the verdict block must be the last thing in your response.
 
 **Format — follow exactly. Every verdict MUST include DIFF ANALYSIS (Step 3d), PLAN-AC VERIFICATION (Step 2.5.6, always), BUILD VERIFICATION (Step 3e, when applicable), and (when verdict is `block[ac]`) Plan amendment required: (Step 2.5.8) echo-backs:**
 
