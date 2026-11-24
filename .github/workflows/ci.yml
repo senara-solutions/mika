@@ -753,6 +753,13 @@ jobs:
       # temp git repositories with a local bare `origin`, only `gh` is faked.
       - name: A rescue draft is not opened on a tree already in main (mika#3038)
         run: bash skills/bundled/_shared/tests/test_rescue_tree_equals_main.sh
+      # A halt the pilot DECLARED is a fact of the log's TAIL, never of its body:
+      # the rule is quoted in the injected plan, near the head, so a bare grep is
+      # a guaranteed false positive. Four flights — #3081, #3092, #3100, #3108 —
+      # had their halted work pushed and drafted by the rescue. Offline: real log
+      # files, no git repository and no `gh`.
+      - name: A pilot-declared halt is read from the session log's tail (mika#3142)
+        run: bash skills/bundled/_shared/tests/test_pilot_halt_declared.sh
       # The two invariants of worktree command seeding: never overwrite a
       # command the branch tracks, never dirty `git status`. Their breach was
       # the dirty-worktree cause behind mika#1414.
