@@ -1050,6 +1050,11 @@ mod tests {
 
     // -- mika#3132: toute clé réglable est déclarée `Database`-backed -------
 
+    /// Les clés réglables dont on accepte sciemment qu'elles ne soient pas
+    /// déclarées `Database`-backed dans `CONFIG_KEYS`. Livrée VIDE, et assertie
+    /// vide : voir la Fire-Disposition du plan de mika#3132.
+    const SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT: &[&str] = &[];
+
     /// Rend la raison pour laquelle `key` n'est pas réglable par
     /// `mika config set`, telle que sa déclaration la décrit — `None` quand la
     /// déclaration est celle qu'il faut.
@@ -1103,6 +1108,45 @@ mod tests {
                 settable_key_divergence(key, mika_common::config::lookup_config_key(key))
             })
             .collect()
+    }
+
+    /// **V1** — toute clé de [`SETTABLE_CONFIG_KEYS`] est déclarée
+    /// `Database`-backed, sans `env_var`, dans `mika_common::config::CONFIG_KEYS`.
+    ///
+    /// L'invariant est une **inclusion**, jamais une égalité : `CONFIG_KEYS`
+    /// porte des clés `Database`-backed délibérément hors de la surface d'outil —
+    /// `context_history_scope` et `context_history_max_tokens`, dont l'absence de
+    /// [`SETTABLE_CONFIG_KEYS`] *est* le refus 2 de mika#2425, tenu vingt lignes
+    /// plus haut par `mika2425_the_db_half_is_absent_from_the_tool_surface`. Une
+    /// bijection ferait de ces deux clés une violation et pousserait à les
+    /// exposer pour rendre la garde verte.
+    ///
+    /// Cette garde vit dans `mika-agent` parce que c'est le seul crate qui voit
+    /// les deux registres : `mika-common` ne peut pas dépendre de celui-ci.
+    #[test]
+    fn mika3132_toute_cle_reglable_est_declaree_database_backed() {
+        assert!(
+            SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT.is_empty(),
+            "mika#3132 (V5) — quand cette garde rougit, déclare la clé dans le bloc \
+             `Database` de `mika-common/src/config.rs` : n'ajoute pas d'entrée ici. Une \
+             allowlist qui cesse d'être vide est exactement le faux vert que mika#3132 a \
+             fermé. Résidu: {SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT:?}"
+        );
+
+        let scrutinees: Vec<&str> = SETTABLE_CONFIG_KEYS
+            .iter()
+            .copied()
+            .filter(|key| !SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT.contains(key))
+            .collect();
+        let divergences = settable_keys_not_database_backed(&scrutinees);
+
+        assert!(
+            divergences.is_empty(),
+            "mika#3132 — une clé que `SETTABLE_CONFIG_KEYS` expose au modèle et à la TUI \
+             n'est pas réglable par `mika config set`. Les deux listes sont le même littéral \
+             écrit deux fois, et rien d'autre que cette garde ne les relie:\n  - {}",
+            divergences.join("\n  - ")
+        );
     }
 
     /// **V2** — le détecteur voit une clé réglable absente de `CONFIG_KEYS`.
