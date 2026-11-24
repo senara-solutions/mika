@@ -4856,7 +4856,7 @@ where
         // start before the CI has concluded — `pull_request.opened` routes to
         // mika-qa with no CI term at all — so refusing here would refuse the
         // nominal case.
-        CiCoherenceOutcome::AllowedPending => {
+        CiCoherenceOutcome::AllowedPending { .. } => {
             audit(
                 ctx,
                 &target_key,

@@ -3527,8 +3527,17 @@ pub(crate) enum CiCoherenceOutcome {
     Refused { failing: Vec<String> },
     /// Tous les checks requis ont conclu au vert (ou il n'y en a aucun).
     AllowedGreen,
-    /// Au moins un check requis est encore `pending`, aucun n'est rouge (R6).
-    AllowedPending,
+    /// Au moins un check requis est encore `pending`, aucun n'est rouge.
+    ///
+    /// Porte leurs noms depuis mika#3137, pour la même raison que
+    /// [`Refused`] porte les siens : le corps du refus doit nommer les
+    /// vérifications encore en cours, sinon il dit « la CI n'a pas conclu »
+    /// sans donner de quoi vérifier l'affirmation. Le champ est vide seulement
+    /// si l'appelant construit le variant à la main — [`classify_ci_coherence`]
+    /// ne produit ce variant que sur au moins un check `pending`.
+    ///
+    /// [`Refused`]: CiCoherenceOutcome::Refused
+    AllowedPending { pending: Vec<String> },
 }
 
 /// Les causes d'abstention du gate, écrites une seule fois.
@@ -3570,7 +3579,11 @@ impl CiAbstention {
 /// classe que `grooming_marker` (mika#2158) a dû fermer après des mois de
 /// divergence silencieuse.
 ///
-/// Seule l'extraction des noms rouges est ajoutée, pour R2.
+/// Seule l'extraction des noms — rouges, et depuis mika#3137 pendants — est
+/// ajoutée. Les deux filtres rejouent **exactement** les prédicats de
+/// [`classify_checks`] : `fail`/`cancel` pour le refus, `bucket == "pending"`
+/// pour l'attente. Une troisième orthographe de « pendant » ici ferait nommer
+/// au refus des checks que le classement, lui, ne compte pas.
 ///
 /// [`classify_checks`]: crate::tools::pr_merge_with_gate::classify_checks
 pub(crate) fn classify_ci_coherence(
@@ -3586,7 +3599,13 @@ pub(crate) fn classify_ci_coherence(
                 .map(|c| c.name.clone())
                 .collect(),
         },
-        CheckClassification::HasPending => CiCoherenceOutcome::AllowedPending,
+        CheckClassification::HasPending => CiCoherenceOutcome::AllowedPending {
+            pending: checks
+                .iter()
+                .filter(|c| c.bucket == "pending")
+                .map(|c| c.name.clone())
+                .collect(),
+        },
         CheckClassification::AllPassed => CiCoherenceOutcome::AllowedGreen,
     }
 }
@@ -3655,6 +3674,237 @@ pub fn log_qa_ci_coherence_gate_state() {
              posté sur une PR dont un check requis est rouge"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// mika#3137 — un `pass` ne peut pas attester ce que la garde ne lui donne pas
+// ---------------------------------------------------------------------------
+//
+// mika#2455 ferme un bras du contrat CI↔verdict : un `pass` rendu sur un check
+// requis ROUGE est refusé. Il laisse ouvert le bras pendant, et délibérément —
+// un check qui tourne encore n'est pas un échec, et refuser là rendrait toute
+// revue impossible sur une PR fraîche. Quatre mesures en deux jours disent ce
+// que cette ouverture coûte : PR #3133 deux fois le 2026-11-21, PR #3139 et
+// PR #3143 le 2026-11-22. Chaque fois un `pass` dont le corps écrit
+// « check_suite success » ou « CI green » alors que les vérifications requises
+// n'avaient pas conclu sur la tête revue — et la première fois, l'une d'elles
+// a fini rouge huit minutes plus tard.
+//
+// Le défaut n'est pas le `pass`, c'est l'ATTESTATION. La garde, elle, sait que
+// des checks tournent encore ; le modèle ne lit pas la CI (mika#2423) et n'a
+// donc aucun moyen de savoir que la phrase qu'il écrit est fausse. Ce qui est
+// refusé ici est exactement la conjonction des deux : un corps qui affirme une
+// CI conclue au vert, sur une tête dont un check requis est encore pendant. Un
+// `pass` muet sur la CI passe inchangé — c'est la préservation de R6 de
+// mika#2455, pas une tolérance.
+//
+// La décision porte sur la **forme** d'une ligne, jamais sur la liste des deux
+// phrases mesurées : « check_suite success » et « CI green » sont deux
+// échantillons d'un gabarit que le modèle réécrit à chaque revue, et une garde
+// qui les énumère est verte le jour où il écrit « required checks: all green »
+// (doctrine mika#1804).
+
+/// Plafond de citation de la ligne attestante, en **caractères**.
+///
+/// Compté en `chars()` et jamais en octets : un corps de revue est de l'UTF-8
+/// arbitraire et une tranche d'octets y panique au milieu d'un `é`
+/// (mika#764, tenu par `scripts/check-byte-slices.sh`).
+const CI_ATTESTATION_QUOTE_MAX_CHARS: usize = 200;
+
+/// Les mots qui font d'une ligne une ligne **sur la CI**, en mots entiers.
+///
+/// Mots entiers, parce qu'un `ci` en sous-chaîne vit dans `précis`, `décision`
+/// et `spécifique`. Un mot est ici une suite maximale d'alphanumériques Unicode
+/// ou de `_` — c'est ce qui fait de `check_suite` **un** mot, et c'est pourquoi
+/// il figure ici plutôt que parmi les phrases.
+///
+/// `check` au singulier n'y est pas : il vit dans « incident-only diff check »,
+/// « the plan-doc-presence check », « check that the status matches » — des
+/// lignes qui ne parlent pas de l'état de la CI. `pipeline` n'y est pas non
+/// plus : `PIPELINE: pass (mika)` est une ligne de verdict sur les gardes
+/// locales, que ce vol n'a aucune raison de toucher.
+const CI_SUBJECT_WORDS: &[&str] = &["ci", "checks", "check_suite", "check_suites"];
+
+/// Les tournures sur la CI que la tokenisation en mots ne peut pas voir.
+///
+/// En sous-chaîne, sur la ligne pliée : ce sont des groupes de deux mots dont
+/// aucun, seul, n'est un sujet CI.
+const CI_SUBJECT_PHRASES: &[&str] = &[
+    "check suite",
+    "required checks",
+    "vérifications requises",
+    "status check",
+];
+
+/// Les termes qui affirment une **conclusion verte**, en mots entiers.
+///
+/// Trois absences délibérées, chacune mesurée sur le prompt de `qa-review` :
+///
+/// - `pass` seul — il est dans `VERDICT: pass`, `PIPELINE: pass (mika)`,
+///   `Build: pass` et `DEP-REVIEW: pass`, donc tout corps de revue conforme le
+///   porte. Il ferait du détecteur une garde qui refuse tous les `pass`.
+/// - `✅` — la ligne de gabarit `- [✅] satisfied: CI job added` le porte, et
+///   elle atteste une AC du plan, pas un état de CI.
+/// - `clean` — « lints clean » parle des gardes locales, et la ligne qui le
+///   porte dans le prompt est déjà une ligne de CI-deferred.
+const CI_GREEN_WORDS: &[&str] = &[
+    "green",
+    "success",
+    "successful",
+    "passed",
+    "vert",
+    "verte",
+    "vertes",
+    "concluded",
+    "conclu",
+    "conclue",
+    "conclues",
+];
+
+/// Les mots qui **désarment** la ligne : négation, incertitude, pendance.
+///
+/// Délibérément sur-inclusive. L'asymétrie se calcule : un mot de trop ici
+/// laisse passer une attestation (le régime actuel, déjà mesuré quatre fois, et
+/// le merge reste fermé par mika#2455) ; un mot qui manque fait refuser une
+/// revue honnête et, si le modèle s'obstine, tue le tour sans revue. `no` et
+/// `not` y sont donc, bien qu'ils attrapent « CI passed with no warnings » —
+/// une ligne qui atteste, et que ce détecteur laissera passer.
+const CI_PENDENCY_WORDS: &[&str] = &[
+    "pending",
+    "queued",
+    "running",
+    "still",
+    "encore",
+    "not",
+    "no",
+    "ne",
+    "ni",
+    "pas",
+    "unknown",
+    "unconfirmed",
+    "in_progress",
+];
+
+/// Les tournures de négation ou de pendance que les mots seuls ne voient pas.
+///
+/// En sous-chaîne, sur la ligne pliée. `cannot`, `could not` et `do not` y
+/// figurent bien qu'un `not` les couvre déjà : la liste dit la forme qu'elle
+/// refuse, pas le plus petit ensemble suffisant.
+const CI_PENDENCY_PHRASES: &[&str] = &[
+    "en cours",
+    "in progress",
+    "not yet",
+    "pas encore",
+    "n'a pas",
+    "n'est pas",
+    "cannot",
+    "could not",
+    "do not",
+];
+
+/// Les lignes que le détecteur ne regarde pas, quoi qu'elles portent.
+///
+/// En sous-chaîne, sur la ligne pliée. Trois entrées, et chacune est une ligne
+/// que le dispositif lui-même produit ou prescrit :
+///
+/// - `ci-deferred` — le gabarit `- [⏭️] CI-deferred: no test regressions` de
+///   `qa-review` : il DIT qu'il défère à la CI, c'est l'inverse d'une
+///   attestation.
+/// - `block[ci]` — un verdict bloquant qui nomme la CI n'atteste rien de vert.
+/// - `ci-status:` — la ligne de remède que le refus prescrit lui-même
+///   (`CI-Status: pending at review time — …`). Elle porte déjà `pending`,
+///   donc un négateur la désarme : l'entrée est **redondante exprès**, pour que
+///   « le remède ne déclenche pas le détecteur » soit une propriété écrite
+///   plutôt qu'un accident de vocabulaire. Si un jour `pending` sort de la liste
+///   des négateurs, le remède reste exempt.
+const CI_ATTESTATION_LINE_EXEMPT: &[&str] = &["ci-deferred", "block[ci]", "ci-status:"];
+
+/// Le nom de fil de l'issue d'audit du refus mika#3137.
+///
+/// **Ajout en queue au vocabulaire de [`QA_CI_COHERENCE_AUDIT_TOOL`], jamais un
+/// renommage** — même discipline que
+/// [`DependabotVerdictOutcome::RefusedUnbuiltCargoBump`]. Les quatre issues
+/// antérieures (`refused`, `allowed_green`, `allowed_pending`, `abstained`)
+/// gardent leur orthographe au caractère près : un `GROUP BY outcome` sur
+/// `audit_events` qui porte sur des mois couperait sa population en deux sans
+/// le dire (doctrine mika#2131).
+///
+/// Celle-ci est une constante là où ses quatre aînées sont des littéraux de
+/// site, parce qu'elle est la première dont un test de câblage a besoin du nom
+/// exact : une seule écriture du nom, deux lecteurs.
+pub const QA_CI_OUTCOME_REFUSED_PENDING_ATTESTED: &str = "refused_pending_attested";
+
+/// Plie une ligne pour la comparaison : minuscules, apostrophes normalisées.
+///
+/// `to_lowercase` et non `to_ascii_lowercase` : le vocabulaire porte du
+/// français accentué. L'apostrophe typographique `’` est ramenée sur `'` parce
+/// que sinon `n’est pas` ne serait pas reconnu comme une négation — et un
+/// négateur manqué fait **refuser** une revue honnête, le mauvais côté de
+/// l'asymétrie.
+fn fold_ci_attestation_line(line: &str) -> String {
+    line.to_lowercase().replace('\u{2019}', "'")
+}
+
+/// Les mots d'une ligne pliée : suites maximales d'alphanumériques ou de `_`.
+fn ci_attestation_words(folded: &str) -> impl Iterator<Item = &str> {
+    folded
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+}
+
+/// La ligne, s'il en existe une, par laquelle un corps de revue **atteste** que
+/// la CI a conclu au vert.
+///
+/// Frère de [`body_asserts_api_surface`] : pure, sans entrée/sortie, décidée sur
+/// le texte seul. Rend la ligne attestante — triée et tronquée sur une frontière
+/// de **caractère** — pour que le corps du refus puisse la citer : sans elle, le
+/// refus dit au modèle de corriger « une phrase » sans dire laquelle, et la
+/// réécriture est une devinette.
+///
+/// Une ligne atteste quand, pliée, elle porte **à la fois** un sujet CI
+/// ([`CI_SUBJECT_WORDS`] ou [`CI_SUBJECT_PHRASES`]) et un terme de conclusion
+/// verte ([`CI_GREEN_WORDS`]), et qu'aucun désarmement ne s'applique
+/// ([`CI_ATTESTATION_LINE_EXEMPT`], [`CI_PENDENCY_PHRASES`],
+/// [`CI_PENDENCY_WORDS`]). La première qui satisfait tout gagne : le refus en
+/// cite une, pas la liste.
+pub fn body_attests_ci_concluded(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let folded = fold_ci_attestation_line(line);
+
+        if CI_ATTESTATION_LINE_EXEMPT
+            .iter()
+            .any(|needle| folded.contains(needle))
+        {
+            return None;
+        }
+        if CI_PENDENCY_PHRASES
+            .iter()
+            .any(|needle| folded.contains(needle))
+        {
+            return None;
+        }
+        if ci_attestation_words(&folded).any(|word| CI_PENDENCY_WORDS.contains(&word)) {
+            return None;
+        }
+
+        if !ci_attestation_words(&folded).any(|word| CI_GREEN_WORDS.contains(&word)) {
+            return None;
+        }
+
+        let has_subject = ci_attestation_words(&folded)
+            .any(|word| CI_SUBJECT_WORDS.contains(&word))
+            || CI_SUBJECT_PHRASES
+                .iter()
+                .any(|needle| folded.contains(needle));
+        if !has_subject {
+            return None;
+        }
+
+        Some(crate::db::truncate_chars(
+            line.trim(),
+            CI_ATTESTATION_QUOTE_MAX_CHARS,
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -8249,12 +8499,18 @@ mod tests {
         /// ferme. `pull_request.opened` route vers mika-qa sans aucun terme CI,
         /// donc une revue qui part avant la conclusion de la CI est le cas
         /// nominal : refuser ici refuserait le nominal.
+        ///
+        /// Depuis mika#3137 le variant porte les **noms** des pendants, et seuls
+        /// eux : `docker-build` a conclu, il n'a rien à faire dans un corps de
+        /// refus qui dit ce qui n'a pas conclu.
         #[test]
-        fn a_pending_required_check_refuses_nothing() {
+        fn a_pending_required_check_refuses_nothing_and_names_what_is_pending() {
             let checks = [check("Check", "pending"), check("docker-build", "pass")];
             assert_eq!(
                 classify_ci_coherence(&checks),
-                CiCoherenceOutcome::AllowedPending
+                CiCoherenceOutcome::AllowedPending {
+                    pending: vec!["Check".to_string()]
+                }
             );
         }
 
@@ -8388,6 +8644,399 @@ mod tests {
                     "assez pour un aller-retour gh"
                 );
             }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // mika#3137 — le détecteur d'attestation CI : sa grammaire, ses
+    // désarmements, et le prompt qu'il ne doit pas mordre.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    mod mika3137 {
+        use super::super::*;
+
+        /// Les deux corps **mesurés**, reproduits à la forme près.
+        ///
+        /// Ce sont les deux occurrences de la PR #3133 du 2026-11-21 : la
+        /// première a été rendue sur une tête dont `Security` a fini rouge huit
+        /// minutes plus tard.
+        const CORPS_3133_PREMIER: &str = "VERDICT: pass ✅\nDEPTH: code-level\n\
+             PIPELINE: pass (mika)\n\
+             REASON: every AC is satisfied; check_suite success on 176bab64.";
+        const CORPS_3133_SECOND: &str = "VERDICT: pass ✅\nDEPTH: code-level\n\
+             REASON: CI green, all ACs verified against the diff.";
+
+        /// Un corps **muet** sur la CI — celui que R6 de mika#2455 protège.
+        const CORPS_MUET: &str =
+            "VERDICT: pass ✅\nDEPTH: code-level\nREASON: every AC is satisfied.";
+
+        // -- La grammaire mord sur ce qui a été mesuré --
+
+        /// AC1/AC2 : les deux formes mesurées sont attrapées, et la ligne rendue
+        /// est **celle qui atteste**, pas la première du corps.
+        #[test]
+        fn les_deux_attestations_mesurees_sont_detectees_et_citees() {
+            let premier = body_attests_ci_concluded(CORPS_3133_PREMIER)
+                .expect("« check_suite success » atteste une CI conclue");
+            assert!(
+                premier.contains("check_suite success"),
+                "la ligne citée doit être l'attestante, obtenu: {premier}"
+            );
+
+            let second = body_attests_ci_concluded(CORPS_3133_SECOND)
+                .expect("« CI green » atteste une CI conclue");
+            assert!(
+                second.contains("CI green"),
+                "la ligne citée doit être l'attestante, obtenu: {second}"
+            );
+        }
+
+        /// AC3 — **le bras que ce vol ne ferme pas.** Un `pass` qui ne dit rien
+        /// de la CI reste un `pass` : c'est R6 de mika#2455, préservée, et le
+        /// cas nominal d'une revue partie avant la fin des checks.
+        #[test]
+        fn un_pass_muet_sur_la_ci_natteste_rien() {
+            assert_eq!(body_attests_ci_concluded(CORPS_MUET), None);
+        }
+
+        /// La décision porte sur la **forme**, jamais sur les deux phrases
+        /// mesurées : des tournures que personne n'a encore écrites, et que la
+        /// garde doit déjà voir.
+        #[test]
+        fn la_decision_porte_sur_la_forme_et_non_sur_les_phrases_mesurees() {
+            for ligne in [
+                "REASON: required checks all green on the reviewed head.",
+                "The check suite concluded successfully.",
+                "Toutes les vérifications requises sont vertes.",
+                "CI: success",
+                "status check passed",
+                "check_suites: success",
+                "La CI a conclu au vert sur cette tête.",
+            ] {
+                assert!(
+                    body_attests_ci_concluded(ligne).is_some(),
+                    "cette forme atteste et doit être vue: {ligne:?}"
+                );
+            }
+        }
+
+        // -- Les trois absences délibérées du vocabulaire vert --
+
+        /// `pass`, `✅` et `pipeline` sont **hors** de la grammaire, et chacun
+        /// pour une ligne que tout corps de revue conforme porte. Les mettre
+        /// ferait du détecteur une garde qui refuse tous les `pass`.
+        #[test]
+        fn les_trois_absences_deliberees_tiennent() {
+            for ligne in [
+                "VERDICT: pass ✅",
+                "PIPELINE: pass (mika)",
+                "- [✅] satisfied: CI job added to ci.yml",
+                "DEP-REVIEW: pass",
+                "Build: pass",
+            ] {
+                assert_eq!(
+                    body_attests_ci_concluded(ligne),
+                    None,
+                    "cette ligne de gabarit ne doit pas attester: {ligne:?}"
+                );
+            }
+        }
+
+        // -- La tokenisation --
+
+        /// `ci` est cherché en **mot entier**. En sous-chaîne il vit dans la
+        /// moitié du vocabulaire français d'une revue, et chacun de ces mots
+        /// cohabite couramment avec un terme vert.
+        #[test]
+        fn ci_en_sous_chaine_nest_pas_un_sujet_ci() {
+            for ligne in [
+                "Le diff est précis et le correctif est conclu.",
+                "La décision est verte sur ce point.",
+                "Un cas spécifique, conclu au vert.",
+                "Merci, c'est concluant.",
+            ] {
+                assert_eq!(
+                    body_attests_ci_concluded(ligne),
+                    None,
+                    "un `ci` en sous-chaîne n'est pas un sujet CI: {ligne:?}"
+                );
+            }
+        }
+
+        /// `_` fait partie du mot — c'est ce qui rend `check_suite` **un** mot
+        /// et non la juxtaposition de `check` et `suite`, dont ni l'un ni
+        /// l'autre n'est un sujet CI.
+        #[test]
+        fn le_souligne_appartient_au_mot() {
+            assert!(body_attests_ci_concluded("check_suite success").is_some());
+            // `check` seul n'est pas un sujet : « check that the status
+            // matches » ne parle pas de l'état de la CI.
+            assert_eq!(
+                body_attests_ci_concluded("the diff check passed"),
+                None,
+                "`check` au singulier n'est pas un sujet CI"
+            );
+        }
+
+        /// Le sujet et le terme vert doivent être sur la **même** ligne. Deux
+        /// lignes voisines ne se composent pas : la citation du refus serait
+        /// alors une ligne qui n'atteste rien à elle seule.
+        #[test]
+        fn le_sujet_et_le_vert_doivent_cohabiter_sur_une_ligne() {
+            assert_eq!(
+                body_attests_ci_concluded("The required checks are listed below.\nAll good."),
+                None
+            );
+        }
+
+        // -- Les désarmements --
+
+        /// Les négateurs désarment, et la liste est **sur-inclusive exprès** :
+        /// un mot de trop laisse passer une attestation (le régime déjà
+        /// mesuré), un mot qui manque refuse une revue honnête.
+        #[test]
+        fn un_negateur_desarme_la_ligne() {
+            for ligne in [
+                "The required checks have not concluded yet.",
+                "CI is still running — no conclusion yet.",
+                "Les vérifications requises ne sont pas encore vertes.",
+                "La CI est en cours, pas encore verte.",
+                "CI status unknown at review time.",
+                "The check suite is in progress.",
+                "I cannot say whether CI is green.",
+                "Je n'ai pas vu la CI verte.",
+                "Je n’ai pas vu la CI verte.",
+                "required checks: queued",
+            ] {
+                assert_eq!(
+                    body_attests_ci_concluded(ligne),
+                    None,
+                    "cette ligne ne doit pas attester: {ligne:?}"
+                );
+            }
+        }
+
+        /// **Le prix de la sur-inclusion, mesuré plutôt que caché.** Une
+        /// attestation qui porte un négateur dans une autre proposition de la
+        /// même ligne passe. C'est le côté choisi de l'asymétrie : ce faux
+        /// négatif laisse subsister le signal trompeur — le régime actuel, et
+        /// le merge reste fermé par mika#2455 — là où un faux positif ferait
+        /// réécrire une revue honnête et, si le modèle s'obstine, tuerait le
+        /// tour sans revue.
+        ///
+        /// Ce test existe pour que le jour où l'on resserre la liste, on sache
+        /// quelle population on gagne. Il n'énonce pas un comportement
+        /// souhaitable.
+        #[test]
+        fn un_negateur_dans_une_autre_proposition_laisse_passer_lattestation() {
+            assert_eq!(
+                body_attests_ci_concluded("REASON: check_suite success, no regression."),
+                None,
+                "faux négatif connu et accepté — voir CI_PENDENCY_WORDS"
+            );
+        }
+
+        /// L'apostrophe typographique est ramenée sur l'apostrophe droite,
+        /// sinon `n’est pas` ne serait pas lu comme une négation — et un
+        /// négateur manqué fait **refuser**, le mauvais côté de l'asymétrie.
+        #[test]
+        fn lapostrophe_typographique_est_normalisee() {
+            assert_eq!(
+                body_attests_ci_concluded("La CI n’est pas verte."),
+                None,
+                "`n’est pas` doit désarmer comme `n'est pas`"
+            );
+        }
+
+        /// AC5 — **la ligne de remède que le refus prescrit lui-même ne
+        /// déclenche pas le détecteur.** Sans quoi le refus demanderait une
+        /// correction qui provoque le même refus, et la revue est perdue.
+        #[test]
+        fn la_ligne_de_remede_canonique_ne_declenche_pas_le_detecteur() {
+            let corrige = "VERDICT: pass ✅\nDEPTH: code-level\n\
+                 CI-Status: pending at review time — Check, Dashboard, Security\n\
+                 REASON: every AC is satisfied.";
+            assert_eq!(
+                body_attests_ci_concluded(corrige),
+                None,
+                "le corps corrigé selon le remède doit passer"
+            );
+        }
+
+        /// Les trois exemptions de ligne, dont `ci-status:` est **redondante
+        /// exprès** avec les négateurs : la propriété d'AC5 est écrite, pas
+        /// héritée du vocabulaire.
+        #[test]
+        fn les_trois_exemptions_de_ligne_desarment() {
+            for ligne in [
+                "- [⏭️] CI-deferred: no test regressions",
+                "VERDICT: block[ci] — the CI is green but the diff is not",
+                "CI-Status: pending at review time — Check",
+            ] {
+                assert_eq!(
+                    body_attests_ci_concluded(ligne),
+                    None,
+                    "cette ligne est exemptée: {ligne:?}"
+                );
+            }
+            // Le contrôle qui rend la redondance visible : la même ligne de
+            // remède, négateur retiré, reste exempte par la seule exemption.
+            assert_eq!(
+                body_attests_ci_concluded("CI-Status: all green at review time"),
+                None,
+                "`ci-status:` exempte la ligne même sans négateur"
+            );
+        }
+
+        // -- La citation --
+
+        /// La troncature coupe sur une frontière de **caractère**. Une tranche
+        /// d'octets panique au milieu d'un `é` (mika#764) — et le corps d'une
+        /// revue française en est plein.
+        #[test]
+        fn la_citation_est_tronquee_sur_une_frontiere_de_caractere() {
+            let longue = format!(
+                "REASON: la CI est verte {}",
+                "é".repeat(CI_ATTESTATION_QUOTE_MAX_CHARS * 2)
+            );
+            let cite = body_attests_ci_concluded(&longue).expect("la ligne atteste");
+            assert_eq!(
+                cite.chars().count(),
+                CI_ATTESTATION_QUOTE_MAX_CHARS + 3,
+                "plafond en caractères, plus les points de suspension"
+            );
+            assert!(cite.ends_with("..."));
+            // Et le résultat est de l'UTF-8 valide par construction : il est
+            // déjà un `String`, donc aucune tranche n'a coupé un `é` en deux.
+            assert!(cite.contains("é"));
+        }
+
+        /// La ligne citée est **triée** : le refus la met entre guillemets, et
+        /// une indentation de gabarit la rendrait illisible.
+        #[test]
+        fn la_citation_est_debarrassee_de_son_indentation() {
+            let cite = body_attests_ci_concluded("    - CI green on the head\n")
+                .expect("la ligne atteste");
+            assert_eq!(cite, "- CI green on the head");
+        }
+
+        // -- Format de fil --
+
+        /// **Ajout en queue**, jamais un renommage : les quatre issues
+        /// antérieures de ce gate gardent leur orthographe, et un `GROUP BY`
+        /// qui porte sur des mois ne doit pas voir sa population coupée en deux
+        /// (doctrine mika#2131).
+        #[test]
+        fn lissue_daudit_est_un_format_de_fil() {
+            assert_eq!(
+                QA_CI_OUTCOME_REFUSED_PENDING_ATTESTED,
+                "refused_pending_attested"
+            );
+        }
+
+        // -- Fire-Disposition : le prompt que le détecteur ne doit pas mordre --
+
+        /// Le prompt **embarqué**, pas celui de l'arbre : `include_str!` fige
+        /// les octets au build, exactement comme `build.rs` les fige dans
+        /// `BUNDLED_SKILL_MANIFESTS`. Une édition de l'arbre est invisible aux
+        /// deux jusqu'au prochain `make deploy` (motif mika#2340). Même idiome
+        /// que `qa_reviewed_head::tests::PROMPT_QA_REVIEW`, sur le même fichier.
+        const PROMPT_QA_REVIEW: &str =
+            include_str!("../../../../skills/bundled/qa-review/system_prompt.md");
+
+        /// Lignes du prompt soustraites au scan d'armement.
+        ///
+        /// **LIVRÉE VIDE**, et son vide est asserté : le détecteur atterrit
+        /// armé, sans exception à son nom. Précédent et idiome :
+        /// `qa_reviewed_head::tests::PROMPT_OUTCOME_ALLOWLIST`, sur le même
+        /// fichier de prompt.
+        ///
+        /// Quand le scan rougit, **la ligne du prompt se corrige** — c'est le
+        /// geste de ce vol, pas une entrée à inscrire ici. Une entrée n'est
+        /// légitime que pour une ligne dont la forme attestante est le sujet
+        /// même (un exemple de ce qu'il ne faut pas écrire), et elle est
+        /// **auto-nettoyante** : la boucle de péremption ci-dessous refuse une
+        /// entrée que le détecteur ne touche plus, donc le geste qui rend
+        /// l'exception inutile est le geste qui la fait expirer — ce qui sépare
+        /// ceci de l'allowlist que mika#2309 condamne.
+        const CI_ATTESTATION_PROMPT_ALLOWLIST: &[(&str, &str)] = &[]; // (ligne, ticket)
+
+        /// AC10 — **aucune ligne du prompt de `qa-review` ne déclenche le
+        /// détecteur.**
+        ///
+        /// Ce n'est pas une précaution de style. Le prompt est le corpus de
+        /// gabarits que le modèle recopie : une ligne de gabarit qui atteste
+        /// une CI verte produit un refus sur **chaque** revue conforme, et le
+        /// refus serait alors indistinguable du défaut qu'il corrige.
+        #[test]
+        fn le_prompt_de_qa_review_ne_declenche_pas_le_detecteur() {
+            let fautives: Vec<(usize, String)> = PROMPT_QA_REVIEW
+                .lines()
+                .enumerate()
+                .filter(|(_, ligne)| {
+                    !CI_ATTESTATION_PROMPT_ALLOWLIST
+                        .iter()
+                        .any(|(exc, _)| ligne.contains(exc))
+                })
+                .filter_map(|(i, ligne)| body_attests_ci_concluded(ligne).map(|cite| (i + 1, cite)))
+                .collect();
+
+            assert!(
+                fautives.is_empty(),
+                "ces lignes du prompt qa-review déclenchent le détecteur — \
+                 corrige la LIGNE DU PROMPT (ajoute un négateur, ou passe par \
+                 la ligne canonique `CI-Status:`), n'inscris pas d'exception : \
+                 {fautives:#?}"
+            );
+        }
+
+        /// Le contrôle de bonne foi du scan ci-dessus : sur un prompt fabriqué
+        /// qui atteste, le même prédicat **mord**. Sans lui, un détecteur
+        /// devenu aveugle rendrait le scan vert pour la mauvaise raison
+        /// (classe mika#2158).
+        #[test]
+        fn le_scan_du_prompt_rougit_sur_une_ligne_fabriquee() {
+            let fabrique = "## Verdict templates\n\
+                 VERDICT: pass ✅\n\
+                 REASON: the check_suite success on the reviewed head confirms it.\n";
+            let fautives: Vec<String> = fabrique
+                .lines()
+                .filter_map(body_attests_ci_concluded)
+                .collect();
+            assert_eq!(fautives.len(), 1, "le scan doit mordre: {fautives:#?}");
+        }
+
+        /// L'auto-nettoyage : une exception que le détecteur ne touche plus est
+        /// refusée, dans les deux sens — la ligne doit être encore dans le
+        /// prompt, **et** elle doit encore déclencher.
+        #[test]
+        fn chaque_entree_de_lallowlist_declenche_encore() {
+            for (ligne, ticket) in CI_ATTESTATION_PROMPT_ALLOWLIST {
+                let trouvee = PROMPT_QA_REVIEW
+                    .lines()
+                    .find(|l| l.contains(ligne))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "l'exception {ligne:?} ({ticket}) ne correspond à aucune ligne du \
+                             prompt — retire-la"
+                        )
+                    });
+                assert!(
+                    body_attests_ci_concluded(trouvee).is_some(),
+                    "l'exception {ligne:?} ({ticket}) ne déclenche plus le détecteur — retire-la"
+                );
+            }
+        }
+
+        /// L'allowlist est livrée **vide**, et c'est la Fire-Disposition de ce
+        /// vol. La remplir est une décision à prendre et à dater, pas une
+        /// réparation de test.
+        #[test]
+        fn lallowlist_du_prompt_est_livree_vide() {
+            assert!(
+                CI_ATTESTATION_PROMPT_ALLOWLIST.is_empty(),
+                "le détecteur atterrit armé, sans exception"
+            );
         }
     }
 
