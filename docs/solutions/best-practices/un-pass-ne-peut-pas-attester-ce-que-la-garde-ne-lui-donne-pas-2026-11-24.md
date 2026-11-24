@@ -105,9 +105,28 @@ texte peut-il affirmer le fait ?* Si oui, la garde a deux sujets et n'en traite
 qu'un.
 
 Et le corollaire sur l'ordre de livraison : la **garde** mord dès le binaire,
-le **prompt** attend `make deploy` (mika#2340). Livrer les deux, dans cet
-ordre — la garde tient sans le prompt, le prompt évite à la garde de devoir
-tirer.
+le **prompt** attend `make deploy` (mika#2340). La garde tient sans le prompt ;
+le prompt n'évite que le refus, jamais le défaut.
+
+## Ce que ce vol n'a pas pu livrer, et pourquoi c'est dicible
+
+La règle d'abstention a été écrite dans `skills/bundled/qa-review/system_prompt.md`,
+mesurée, puis **retirée** : le prompt est à 77 782 octets pour une jauge à 95 %
+de 77 824 — **42 octets de marge** — et les deux puces en pesaient 1 296. Le
+premier remède de la jauge est épuisé au sens littéral :
+`max_prompt_size = 81920` **est** `MAX_PROMPT_SIZE_CEILING`, il n'y a plus de
+nombre à écrire. Le second — trimmer — n'avait pas de candidat honnête : la
+queue de la ligne 46, dont le *pourquoi* vit déjà à son site de consommation,
+est **épinglée** par `skills/executor.rs` (`not a tooling limitation`,
+`belongs to the merge gate`, `CheckClassification::HasFailures`), précisément
+pour que personne ne la trimme. Le dépôt avait donc déjà répondu.
+
+Ce que coûte le report se nomme : un aller-retour moteur de plus par
+occurrence, et non un défaut qui passe. Le refus de la garde **porte lui-même
+le remède**, la ligne canonique comprise, donc le modèle apprend la règle à
+l'instant où elle mord, en bande. Le vol de budget (trim argumenté ou
+sharding par `[dependencies]`, que le `skill.toml` a décliné deux fois comme
+hors périmètre) est un ticket à lui seul.
 
 ## Disposition de tir
 
