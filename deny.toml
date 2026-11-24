@@ -19,7 +19,7 @@ reason = "scc Array::insert exception safety (unsound); transitive dep only, we 
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0459"
-reason = "Temporary exception set 2026-11-09, approved by Vincent. libsqlite3-sys 0.30.1 (bundled SQLite < 3.54.0) via rusqlite 0.32 (Cargo.toml:30); the fix (>= 0.39.0) needs a major rusqlite bump to 0.41, tracked on the parking mika#2983 for a dedicated flight. Keep in sync with .cargo/audit.toml."
+reason = "Temporary exception set 2026-11-09, approved by Vincent; cout re-mesure 2026-11-24 (mika#3131). libsqlite3-sys 0.30.1 (bundled SQLite < 3.54.0) via rusqlite 0.32 (Cargo.toml:30). Le remede (libsqlite3-sys >= 0.39.0, atteint par rusqlite 0.41.1) est une CASCADE de trois montees, pas une: rusqlite 0.41 et sqlx 0.8.6 declarent tous deux links = \"sqlite3\", donc cargo refuse de resoudre et sqlx doit monter en 0.9 (majeure, mika-gateway); sqlx 0.9.1 exige rustc 1.94.0 alors que rust-toolchain.toml fixe 1.93. Classe OPERATEUR, non dispatchable: le bac a sable monte ~/.cargo/registry/src en lecture seule, donc aucune caisse nouvelle ne se compile. Procedure: docs/plans/2026-11-24-001-chore-3131-rusqlite-0-41-cascade-plan.md. Keep in sync with .cargo/audit.toml."
 
 [[advisories.ignore]]
 id = "RUSTSEC-2026-0543"
