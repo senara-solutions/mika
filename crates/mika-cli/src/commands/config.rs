@@ -198,8 +198,21 @@ async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<(
             println!("Set {key} in ~/.mika/.env");
         }
         ConfigBackend::Database => {
-            let val =
-                value.ok_or_else(|| anyhow::anyhow!("Usage: mika config set {key} <value>"))?;
+            // mika#3132 — la provenance est décidée avant toute lecture, par une
+            // fonction pure à qui `is_terminal` est injecté.
+            let source = decide_database_value_source(
+                value,
+                std::io::IsTerminal::is_terminal(&std::io::stdin()),
+            );
+            let channel = source.channel();
+            let raw = match source {
+                DatabaseValueSource::Argv(v) => v,
+                DatabaseValueSource::Stdin => std::io::read_to_string(std::io::stdin())?,
+                DatabaseValueSource::Prompt => dialoguer::Input::<String>::new()
+                    .with_prompt(format!("Enter value for {key}"))
+                    .interact_text()?,
+            };
+            let val = finalize_database_value(key, channel, &raw)?;
             mika_agent::config_keys::validate_config_value(key, &val)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             warn_session_scope_on_non_singleton(key, &val, &ctx.home_dir);
@@ -210,6 +223,87 @@ async fn run_set(agent_name: &str, key: &str, value: Option<String>) -> Result<(
     }
 
     Ok(())
+}
+
+/// D'où vient la valeur de la branche `Database` (mika#3132).
+#[derive(Debug, PartialEq)]
+enum DatabaseValueSource {
+    /// Fournie sur la ligne de commande — le chemin historique, inchangé.
+    Argv(String),
+    /// À lire sur l'entrée standard jusqu'à EOF : c'est le canal qui garde une
+    /// valeur hors de l'historique du shell et hors de la table des processus.
+    Stdin,
+    /// À demander à l'opérateur, qui est devant un terminal.
+    Prompt,
+}
+
+impl DatabaseValueSource {
+    /// Le nom du canal, tel qu'un refus doit le citer.
+    ///
+    /// Un refus qui ne nomme pas le canal envoie chercher la panne du côté de la
+    /// valeur alors qu'elle est du côté du tuyau — `printf '' | mika config set
+    /// chat_id` doit dire que stdin n'a rien apporté, pas que `chat_id` est
+    /// invalide.
+    fn channel(&self) -> &'static str {
+        match self {
+            DatabaseValueSource::Argv(_) => "the command line",
+            DatabaseValueSource::Stdin => "stdin",
+            DatabaseValueSource::Prompt => "the interactive prompt",
+        }
+    }
+}
+
+/// Décide d'où la valeur vient, sans la lire (mika#3132).
+///
+/// Pure : `stdin_is_terminal` est **injecté**, jamais lu ici — c'est ce qui rend
+/// les trois cas mesurables sans terminal ni pipe.
+///
+/// | valeur | stdin | source |
+/// |---|---|---|
+/// | `Some(v)` | peu importe | `Argv(v)` — compatibilité entière, ni pipe ni prompt ouverts |
+/// | `None` | pipe ou fichier | `Stdin` |
+/// | `None` | terminal | `Prompt` — remplace l'ancien *Usage:* |
+fn decide_database_value_source(
+    value: Option<String>,
+    stdin_is_terminal: bool,
+) -> DatabaseValueSource {
+    match value {
+        Some(v) => DatabaseValueSource::Argv(v),
+        None if stdin_is_terminal => DatabaseValueSource::Prompt,
+        None => DatabaseValueSource::Stdin,
+    }
+}
+
+/// Trim, puis refus **nommé** du vide et du multi-ligne (mika#3132).
+///
+/// Site unique du refus de forme, avant `validate_config_value` : les deux
+/// juges ne mesurent pas la même chose — celui-ci juge le canal, celui-là le
+/// domaine de la clé.
+///
+/// Le trim est complet et non seulement terminal : aucune des clés
+/// `Database`-backed n'admet d'espace interne significatif, et un `$(…)` de
+/// shell en ajoute volontiers une.
+///
+/// Les deux refus nomment la clé **et** le canal, parce qu'une valeur vide
+/// écrite serait pire qu'un refus : une clé présente à la chaîne vide se lit
+/// tout autrement qu'une clé absente (mika#2331).
+fn finalize_database_value(key: &str, channel: &str, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "No value for {key}: nothing came in on {channel}.\n\
+             An empty value is refused rather than written — a key present at the empty \
+             string does not read like a key that was never set."
+        );
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        anyhow::bail!(
+            "Multi-line value for {key} on {channel}: a config value is a single line.\n\
+             Check the producer — `printf '%s'` rather than `echo`, or a file without its \
+             trailing content."
+        );
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Warn — never refuse — when `context_history_scope=session` lands on an agent
@@ -651,5 +745,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -- mika#3132: la valeur de la branche `Database` --------------------
+
+    /// **V7** — la table de décision, et la priorité d'argv sous les deux états
+    /// de stdin.
+    #[test]
+    fn mika3132_la_source_suit_la_table_de_decision() {
+        for stdin_is_terminal in [true, false] {
+            assert_eq!(
+                decide_database_value_source(Some("123".into()), stdin_is_terminal),
+                DatabaseValueSource::Argv("123".into()),
+                "une valeur fournie n'ouvre ni stdin ni prompt, quel que soit le canal : \
+                 c'est la compatibilité du chemin existant (AC9)"
+            );
+        }
+
+        assert_eq!(
+            decide_database_value_source(None, false),
+            DatabaseValueSource::Stdin,
+            "sans valeur et sans terminal, la valeur se lit sur l'entrée standard"
+        );
+        assert_eq!(
+            decide_database_value_source(None, true),
+            DatabaseValueSource::Prompt,
+            "sur un terminal, l'absence de valeur se demande au lieu de rendre un `Usage:`"
+        );
+    }
+
+    /// **V8/V9** — le vide et le multi-ligne sont refusés, en nommant la clé et
+    /// le canal ; le cas nominal est trimé.
+    #[test]
+    fn mika3132_la_valeur_est_trimee_et_le_vide_refuse_en_le_nommant() {
+        assert_eq!(
+            finalize_database_value("chat_id", "stdin", " 123 \n").unwrap(),
+            "123",
+            "le trim est complet : un `$(…)` de shell ajoute volontiers une espace"
+        );
+
+        for vide in ["", "   ", "\n", " \r\n "] {
+            let err = finalize_database_value("chat_id", "stdin", vide)
+                .expect_err("une valeur vide doit être refusée, jamais écrite");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("chat_id") && msg.contains("stdin"),
+                "le refus doit nommer la clé et le canal — sinon l'opérateur cherche la \
+                 panne du côté de la valeur: {msg}"
+            );
+        }
+
+        let err = finalize_database_value("chat_id", "stdin", "12\n34")
+            .expect_err("une valeur multi-ligne doit être refusée");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Multi-line") && msg.contains("chat_id") && msg.contains("stdin"),
+            "le multi-ligne se nomme comme tel : « Invalid chat_id » enverrait chercher la \
+             panne du côté de la valeur alors qu'elle est du côté du tuyau: {msg}"
+        );
+    }
+
+    /// Le canal cité par un refus est celui d'où la valeur venait.
+    #[test]
+    fn mika3132_le_canal_cite_est_celui_de_la_source() {
+        assert_eq!(
+            DatabaseValueSource::Argv("x".into()).channel(),
+            "the command line"
+        );
+        assert_eq!(DatabaseValueSource::Stdin.channel(), "stdin");
+        assert_eq!(
+            DatabaseValueSource::Prompt.channel(),
+            "the interactive prompt"
+        );
     }
 }
