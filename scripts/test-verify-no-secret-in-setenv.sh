@@ -46,7 +46,8 @@ assert_exit() {
 
 assert_mentions() {
     local label="$1" needle="$2" result="$3"
-    if printf '%s' "${result#*|}" | grep -q -- "$needle"; then
+    # Here-string, jamais `printf … | grep -q` (mika#2055, mika#3130).
+    if grep -q -- "$needle" <<<"${result#*|}"; then
         PASS=$((PASS + 1)); echo "  ✓ $label"
     else
         FAIL=$((FAIL + 1)); echo "  ✗ $label — output does not mention '$needle'"

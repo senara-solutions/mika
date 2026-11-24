@@ -4500,8 +4500,10 @@ fi
 # re-dispatch (skip when HEAD is already a wip(mika#1383) marker) and the push
 # failure is surfaced as an observable signal rather than silently swallowed
 # (so an unpushed marker = unarmed Guard 2 is visible to operator/telemetry).
+# Le needle porte le `--` et la lecture est en here-string depuis mika#3130 : la
+# forme `printf … | grep -qF` d'avant pouvait lire FAUX sur un sujet PRÉSENT.
 assert_contains "Hardening: marker commit is idempotent (skip when HEAD already a wip(mika#1383) marker)" \
-    "grep -qF 'wip(mika#1383): auto-PR-create rescue'" "$MARKER_GUARD_BLOCK"
+    "grep -qF -- 'wip(mika#1383): auto-PR-create rescue' <<<" "$MARKER_GUARD_BLOCK"
 assert_contains "Hardening: marker push failure is surfaced (rescue_marker_push.failed), not silenced" \
     'rescue_marker_push.failed' "$PATHB_BLOCK"
 assert_not_contains "Hardening: marker push no longer uses a bare '|| true' silent swallow" \
@@ -7538,9 +7540,16 @@ assert_eq "mika#2211: the injection sits AFTER the ITERATION CONTEXT reassignmen
 # The mika#138 contract: the first line of PROMPT stays `<repo>#<num>`. The
 # anchored parse in _set_up_worktree depends on it, so appending must never
 # prepend.
+# Here-string, et jamais `printf … | grep -q` (mika#2055, mika#3130) : `grep -q`
+# sort au premier match et ferme le tube, `printf` prend EPIPE et sort 141, et
+# sous le `pipefail` de l'en-tête ce 141 est promu au statut du pipeline — le
+# `if` lirait alors FAUX sur une chaîne PRÉSENTE. Mesuré : rouge à la tentative 1
+# du run 43079844489 (#3075), vert à la tentative 2 sur le même diff.
+# Le needle sort en variable : il porte des quotes imbriquées, et le lire deux
+# fois serait une occasion de le désaligner.
+T2211_APPEND_NEEDLE='PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")'
 assert_eq "mika#2211: the rule is APPENDED (repo#N stays the first line)" "yes" \
-    "$(if printf '%s' "$T2211_SUW_SRC" \
-        | grep -qF 'PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_PR_BODY_CONTAINMENT_RULE")'; \
+    "$(if grep -qF -- "$T2211_APPEND_NEEDLE" <<<"$T2211_SUW_SRC"; \
        then printf 'yes'; else printf 'no'; fi)"
 
 # --- The rule says the three things that make it actionable -----------------
@@ -11457,8 +11466,12 @@ assert_eq "mika#2608 (R7, anti-vacuité a): le motif a une population non vide (
 # serait revenu satisferait l'anti-vacuité tout en cassant R7, et les deux
 # assertions se contrediraient sans que rien ne dise laquelle croire.
 M2194_WRITER_SRC=$(sed -n '/^_write_canonical_callout()/,/^}/p' "$DISPATCH_LIB")
+# Le filtre intermédiaire est matérialisé plutôt qu'enchaîné : `grep -qE` sort au
+# premier match, et sous `pipefail` l'EPIPE du producteur serait promu (mika#2055,
+# mika#3130). `|| true` parce que `grep -v` rend 1 sur un filtrage total.
+M2194_WRITER_NOCOMMENT=$(printf '%s\n' "$M2194_WRITER_SRC" | grep -v '^[[:space:]]*#' || true)
 assert_eq "mika#2608 (R7, anti-vacuité b): la population est l'écrivain _write_canonical_callout" "yes" \
-    "$(if printf '%s\n' "$M2194_WRITER_SRC" | grep -v '^[[:space:]]*#' | grep -qE -- "$M2194_NEEDLE"; then printf 'yes'; else printf 'no'; fi)"
+    "$(if grep -qE -- "$M2194_NEEDLE" <<<"$M2194_WRITER_NOCOMMENT"; then printf 'yes'; else printf 'no'; fi)"
 
 # Et le contrôle positif que le scan a bien vu le fichier : un dispatch-lib
 # introuvable rendrait zéro ligne de commande, donc zéro offender, donc un vert

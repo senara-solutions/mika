@@ -224,7 +224,10 @@ else
     echo "  ✓ strip: STALE content removed"
 fi
 # Trailing `---` must also be stripped so the fresh block's re-added `---` doesn't stack
-if printf '%s\n' "$stripped" | tail -1 | grep -q '^---$'; then
+# `tail -1` reste, mais HORS du tube du `grep` : jamais `printf … | grep -q`
+# (mika#2055, mika#3130).
+_last_line=$(printf '%s\n' "$stripped" | tail -1)
+if grep -q -- '^---$' <<<"$_last_line"; then
     FAIL=$((FAIL + 1))
     echo "  ✗ strip: trailing --- separator should be gone"
 else
