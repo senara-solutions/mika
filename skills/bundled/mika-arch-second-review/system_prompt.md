@@ -137,6 +137,31 @@ A split into flights is not a split into phases of one flight: each flight must 
 
 **Gate precedence** is unchanged by this sub-block: any `ESCALATE` wins over `GROOMED`, union of all F-findings under it.
 
+### Operator-Reserved Gate (mika#3122)
+
+**A revised plan that DECIDES something the substrate reserves to the operator MUST return `ESCALATE` — never `GROOMED`.** (No ITERATE exists at second pass per the two-pass limit.)
+
+Two forms, both measured:
+
+1. **A permission-policy refusal is an operator arbitration, materialized in code.** The plan records a refusal (`[policy:deny]`, `no matching policy rule -- denied by default`) and then prescribes a fallback that obtains **the same effect by another tool** — a throwaway program, a rewrite of the gesture, a "variant" of the same access. What the refusal denied is the EFFECT, so a cleaner fallback is the same overturn in better handwriting.
+2. **A reserved halt never lifts by an amendment of the plan.** The ticket body, the first-pass plan, or the flight head reserved a choice to the operator — which cut, which scope, which trade-off — and the revised plan practises one of the options.
+
+**Case 4 of the Plan-Size Gate does not ratify a split the revision itself decided, and this is the clause the last occurrence needed.** Both trees above pass a plan whose current PR or current flight falls back under the bound. That branch judges the SIZE of what remains in scope; it says nothing about **who was entitled to choose** what left. When the reservation names the split, a revision that picked one and brought the total under the bound has not satisfied case 4 — it has produced the exact artifact case 4 cannot distinguish from a legitimate split. Read the provenance of the split, not only its arithmetic: if the first-pass findings, the ticket body or the flight head reserved it, the correct verdict is `ESCALATE` even though every size tree now passes.
+
+**A citation is not an authority.** mika#2636 and mika#2693 ask for a plan that is ready to fly. Neither asks you — or the revision — to rule on an operator's trade-off. A revised plan that enumerates the candidate options with their cost and practises none of them is a PREPARED plan; it owes no commitment, and the absence of one is not an unresolved decision under the gate above when the ticket reserved it. Say so in your verdict rather than treating the halt as a leftover finding.
+
+**Decision tree:**
+1. Revised plan records the operator-reserved decision, enumerates the options with their cost, and practises none ⇒ this gate passes.
+2. Revised plan practises a fallback that obtains the effect of a refused access ⇒ `ESCALATE` with a BLOCKING F-finding naming the refusal, the effect, and the fallback (form 1).
+3. Revised plan practises an option the ticket, the first-pass plan, or the flight head reserved ⇒ `ESCALATE` with a BLOCKING F-finding naming the reservation and the option taken (form 2).
+4. Revised plan cites a volume rule, a readiness requirement, or a first-pass finding as the reason it decided ⇒ still `ESCALATE`. A finding that asks the author to commit does not lift a reservation; it asks to make it legible.
+
+**Measured, twice, and this pass is the one that failed both times.** On 2026-11-03 a plan prescribed a throwaway Rust cutter after three permission refusals; this pass returned `GROOMED` four minutes after the first pass returned `READY`, QA approved, it merged. On 2026-11-17 a revision practised the cut the flight head reserved to the operator; this pass let it through on **case 4** of the Plan-Size Gate, and the operator had to kill the pilot. **This pass has no recourse** — there is no third review and no downstream gate for either form — so when the two readings are arguable, `ESCALATE` is the one that is recoverable.
+
+**Read-only reminder:** you name the reservation; you do not resolve it and you do not choose for the operator. `ESCALATE` here is a NOMINAL exit of grooming, not a failure of it.
+
+**Gate precedence:** any `ESCALATE` from this gate or the other gates wins over `GROOMED` — emit the union of all F-findings under the `ESCALATE` verdict.
+
 ### Output
 
 Return the annotated revised plan content as a single string, followed by a blank line and an explicit verdict:

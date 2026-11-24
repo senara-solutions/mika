@@ -18013,6 +18013,404 @@ assert_eq "mika#3030 AC4: aucun cp d'un settings.local.json dans dispatch-lib.sh
 assert_eq "mika#3030 AC1: le settings.json tracké (source project) ne porte aucune permission" \
     "null" "$(jq -r '.permissions // "null"' "$REPO_ROOT/.claude/settings.json" 2>/dev/null)"
 
+echo ""
+echo 'Test: mika#3122 — une décision réservée à l`opérateur (OR1–OR7)'
+echo "-----------------------------------------------------------------------"
+
+# Le défaut mesuré : deux fois en deux semaines, une décision que le substrat
+# réserve à l'opérateur a été tranchée par la boucle, et les deux passes de
+# `mika-arch` l'ont ratifiée. 03/11 — un plan a prévu de contourner trois refus
+# de politique de permission par un programme jetable (mika#3024 / PR #3029).
+# 17/11 — une révision a pratiqué la coupe que la tête du vol réservait à
+# l'opérateur, en citant mika#2636 et mika#2693 (mika#1727, vol V3c-2b).
+#
+# Un invariant, un texte, trois sites : les deux producteurs (le groomeur par
+# son `PROMPT`, le réviseur par son findings-file) et le juge (les deux passes
+# architecte). Les sept groupes ci-dessous tiennent chacun un site ou une
+# propriété de position, et chacun a été vu ROUGE avant d'être vu vert.
+
+T3122_LIB_SRC=$(cat "$DISPATCH_LIB")
+T3122_SUW_SRC=$(sed -n '/^_set_up_worktree() {/,/^}/p' "$DISPATCH_LIB")
+
+# Réplique le site d'injection de `_set_up_worktree` dans son ORDRE réel :
+# règle de corps de PR (inconditionnelle), règle du scratch (inconditionnelle),
+# puis les trois conditionnées au skill — mika#2306, mika#2636, mika#3122. OR2 et
+# OR3 assertent sur CETTE chaîne ; l'assertion de fidélité de miroir d'OR2 tient
+# la réplique contre la dérive (patron mika#2178 T3 / mika#2306 T4).
+_t3122_inject() {
+    local skill="$1" repo="${2:-mika}" issue_num="${3:-3122}"
+    local prompt="${repo}#${issue_num}"
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PR_BODY_CONTAINMENT_RULE")
+    prompt=$(printf '%s\n\n%s' "$prompt" "$_PILOT_SCRATCH_RULE")
+    if [ "$skill" = "dev-groom" ]; then
+        prompt=$(printf '%s\n\n%s' "$prompt" "$_FIRE_DISPOSITION_RULE")
+        _plan_size_rule; prompt=$(printf '%s\n\n%s' "$prompt" "$_PLAN_SIZE_RULE")
+        prompt=$(printf '%s\n\n%s' "$prompt" "${_OPERATOR_RESERVED_RULE:-}")
+    fi
+    printf '%s' "$prompt"
+}
+
+# Réplique la composition du findings-file de première passe. Même remarque : la
+# fidélité du miroir est assertée sur la source par OR4.
+_t3122_findings() { printf '%s\n\n%s\n' "$1" "${_OPERATOR_RESERVED_RULE:-}"; }
+
+# Sonde des DEUX rattrapages, exercés POUR DE VRAI.
+#
+# C'est la seule façon honnête de mesurer leur terme 1 : le re-grepper dans le
+# test en ferait un second site de vérité, et une faute de frappe y serait verte.
+# Ici la vraie fonction est appelée sur un findings-file de fixture et sur un plan
+# qui ne porte NI l'une NI l'autre des deux sections — donc leur terme 2 est vrai
+# par construction. Le compte de lancements de pilote lit alors exactement leur
+# terme 1 : 0 ⇒ faux (rien ne tire), 1 ⇒ vrai (la relance part).
+#
+# $1 = `fd` ou `size` — quel rattrapage exercer
+# $2 = contenu du findings-file de première passe
+# Rend le nombre de lancements de pilote.
+_t3122_retry_probe() {
+    local t3122_which="$1" t3122_findings="$2"
+    local t3122_root t3122_plan t3122_f t3122_counter t3122_n
+    t3122_root=$(mktemp -d)
+    t3122_plan="$t3122_root/plan.md"
+    t3122_f="$t3122_root/findings-1.md"
+    printf '# plan de sonde mika#3122\n\n## Problème\n\nAucune des deux sections.\n' \
+        > "$t3122_plan"
+    printf '%s\n' "$t3122_findings" > "$t3122_f"
+    t3122_counter="$t3122_root/pilot-invocations"
+    printf '0\n' > "$t3122_counter"
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+        _run_pilot_sandboxed() {
+            printf '%s\n' "$(( $(cat "$t3122_counter") + 1 ))" > "$t3122_counter"
+            return 0
+        }
+        _FD_REVISE_RETRIED=0 _PLAN_SIZE_REVISE_RETRIED=0
+        set +e
+        REPO="mika" ISSUE_NUM="3122" LOG_ID="t3122" CWD_ARGS="--cwd $t3122_root"
+        case "$t3122_which" in
+            fd)   _fd_retry_if_section_still_missing "$t3122_f" "$t3122_plan" ;;
+            size) _plan_size_retry_if_section_still_missing "$t3122_f" "$t3122_plan" ;;
+        esac
+    ) >/dev/null 2>&1
+    t3122_n=$(cat "$t3122_counter")
+    rm -rf "$t3122_root"
+    printf '%s' "$t3122_n"
+}
+
+# --- OR1 : la règle existe, et elle dit LE GESTE avant l'interdit -----------
+#
+# ROUGE AVANT, mesuré : sur la bibliothèque d'avant le premier commit la constante
+# n'existait pas, et les treize assertions ci-dessous ont tiré sur la chaîne vide.
+#
+# Une règle qui dirait seulement « n'écris pas ce repli » laisserait au groomeur
+# à inventer quoi écrire, et ce qu'il invente est le défaut sous une autre
+# orthographe. La forme positive d'abord est donc une propriété DE POSITION, pas
+# une préférence de ton, et elle est assertée comme telle.
+
+assert_eq "OR1: _OPERATOR_RESERVED_RULE est définie et non vide" "non-vide" \
+    "$([ -n "${_OPERATOR_RESERVED_RULE:-}" ] && echo non-vide || echo vide)"
+assert_contains "OR1: la règle cite son ticket par référence" \
+    "mika#3122" "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1: elle prescrit de chiffrer les options" \
+    "chiffre les options" "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1: et de n'en pratiquer AUCUNE" \
+    "N'EN PRATIQUE AUCUNE" "${_OPERATOR_RESERVED_RULE:-}"
+# Forme 1, nommée par le texte que le pilote verra dans son propre journal : sans
+# les deux chaînes exactes, un groomeur ne reconnaît pas le refus qu'il a sous
+# les yeux comme étant celui dont parle la règle.
+assert_contains "OR1 (forme 1): la règle nomme le marqueur de refus de permission" \
+    '[policy:deny]' "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1 (forme 1): et le motif que la politique imprime" \
+    'no matching policy rule -- denied by default' "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1 (forme 1): elle refuse le repli qui obtient le même effet autrement" \
+    'LE MÊME EFFET' "${_OPERATOR_RESERVED_RULE:-}"
+# Forme 2, dans les mots de la tête de vol du 17/11 — la phrase qui existait et
+# que rien ne portait au réviseur.
+assert_contains "OR1 (forme 2): une halte réservée ne se lève pas par un amendement du plan" \
+    "NE SE LÈVE JAMAIS PAR UN AMENDEMENT DU PLAN" "${_OPERATOR_RESERVED_RULE:-}"
+# Point 3 — la QUALIFICATION des deux voisines. C'est leur lecture, citée au
+# journal de révision du 17/11, qui a produit la levée de halte : une règle qui
+# s'ajouterait à côté d'elles sans les qualifier ne fermerait pas ce défaut-là.
+assert_contains "OR1 (point 3): la règle nomme mika#2636 par numéro" \
+    "mika#2636" "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1 (point 3): et mika#2693 par numéro" \
+    "mika#2693" "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1 (point 3): une halte réservée n'est PAS un défaut de préparation" \
+    "N'EST PAS UN DÉFAUT DE PRÉPARATION" "${_OPERATOR_RESERVED_RULE:-}"
+assert_contains "OR1 (point 3): et ESCALATE est dit SORTIE NOMINALE, pas un échec" \
+    "NOMINALE" "${_OPERATOR_RESERVED_RULE:-}"
+# LA FORME POSITIVE EST EN PREMIER, et c'est une position dans le texte.
+#
+# `|| true` SUR CHAQUE RELEVÉ DE POSITION, et ce n'est pas de la cosmétique : le
+# harnais tourne sous `set -euo pipefail` (ligne 15), donc un `grep` qui ne trouve
+# rien dans une substitution de commande en position d'affectation TUE LA SUITE sur
+# le coup. C'est exactement l'état « rouge avant » qu'on vient mesurer — la règle
+# absente, le motif introuvable. Sans le `|| true`, le rouge avant n'échoue pas :
+# il avorte, les assertions suivantes ne tournent jamais, et on repart avec la
+# croyance qu'elles tiennent. Mesuré ici le 23/11 : 12 rouges OR1 puis plus rien.
+# La variable vide est alors une donnée, et le `[ -n … ]` de garde ci-dessous la
+# traduit en `no` — un échec qui se lit.
+T3122_LN_GESTE=$(printf '%s\n' "${_OPERATOR_RESERVED_RULE:-}" \
+    | grep -n 'Le geste, dans les trois cas' | head -1 | cut -d: -f1 || true)
+T3122_LN_FORME1=$(printf '%s\n' "${_OPERATOR_RESERVED_RULE:-}" \
+    | grep -n '1. UN REFUS DE LA POLITIQUE DE PERMISSION' | head -1 | cut -d: -f1 || true)
+assert_eq "OR1: le geste à faire précède le premier interdit" "yes" \
+    "$( [ -n "$T3122_LN_GESTE" ] && [ -n "$T3122_LN_FORME1" ] \
+        && [ "$T3122_LN_GESTE" -lt "$T3122_LN_FORME1" ] && echo yes || echo no)"
+
+# --- OR2 : l'injection atteint le groomeur, EN DERNIER ----------------------
+#
+# ROUGE AVANT, mesuré : sans la ligne d'injection, six des huit assertions
+# ci-dessous tirent — les deux de présence (prompt rendu, source de la fonction),
+# celle de récence, celle d'ordre de source, celle de fidélité de miroir et celle
+# d'appartenance au bloc gardé. Les deux vertes sont la contre-vacuité de
+# l'extraction et la survie des deux aînées : elles mesurent l'instrument, pas la
+# règle, et doivent rester vertes dans les deux états.
+#
+# La récence est le seul levier d'une consigne en fin d'un prompt qui porte
+# jusqu'à 16 KiB de contexte de ticket (note de `_PILOT_SCRATCH_RULE`), et ici
+# elle est DÉMONTRABLE et non supposée : le défaut que cette règle ferme a été
+# produit par la lecture des deux règles qu'elle suit. Une qualification placée
+# avant ce qu'elle qualifie ne se lit que comme une nuance.
+
+T3122_PROMPT_GROOM=$(_t3122_inject "dev-groom")
+assert_contains "OR2: la règle est injectée dans le PROMPT pour SKILL=dev-groom" \
+    'RÈGLE DE GROOMING (mika#3122)' "$T3122_PROMPT_GROOM"
+assert_contains "OR2: et le site d'injection existe bien dans _set_up_worktree" \
+    '_OPERATOR_RESERVED_RULE' "$T3122_SUW_SRC"
+T3122_LN_2306=$(printf '%s\n' "$T3122_PROMPT_GROOM" | grep -n 'RÈGLE DE GROOMING (mika#2306)' | head -1 | cut -d: -f1 || true)
+T3122_LN_2636=$(printf '%s\n' "$T3122_PROMPT_GROOM" | grep -n 'RÈGLE DE GROOMING (mika#2636)' | head -1 | cut -d: -f1 || true)
+T3122_LN_3122=$(printf '%s\n' "$T3122_PROMPT_GROOM" | grep -n 'RÈGLE DE GROOMING (mika#3122)' | head -1 | cut -d: -f1 || true)
+assert_eq "OR2: la règle est la DERNIÈRE des trois règles de grooming du prompt" "yes" \
+    "$( [ -n "$T3122_LN_2306" ] && [ -n "$T3122_LN_2636" ] && [ -n "$T3122_LN_3122" ] \
+        && [ "$T3122_LN_3122" -gt "$T3122_LN_2636" ] && [ "$T3122_LN_2636" -gt "$T3122_LN_2306" ] \
+        && echo yes || echo no)"
+assert_eq "OR2: et l'injection source suit celle de mika#2636" "yes" \
+    "$(_t2178_after '"$PROMPT" "$_OPERATOR_RESERVED_RULE")' '"$PROMPT" "$_PLAN_SIZE_RULE")')"
+assert_contains "OR2: l'expression source est littéralement celle que le miroir réplique" \
+    'PROMPT=$(printf '"'"'%s\n\n%s'"'"' "$PROMPT" "$_OPERATOR_RESERVED_RULE")' "$T3122_LIB_SRC"
+# La conditionnalité se lit par APPARTENANCE AU BLOC, jamais par un préfixe : un
+# scan « la garde apparaît-elle AVANT l'injection ? » resterait vert en déplaçant
+# l'injection d'une ligne APRÈS le `fi`, c'est-à-dire sur la régression exacte
+# qu'OR3 existe pour attraper. Forme reprise de S13.
+T3122_GROOM_BLOCK=$(printf '%s\n' "$T3122_SUW_SRC" \
+    | sed -n '/if \[ "\$SKILL" = "dev-groom" \]; then/,/^        fi/p')
+assert_eq "OR2 contre-vacuité: le bloc gardé sur le skill a bien été extrait" "non-vide" \
+    "$([ -n "$T3122_GROOM_BLOCK" ] && echo non-vide || echo vide)"
+assert_contains "OR2: l'injection vit DANS la branche gardée sur le skill" \
+    '_OPERATOR_RESERVED_RULE' "$T3122_GROOM_BLOCK"
+assert_contains "OR2: et ses deux aînées y vivent toujours" \
+    '_PLAN_SIZE_RULE' "$T3122_GROOM_BLOCK"
+
+# --- OR3 : contrôle négatif — dev-pilot ne la reçoit pas -------------------
+#
+# PORTEUR, pas décoratif : les deux sites voisins de cette branche
+# (`_PR_BODY_CONTAINMENT_RULE`, `_PILOT_SCRATCH_RULE`) sont inconditionnels, donc
+# la condition se PERD en copiant le voisin. L'écart ne rendrait aucune décision
+# fausse — il mettrait du bruit dans le prompt de tout pilote d'implémentation,
+# qui n'écrit aucun plan.
+#
+# Et le contrat mika#138, invariant de position 2 : si la première ligne du
+# `PROMPT` cesse d'être `<repo>#<num>`, la regex ancrée manque, le dispatch tombe
+# en mode free-text et AUCUN worktree n'est créé. Régression de premier ordre,
+# invisible à toute assertion sur le contenu de la règle.
+
+T3122_PROMPT_PILOT=$(_t3122_inject "dev-pilot")
+assert_not_contains "OR3: la règle n'est PAS injectée pour SKILL=dev-pilot" \
+    'RÈGLE DE GROOMING (mika#3122)' "$T3122_PROMPT_PILOT"
+assert_contains "OR3: mais dev-pilot reçoit bien les deux règles inconditionnelles voisines" \
+    "RÈGLE DE DISPATCH (mika#2211)" "$T3122_PROMPT_PILOT"
+assert_contains "OR3: dont celle du scratch" \
+    "RÈGLE DE DISPATCH (mika#2548)" "$T3122_PROMPT_PILOT"
+assert_eq "OR3 (mika#138): la première ligne du PROMPT reste exactement mika#3122" "mika#3122" \
+    "$(printf '%s' "$T3122_PROMPT_GROOM" | head -1)"
+assert_eq "OR3 (mika#138): idem sur le chemin dev-pilot" "mika#3122" \
+    "$(printf '%s' "$T3122_PROMPT_PILOT" | head -1)"
+
+# --- OR4 : le findings-file de première passe porte la règle ---------------
+#
+# ROUGE AVANT, mesuré : avec le `printf` à un seul argument, trois des cinq
+# assertions ci-dessous tirent — présence de la règle, ordre, fidélité de miroir.
+# Les deux qui restent vertes le sont à bon droit : le findings-file portait déjà
+# le contenu architecte, et la contre-vacuité compte un site d'écriture qui
+# préexistait au changement. C'est ce qu'elle garde — qu'un SECOND site n'apparaisse
+# pas et n'emporte pas la règle hors du seul fichier que le réviseur lit.
+#
+# Ce fichier EST le prompt du pilote de révision : `_launch_revise_pilot` le lance
+# avec `-- "@…"` et rien d'autre. C'est la doctrine du 2026-09-07 appliquée telle
+# quelle — la garde vit sur le canal de l'exécutant, pas sur celui de son donneur
+# d'ordre. L'ORDRE compte : le contenu architecte d'abord, la règle ensuite, pour
+# la même raison de récence qu'OR2.
+
+T3122_ARCH_CONTENT="F1 [BLOQUANT] — l'unité U2 laisse le choix de la coupe à l'implémenteur.
+
+Disposition: ITERATE"
+T3122_FINDINGS=$(_t3122_findings "$T3122_ARCH_CONTENT")
+assert_contains "OR4: le findings-file porte le contenu architecte" \
+    'Disposition: ITERATE' "$T3122_FINDINGS"
+assert_contains "OR4: et la règle" \
+    'RÈGLE DE GROOMING (mika#3122)' "$T3122_FINDINGS"
+T3122_LN_ARCH=$(printf '%s\n' "$T3122_FINDINGS" | grep -n 'Disposition: ITERATE' | head -1 | cut -d: -f1 || true)
+T3122_LN_RULE=$(printf '%s\n' "$T3122_FINDINGS" | grep -n 'RÈGLE DE GROOMING (mika#3122)' | head -1 | cut -d: -f1 || true)
+assert_eq "OR4: le contenu architecte vient d'abord, la règle ensuite" "yes" \
+    "$( [ -n "$T3122_LN_ARCH" ] && [ -n "$T3122_LN_RULE" ] \
+        && [ "$T3122_LN_RULE" -gt "$T3122_LN_ARCH" ] && echo yes || echo no)"
+assert_contains "OR4: l'expression source est littéralement celle que le miroir réplique" \
+    'printf '"'"'%s\n\n%s\n'"'"' "$content1" "$_OPERATOR_RESERVED_RULE" > "$findings_file"' \
+    "$T3122_LIB_SRC"
+# Contre-vacuité du scan : il y a bien UN SEUL écrivain de ce fichier. Un second
+# site qui l'écrirait sans la règle serait la régression que ce compte refuse.
+assert_eq "OR4 contre-vacuité: findings-1.md a un site d'écriture unique" "1" \
+    "$(grep -cF 'findings_file="$findings_dir/findings-1.md"' "$DISPATCH_LIB" || true)"
+
+# --- OR5 : la règle n'ARME PAS les deux rattrapages ------------------------
+#
+# ROUGE AVANT, mesuré le 23/11 sur les DEUX termes, en injectant le titre interdit
+# dans le texte de la règle (`Les règles de volume (## Taille estimée, mika#2636)`,
+# puis la même ligne avec `## Fire-Disposition`) : chaque fois, l'assertion lexicale
+# tire ET la sonde correspondante rend 1 au lieu de 0 — `size` pour la première,
+# `fd` pour la seconde. Les deux moitiés comptent : la lexicale nomme la faute, la
+# sonde prouve la CONSÉQUENCE, et c'est la conséquence qui a tué un pilote.
+#
+# La contrainte R3 gouverne la RÉDACTION, pas seulement la vérification. Les
+# termes 1 de `_fd_retry_if_section_still_missing` et de
+# `_plan_size_retry_if_section_still_missing` sont deux `grep -qF` sur le TITRE de
+# la section que chacun réclame, et ils lisent CE FICHIER-LÀ. Orthographier l'un
+# des deux titres dans la règle rendrait leur premier terme vrai PAR
+# CONSTRUCTION : les deux rattrapages relanceraient un pilote de revise à chaque
+# ITERATE, avec un finding synthétique faux — exactement le piège que l'en-tête de
+# `_plan_size_retry_if_section_still_missing` documente. C'est pourquoi la règle
+# cite ses voisines par NUMÉRO et jamais par le titre de leur section.
+#
+# Les deux prédicats sont exercés par la VRAIE fonction, jamais re-grepés ici : un
+# `grep` retapé dans le test serait un second site de vérité, et une faute de
+# frappe y serait verte.
+
+assert_not_contains "OR5: la règle n'orthographie pas la première chaîne-sonde" \
+    "Fire-Dispo" "${_OPERATOR_RESERVED_RULE:-}"
+assert_not_contains "OR5: ni la seconde" \
+    "Taille estim" "${_OPERATOR_RESERVED_RULE:-}"
+assert_eq "OR5: un findings-file muet + la règle laisse le rattrapage mika#2306 au repos" \
+    "0" "$(_t3122_retry_probe fd "$T3122_FINDINGS")"
+assert_eq "OR5: et le rattrapage mika#2636 aussi" \
+    "0" "$(_t3122_retry_probe size "$T3122_FINDINGS")"
+# CONTRE-VACUITÉ, et elle est la moitié qui compte : sans elle, les deux
+# assertions ci-dessus seraient vertes sur un prédicat cassé, sur une sonde muette
+# ou sur une fonction qui ne relance plus rien. Un contenu architecte qui réclame
+# VRAIMENT chaque section rend son terme 1 vrai, et la relance part.
+assert_eq "OR5 contre-vacuité: un contenu qui réclame la section de mika#2306 fait tirer son rattrapage" \
+    "1" "$(_t3122_retry_probe fd "$(_t3122_findings "F1 — le plan ne porte pas de section \`## Fire-Disposition\`.
+
+Disposition: ITERATE")")"
+assert_eq "OR5 contre-vacuité: idem pour celle de mika#2636" \
+    "1" "$(_t3122_retry_probe size "$(_t3122_findings "F1 — le plan ne porte pas de section \`## Taille estimée\`.
+
+Disposition: ITERATE")")"
+
+# --- OR6 / OR7 : la porte vit dans les DEUX prompts architecte -------------
+#
+# Patron S14 / V4, pour la même raison qu'eux : le jugement vit chez l'architecte,
+# dont le `system_prompt.md` est STATIQUE — aucune interpolation au dispatch. La
+# règle du substrat et la porte de l'architecte sont donc deux écritures du même
+# invariant, et rien ne les relie à l'exécution. Sans ces deux blocs, retoucher
+# l'une laisserait l'autre en place et la divergence serait MUETTE : la boucle
+# continuerait de refuser côté groomeur pendant que l'architecte ratifierait, ce
+# qui est EXACTEMENT la configuration des deux épisodes mesurés.
+#
+# Chaque assertion est sous la garde de lisibilité de la boucle, et le bras `else`
+# ASSERTE au lieu de passer en silence : un fichier renommé est l'une des quatre
+# façons dont une section de test passe en entier sans avoir rien mesuré.
+#
+# FIRE-DISPOSITION (du plan) : si l'un de ces blocs tire pour une raison AUTRE que
+# la section absente — fenêtre vide parce qu'un `###` voisin a bougé, prompt
+# déplacé — on s'arrête et on le remonte. On N'ÉLARGIT PAS l'ancre pour le
+# reverdir : une ancre élargie est une assertion qui ne mesure plus sa fenêtre.
+
+T3122_GATE_FIRST=""
+T3122_GATE_SECOND=""
+for t3122_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    t3122_pf="$SCRIPT_DIR/../$t3122_prompt/system_prompt.md"
+    if [ -r "$t3122_pf" ]; then
+        t3122_gate=$(sed -n '/^### Operator-Reserved Gate/,/^### /p' "$t3122_pf")
+        case "$t3122_prompt" in
+            mika-arch-groom-ticket)   T3122_GATE_FIRST="$t3122_gate" ;;
+            mika-arch-second-review)  T3122_GATE_SECOND="$t3122_gate" ;;
+        esac
+        assert_eq "OR6/OR7: $t3122_prompt porte un Operator-Reserved Gate" "non-vide" \
+            "$([ -n "$t3122_gate" ] && echo non-vide || echo vide)"
+        # Les deux formes, nommées par les mêmes chaînes que la règle du substrat.
+        # C'est la parité qui compte, pas la tournure : un groomeur qui reconnaît
+        # le refus dans son journal et un architecte qui lit le même refus dans le
+        # plan doivent parler du même objet.
+        assert_contains "OR6/OR7: $t3122_prompt — la porte nomme le marqueur de refus" \
+            '[policy:deny]' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — et le motif que la politique imprime" \
+            'no matching policy rule -- denied by default' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — forme 1 : le repli au même effet par un autre outil" \
+            'the same effect by another tool' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — forme 2 : la halte ne se lève pas par un amendement" \
+            'never lifts by an amendment of the plan' "$t3122_gate"
+        # Les deux voisines de volume sont citées PAR NUMÉRO, comme dans la règle,
+        # et pour y dire qu'une citation n'est pas une autorité.
+        assert_contains "OR6/OR7: $t3122_prompt — la porte cite mika#2636" \
+            'mika#2636' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — et mika#2693" \
+            'mika#2693' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — ESCALATE y est dit sortie NOMINALE" \
+            'NOMINAL exit of grooming' "$t3122_gate"
+        # LES DEUX MESURES SONT DANS LE PROMPT, par date. Une porte dont on a perdu
+        # l'épisode se relitige au premier plan qui la trouve gênante.
+        assert_contains "OR6/OR7: $t3122_prompt — l'épisode du 03/11 est daté dans la porte" \
+            '2026-11-03' "$t3122_gate"
+        assert_contains "OR6/OR7: $t3122_prompt — et celui du 17/11" \
+            '2026-11-17' "$t3122_gate"
+    else
+        assert_eq "OR6/OR7: $t3122_prompt/system_prompt.md lisible" "lisible" \
+            "fichier introuvable: $t3122_pf"
+    fi
+done
+
+# OR6, propre à la première passe : la disposition est ESCALATE, et le refus
+# d'ITERATE est ÉCRIT. C'est la seule assertion de tout ce ticket qui porte sur le
+# coeur du défaut — `ITERATE` renvoie le plan au pilote de révision, l'exécutant
+# même qui a pratiqué la coupe le 17/11. Un `ITERATE` ici n'est pas un remède plus
+# doux, c'est le véhicule du défaut.
+assert_contains "OR6: la première passe refuse en ESCALATE" \
+    'MUST return `ESCALATE`' "$T3122_GATE_FIRST"
+assert_contains "OR6: et elle écrit que ce n'est JAMAIS ITERATE" \
+    'never `ITERATE`' "$T3122_GATE_FIRST"
+assert_contains "OR6: la porte se dit branche 2 de celle de mika#1244" \
+    'branch 2 of the Unresolved-Decision Gate' "$T3122_GATE_FIRST"
+assert_contains "OR6: et elle dit POURQUOI ITERATE est le véhicule du défaut" \
+    "defect's own delivery vector" "$T3122_GATE_FIRST"
+
+# OR7, propre à la seconde passe : ESCALATE, pas d'ITERATE offert du tout, et la
+# clause du cas 4 — celle dont la dernière occurrence avait besoin.
+assert_contains "OR7: la seconde passe refuse en ESCALATE" \
+    'MUST return `ESCALATE`' "$T3122_GATE_SECOND"
+assert_not_contains "OR7: et elle n'offre PAS d'ITERATE (limite des deux passes)" \
+    'return `ITERATE`' "$T3122_GATE_SECOND"
+assert_contains "OR7: le cas 4 du Plan-Size Gate ne ratifie pas une coupe décidée par la révision" \
+    'does not ratify a split the revision itself decided' "$T3122_GATE_SECOND"
+assert_contains "OR7: on y lit la PROVENANCE de la coupe, pas son arithmétique" \
+    'provenance of the split' "$T3122_GATE_SECOND"
+assert_contains "OR7: une citation n'est pas une autorité" \
+    'citation is not an authority' "$T3122_GATE_SECOND"
+assert_contains "OR7: et cette passe est dite SANS RECOURS" \
+    'This pass has no recourse' "$T3122_GATE_SECOND"
+
+# CONTRE-VACUITÉ de tout OR6/OR7, et c'est la moitié qui compte : les deux
+# fenêtres sont lues NON VIDES avant qu'on conclue quoi que ce soit de leur
+# contenu, et les deux fichiers sont lus LISIBLES et non absents. Sans ces quatre
+# assertions, un prompt renommé rendrait les vingt-six ci-dessus vertes sur la
+# chaîne vide — `assert_not_contains` en tête.
+assert_eq "OR6/OR7 contre-vacuité: les deux fenêtres de porte sont lues non vides" "oui|oui" \
+    "$([ -n "$T3122_GATE_FIRST" ] && printf 'oui' || printf 'non')|$([ -n "$T3122_GATE_SECOND" ] && printf 'oui' || printf 'non')"
+for t3122_prompt in mika-arch-groom-ticket mika-arch-second-review; do
+    assert_eq "OR6/OR7 contre-vacuité: $t3122_prompt/system_prompt.md est LISIBLE, pas absent" "lisible" \
+        "$([ -r "$SCRIPT_DIR/../$t3122_prompt/system_prompt.md" ] && echo lisible || echo absent)"
+done
+
 # ============================================================================
 # mika#3121 — la porte de lancement : les cinq issues, sur de vraies fixtures
 # ============================================================================

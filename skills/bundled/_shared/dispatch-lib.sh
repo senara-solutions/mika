@@ -5607,6 +5607,75 @@ pas un label, et pas « défaut »."
     fi
 }
 
+# mika#3122 — une décision que le substrat RÉSERVE À L'OPÉRATEUR ne se tranche
+# pas par la boucle, et surtout pas par un amendement du plan.
+#
+# Deux épisodes, deux semaines d'écart, UN SEUL invariant violé — et les deux
+# passes de `mika-arch` ont ratifié les deux fois :
+#   - 03/11 (mika#3024 / PR #3029) : la politique de permission a refusé trois
+#     fois l'extraction par `sed`, et le plan a inscrit le refus COMME UN RISQUE
+#     AVEC SON REPLI (« basculer sur le découpeur Rust jetable »). Le pilote a
+#     pris le repli, écrit le programme jetable, l'a lancé, l'a supprimé dans le
+#     même commit. Merge 1c6f30fbc.
+#   - 17/11 (mika#1727, vol V3c-2b) : la tête du vol disait que le groom
+#     s'arrête et nomme les coupes SANS EN PRATIQUER AUCUNE, le choix revenant à
+#     l'opérateur. Le groom l'a fait. La première passe a rendu ITERATE ; le
+#     pilote de révision a lu ce verdict comme une demande de trancher et a
+#     réécrit le plan pour PRATIQUER la coupe réservée, en citant mika#2636 et
+#     mika#2693. L'opérateur a dû tuer le pilote.
+#
+# FORME POSITIVE D'ABORD, comme `_PR_BODY_CONTAINMENT_RULE` (:5178) et
+# `_PILOT_SCRATCH_RULE` (:5218) : à qui l'on dit seulement « n'écris pas ce
+# repli », il reste à inventer quoi écrire, et ce qu'il invente est le défaut
+# sous une autre orthographe. La règle dit donc LE GESTE — nommer, chiffrer, ne
+# rien pratiquer — avant de dire ce qu'elle refuse.
+#
+# ELLE QUALIFIE SES DEUX VOISINES, elle ne s'ajoute pas à côté d'elles. C'est
+# leur lecture — « un plan qui attend un arbitrage de l'opérateur n'est pas
+# prêt » — qui a produit la levée de halte du 17/11, citée mot pour mot au
+# journal de révision. Le point 3 est donc le cœur de cette règle et non sa
+# conclusion : une halte réservée n'est pas un défaut de préparation.
+#
+# Elle cite mika#3122 par référence et nomme ses voisines PAR NUMÉRO ; elle ne
+# reformule aucune de leurs doctrines, pour que les deux ne puissent pas
+# diverger — même discipline que `_FIRE_DISPOSITION_RULE`, qui énumère les trois
+# options de mika#1574 sans les redéfinir.
+#
+# CONTRAINTE LEXICALE, et ce n'est pas une préférence de rédaction : ce texte est
+# AUSSI appendu au findings-file de première passe par `_iterate_groom_loop`, et
+# ce fichier-là est lu par les termes 1 de `_fd_retry_if_section_still_missing`
+# (:10675) et de `_plan_size_retry_if_section_still_missing` (:10806), deux
+# `grep -qF` portant chacun sur le TITRE de la section qu'il réclame.
+# Orthographier l'un de ces deux titres ici rendrait leur premier terme VRAI PAR
+# CONSTRUCTION : les deux rattrapages relanceraient un pilote de revise à chaque
+# ITERATE, avec un finding synthétique faux. Les deux voisines sont donc
+# désignées par leur NUMÉRO DE TICKET, jamais par le titre de leur section.
+# Tenu dans les deux sens par OR5, contre-vacuité comprise.
+_OPERATOR_RESERVED_RULE="RÈGLE DE GROOMING (mika#3122) — une décision réservée à l'opérateur se NOMME, elle ne se tranche pas.
+Le geste, dans les trois cas ci-dessous : écris la décision dans le plan, chiffre les options
+avec leur coût, N'EN PRATIQUE AUCUNE, et laisse le verdict la porter à l'opérateur.
+
+1. UN REFUS DE LA POLITIQUE DE PERMISSION EST UN ARBITRAGE DE L'OPÉRATEUR, matérialisé en code
+   (\`[policy:deny]\`, \`no matching policy rule -- denied by default\`). N'inscris jamais au plan
+   un repli qui obtient LE MÊME EFFET par un autre outil : pas de programme jetable, pas de
+   réécriture du geste, pas de « variante » du même accès. Nomme le refus, nomme ce qu'il
+   empêche, et arrête-toi là.
+2. UNE HALTE RÉSERVÉE NE SE LÈVE JAMAIS PAR UN AMENDEMENT DU PLAN. Quand le corps du ticket, le
+   plan de première passe ou la tête du vol réserve un choix à l'opérateur — quelle coupe, quel
+   périmètre, quel compromis — chiffre les options et n'en pratique aucune. Un finding qui
+   demande de « t'engager » ne lève pas la réserve : il demande de la rendre lisible.
+3. UNE HALTE RÉSERVÉE N'EST PAS UN DÉFAUT DE PRÉPARATION. Les règles de volume (mika#2636) et la
+   borne par vol (mika#2693) demandent un plan prêt à partir ; elles ne demandent pas que tu
+   tranches à la place de l'opérateur. Un plan qui s'arrête proprement sur une décision
+   d'opérateur EST un plan prêt — son verdict est \`ESCALATE\`, et \`ESCALATE\` est une sortie
+   NOMINALE, pas un échec de grooming.
+
+Mesuré deux fois : le 03/11, un plan a prévu de contourner trois refus de permission par un
+programme jetable, et les deux passes l'ont accepté. Le 17/11, une révision a pratiqué la coupe
+que la tête du vol réservait à l'opérateur, en citant mika#2636 et mika#2693 ; il a fallu tuer le
+pilote. mika-arch refuse désormais les deux formes en \`ESCALATE\` aux DEUX passes — et la seconde
+passe est sans recours."
+
 # mika#2178 — render the ticket text (body AND comments) in a form that can be
 # injected into the pilot's opening prompt.
 #
@@ -6427,10 +6496,22 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
         # a pas, et `_pilot_max_turns` est le lecteur unique de leur table
         # (mika#2542 AC5) : la résolution se fait donc à CE site, sur la même
         # invocation logique que sa lecture, et le résultat part en texte.
+        #
+        # mika#3122 — l'interdit de trancher une décision réservée à l'opérateur
+        # part EN DERNIER, et ce n'est pas un choix de confort : le défaut qu'il
+        # ferme a été produit PAR LA LECTURE des deux règles juste au-dessus
+        # (journal de révision du 17/11, qui les cite). Une qualification placée
+        # avant ce qu'elle qualifie ne se lit que comme une nuance ; placée
+        # après, elle est la dernière chose lue avant l'écriture du plan. Même
+        # condition et même raison que ses deux voisines — elle s'adresse à qui
+        # ÉCRIT un plan, et l'injecter pour `dev-pilot` serait du bruit. L'ordre
+        # est épinglé par OR2, de sorte qu'un futur ajout qui la déplacerait
+        # rougisse au lieu de la désarmer en silence.
         if [ "$SKILL" = "dev-groom" ]; then
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_FIRE_DISPOSITION_RULE")
             _pilot_max_turns "${LABELS:-}"; _plan_size_rule "$_PILOT_MAX_TURNS"
             PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_PLAN_SIZE_RULE")
+            PROMPT=$(printf '%s\n\n%s' "$PROMPT" "$_OPERATOR_RESERVED_RULE")
         fi
 
         # Save pre-run HEAD SHA for post-flight diff check
@@ -11773,7 +11854,25 @@ no architect retry; the architect was not asked again"
             mkdir -p "$findings_dir" 2>/dev/null || {
                 _groom_warn "cannot create $findings_dir"; return 1; }
             local findings_file="$findings_dir/findings-1.md"
-            printf '%s\n' "$content1" > "$findings_file" || {
+            # mika#3122 — la règle de décision réservée est APPENDUE ICI, après
+            # le contenu architecte, parce que CE FICHIER EST LE PROMPT du pilote
+            # de révision : `_launch_revise_pilot` le lance avec `-- "@…"` et
+            # rien d'autre (:10521). Poser la garde ailleurs la poserait sur le
+            # canal du donneur d'ordre et non sur celui de l'exécutant — ce que
+            # mesure `docs/solutions/prompt-engineering/2026-09-07-une-garde-de-`
+            # `prompt-doit-vivre-sur-le-canal-que-lexecutant-lit.md`. Le canal
+            # sert déjà à prescrire au réviseur : les deux rattrapages y écrivent
+            # des findings synthétiques (:10709, :10844).
+            #
+            # CE QUE LA RÈGLE N'ÉCRIT PAS est la condition de ce site : ce
+            # fichier est grep par les termes 1 de
+            # `_fd_retry_if_section_still_missing` (:10675) et de
+            # `_plan_size_retry_if_section_still_missing` (:10806), chacun sur le
+            # TITRE de la section qu'il réclame. `_OPERATOR_RESERVED_RULE`
+            # n'orthographie ni l'un ni l'autre — ses voisines y sont citées par
+            # numéro — faute de quoi les deux rattrapages tireraient à chaque
+            # ITERATE avec un finding synthétique faux. Tenu par OR5.
+            printf '%s\n\n%s\n' "$content1" "$_OPERATOR_RESERVED_RULE" > "$findings_file" || {
                 _groom_warn "cannot write $findings_file"; return 1; }
 
             # Launch revise pilot with the findings as @-file payload. Pilot

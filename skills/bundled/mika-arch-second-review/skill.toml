@@ -9,7 +9,10 @@ timeout_secs = 120
 # skill would be skipped at load (mika#852). Raised to 24 KiB like
 # mika-arch-groom-ticket: headroom for one more rule, well under the 80 KiB
 # ceiling. The declared size costs nothing — the real size is injected.
-max_prompt_size = 24576
+# mika#3122 — la clause de halte réservée a porté le prompt à 24 579 bytes, au-delà
+# des 24 KiB : le skill serait sauté au chargement. Monté à 32 KiB comme
+# mika-arch-groom-ticket, sur le même raisonnement.
+max_prompt_size = 32768
 
 [triggers]
 keywords = [
