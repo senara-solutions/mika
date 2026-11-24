@@ -10,7 +10,10 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use super::budget::output_tokens_per_sec_floor;
 use super::error::LlmError;
 use super::openai::extract_think_block;
-use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
+use super::retry_gate::{
+    RetryClass, RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict,
+    transport_concession_applies,
+};
 use super::types::*;
 use super::{LlmProvider, LlmTimeoutBudget};
 
@@ -631,6 +634,9 @@ impl OllamaProvider {
         let request_bytes = request.payload_bytes() as u64;
 
         let mut last_error = None;
+        // mika#3126 — see the twin comment in `openai.rs`: the flag travels
+        // beside the error because the variant cannot carry it.
+        let mut last_cap_exhausted = false;
 
         // AC3-b (mika#2189) — see the twin comment in `openai.rs` for the full
         // reasoning. Deadline-gated for the same reason: without an envelope
@@ -663,17 +669,22 @@ impl OllamaProvider {
                 // Deadline-aware retry abort
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    let last_was_transport = last_error
-                        .as_ref()
-                        .is_some_and(super::error::LlmError::is_transport);
+                    // mika#3126 — see the twin comment in `openai.rs`.
+                    let transport_concession = transport_concession_applies(
+                        last_error.as_ref().map(|e: &LlmError| e as &dyn RetryClass),
+                        last_cap_exhausted,
+                    );
                     if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
-                        deadline_verdict(Some(remaining), last_was_transport, &thresholds)
+                        deadline_verdict(Some(remaining), transport_concession, &thresholds)
                     {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
                             threshold_secs,
-                            last_was_transport,
+                            // mika#3126 — the decision and the measurement, two
+                            // fields; see the twin comment in `openai.rs`.
+                            transport_concession,
+                            last_cap_exhausted,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         // mika#2331 AC2 — see the twin comment in `openai.rs`.
@@ -736,6 +747,9 @@ impl OllamaProvider {
                     attempt,
                     max_attempts,
                     Some(e),
+                    // mika#3126: **this** attempt's flag — see the twin comment
+                    // in `openai.rs`.
+                    attempt_cap_exhausted,
                     deadline_remaining_ms.map(Duration::from_millis),
                     &thresholds,
                 )),
@@ -778,6 +792,9 @@ impl OllamaProvider {
                     if attempt + 1 < max_attempts && e.is_retryable() {
                         warn!(attempt, max_attempts, error = %e, "transient Ollama API error");
                         last_error = Some(e);
+                        // mika#3126 — retained beside the error; see the twin
+                        // comment in `openai.rs`.
+                        last_cap_exhausted = attempt_cap_exhausted;
                         continue;
                     }
                     return Err(e);
@@ -789,12 +806,15 @@ impl OllamaProvider {
         // see the twin comment in `openai.rs`: the agreement with the guard is
         // structural now, not a copy, while the margin is still measured at
         // this later instant.
-        let last_was_transport = last_error
-            .as_ref()
-            .is_some_and(super::error::LlmError::is_transport);
+        // mika#3126 — the same pair as the guard; see the twin comment in
+        // `openai.rs`.
+        let transport_concession = transport_concession_applies(
+            last_error.as_ref().map(|e| e as &dyn RetryClass),
+            last_cap_exhausted,
+        );
         let deadline_aborted = deadline_verdict(
             deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
-            last_was_transport,
+            transport_concession,
             &thresholds,
         )
         .is_deadline_insufficient();

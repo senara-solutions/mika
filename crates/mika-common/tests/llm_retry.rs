@@ -1167,3 +1167,81 @@ async fn mika2280_deadline_abort_carries_no_cap_flag() {
         "the declaration is true everywhere: {lines:?}"
     );
 }
+
+/// The mika#3126 geometry, scaled down: a plafond of 4 s under an envelope of
+/// 12 s, so the transport threshold is 2 s and the default one is 4 s.
+///
+/// `max_attempts = floor(12 / 4) = 3`, which is what makes the refusal below a
+/// deadline refusal and never a spent budget.
+fn guillotine_budget() -> LlmTimeoutBudget {
+    LlmTimeoutBudget::unvalidated(4, 12)
+}
+
+/// mika#3126, end to end on the rail where the incident happened: a cut at the
+/// plafond no longer buys a relance under a margin smaller than a whole call.
+///
+/// Guillotine arm: the 2xx head arrives, the body never does, and the client's
+/// own plafond cuts the attempt at ≈4 s. The deadline was 8 s away, so the
+/// guard sees ≈4 s of margin — enough for the mika#1744 concession (2 s), not
+/// for a whole call (4 s). One hit, `cap_exhausted = "true"` and
+/// `outcome = "exhausted"` on the line.
+///
+/// Control arm, **at the same ≈4 s margin**: a body cut at once fails in
+/// milliseconds under a 4 s deadline, so the margin at the guard is the same
+/// ≈4 s — and because that attempt was not cut at its plafond, the concession
+/// holds and the retry runs. The only variable between the two arms is the cut,
+/// which is what makes this a probe of mika#3126 rather than of the geometry.
+#[tokio::test]
+#[serial]
+async fn mika3126_openai_une_coupure_au_plafond_ne_relance_pas_sous_un_appel_entier() {
+    let api = FakeApi::start(vec![Reply::HeadersThenSilence, Reply::Ok(openai_body())]).await;
+    let provider = openai_provider(api.base_url(), guillotine_budget());
+
+    let (guard, sink) = capture::start();
+    let _ = provider
+        .send_message_with_deadline(&llm_request(), Some(deadline_in(8)))
+        .await
+        .expect_err("a guillotine with less than a whole call left must not retry");
+    let lines = sink.attempts();
+    drop(guard);
+
+    assert_eq!(
+        api.hits(),
+        1,
+        "the relance the incident paid 4.82 USD for must not run: {lines:?}"
+    );
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("true"),
+        "the attempt was cut at its plafond: {lines:?}"
+    );
+    assert_eq!(
+        lines[0].outcome, "exhausted",
+        "and the line must say so, not `retrying`: {lines:?}"
+    );
+
+    // Control: the same rail, the same margin, no cut at the plafond.
+    let api = FakeApi::start(vec![Reply::TruncatedBody, Reply::Ok(openai_body())]).await;
+    let provider = openai_provider(api.base_url(), guillotine_budget());
+
+    let (guard, sink) = capture::start();
+    let response = provider
+        .send_message_with_deadline(&llm_request(), Some(deadline_in(4)))
+        .await
+        .expect("a transport failure that resolved in milliseconds keeps its concession");
+    let lines = sink.attempts();
+    drop(guard);
+
+    assert_eq!(response.usage.input_tokens, 3);
+    assert_eq!(
+        api.hits(),
+        2,
+        "the mika#1744 population must keep its fast retry: {lines:?}"
+    );
+    assert_eq!(
+        lines[0].cap_exhausted.as_deref(),
+        Some("false"),
+        "the attempt ran and was not cut: {lines:?}"
+    );
+    assert_eq!(lines[0].outcome, "retrying", "{lines:?}");
+}

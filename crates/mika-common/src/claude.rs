@@ -636,20 +636,31 @@ impl ClaudeClient {
                 // (mika#2331 §3.3). The symmetry is structural now.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    let last_was_transport = last_error.as_ref().is_some_and(is_transport_class);
+                    // mika#3126: through the same single site as the other two
+                    // rails. `cap_exhausted = false` is the honest answer here
+                    // and not an instrumentation gap — `budget.rs:434-437`
+                    // forbids the measurement on this rail; see the twin comment
+                    // at the outcome site below.
+                    let wrapped = last_error.as_ref().map(ClaudeRetryClass);
+                    let transport_concession = crate::llm::retry_gate::transport_concession_applies(
+                        wrapped
+                            .as_ref()
+                            .map(|w| w as &dyn crate::llm::retry_gate::RetryClass),
+                        false,
+                    );
                     if let crate::llm::retry_gate::RetryVerdict::DeadlineInsufficient {
                         threshold_secs,
                         ..
                     } = crate::llm::retry_gate::deadline_verdict(
                         Some(remaining),
-                        last_was_transport,
+                        transport_concession,
                         &thresholds,
                     ) {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
                             threshold_secs,
-                            last_was_transport,
+                            last_was_transport = transport_concession,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         // mika#2331 AC2 — see the twin comment in `openai.rs`.
@@ -723,6 +734,21 @@ impl ClaudeClient {
                         attempt,
                         ANTHROPIC_MAX_ATTEMPTS,
                         Some(&ClaudeRetryClass(e)),
+                        // mika#3126 D5: `false` is the honest answer on this
+                        // rail, not an instrumentation gap. `is_cap_exhaustion`
+                        // compares an elapsed time against the plafond of the
+                        // budget the rail was built with, and `budget.rs:434-437`
+                        // forbids asking it here for the reason the `None` below
+                        // spells out: this rail hands `reqwest` the literal
+                        // `ANTHROPIC_HTTP_TIMEOUT_SECS` instead of reading a
+                        // plafond, so there is no applied bound to judge against.
+                        // With no measurement, the concession is not withdrawn —
+                        // which is exactly the pre-mika#3126 behaviour, and R6:
+                        // this rail's conduct is unchanged and it never produces
+                        // the new class. The day it reads the budget
+                        // (mika#2189's named follow-up), this `false` becomes the
+                        // measured flag and nothing else here moves.
+                        false,
                         deadline_remaining_ms.map(Duration::from_millis),
                         &thresholds,
                     ),
@@ -844,10 +870,19 @@ impl ClaudeClient {
         // rail where that message is *observable*: it wraps the real error as
         // context, where the OpenAI-shaped rails only use it for a
         // `last_error == None` case their loop cannot reach.
-        let last_was_transport = last_error.as_ref().is_some_and(is_transport_class);
+        // mika#3126 — through the single site, `cap_exhausted = false` for the
+        // reason `budget.rs:434-437` gives; see the twin comment at the outcome
+        // site above.
+        let wrapped = last_error.as_ref().map(ClaudeRetryClass);
+        let transport_concession = crate::llm::retry_gate::transport_concession_applies(
+            wrapped
+                .as_ref()
+                .map(|w| w as &dyn crate::llm::retry_gate::RetryClass),
+            false,
+        );
         let deadline_aborted = crate::llm::retry_gate::deadline_verdict(
             deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
-            last_was_transport,
+            transport_concession,
             &thresholds,
         )
         .is_deadline_insufficient();

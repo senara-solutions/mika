@@ -9,7 +9,10 @@ use serde_json::Value;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::error::{LlmError, blank_response_body};
-use super::retry_gate::{RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict};
+use super::retry_gate::{
+    RetryClass, RetryThresholds, RetryVerdict, deadline_verdict, next_attempt_verdict,
+    transport_concession_applies,
+};
 use super::types::*;
 use super::{LlmProvider, ProviderKind};
 
@@ -449,6 +452,13 @@ impl OpenAiCompatibleProvider {
         let request_bytes = request.payload_bytes() as u64;
 
         let mut last_error = None;
+        // mika#3126: the error alone cannot say whether the attempt that
+        // produced it was cut at its own plafond — `LlmError::Transport` is the
+        // variant of a DNS failure and of a guillotine alike, deliberately so
+        // (mika#2280 D2). The flag travels **beside** the error, as it does on
+        // the per-attempt event, and is what withdraws the mika#1744 concession
+        // from an attempt that has just proved it will not resolve in seconds.
+        let mut last_cap_exhausted = false;
 
         // AC3-b (mika#2189): the failure cost is bounded by the envelope, not
         // merely trimmed by the remaining-deadline check below.
@@ -509,9 +519,13 @@ impl OpenAiCompatibleProvider {
                 // fast-failing transport retry.
                 if let Some(dl) = deadline {
                     let remaining = dl.saturating_duration_since(Instant::now());
-                    let last_was_transport = last_error
-                        .as_ref()
-                        .is_some_and(super::error::LlmError::is_transport);
+                    // mika#3126: membership in the mika#1744 concession is
+                    // decided at one site, never by an `is_transport` read here
+                    // — and an attempt cut at its plafond does not belong to it.
+                    let transport_concession = transport_concession_applies(
+                        last_error.as_ref().map(|e: &LlmError| e as &dyn RetryClass),
+                        last_cap_exhausted,
+                    );
                     // mika#2189 D3: derived from the effective plafond, not
                     // from literals calibrated against a 120 s one. At the
                     // default plafond these reproduce 60 and 90+30 exactly.
@@ -520,13 +534,24 @@ impl OpenAiCompatibleProvider {
                     // used to be two, and the outcome line ignored the deadline
                     // entirely.
                     if let RetryVerdict::DeadlineInsufficient { threshold_secs, .. } =
-                        deadline_verdict(Some(remaining), last_was_transport, &thresholds)
+                        deadline_verdict(Some(remaining), transport_concession, &thresholds)
                     {
                         warn!(
                             attempt,
                             remaining_ms = remaining.as_millis() as u64,
                             threshold_secs,
-                            last_was_transport,
+                            // mika#3126: two fields, because they answer two
+                            // questions. `transport_concession` is the
+                            // **decision** the threshold came from;
+                            // `last_cap_exhausted` is the **measurement** that
+                            // may have withdrawn it. One field could not say
+                            // "transport, but cut at its plafond" — the shape of
+                            // the incident — and that reading is the whole point
+                            // of the line. Replaces `last_was_transport`, whose
+                            // name claimed to report the class and in fact
+                            // reported the decision.
+                            transport_concession,
+                            last_cap_exhausted,
                             "aborting retry chain — remaining deadline insufficient for another attempt"
                         );
                         // mika#2331 AC2: the attempt that did NOT happen is
@@ -609,6 +634,13 @@ impl OpenAiCompatibleProvider {
                     attempt,
                     max_attempts,
                     Some(e),
+                    // mika#3126: the flag of **this** attempt, the one the
+                    // guard at the top of the next iteration will read as
+                    // `last_cap_exhausted`. Reading the retained field here
+                    // would describe the previous attempt and re-open the
+                    // mika#2362 divergence — the outcome line announcing a
+                    // retry the guard is about to refuse.
+                    attempt_cap_exhausted,
                     deadline_remaining_ms.map(Duration::from_millis),
                     &thresholds,
                 )),
@@ -656,6 +688,11 @@ impl OpenAiCompatibleProvider {
                     if attempt + 1 < max_attempts && e.is_retryable() {
                         warn!(attempt, max_attempts, error = %e, "transient API error");
                         last_error = Some(e);
+                        // mika#3126: retained beside the error, and overwritten
+                        // on every retained failure rather than accumulated —
+                        // the question the guard asks is about the attempt that
+                        // just failed, not about any earlier one.
+                        last_cap_exhausted = attempt_cap_exhausted;
                         continue;
                     }
                     return Err(e);
@@ -670,12 +707,15 @@ impl OpenAiCompatibleProvider {
         // predicate, so the agreement is structural. The margin is still
         // measured *here* rather than reused from the guard: this site runs at
         // a later instant, and its verdict may legitimately differ.
-        let last_was_transport = last_error
-            .as_ref()
-            .is_some_and(super::error::LlmError::is_transport);
+        // mika#3126: the same pair as the guard, so this message cannot name a
+        // threshold the guard did not apply.
+        let transport_concession = transport_concession_applies(
+            last_error.as_ref().map(|e| e as &dyn RetryClass),
+            last_cap_exhausted,
+        );
         let deadline_aborted = deadline_verdict(
             deadline.map(|dl| dl.saturating_duration_since(Instant::now())),
-            last_was_transport,
+            transport_concession,
             &thresholds,
         )
         .is_deadline_insufficient();
