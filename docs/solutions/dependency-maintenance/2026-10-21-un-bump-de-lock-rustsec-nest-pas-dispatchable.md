@@ -19,6 +19,15 @@ tags: [mika-2861, mika-2685, dependency, security, cargo-audit, cargo-update, lo
 
 # Un bump de `Cargo.lock` pour RUSTSEC n'est pas dispatchable — le bac à sable refuse `cargo update`
 
+> **Ce document couvre une classe sur deux.** Il traite le bump d'un nœud
+> **transitif** dans `Cargo.lock`. Une montée de version **déclarée dans
+> `Cargo.toml`** est bloquée aussi, mais par une autre porte — l'édition et la
+> résolution passent, le **dépaquetage** échoue (`~/.cargo/registry/src/` en
+> lecture seule), donc le blocage ressemble à un succès. Si votre geste est une
+> édition de manifeste, ne concluez pas « ceci ne s'applique pas » :
+> [2026-11-24 — une montée déclarée dans `Cargo.toml` n'est pas plus dispatchable](2026-11-24-une-montee-declaree-dans-cargo-toml-nest-pas-plus-dispatchable.md)
+> porte le préflight de cette classe-là (mika#3131).
+
 ## Le problème
 
 mika#2861 demandait de monter quatre nœuds de `Cargo.lock` pour éteindre
