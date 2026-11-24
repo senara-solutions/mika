@@ -115,6 +115,31 @@ pub(crate) enum SessionRemoteIssue {
     },
 }
 
+impl SessionRemoteIssue {
+    /// Vrai quand **aucune réponse n'a été reçue** — rien n'écoute encore, ou le
+    /// `timeout` de [`post`] a expiré sur un port lié dont le serveur ne sert pas
+    /// encore. C'est la seule classe qu'une attente peut changer (mika#3138).
+    ///
+    /// Le prédicat vit **sur le type**, et non chez son appelant : ce module est
+    /// le seul juge du vocabulaire d'erreur, et une seconde lecture de ce
+    /// vocabulaire chez un appelant dériverait le jour où une variante
+    /// s'ajoute. Sa visibilité est ce qui tient « un seul site décide de la
+    /// classe réessayable » — un unique appelant, le démarrage de la TUI
+    /// (`commands/chat.rs::ouvrir_en_attendant_spirit`).
+    ///
+    /// Le discriminant est « une réponse a-t-elle été reçue », jamais « est-ce
+    /// que ça pourrait marcher plus tard ». Un 401 ne devient pas juste en
+    /// attendant, et c'est la panne la plus fréquente après celle-ci : la faire
+    /// attendre le budget entier la rendrait illisible. Un 404, un 409 et tout
+    /// autre statut **sont** des réponses, donc des provenances ; les attendre à
+    /// nouveau en fabriquerait une fausse, ce qui coûte plus cher qu'une
+    /// provenance absente (motif mika#2331, que le doc-comment de l'enum invoque
+    /// déjà pour le `None` de `status`).
+    pub(crate) fn attendre_peut_changer_lissue(&self) -> bool {
+        matches!(self, Self::Unexpected { status: None, .. })
+    }
+}
+
 // `Display` à la main : rien à chaîner, aucune frontière de bibliothèque.
 impl std::fmt::Display for SessionRemoteIssue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -720,5 +745,60 @@ mod tests {
             1,
             "un seul appel attendu"
         );
+    }
+
+    /// Le fait mesuré : `attendre_peut_changer_lissue` est vrai pour la **seule**
+    /// classe où aucune réponse n'a été reçue, et faux pour les cinq autres
+    /// (mika#3138).
+    ///
+    /// Le `Some(503)` est le cas qui compte : c'est le statut qu'un lecteur futur
+    /// ajouterait par analogie avec `/health`. Le discriminant n'est pas « est-ce
+    /// que ça pourrait marcher plus tard » mais « une réponse a-t-elle été
+    /// reçue » — une réponse reçue **est** une provenance, et l'attendre à
+    /// nouveau en fabriquerait une fausse (motif mika#2331).
+    #[test]
+    fn mika3138_seule_labsence_de_reponse_se_reessaie() {
+        let cas = [
+            (
+                SessionRemoteIssue::Unexpected {
+                    status: None,
+                    url: "http://127.0.0.1:1/api/v1/sessions".to_string(),
+                    body: "connection refused".to_string(),
+                },
+                true,
+            ),
+            (
+                SessionRemoteIssue::Unexpected {
+                    status: Some(503),
+                    url: "http://127.0.0.1:1/api/v1/sessions".to_string(),
+                    body: String::new(),
+                },
+                false,
+            ),
+            (
+                SessionRemoteIssue::Unexpected {
+                    status: Some(500),
+                    url: "http://127.0.0.1:1/api/v1/sessions".to_string(),
+                    body: "boom".to_string(),
+                },
+                false,
+            ),
+            (SessionRemoteIssue::Denied, false),
+            (
+                SessionRemoteIssue::NotFound {
+                    url: "http://127.0.0.1:1/api/v1/sessions".to_string(),
+                },
+                false,
+            ),
+            (SessionRemoteIssue::Busy, false),
+        ];
+
+        for (probleme, attendu) in cas {
+            assert_eq!(
+                probleme.attendre_peut_changer_lissue(),
+                attendu,
+                "{probleme:?}"
+            );
+        }
     }
 }
