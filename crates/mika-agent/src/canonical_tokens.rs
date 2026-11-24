@@ -8163,4 +8163,348 @@ And `run_gh(\"issue create --title t -l ready,urgent\")` creates it promoted.
             }
         }
     }
+
+    // ---- mika#3140 : les sorties de précondition de l'auto-fire se nomment --
+
+    /// Ce qu'une traversée du corps d'une fonction a trouvé comme sorties sans
+    /// valeur (mika#3140 D5).
+    struct SortiesDuCorps {
+        /// Les lignes (1-indexées **dans le fichier**) des sorties **nues** :
+        /// un `return` sans valeur qu'aucune émission ne précède dans son bloc
+        /// englobant immédiat.
+        nues: Vec<usize>,
+        /// Les lignes de **toutes** les sorties sans valeur, nues ou
+        /// accompagnées. Bonne foi : un prédicat qui ne discriminerait plus
+        /// rendrait ces deux ensembles égaux, et le scan serait vert pour rien.
+        toutes: Vec<usize>,
+        /// Le corps a-t-il été refermé ? Un `false` dit que la délimitation a
+        /// échoué — donc qu'une absence de sortie ne prouve rien (mika#2340).
+        corps_clos: bool,
+    }
+
+    /// `octets[i..]` commence-t-il par `mot` ?
+    ///
+    /// Comparaison d'octets, et jamais un `&source[i..]` : ce scan lit un
+    /// fichier dont les commentaires sont en français, où un décalage calculé
+    /// tombe au milieu d'un caractère UTF-8 et fait paniquer le slice
+    /// (mika#764 / mika#2103). Un `&[u8]` n'a pas de frontière à violer.
+    fn mika3140_commence_par(octets: &[u8], i: usize, mot: &[u8]) -> bool {
+        octets.len() >= i + mot.len() && &octets[i..i + mot.len()] == mot
+    }
+
+    /// Un octet peut-il appartenir à un identifiant ? Sert à ne pas confondre
+    /// `return` avec `returned` ou `_return`.
+    fn mika3140_octet_de_mot(o: u8) -> bool {
+        o.is_ascii_alphanumeric() || o == b'_'
+    }
+
+    /// Traverse le corps de la fonction ouverte par `signature` et sépare ses
+    /// sorties sans valeur en nues et accompagnées.
+    ///
+    /// **Le prédicat, et pourquoi il n'est pas « compter les `return;` ».** Le
+    /// corps de `try_dispatch_pilot_after_groom_success` porte une dizaine de
+    /// `return;`, et tous sauf un sont **précédés d'une émission** dans leur
+    /// bloc : ce sont les refus nommés des étapes 3bis, 4, 4bis et 5a-5g, qui
+    /// sont exactement ce que le vol voulait obtenir. Un compteur de `return;`
+    /// mesurerait donc la taille de la fonction, pas son mutisme. Ce qui est
+    /// mesuré ici est l'absence de parole : *aucun* `info!`, `warn!` ou
+    /// `error!` entre l'accolade ouvrante du bloc englobant immédiat et la
+    /// sortie.
+    ///
+    /// **Le corps est délimité par équilibrage d'accolades**, depuis la `{` de
+    /// la signature jusqu'à celle qui la referme. C'est ce qui rend toute
+    /// troncature au premier `#[cfg(test)]` inutile — la borne est structurelle,
+    /// pas lexicale (le faux prémisse que mika#2310 a démonté) — et c'est aussi
+    /// ce qui garantit qu'une fonction voisine ne contribue aucune sortie.
+    ///
+    /// Chaînes et commentaires sont suivis, de sorte que le mot `return` dans
+    /// une prose ou dans un littéral ne compte pas. Aucun helper partagé
+    /// n'existe pour cela dans ce crate : chaque site porte sa propre machine à
+    /// états (`auto_pull.rs`, `kg/subject_extractor.rs`, `teams/engine.rs`), et
+    /// celle-ci reste locale au scan qui l'emploie.
+    fn mika3140_sorties_sans_valeur(source: &str, signature: &str) -> SortiesDuCorps {
+        const EMISSIONS: [&[u8]; 3] = [b"info!(", b"warn!(", b"error!("];
+
+        let octets = source.as_bytes();
+        let debut = source.find(signature).unwrap_or_else(|| {
+            panic!("mika#3140 — `{signature}` est introuvable : ce scan vise une forme morte")
+        });
+
+        // La ligne de la signature, pour que les lignes rendues soient celles
+        // du fichier et non celles du corps : un numéro qu'on ne peut pas
+        // ouvrir dans un éditeur n'est pas actionnable.
+        let mut ligne = 1 + octets[..debut].iter().filter(|o| **o == b'\n').count();
+
+        // Une entrée par bloc ouvert : « une émission a-t-elle déjà parlé
+        // ici ? ». L'émission marque le bloc courant, donc un `warn!` niché
+        // dans un `if let Err(…)` n'absout pas le bloc qui le contient.
+        let mut blocs: Vec<bool> = Vec::new();
+        let mut nues = Vec::new();
+        let mut toutes = Vec::new();
+        let mut corps_clos = false;
+
+        let mut dans_chaine = false;
+        let mut dans_commentaire_ligne = false;
+        let mut dans_commentaire_bloc = false;
+        let mut i = debut;
+
+        while i < octets.len() {
+            let o = octets[i];
+
+            if o == b'\n' {
+                ligne += 1;
+                dans_commentaire_ligne = false;
+                i += 1;
+                continue;
+            }
+            if dans_commentaire_ligne {
+                i += 1;
+                continue;
+            }
+            if dans_commentaire_bloc {
+                if mika3140_commence_par(octets, i, b"*/") {
+                    dans_commentaire_bloc = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if dans_chaine {
+                if o == b'\\' {
+                    i += 2;
+                } else {
+                    if o == b'"' {
+                        dans_chaine = false;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            if o == b'"' {
+                dans_chaine = true;
+                i += 1;
+                continue;
+            }
+            if mika3140_commence_par(octets, i, b"//") {
+                dans_commentaire_ligne = true;
+                i += 2;
+                continue;
+            }
+            if mika3140_commence_par(octets, i, b"/*") {
+                dans_commentaire_bloc = true;
+                i += 2;
+                continue;
+            }
+            if o == b'{' {
+                blocs.push(false);
+                i += 1;
+                continue;
+            }
+            if o == b'}' {
+                blocs.pop();
+                if blocs.is_empty() {
+                    corps_clos = true;
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(mot) = EMISSIONS
+                .iter()
+                .find(|m| mika3140_commence_par(octets, i, m))
+            {
+                if let Some(bloc) = blocs.last_mut() {
+                    *bloc = true;
+                }
+                i += mot.len();
+                continue;
+            }
+            if mika3140_commence_par(octets, i, b"return")
+                && (i == 0 || !mika3140_octet_de_mot(octets[i - 1]))
+            {
+                // Sans valeur ⇔ rien ne suit que la fin de l'instruction, du
+                // bras de `match` ou du bloc.
+                let mut j = i + b"return".len();
+                while j < octets.len() && octets[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let sans_valeur = matches!(octets.get(j), Some(b';') | Some(b',') | Some(b'}'));
+                if sans_valeur {
+                    toutes.push(ligne);
+                    if blocs.last() == Some(&false) {
+                        nues.push(ligne);
+                    }
+                }
+                i += b"return".len();
+                continue;
+            }
+            i += 1;
+        }
+
+        SortiesDuCorps {
+            nues,
+            toutes,
+            corps_clos,
+        }
+    }
+
+    /// La signature qui ouvre le corps surveillé, composée à l'exécution pour
+    /// que ce fichier ne porte pas une copie du code qu'il surveille.
+    fn mika3140_signature_de_lautofire() -> String {
+        format!("async fn {}(", "try_dispatch_pilot_after_groom_success")
+    }
+
+    /// **V8 / AC7 — une sortie de précondition ne peut plus être muette.**
+    ///
+    /// Le défaut mesuré le 2026-11-22 : le groom de #3119 est sorti de
+    /// `try_dispatch_pilot_after_groom_success` par un `return` nu, sans
+    /// événement ni ligne d'audit, et rien n'en a gardé la trace. Aucun test
+    /// comportemental ne couvre cette classe — un éditeur qui ajoute une
+    /// septième précondition avec un `return` nu laisse les sept tests du vol
+    /// verts, ce qui est très exactement la forme du défaut d'aujourd'hui.
+    ///
+    /// Le fichier est lu **directement**, et la seule classification qui le
+    /// qualifie est [`crate::source_scan::is_test_source_path`] : ni allowlist
+    /// de fichiers (mika#2309), ni troncature au premier `#[cfg(test)]`, dont la
+    /// délimitation par accolades rend la question sans objet.
+    #[test]
+    fn mika3140_les_sorties_de_precondition_de_lautofire_sont_nommees() {
+        /// L'unique sortie nue tolérée dans le corps de
+        /// `try_dispatch_pilot_after_groom_success`.
+        ///
+        /// Donnée précise : le `return` de l'étape 1,
+        /// `task.dispatch_class != Some("groom")`.
+        /// Décision : mika#3140 — ce n'est pas une précondition échouée du groom
+        /// mais le discriminant de pertinence, franchi à chaque callback de
+        /// l'agent toutes classes confondues ; l'instrumenter noierait la
+        /// population des six refus sous celle des callbacks `implement`
+        /// (mika#2205).
+        /// Ce n'est donc PAS un suivi à armer : l'exception est définitive et
+        /// argumentée.
+        const SORTIES_NUES_TOLEREES: usize = 1;
+
+        let rel = "crates/mika-agent/src/task_engine/dispatcher.rs";
+        let chemin = repo_root().join(rel);
+        assert!(
+            !crate::source_scan::is_test_source_path(&chemin),
+            "mika#3140 — {rel} serait classé source de test : le scan lirait des \
+             fixtures et non la production"
+        );
+        let source = std::fs::read_to_string(&chemin)
+            .unwrap_or_else(|e| panic!("mika#3140 — {rel} illisible ({e}) : le scan ne lit rien"));
+
+        let signature = mika3140_signature_de_lautofire();
+        let occurrences = source.matches(signature.as_str()).count();
+        assert_eq!(
+            occurrences, 1,
+            "bonne foi : la signature surveillée doit apparaître exactement une fois \
+             dans {rel}, trouvée {occurrences} fois — un scan qui ne reconnaît plus sa \
+             forme serait vert pour rien"
+        );
+
+        let sorties = mika3140_sorties_sans_valeur(&source, &signature);
+        assert!(
+            sorties.corps_clos,
+            "bonne foi : le corps n'a pas été refermé par équilibrage d'accolades. \
+             Une absence de sortie ne prouverait rien — elle dirait seulement que la \
+             délimitation a échoué (mika#2340)."
+        );
+        assert!(
+            sorties.toutes.len() > sorties.nues.len(),
+            "bonne foi : le prédicat ne discrimine plus. Le corps porte des sorties \
+             **accompagnées** — les refus nommés des étapes 3bis, 4, 4bis et 5a-5g — \
+             et un scan qui les compterait comme nues mesurerait la taille de la \
+             fonction, pas son mutisme. Trouvé {} sorties sans valeur dont {} nues.",
+            sorties.toutes.len(),
+            sorties.nues.len()
+        );
+
+        assert_eq!(
+            sorties.nues.len(),
+            SORTIES_NUES_TOLEREES,
+            "mika#3140 — {} sortie(s) nue(s) dans le corps de \
+             `try_dispatch_pilot_after_groom_success` (lignes {:?} de {rel}), attendu \
+             {SORTIES_NUES_TOLEREES}. L'assertion est une **égalité**, donc elle \
+             rougit dans les deux sens. \
+             RÉSOLUTION, si le compte a monté : une précondition est sortie sans \
+             rien dire — c'est le défaut du 2026-11-22 sur #3119, où le groom est \
+             sorti en silence et le frein STOP n'a jamais été atteint. Faire passer \
+             la sortie par `refuse_on_precondition`, qui nomme son verdict et écrit \
+             sa ligne d'audit, plutôt que de rehausser ce nombre. \
+             RÉSOLUTION, s'il a baissé : l'étape 1 a cessé d'être une sortie nue, \
+             donc l'exception a survécu à sa raison d'être — la retirer du même \
+             geste (c'est l'allowlist que mika#2309 condamne).",
+            sorties.nues.len(),
+            sorties.nues
+        );
+    }
+
+    /// **AC7, contrôle négatif — et sans lui le scan ci-dessus ne dit rien.**
+    ///
+    /// « Aucune sortie nue de trop » est satisfait en entier par un détecteur
+    /// qui ne détecte rien, et il le reste tant que le dépôt est propre — c'est
+    /// le jour de la régression qu'on apprendrait qu'il était aveugle. La
+    /// détection est donc mesurée sur une entrée **fabriquée**, où les quatre
+    /// formes voisines sont présentes et doivent être distinguées (motif
+    /// mika#3132).
+    #[test]
+    fn mika3140_le_scan_rougit_sur_une_seconde_sortie_nue() {
+        let signature = "async fn faux_autofire(";
+
+        // Quatre formes, dont une seule est une sortie nue : l'étape 1.
+        let fabrique = concat!(
+            "async fn faux_autofire(task: &Task) {\n",
+            "    // Le discriminant de pertinence : la sortie nue tolérée.\n",
+            "    if task.classe != \"groom\" {\n",
+            "        return;\n",
+            "    }\n",
+            "    // Une sortie accompagnée : elle parle avant de partir.\n",
+            "    if task.jeton.is_none() {\n",
+            "        warn!(\"pas de jeton\");\n",
+            "        return;\n",
+            "    }\n",
+            "    // Une sortie qui rend une valeur n'est pas une sortie nue.\n",
+            "    match verifier(task) {\n",
+            "        Ok(v) => v,\n",
+            "        Err(p) => return refuser(p).await,\n",
+            "    };\n",
+            "    // Le mot dans un commentaire ne compte pas : return;\n",
+            "    let _ = \"ni dans une chaine : return;\";\n",
+            "}\n",
+        );
+
+        let propre = mika3140_sorties_sans_valeur(fabrique, signature);
+        assert!(propre.corps_clos, "la fabrique doit se refermer");
+        assert_eq!(
+            propre.nues,
+            vec![4],
+            "une seule sortie nue sur l'entrée fabriquée : celle de l'étape 1, \
+             ligne 4. Trouvé {:?}",
+            propre.nues
+        );
+        assert_eq!(
+            propre.toutes,
+            vec![4, 9],
+            "deux sorties sans valeur en tout — la nue et l'accompagnée. Ni le \
+             `return <expr>` du bras de `match`, ni le mot en commentaire, ni le \
+             mot en littéral ne sont des sorties. Trouvé {:?}",
+            propre.toutes
+        );
+
+        // La régression : une septième précondition qui sort sans rien dire.
+        let regression = fabrique.replace(
+            "    // Le mot dans un commentaire",
+            "    if task.parente.is_none() {\n        return;\n    }\n    \
+             // Le mot dans un commentaire",
+        );
+        let vu = mika3140_sorties_sans_valeur(&regression, signature);
+        assert_eq!(
+            vu.nues.len(),
+            2,
+            "le scan doit VOIR la seconde sortie nue — s'il ne la voit pas sur une \
+             entrée fabriquée, sa verdeur sur le dépôt ne prouve rien. Trouvé {:?}",
+            vu.nues
+        );
+    }
 }
