@@ -443,6 +443,39 @@ pub static CONFIG_KEYS: &[ConfigKeyInfo] = &[
         secret: false,
         description: "Claude thinking level (low/medium/high/off)",
     },
+    // mika#3132 — les quatre clés que `SETTABLE_CONFIG_KEYS` expose déjà au modèle
+    // et à la TUI. Le littéral est écrit deux fois parce que `mika-common` ne peut
+    // pas dépendre de `mika-agent`; l'inclusion est tenue par
+    // `config_keys::tests::mika3132_toute_cle_reglable_est_declaree_database_backed`.
+    // Retirer une de ces quatre entrées fait rougir cette garde, jamais ce fichier.
+    ConfigKeyInfo {
+        key: "chat_id",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Telegram chat id the agent answers on",
+    },
+    ConfigKeyInfo {
+        key: "proactive_daily_budget",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Per-tenant daily ceiling of proactive wake-ups: an integer between 0 (none at all) and 24. Unset means the engine default.",
+    },
+    ConfigKeyInfo {
+        key: "proactive_pause_until",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Pause proactive messages until this RFC 3339 instant, or none (neutral) to resume",
+    },
+    ConfigKeyInfo {
+        key: "language",
+        backend: ConfigBackend::Database,
+        env_var: None,
+        secret: false,
+        description: "Per-tenant conversation language: fr or en. Unset poses nothing.",
+    },
     // mika#2425 — the per-tenant half of `[context.history]`. The identity
     // declares a role's floor; these two may only NARROW it, never widen it.
     // Deliberately absent from `mika_agent::config_keys::SETTABLE_CONFIG_KEYS`:

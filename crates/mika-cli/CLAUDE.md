@@ -131,6 +131,31 @@ SELECT id, result FROM tasks
 - `mika reminders get <id>` — Show full details for a single reminder. Validates the task is a reminder (trigger_type: time/recurring). Supports `--format text|json|yaml`.
 - `mika reminders cancel <id>` — Cancel a reminder by ID.
 
+### `mika config set` — trois canaux pour une clé per-tenant (mika#3132)
+
+La branche `Database` de `run_set` ne lisait sa valeur que dans argv : un
+`chat_id` passait par l'historique du shell et par la table des processus, et son
+absence rendait un `Usage:` même devant un opérateur. Deux fonctions **pures** la
+décident maintenant, et elles sont les seuls juges de ce qu'elles jugent :
+
+- `decide_database_value_source(value, stdin_is_terminal)` → `Argv` | `Stdin` |
+  `Prompt`. `is_terminal` est **injecté**, jamais lu dans la fonction — c'est ce
+  qui rend les trois cas mesurables sans terminal ni pipe. Une valeur fournie rend
+  `Argv` sous les deux états de stdin : le chemin existant n'ouvre ni pipe ni
+  prompt, et aucune invocation scriptée ne change de comportement.
+- `finalize_database_value(key, channel, raw)` — site unique du refus de forme :
+  trim complet (aucune clé `Database` n'admet d'espace interne significatif, et un
+  `$(…)` de shell en ajoute volontiers une), puis refus du vide et du multi-ligne
+  **en nommant la clé et le canal**. Écrire une chaîne vide serait pire qu'un
+  refus — une clé présente au vide ne se lit pas comme une clé absente
+  (mika#2331) — et « Invalid chat_id » sur un `cat fichier |` enverrait chercher
+  la panne du côté de la valeur alors qu'elle est du côté du tuyau.
+
+`validate_config_value` garde son **site d'appel unique, après matérialisation** :
+les deux juges ne mesurent pas la même chose, l'un le canal, l'autre le domaine de
+la clé. Le `println!` final affiche la valeur, stdin comprise — le but de stdin est
+de la garder hors de l'historique du shell, pas hors de l'écran.
+
 ### `mika ask`
 
 Sends a single non-interactive message; `--format text|json|yaml` (default `text`) controls output format — `json` emits `{"role":"assistant","content":"..."}` to stdout (includes optional `pending_tasks` array when background callback tasks were spawned during the session — omitted when empty for backward compatibility); after the agent loop, queries for pending callback tasks and prints a stderr notice if any exist (`[mika] N background task(s) started. Open TUI or start server to receive results.`).

@@ -1047,4 +1047,194 @@ mod tests {
         );
         assert_eq!(parse_context_history_scope("channel"), None);
     }
+
+    // -- mika#3132: toute clé réglable est déclarée `Database`-backed -------
+
+    /// Les clés réglables dont on accepte sciemment qu'elles ne soient pas
+    /// déclarées `Database`-backed dans `CONFIG_KEYS`. Livrée VIDE, et assertie
+    /// vide : voir la Fire-Disposition du plan de mika#3132.
+    const SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT: &[&str] = &[];
+
+    /// Rend la raison pour laquelle `key` n'est pas réglable par
+    /// `mika config set`, telle que sa déclaration la décrit — `None` quand la
+    /// déclaration est celle qu'il faut.
+    ///
+    /// Pure, et la déclaration arrive **en argument** : c'est la seule forme qui
+    /// permette de lui présenter une entrée fabriquée, donc de mesurer qu'elle
+    /// voit, sans rien retirer de `CONFIG_KEYS`.
+    ///
+    /// Les trois états sont rendus distincts parce qu'ils n'appellent pas le même
+    /// geste : déclarer la clé, corriger son backend, retirer son `env_var`.
+    fn settable_key_divergence(
+        key: &str,
+        declared: Option<&mika_common::config::ConfigKeyInfo>,
+    ) -> Option<String> {
+        let Some(info) = declared else {
+            return Some(format!(
+                "`{key}` est réglable (SETTABLE_CONFIG_KEYS) mais absente de CONFIG_KEYS — \
+                 `mika config set {key} …` répond « Unknown config key ». Déclare-la dans le \
+                 bloc `Database` de `mika-common/src/config.rs`."
+            ));
+        };
+        if info.backend != mika_common::config::ConfigBackend::Database {
+            return Some(format!(
+                "`{key}` est déclarée sur le backend {:?} — `mika config set {key} …` écrirait \
+                 dans le mauvais dos (fichier ou `.env`) pendant que l'agent et la TUI lisent \
+                 `customer_config`. Déclare-la `ConfigBackend::Database` dans \
+                 `mika-common/src/config.rs`.",
+                info.backend
+            ));
+        }
+        if let Some(env_var) = info.env_var {
+            return Some(format!(
+                "`{key}` est déclarée `Database` mais porte l'env var `{env_var}` — une \
+                 variable d'environnement de flotte rendrait l'écriture par tenant vraie et \
+                 sans effet, ce que mika#2293 a mesuré sur la paire de timeouts. Retire son \
+                 `env_var` dans `mika-common/src/config.rs`."
+            ));
+        }
+        None
+    }
+
+    /// Rend, pour chaque clé fournie, la raison pour laquelle elle n'est pas
+    /// déclarée `Database`-backed dans `CONFIG_KEYS` — vide quand tout va bien.
+    ///
+    /// Pure : prend la liste **en argument** et non [`SETTABLE_CONFIG_KEYS`], ce
+    /// qui est ce qui rend les contrôles négatifs écrivables sans casser le
+    /// dépôt.
+    fn settable_keys_not_database_backed(keys: &[&str]) -> Vec<String> {
+        keys.iter()
+            .filter_map(|key| {
+                settable_key_divergence(key, mika_common::config::lookup_config_key(key))
+            })
+            .collect()
+    }
+
+    /// **V1** — toute clé de [`SETTABLE_CONFIG_KEYS`] est déclarée
+    /// `Database`-backed, sans `env_var`, dans `mika_common::config::CONFIG_KEYS`.
+    ///
+    /// L'invariant est une **inclusion**, jamais une égalité : `CONFIG_KEYS`
+    /// porte des clés `Database`-backed délibérément hors de la surface d'outil —
+    /// `context_history_scope` et `context_history_max_tokens`, dont l'absence de
+    /// [`SETTABLE_CONFIG_KEYS`] *est* le refus 2 de mika#2425, tenu vingt lignes
+    /// plus haut par `mika2425_the_db_half_is_absent_from_the_tool_surface`. Une
+    /// bijection ferait de ces deux clés une violation et pousserait à les
+    /// exposer pour rendre la garde verte.
+    ///
+    /// Cette garde vit dans `mika-agent` parce que c'est le seul crate qui voit
+    /// les deux registres : `mika-common` ne peut pas dépendre de celui-ci.
+    #[test]
+    fn mika3132_toute_cle_reglable_est_declaree_database_backed() {
+        assert!(
+            SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT.is_empty(),
+            "mika#3132 (V5) — quand cette garde rougit, déclare la clé dans le bloc \
+             `Database` de `mika-common/src/config.rs` : n'ajoute pas d'entrée ici. Une \
+             allowlist qui cesse d'être vide est exactement le faux vert que mika#3132 a \
+             fermé. Résidu: {SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT:?}"
+        );
+
+        let scrutinees: Vec<&str> = SETTABLE_CONFIG_KEYS
+            .iter()
+            .copied()
+            .filter(|key| !SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT.contains(key))
+            .collect();
+        let divergences = settable_keys_not_database_backed(&scrutinees);
+
+        assert!(
+            divergences.is_empty(),
+            "mika#3132 — une clé que `SETTABLE_CONFIG_KEYS` expose au modèle et à la TUI \
+             n'est pas réglable par `mika config set`. Les deux listes sont le même littéral \
+             écrit deux fois, et rien d'autre que cette garde ne les relie:\n  - {}",
+            divergences.join("\n  - ")
+        );
+    }
+
+    /// **V2** — le détecteur voit une clé réglable absente de `CONFIG_KEYS`.
+    ///
+    /// `timezone` sert de témoin conforme : elle est déclarée `Database` sans
+    /// `env_var` depuis mika#2425, donc elle ne doit rien rapporter, ni avant ni
+    /// après les déclarations de ce vol.
+    #[test]
+    fn mika3132_le_detecteur_voit_une_cle_absente() {
+        let divergences =
+            settable_keys_not_database_backed(&["timezone", "cle_inexistante_mika3132"]);
+        assert_eq!(
+            divergences.len(),
+            1,
+            "`timezone` est déclarée Database-backed et ne doit rien rapporter: {divergences:?}"
+        );
+        assert!(
+            divergences[0].contains("cle_inexistante_mika3132"),
+            "le message doit nommer la clé: {}",
+            divergences[0]
+        );
+        assert!(
+            divergences[0].contains("mika-common/src/config.rs"),
+            "et le fichier où la déclarer — un message qui nomme le défaut sans nommer le \
+             geste fait rouvrir l'enquête à chaque fois: {}",
+            divergences[0]
+        );
+    }
+
+    /// **V3** — le détecteur voit un backend qui n'est pas `Database`.
+    #[test]
+    fn mika3132_le_detecteur_voit_un_mauvais_backend() {
+        let divergences = settable_keys_not_database_backed(&["log_level"]);
+        assert_eq!(
+            divergences.len(),
+            1,
+            "`log_level` est déclarée sur le backend File: {divergences:?}"
+        );
+        assert!(
+            divergences[0].contains("log_level") && divergences[0].contains("File"),
+            "le message doit nommer la clé et le backend trouvé: {}",
+            divergences[0]
+        );
+        assert!(
+            divergences[0].contains("mauvais dos"),
+            "une clé déclarée `File` fait écrire `mika config set` ailleurs que là où la TUI \
+             lit : le remède n'est pas celui d'une clé absente, donc le message ne doit pas \
+             se confondre avec lui: {}",
+            divergences[0]
+        );
+    }
+
+    /// **V4** — le détecteur voit un `env_var` parasite sur une clé `Database`.
+    ///
+    /// Aucune entrée de `CONFIG_KEYS` ne porte cette forme aujourd'hui, et c'est
+    /// bien : l'état se mesure sur une déclaration fabriquée, ce que la signature
+    /// de [`settable_key_divergence`] rend possible sans toucher au registre.
+    #[test]
+    fn mika3132_le_detecteur_voit_un_env_var_parasite() {
+        let parasite = mika_common::config::ConfigKeyInfo {
+            key: "cle_fictive_mika3132",
+            backend: mika_common::config::ConfigBackend::Database,
+            env_var: Some("MIKA_CLE_FICTIVE_MIKA3132"),
+            secret: false,
+            description: "fixture de test — jamais déclarée dans CONFIG_KEYS",
+        };
+        let divergence = settable_key_divergence(parasite.key, Some(&parasite))
+            .expect("un `env_var` sur une clé Database doit être rapporté");
+        assert!(
+            divergence.contains("MIKA_CLE_FICTIVE_MIKA3132"),
+            "le message doit nommer la variable qui ombrage l'écriture: {divergence}"
+        );
+        assert!(
+            divergence.contains("sans effet"),
+            "le mode de panne est une écriture qui réussit et ne sert à rien — c'est ce qu'il \
+             faut dire, pas « mauvais backend »: {divergence}"
+        );
+
+        let conforme = mika_common::config::ConfigKeyInfo {
+            env_var: None,
+            ..parasite
+        };
+        assert_eq!(
+            settable_key_divergence(conforme.key, Some(&conforme)),
+            None,
+            "la même déclaration sans `env_var` est conforme : le détecteur ne doit pas \
+             rapporter sur la seule base d'une clé absente de CONFIG_KEYS, puisque la \
+             déclaration lui est fournie"
+        );
+    }
 }

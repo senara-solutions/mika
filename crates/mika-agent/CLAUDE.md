@@ -133,6 +133,26 @@ a "session" *is* a message, so `session` does not trim the window, it empties it
 — live in the root `CLAUDE.md` § *La fenêtre de conversation est réglable par
 tenant*.
 
+### Toute clé réglable est déclarée `Database`-backed (mika#3132)
+
+`config_keys::SETTABLE_CONFIG_KEYS` est la surface de `set_config` et de la TUI ;
+`mika_common::config::CONFIG_KEYS` est le registre que la CLI consulte. Le même
+littéral y est écrit deux fois, parce que `mika-common` ne peut pas dépendre de ce
+crate — et jusqu'à mika#3132 rien ne reliait les deux : `chat_id`,
+`proactive_daily_budget`, `proactive_pause_until` et `language` étaient réglables
+par le modèle et répondaient *« Unknown config key »* à `mika config set`.
+
+`mika3132_toute_cle_reglable_est_declaree_database_backed` tient l'invariant, et
+c'est une **inclusion** et jamais une égalité : les deux clés
+`context_history_*` sont `Database`-backed et délibérément hors de la surface
+d'outil (refus 2 de mika#2425), qu'une bijection pousserait à exposer pour
+rendre la garde verte. Son allowlist `SETTABLE_KEYS_NOT_DB_BACKED_EXEMPT` est
+livrée **vide** et son vide est asserté : quand la garde rougit, la clé se
+déclare dans le bloc `Database` de `mika-common/src/config.rs`, jamais ici. Trois
+contrôles négatifs (clé absente, backend `File`, `env_var` parasite) mesurent la
+détection sur des entrées fabriquées, donc le détecteur reste attesté comme
+voyant même quand le dépôt est propre.
+
 ## Session Configuration
 
 `[session]` section in `identity.toml` makes an agent **single-session-by-nature** (mika#1401). `SessionIdentityConfig` in `prompt.rs` deserializes it.
