@@ -175,9 +175,17 @@ voie.
   ne pas le proposer comme remède.
 - **Un fait, un lecteur.** Quand un fichier pose deux fois la même question,
   extraire le lecteur et y faire déléguer les deux sites. Ne pas unifier pour
-  autant des questions voisines : les deux autres `ls-remote` de
+  autant des questions voisines — mais vérifier que ce sont bien des questions
+  voisines. Il était écrit ici : « les deux autres `ls-remote` de
   `dispatch-lib.sh` (`PRE_RUN_REMOTE_HEAD`, `_check_pilot_force_push`) lisent un
-  **SHA**, pas l'existence.
+  **SHA**, pas l'existence ». mika#3128 a réfuté la prémisse : #3004 a montré que
+  la garde de mika#1318 a besoin des **deux** faits — elle attribuait au pilote
+  une *suppression* de la ref distante faute de savoir distinguer « la ref a
+  avancé » de « la ref a disparu ». Les deux sites délèguent donc maintenant au
+  lecteur, qui publie le SHA qu'il jetait (`REMOTE_BRANCH_SHA`) : c'est l'inverse
+  de l'unification interdite — un seul `ls-remote --exit-code` répond aux deux
+  questions, là où deux appels auraient rouvert la fenêtre TOCTOU que la garde
+  corrige. L'invariant du scan V5 ne bouge pas : **un** site lit `--exit-code`.
 - **Un rc à trois issues reste à trois issues.** « Indéterminé » ne se replie ni
   sur « absent » ni sur « présent » en silence : le repli est nommé et écrit dans
   une surface lue (le `RESULT`, pas le stderr d'avant-pilote, perdu sur un
@@ -192,8 +200,10 @@ voie.
   correctif avec `mode=diverged` / `Push: FAILED` ; un rouge pour une autre raison
   ne confirme rien. Les tests 12a-12h (lease légitime) passent sans modification.
   Le scan V5 refuse tout `ls-remote --exit-code` sur `refs/heads/` hors du
-  lecteur, **et** affirme exactement deux appelants (anti-vacuité, classe
-  mika#2205).
+  lecteur, **et** affirme un compte exact d'appelants (anti-vacuité, classe
+  mika#2205) — deux à l'écriture, cinq depuis mika#2976 et mika#3128. Ce compte
+  **suit** chaque délégation nouvelle au lecteur ; il ne s'élargit pas, et c'est
+  l'assertion « exactement un site lit `--exit-code` » qui ne bouge jamais.
 
 ## Références
 
