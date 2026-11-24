@@ -5499,6 +5499,66 @@ const GROOM_PILOT_ISSUE_CLOSED_VALUE: &str = "issue_closed_at_autofire";
 /// deux populations, la seconde devant rester vide en régime sain.
 const GROOM_PILOT_CONSENT_UNREADABLE_VALUE: &str = "consent_unreadable_at_autofire";
 
+/// L'état d'où part le refus « marqueur non convergé » (mika#3140 R4) : le
+/// callback du groom est terminé, et rien de plus.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_BEFORE_VALUE`] (`"groom_delivered"`) : à cet
+/// instant le groom n'est précisément **pas** délivré — c'est ce que le refus
+/// constate. Porter l'autre valeur ferait mentir le `before_value` sur la seule
+/// branche où il importe.
+const GROOM_PILOT_CALLBACK_BEFORE_VALUE: &str = "groom_callback_completed";
+
+/// L'issue mika#3140 : le `result` du callback ne porte pas de marqueur de
+/// convergence (`PLAN_ITERATE`, enveloppe d'auto-skip, `result` absent).
+///
+/// Ce n'est **pas** un compteur de la porte de mika#2590 R5/R6, qui mesure la
+/// *position* du marqueur dans le texte : cette valeur nomme une **précondition**
+/// de l'auto-fire. Les deux populations restent séparables par la valeur, ce que
+/// mika#2205 exige (cf. le doc-comment de l'étape 2).
+const GROOM_PILOT_NOT_CONVERGED_VALUE: &str = "marker_not_converged";
+
+/// L'issue mika#3140 : le callback ne déclare aucune `parent_task_id`.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_PARENT_MISSING_VALUE`] : ici le moteur n'a
+/// jamais eu d'identifiant à chercher, là il en avait un et la ligne a disparu.
+/// Fondre les deux rendrait la seconde — la seule qui dénonce une base
+/// incohérente — invisible derrière la première.
+const GROOM_PILOT_PARENT_ID_ABSENT_VALUE: &str = "parent_task_id_absent";
+
+/// L'issue mika#3140 : la `parent_task_id` est connue mais la ligne parente est
+/// absente de `tasks`.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE`] : un `Ok(None)`
+/// est une réponse — la ligne n'existe pas — alors qu'un `Err` est une
+/// non-réponse. Une parente supprimée et une base injoignable sont deux pannes,
+/// aujourd'hui fondues par le `_ => return` du `get_task_unscoped` (mika#3140 R1).
+const GROOM_PILOT_PARENT_MISSING_VALUE: &str = "parent_task_row_missing";
+
+/// L'issue mika#3140 : la lecture de la ligne parente a rendu une erreur.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_PARENT_MISSING_VALUE`] (voir ci-dessus), et ce
+/// n'est pas une population qui doit exister en régime sain : une ligne ici
+/// nomme la base, pas le groom. C'est la seule des six préconditions à porter un
+/// `reason`.
+const GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE: &str = "parent_task_lookup_failed";
+
+/// L'issue mika#3140 : la ligne parente est lue et ne porte pas de
+/// `reference_url`. C'est le cas littéral du 2026-11-22 sur `a099d8af`.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_REF_URL_UNPARSABLE_VALUE`] : « aucune URL » et
+/// « une URL que le moteur ne sait pas lire » demandent deux gestes différents —
+/// le volet (B) de mika#3140 pour la première, un correctif de
+/// [`parse_repo_issue_from_url`] pour la seconde.
+const GROOM_PILOT_REF_URL_ABSENT_VALUE: &str = "parent_reference_url_absent";
+
+/// L'issue mika#3140 : la `reference_url` existe mais
+/// [`parse_repo_issue_from_url`] n'en tire pas de coordonnées d'issue.
+///
+/// Ce n'est **pas** [`GROOM_PILOT_REF_URL_ABSENT_VALUE`] (voir ci-dessus), et ce
+/// n'est pas non plus un refus de consentement : le ticket n'a même pas été
+/// identifié, donc rien n'a été demandé à la forge.
+const GROOM_PILOT_REF_URL_UNPARSABLE_VALUE: &str = "parent_reference_url_unparsable";
+
 /// Ce que la relecture du consentement a trouvé à l'instant du dispatch
 /// (mika#3118 D2).
 ///
@@ -5549,6 +5609,108 @@ impl AutofireConsent {
         match self {
             Self::Held | Self::ReadyAbsent | Self::IssueClosed => None,
             Self::Unreadable(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
+/// La précondition de l'auto-fire qui a échoué, nommée (mika#3140 D1).
+///
+/// **Frère exact d'[`AutofireConsent`]**, et délibérément : la forme — un
+/// vocabulaire clos, un verdict par branche, un motif porté par la seule
+/// variante qui en a un — est déjà celle que ce fichier enseigne. Ce qu'elle
+/// change ici : les six sorties des étapes 2 et 3 de
+/// [`try_dispatch_pilot_after_groom_success`] étaient six `return` nus, sans
+/// événement ni ligne d'audit. Le groom de #3119 du 2026-11-22 est sorti par la
+/// cinquième variante, en silence, et le frein STOP de l'étape 3bis n'a jamais
+/// été atteint.
+///
+/// Les six variantes ne sont **pas** interchangeables deux à deux : chacune
+/// porte sa valeur d'audit, de sorte qu'un `GROUP BY after_value` les sépare
+/// sans qu'aucune soit obtenue par soustraction (mika#2205).
+#[derive(Debug)]
+enum AutofirePrecondition {
+    /// Le `result` du callback ne porte pas de marqueur convergé. Seule des six
+    /// à être antérieure à la livraison du groom — d'où son `before_value`
+    /// propre.
+    MarkerNotConverged,
+    /// Le callback ne déclare pas de `parent_task_id`.
+    ParentIdAbsent,
+    /// La `parent_task_id` est connue, la ligne est absente de `tasks` —
+    /// `Ok(None)`, qui est une réponse.
+    ParentRowMissing,
+    /// La lecture de la ligne parente a rendu un `Err` — une non-réponse, et la
+    /// seule des six à porter un motif.
+    ParentLookupFailed(String),
+    /// La parente est lue et n'a pas de `reference_url`. Le cas du 2026-11-22.
+    ReferenceUrlAbsent,
+    /// La `reference_url` existe et [`parse_repo_issue_from_url`] n'en tire rien.
+    ReferenceUrlUnparsable,
+}
+
+impl AutofirePrecondition {
+    /// La valeur de `verdict` que la sonde
+    /// `groom_autofire_preconditions_checked` porte (mika#3140 R2).
+    ///
+    /// Six valeurs deux à deux distinctes, auxquelles la branche saine ajoute
+    /// `"held"` — c'est cette septième qui donne au recensement son
+    /// dénominateur (mika#3050).
+    fn verdict(&self) -> &'static str {
+        match self {
+            Self::MarkerNotConverged => "marker_not_converged",
+            Self::ParentIdAbsent => "parent_id_absent",
+            Self::ParentRowMissing => "parent_row_missing",
+            Self::ParentLookupFailed(_) => "parent_lookup_failed",
+            Self::ReferenceUrlAbsent => "reference_url_absent",
+            Self::ReferenceUrlUnparsable => "reference_url_unparsable",
+        }
+    }
+
+    /// Le motif d'une lecture de parente en erreur, `None` sur les cinq autres
+    /// branches.
+    ///
+    /// `None` et non `""` : le champ doit être **absent** du log, pas vide
+    /// (mika#2331), comme pour [`AutofireConsent::reason`].
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::MarkerNotConverged
+            | Self::ParentIdAbsent
+            | Self::ParentRowMissing
+            | Self::ReferenceUrlAbsent
+            | Self::ReferenceUrlUnparsable => None,
+            Self::ParentLookupFailed(reason) => Some(reason.as_str()),
+        }
+    }
+
+    /// La valeur d'audit écrite dans `audit_events.after_value` (mika#3140 R1).
+    ///
+    /// Le `match` est **exhaustif sans bras `_`** : une septième précondition ne
+    /// compile pas sans nommer sa valeur d'audit. C'est le procédé du
+    /// `match &consent` de l'étape 4bis.
+    fn audit_value(&self) -> &'static str {
+        match self {
+            Self::MarkerNotConverged => GROOM_PILOT_NOT_CONVERGED_VALUE,
+            Self::ParentIdAbsent => GROOM_PILOT_PARENT_ID_ABSENT_VALUE,
+            Self::ParentRowMissing => GROOM_PILOT_PARENT_MISSING_VALUE,
+            Self::ParentLookupFailed(_) => GROOM_PILOT_PARENT_LOOKUP_FAILED_VALUE,
+            Self::ReferenceUrlAbsent => GROOM_PILOT_REF_URL_ABSENT_VALUE,
+            Self::ReferenceUrlUnparsable => GROOM_PILOT_REF_URL_UNPARSABLE_VALUE,
+        }
+    }
+
+    /// L'état d'où part le refus, écrit dans `audit_events.before_value`
+    /// (mika#3140 R4).
+    ///
+    /// Deux valeurs et non une : les cinq refus postérieurs au marqueur partent
+    /// d'un groom délivré, celui du marqueur non convergé constate justement
+    /// qu'il ne l'est pas.
+    fn before_value(&self) -> &'static str {
+        match self {
+            Self::MarkerNotConverged => GROOM_PILOT_CALLBACK_BEFORE_VALUE,
+            Self::ParentIdAbsent
+            | Self::ParentRowMissing
+            | Self::ParentLookupFailed(_)
+            | Self::ReferenceUrlAbsent
+            | Self::ReferenceUrlUnparsable => GROOM_PILOT_BEFORE_VALUE,
         }
     }
 }
