@@ -53,6 +53,108 @@ struct AgentWorker {
 // Les deux avaient déjà divergé ; c'était l'argument de leur mise en commun.
 use crate::commands::session_remote::{SourceEnv, jeton_interne};
 
+/// La borne de l'attente que le **démarrage** de la TUI accorde à mika-spirit
+/// (mika#3138).
+///
+/// Elle arrive par argument jusqu'à [`ouvrir_en_attendant_spirit`] pour la
+/// raison de mika#1727 : un test pilote la borne sans muter l'environnement et
+/// sans horloge virtuelle — les deux valeurs de production tiendraient la suite
+/// trente secondes sur un refus.
+pub(crate) struct AttenteOuverture {
+    /// Au-delà, le démarrage renonce. Compté depuis l'instant d'entrée, donc il
+    /// borne l'attente **totale** et non la seule somme des pauses.
+    budget: Duration,
+    /// Entre deux tentatives. Ni dégressive ni croissante : la fenêtre à couvrir
+    /// vaut quelques secondes, et un recul exponentiel y dépenserait sa dernière
+    /// pause après que spirit répond.
+    pause: Duration,
+}
+
+impl AttenteOuverture {
+    /// Les deux valeurs du démarrage. Pire cas ~35 s avant le refus.
+    ///
+    /// Elles sont **choisies, pas mesurées** : le ticket atteste deux fois que
+    /// 3 minutes de relance manuelle suffisent (2026-11-22T17:24Z puis 19:22Z),
+    /// jamais la durée réelle de démarrage de mika-spirit. 30 s couvre les deux
+    /// occurrences avec de la marge ; 1,5 s donne ~20 tentatives dans la
+    /// fenêtre `ECONNREFUSED` et ~6 dans celle du port lié que rien ne sert
+    /// encore, où chaque tentative paie en plus le `timeout` de 5 s de
+    /// [`session_remote::post`].
+    ///
+    /// Aucune variable `MIKA_*` ne les règle, délibérément : une borne que
+    /// l'opérateur n'a jamais eu à bouger n'a pas besoin d'une surface qu'il
+    /// faudrait documenter, et la rendre réglable avant la première demande
+    /// serait la faire exister pour rien.
+    pub(crate) fn du_demarrage() -> Self {
+        Self {
+            budget: Duration::from_secs(30),
+            pause: Duration::from_millis(1_500),
+        }
+    }
+
+    /// La même borne, courte, pour un test qui veut observer plusieurs
+    /// tentatives sans tenir la suite trente secondes.
+    #[cfg(test)]
+    fn courte(budget: Duration, pause: Duration) -> Self {
+        Self { budget, pause }
+    }
+}
+
+/// Ouvre la session en accordant à mika-spirit l'attente de `attente`
+/// (mika#3138).
+///
+/// La boucle vit **ici**, au site du démarrage, et non dans
+/// [`session_remote::post`] : `post` est partagé par `ouvrir`, `clore` et
+/// `compacter`, donc une attente posée là ferait payer le budget entier à
+/// `/clear`, à `/compact` et aux trois sorties de `clore_session_de_sortie` —
+/// sur le chemin où l'opérateur veut justement partir. Le démarrage est le seul
+/// moment où patienter est ce que l'opérateur veut.
+///
+/// Une seule classe de refus se réessaie, celle que
+/// [`session_remote::SessionRemoteIssue::attendre_peut_changer_lissue`] nomme ;
+/// toute autre arrête le démarrage **à la première tentative**, sans consommer
+/// la borne.
+///
+/// L'`Err` porte de quoi écrire le refus final : la cause, le nombre de
+/// tentatives réellement parties, et le temps écoulé. L'horloge est
+/// [`std::time::Instant`] et non celle de tokio : les tests font un vrai appel
+/// réseau contre un point mort, donc un `start_paused` figerait le temps que le
+/// `timeout` de `post` consomme.
+async fn ouvrir_en_attendant_spirit(
+    base_url: &str,
+    jeton: &str,
+    agent: &str,
+    attente: &AttenteOuverture,
+) -> std::result::Result<
+    session_remote::CreatedSessionMirror,
+    (session_remote::SessionRemoteIssue, u32, Duration),
+> {
+    let depart = std::time::Instant::now();
+    let mut tentatives = 0_u32;
+
+    loop {
+        tentatives += 1;
+        let probleme = match session_remote::ouvrir(base_url, jeton, agent).await {
+            Ok(miroir) => return Ok(miroir),
+            Err(probleme) => probleme,
+        };
+
+        if !probleme.attendre_peut_changer_lissue() {
+            return Err((probleme, tentatives, depart.elapsed()));
+        }
+
+        // La pause n'est prise que si elle **tient** dans le budget : sinon le
+        // refus arriverait après une attente que personne n'a autorisée, et le
+        // pire cas ne serait plus lisible dans les deux valeurs de
+        // `du_demarrage`.
+        let ecoule = depart.elapsed();
+        if ecoule + attente.pause >= attente.budget {
+            return Err((probleme, tentatives, ecoule));
+        }
+        tokio::time::sleep(attente.pause).await;
+    }
+}
+
 /// Ouvre — ou reprend — la session de la TUI (mika#1727, vol V2d-4a).
 ///
 /// Tout ce qui touche le monde arrive par argument, donc un test pilote la
@@ -72,6 +174,7 @@ async fn ouvrir_session_par_spirit(
     agent: &str,
     session_id: Option<&str>,
     canonical_session_id: Option<&str>,
+    attente: &AttenteOuverture,
 ) -> Result<(String, bool)> {
     // Avant toute construction de client, et sur les **deux** bras : le premier
     // tour part sur le fil de toute façon, et un refus qui attendrait le tour
@@ -81,10 +184,21 @@ async fn ouvrir_session_par_spirit(
     let jeton = jeton_interne(lire_env).map_err(anyhow::Error::msg)?;
 
     let Some(id) = session_id else {
-        let miroir = session_remote::ouvrir(base_url, &jeton, agent)
+        // mika#3138 : seul ce bras attend. Le bras `--session-id` juste en
+        // dessous ne parle pas au fil, et les trois autres routes de
+        // `session_remote` gardent leur comportement à la ligne.
+        let miroir = ouvrir_en_attendant_spirit(base_url, &jeton, agent, attente)
             .await
-            .map_err(|probleme| {
-                anyhow::anyhow!("La TUI n'a pas pu ouvrir sa session : {probleme}")
+            .map_err(|(probleme, tentatives, ecoule)| {
+                // Le refus **dit l'attente**. Sans les deux nombres, l'opérateur
+                // du 2026-11-22T17:24Z relit le message d'avant et ne sait pas
+                // si la TUI a patienté une fois ou vingt — donc ne sait pas si
+                // la cause est l'ordre de lancement ou mika-spirit lui-même.
+                anyhow::anyhow!(
+                    "La TUI n'a pas pu ouvrir sa session après {tentatives} tentative(s) \
+                     en {:.1} s : {probleme}",
+                    ecoule.as_secs_f64()
+                )
             })?;
         return Ok((miroir.session_id, miroir.canonical));
     };
@@ -287,6 +401,10 @@ async fn spawn_agent_worker(
     // session, et chaque tour prenait la panne plus loin, là où elle ne se lit
     // plus. Le `?` remonte au site d'appel du démarrage (l. 543), avant
     // l'installation du terminal.
+    // mika#3138 — et elle lui accorde l'attente du démarrage : le lanceur des
+    // TUI part avant que mika-spirit écoute, donc le premier appel tombe sur un
+    // port que rien ne sert encore (deux occurrences, 2026-11-22T17:24Z et
+    // 19:22Z, cinq puis quatre TUI mortes au lancement).
     let (session_id, is_singleton_session) = ouvrir_session_par_spirit(
         &ctx.async_db,
         base_url,
@@ -294,6 +412,7 @@ async fn spawn_agent_worker(
         agent_name,
         session_id,
         canonical_session_id.as_deref(),
+        &AttenteOuverture::du_demarrage(),
     )
     .await?;
     // mika#1727 vol V3c-2b-A1 — le registre des skills arrive par la route, et
@@ -1470,6 +1589,25 @@ mod tests {
         move |nom| (nom == "MIKA_INTERNAL_TOKEN").then(|| valeur.to_string())
     }
 
+    /// La borne de mika#3138, réduite : les deux valeurs du démarrage tiendraient
+    /// la suite trente secondes sur chaque refus.
+    ///
+    /// Le budget vaut trente fois la pause, et non six : un test qui sort après
+    /// deux tentatives parce que la machine est chargée mesurerait la charge de
+    /// la machine. Ici une tentative peut coûter dix fois son budget nominal
+    /// sans faire tomber « au moins trois tentatives ».
+    fn attente_courte() -> AttenteOuverture {
+        AttenteOuverture::courte(Duration::from_millis(600), Duration::from_millis(20))
+    }
+
+    /// Une borne dont **une seule pause se verrait** : cinq secondes. Pour les
+    /// deux tests qui mesurent qu'aucune pause n'a été prise — un refus du
+    /// serveur, ou une ouverture réussie. Avec la pause courte ci-dessus,
+    /// 20 ms de régression se perdraient dans le bruit d'un appel réseau local.
+    fn attente_dont_une_pause_se_verrait() -> AttenteOuverture {
+        AttenteOuverture::courte(Duration::from_secs(30), Duration::from_secs(5))
+    }
+
     #[tokio::test]
     async fn mika1727_v2d4a_sans_jeton_interne_le_demarrage_refuse_avant_tout_appel() {
         let db = base_en_memoire();
@@ -1477,9 +1615,17 @@ mod tests {
         // « refusé avant tout appel » de « refusé par le serveur ».
         let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
 
-        let refus = ouvrir_session_par_spirit(&db, &base, &|_| None, "mika-dev", None, None)
-            .await
-            .expect_err("sans jeton, le démarrage refuse");
+        let refus = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &|_| None,
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect_err("sans jeton, le démarrage refuse");
 
         let message = refus.to_string();
         assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
@@ -1494,9 +1640,17 @@ mod tests {
         let tableau_seul =
             |nom: &str| (nom == "MIKA_DASHBOARD_TOKEN").then(|| "jeton-tableau".to_string());
 
-        let refus = ouvrir_session_par_spirit(&db, &base, &tableau_seul, "mika-dev", None, None)
-            .await
-            .expect_err("le jeton du tableau de bord n'ouvre pas de session");
+        let refus = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &tableau_seul,
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect_err("le jeton du tableau de bord n'ouvre pas de session");
 
         let message = refus.to_string();
         assert!(message.contains("MIKA_INTERNAL_TOKEN"), "{message}");
@@ -1516,10 +1670,17 @@ mod tests {
             "MIKA_INTERNAL_TOKEN" => Some("jeton-interne".to_string()),
             _ => None,
         };
-        let (session_id, _) =
-            ouvrir_session_par_spirit(&db, &base, &les_deux, "mika-dev", None, None)
-                .await
-                .expect("la même source, plus le jeton interne, ouvre");
+        let (session_id, _) = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &les_deux,
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect("la même source, plus le jeton interne, ouvre");
         assert_eq!(session_id, "s-du-fil");
         assert_eq!(
             recues.lock().expect("le témoin du banc").len(),
@@ -1540,6 +1701,7 @@ mod tests {
             "mika-dev",
             None,
             None,
+            &attente_courte(),
         )
         .await
         .expect("un 200 au corps lisible ouvre la session");
@@ -1574,10 +1736,17 @@ mod tests {
 
         // `canonical_session_id` est volontairement `None` : si la TUI lisait
         // encore son identité locale pour ce booléen, ce test serait faux.
-        let (session_id, is_singleton_session) =
-            ouvrir_session_par_spirit(&db, &base, &jeton_pose("jeton"), "mika-dev", None, None)
-                .await
-                .expect("un 200 au corps lisible ouvre la session");
+        let (session_id, is_singleton_session) = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton"),
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect("un 200 au corps lisible ouvre la session");
 
         assert_eq!(session_id, "s-canonique");
         assert!(
@@ -1591,10 +1760,17 @@ mod tests {
         let db = base_en_memoire();
         let (base, _) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
 
-        let (_, is_singleton_session) =
-            ouvrir_session_par_spirit(&db, &base, &jeton_pose("jeton"), "mika-dev", None, None)
-                .await
-                .expect("un 200 au corps lisible ouvre la session");
+        let (_, is_singleton_session) = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton"),
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect("un 200 au corps lisible ouvre la session");
 
         assert!(!is_singleton_session);
     }
@@ -1611,6 +1787,7 @@ mod tests {
             "mika-dev",
             None,
             None,
+            &attente_courte(),
         )
         .await
         .expect_err("un 401 arrête le démarrage");
@@ -1630,10 +1807,17 @@ mod tests {
         let dead = DeadEndpoint::reserve();
         let base = format!("http://{}", dead.addr());
 
-        let refus =
-            ouvrir_session_par_spirit(&db, &base, &jeton_pose("jeton"), "mika-dev", None, None)
-                .await
-                .expect_err("rien n'écoute : le démarrage doit s'arrêter");
+        let refus = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton"),
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect_err("rien n'écoute : le démarrage doit s'arrêter");
 
         let message = refus.to_string();
         assert!(message.contains("unreachable"), "{message}");
@@ -1641,6 +1825,149 @@ mod tests {
             message.contains(&format!("{base}{ROUTE_SESSIONS}")),
             "{message}"
         );
+        // mika#3138 : le refus final **dit que l'attente a eu lieu**. Sans ces
+        // deux lignes, l'opérateur du 2026-11-22T17:24Z lit le même message
+        // qu'avant et ne sait pas si la TUI a patienté une fois ou vingt.
+        assert!(message.contains("tentative"), "{message}");
+        assert!(message.contains(" s "), "{message}");
+    }
+
+    /// Le fait mesuré : quand **rien ne répond**, le démarrage réessaie
+    /// plusieurs fois et s'arrête à sa borne — il ne meurt pas sur le premier
+    /// `ECONNREFUSED` (mika#3138).
+    ///
+    /// C'est la panne du ticket : le lanceur part avant que mika-spirit écoute,
+    /// et les cinq TUI sortent sur le même refus de transport. Le point mort est
+    /// `DeadEndpoint::reserve()` et le port est **tenu** tout du long
+    /// (mika#2569) : un factice voisin servirait sinon l'appel censé échouer.
+    #[tokio::test]
+    async fn mika3138_rien_ne_repond_la_tui_reessaie_jusqua_sa_borne() {
+        let dead = DeadEndpoint::reserve();
+        let base = format!("http://{}", dead.addr());
+        let attente = attente_courte();
+
+        let (probleme, tentatives, ecoule) =
+            ouvrir_en_attendant_spirit(&base, "jeton", "mika-dev", &attente)
+                .await
+                .expect_err("rien n'écoute : l'attente finit par renoncer");
+
+        // Plusieurs tentatives, et pas une seule : c'est tout l'objet du vol.
+        assert!(tentatives >= 3, "{tentatives} tentative(s)");
+        // Le temps écoulé couvre au moins deux pauses, donc l'attente a bien été
+        // *dormie* et non seulement comptée.
+        assert!(ecoule >= Duration::from_millis(40), "{ecoule:?}");
+        // Et la borne tient : sans elle, cette boucle ne rendrait jamais.
+        assert!(ecoule < Duration::from_secs(5), "{ecoule:?}");
+        // La cause rendue est celle qui autorisait l'attente, pas une autre
+        // tombée en chemin.
+        assert!(
+            probleme.attendre_peut_changer_lissue(),
+            "{probleme:?} n'est pas la classe réessayable"
+        );
+    }
+
+    /// Le fait mesuré : un **401 ne consomme pas la borne**. Le démarrage
+    /// s'arrête à la première tentative (mika#3138).
+    ///
+    /// C'est la panne la plus fréquente après celle du ticket, et la faire
+    /// attendre trente secondes la rendrait illisible. Le discriminant n'est pas
+    /// « est-ce que ça pourrait marcher plus tard » mais « une réponse a-t-elle
+    /// été reçue » : une réponse **est** une provenance, et l'attendre à nouveau
+    /// en fabriquerait une fausse (motif mika#2331).
+    #[tokio::test]
+    async fn mika3138_un_401_ne_consomme_pas_la_borne() {
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::UNAUTHORIZED, "")]).await;
+        let attente = attente_dont_une_pause_se_verrait();
+
+        let avant = std::time::Instant::now();
+        let (_, tentatives, _) =
+            ouvrir_en_attendant_spirit(&base, "mauvais-jeton", "mika-dev", &attente)
+                .await
+                .expect_err("un 401 arrête le démarrage");
+        let ecoule = avant.elapsed();
+
+        assert_eq!(tentatives, 1, "un 401 ne se réessaie pas");
+        // Le banc est le témoin qui compte : le compte de tentatives rendu
+        // pourrait mentir, la socket non.
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une seule requête doit partir"
+        );
+        assert!(ecoule < Duration::from_secs(5), "aucune pause : {ecoule:?}");
+    }
+
+    /// Le fait mesuré : quand mika-spirit répond du premier coup, le démarrage
+    /// n'attend **rien** (mika#3138).
+    ///
+    /// Le contrôle positif du vol : sans lui, une attente qui dormirait avant son
+    /// premier appel rendrait les trois tests voisins verts en ajoutant une
+    /// pause à chaque lancement nominal de TUI.
+    #[tokio::test]
+    async fn mika3138_un_200_ouvre_sans_aucune_pause() {
+        let (base, recues) = fake_spirit(&[(ROUTE_SESSIONS, StatusCode::OK, CORPS_OUVERT)]).await;
+        let attente = attente_dont_une_pause_se_verrait();
+
+        let avant = std::time::Instant::now();
+        let miroir = ouvrir_en_attendant_spirit(&base, "jeton", "mika-dev", &attente)
+            .await
+            .expect("un 200 au corps lisible ouvre la session");
+        let ecoule = avant.elapsed();
+
+        assert_eq!(miroir.session_id, "s-du-fil");
+        assert_eq!(
+            recues.lock().expect("le témoin du banc").len(),
+            1,
+            "une seule requête doit partir"
+        );
+        assert!(ecoule < Duration::from_secs(5), "aucune pause : {ecoule:?}");
+    }
+
+    /// Le fait mesuré : le refus que l'opérateur lit porte les **vrais** nombres
+    /// — le compte de tentatives réellement parties et le temps réellement
+    /// écoulé —, et non deux constantes de forme (mika#3138).
+    ///
+    /// Le test voisin `mika1727_v2d4a_un_point_injoignable_nomme_lurl` atteste
+    /// que les deux mots sont dans la phrase ; celui-ci relit les nombres. Un
+    /// message qui dirait toujours « après 1 tentative(s) en 0.0 s » passerait
+    /// l'un et tomberait ici, et c'est exactement le message qui ferait croire à
+    /// l'opérateur que la TUI n'a pas attendu.
+    #[tokio::test]
+    async fn mika3138_le_refus_final_dit_combien_de_fois_et_combien_de_temps() {
+        let db = base_en_memoire();
+        let dead = DeadEndpoint::reserve();
+        let base = format!("http://{}", dead.addr());
+
+        let refus = ouvrir_session_par_spirit(
+            &db,
+            &base,
+            &jeton_pose("jeton"),
+            "mika-dev",
+            None,
+            None,
+            &attente_courte(),
+        )
+        .await
+        .expect_err("rien n'écoute : le démarrage doit s'arrêter");
+
+        let message = refus.to_string();
+        let apres = message.split("après ").nth(1).unwrap_or_else(|| {
+            panic!("le refus doit dire après combien de tentatives : {message}")
+        });
+        let tentatives: u32 = apres
+            .split(' ')
+            .next()
+            .and_then(|mot| mot.parse().ok())
+            .unwrap_or_else(|| panic!("un compte de tentatives lisible : {message}"));
+        let secondes: f64 = apres
+            .split(" en ")
+            .nth(1)
+            .and_then(|reste| reste.split(' ').next())
+            .and_then(|mot| mot.parse().ok())
+            .unwrap_or_else(|| panic!("un nombre de secondes lisible : {message}"));
+
+        assert!(tentatives >= 3, "{message}");
+        assert!(secondes > 0.0, "{message}");
     }
 
     #[tokio::test]
@@ -1655,6 +1982,7 @@ mod tests {
             "mika-dev",
             Some("s-absente"),
             None,
+            &attente_courte(),
         )
         .await
         .expect_err("une session inconnue ne se reprend pas");
@@ -1693,6 +2021,7 @@ mod tests {
             "mika-dev",
             Some("s-connue"),
             None,
+            &attente_courte(),
         )
         .await
         .expect("une session de l'agent se reprend");
