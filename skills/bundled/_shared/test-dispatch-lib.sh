@@ -12548,9 +12548,17 @@ fi
 # répondu « présente ».
 #
 # Le prédicat porte sur `--exit-code`, la question d'EXISTENCE, et non sur
-# `ls-remote` en général : les deux autres sites du fichier lisent un **SHA**
-# (`PRE_RUN_REMOTE_HEAD`, `_check_pilot_force_push`), question différente,
-# prédicat différent — et un scan qui les dénoncerait à tort se fait désarmer.
+# `ls-remote` en général — un scan qui dénoncerait à tort une lecture de SHA se
+# fait désarmer. Il y avait ici, jusqu'à mika#3128 : « les deux autres sites du
+# fichier lisent un **SHA** (`PRE_RUN_REMOTE_HEAD`, `_check_pilot_force_push`),
+# question différente, prédicat différent ». Les deux délèguent maintenant au
+# lecteur : #3004 a demandé à la garde de mika#1318 de distinguer « la ref a
+# avancé » (SHA) de « la ref a disparu » (existence), donc elle a besoin des
+# DEUX faits, et deux appels auraient rouvert une fenêtre TOCTOU sur la race
+# même qu'elle corrige. Un `ls-remote --exit-code` répond aux deux en une
+# lecture, et le lecteur publie le SHA qu'il jetait (`REMOTE_BRANCH_SHA`).
+# L'invariant du scan n'en bouge pas d'un pouce : UN site lit `--exit-code`, et
+# le compte d'appelants SUIT cette délégation — il ne s'élargit pas.
 echo ""
 echo "Test mika#2626 (V5): lecteur unique de l'existence distante"
 echo "-----------------------------------------------------------"
@@ -12599,9 +12607,11 @@ assert_eq "mika#2626 (V5): et ce site est DANS le lecteur" "1" \
 
 # Anti-vacuité, et c'est une ASSERTION, pas un commentaire : un prédicat devenu
 # trop étroit passerait sinon en ne regardant rien (classe mika#2205).
-# EXACTEMENT deux appelants — l.3457 (`_set_up_worktree`, qui délègue) et
-# `_push_branch` (nouveau). Les deux n'opèrent pas sur le même répertoire
-# (`$SUB_REPO_DIR` contre `$WORKTREE_DIR`), d'où l'argument de répertoire.
+# À l'écriture (mika#2626) : deux appelants — l.3457 (`_set_up_worktree`, qui
+# délègue) et `_push_branch` (nouveau). Les deux n'opèrent pas sur le même
+# répertoire (`$SUB_REPO_DIR` contre `$WORKTREE_DIR`), d'où l'argument de
+# répertoire. Le compte courant est en bas de ce bloc, avec l'historique de
+# chaque appelant ajouté depuis.
 #
 # Le filtre de commentaires est load-bearing ici AUSSI, et son absence a été
 # mesurée : le compte brut rend 3 — les deux appelants (l.3463, l.5879) plus la
@@ -12617,7 +12627,17 @@ M2626_CALLERS=$(grep -v '^[[:space:]]*#' "$DISPATCH_LIB" \
 # distant si la branche existe avant de lire la ref de suivi, et il le demande
 # au lecteur unique plutôt qu'à un second `ls-remote --exit-code` — c'est
 # exactement ce que ce test protège. Le compte suit, il ne s'élargit pas.
-assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT trois appelants du lecteur" "3" \
+#
+# mika#3128 ajoute les QUATRIÈME et CINQUIÈME, par la même porte : la capture
+# d'avant-vol (`_set_up_worktree`, qui posait son propre `ls-remote` nu) et
+# `_check_pilot_force_push` (qui posait le sien) délèguent désormais au lecteur
+# unique. Elles ont besoin du SHA **et** de l'existence — #3004 a montré qu'un
+# seul terme d'égalité attribuait au pilote une SUPPRESSION de la ref — et le
+# lecteur publie maintenant le SHA qu'il jetait (`REMOTE_BRANCH_SHA`), donc
+# aucun second site `--exit-code` n'est ouvert et aucune fenêtre TOCTOU n'est
+# rouverte. Le compte suit cette délégation, il ne s'élargit pas : l'assertion
+# du dessus (« EXACTEMENT un site ») est celle qui ne bouge jamais.
+assert_eq "mika#2626 (V5, anti-vacuité): EXACTEMENT cinq appelants du lecteur" "5" \
     "$M2626_CALLERS"
 
 # Contrôle de bonne foi, DANS LES DEUX SENS, et chaque sens exerce le prédicat

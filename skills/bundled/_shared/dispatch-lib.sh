@@ -6435,13 +6435,42 @@ Resolve manually before re-dispatching ${REPO}#${ISSUE_NUM}."
 
         # Save pre-run HEAD SHA for post-flight diff check
         PRE_RUN_HEAD=$(git -C "$WORKTREE_DIR" rev-parse HEAD 2>/dev/null || true)
-        # Save pre-run remote HEAD for pilot push guard (mika#1318).
-        # Empty if branch doesn't exist on remote yet.
-        PRE_RUN_REMOTE_HEAD=$(git -C "$WORKTREE_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1 || true)
+        # Save pre-run remote HEAD for the pilot push guard (mika#1318), and
+        # the STATE that qualifies it (mika#3128).
+        #
+        # DEUX globaux, et pas un champ à double sens. `PRE_RUN_REMOTE_HEAD`
+        # était vide dans DEUX cas — la branche n'est pas sur le distant, et
+        # l'`ls-remote` n'a pas répondu — et la garde, qui n'a que ce champ, ne
+        # pouvait pas distinguer « je n'ai pas lu » de « il n'y avait rien » :
+        # un échec réseau d'avant-vol lui faisait lire « la branche est apparue
+        # pendant le vol ⇒ violation » sur une branche présente depuis le
+        # début. Un état glissé dans le champ SHA (`"<unread>"`) aurait fermé le
+        # trou en rouvrant le même motif : un champ qui porte parfois un SHA et
+        # parfois un mot est exactement ce qui a fait écrire `post_remote=<none>`
+        # dans une phrase qui parlait de push (#3004). L'état est donc un global
+        # NOMMÉ, et le champ SHA ne porte qu'un SHA ou rien.
+        #
+        # La mesure passe par le lecteur unique de l'existence distante
+        # (`_remote_branch_exists`, mika#2626), qui publie aussi le SHA depuis
+        # mika#3128 : UN seul appel pour les deux faits, ici comme dans la
+        # garde.
+        local _pre_remote_rc=0
+        _remote_branch_exists "$WORKTREE_DIR" "$BRANCH" || _pre_remote_rc=$?
+        case "$_pre_remote_rc" in
+            0) PRE_RUN_REMOTE_STATE="present"; PRE_RUN_REMOTE_HEAD="$REMOTE_BRANCH_SHA" ;;
+            1) PRE_RUN_REMOTE_STATE="absent";  PRE_RUN_REMOTE_HEAD="" ;;
+            *) PRE_RUN_REMOTE_STATE="unread";  PRE_RUN_REMOTE_HEAD="" ;;
+        esac
     else
         # --- Free-text mode: pass prompt as-is, no worktree ---
         PRE_RUN_HEAD=""
         PRE_RUN_REMOTE_HEAD=""
+        # mika#3128 — posé vide, et la garde traite le vide comme « non
+        # mesurée » : un état non initialisé n'accuse personne. C'est une
+        # ceinture et non le terme portant — la garde sort de toute façon plus
+        # tôt, sur l'absence de worktree — mais l'écrire explicitement est ce
+        # qui empêche le prochain lecteur de déduire un état d'un champ vide.
+        PRE_RUN_REMOTE_STATE=""
         LOG_ID="$TASK_ID"
         CWD_ARGS="--cwd $PLATFORM_DIR"
 
@@ -8848,6 +8877,54 @@ _check_pilot_force_push() {
     # no violation, 1 if violation detected. Called unconditionally from
     # dispatch_claude_pilot(); skill-scoping is internal (early-return for
     # non-dev-groom skills).
+    #
+    # LA QUESTION POSÉE, et elle est plus étroite que « le SHA a-t-il changé ? »
+    # (mika#3128). Il y avait ici : « if remote state changed between pre-run
+    # and post-run, the pilot pushed (any push, not just force-push, is a
+    # violation) » — et c'est littéralement la phrase que #3004 a démentie. La
+    # question est : la ref distante a-t-elle avancé vers du contenu PRODUIT PAR
+    # LE PILOTE ? Une ref qui DISPARAÎT ne produit aucun contenu — après elle il
+    # n'existe, nulle part, aucun commit à attribuer à qui que ce soit.
+    #
+    # Le 2026-11-01, #3004 : le groom démarre sur une branche présente sur
+    # `origin` à `8da087abd` ; 66 secondes plus tard, le vol en cours,
+    # l'opérateur ferme la draft sans merge et supprime la branche. Dix minutes
+    # après, la garde lit `post_remote=<none>`, le terme d'égalité est faux, et
+    # le dispatch rend `STRUCTURAL VIOLATION: pilot push detected`. Le coût
+    # n'est pas la phrase fausse : au site d'appel, un `rc=1` court-circuite
+    # `_iterate_groom_loop` ET `_push_branch` puis délivre le callback — le plan
+    # était commité en local et n'a jamais vu l'architecte. Un vol de groom
+    # entier perdu sur un geste humain.
+    #
+    # Haleter ne récupère rien, d'ailleurs, et coûte tout : la ref est déjà
+    # partie et aucune garde post-vol ne la ramène. L'arrêt ne protégeait rien.
+    #
+    # TROIS issues de chaque côté, jamais deux, et elles viennent du CONTRAT du
+    # rc de `ls-remote --exit-code` (lu via le lecteur unique
+    # `_remote_branch_exists`, mika#2626), pas d'une inférence sur un `stdout`
+    # vide :
+    #
+    #  pré-vol \ post-vol | présente, même SHA | présente, autre SHA | absente         | indéterminée
+    #  ------------------ | ------------------ | ------------------- | --------------- | ------------
+    #  présente           | propre (0)         | VIOLATION (1)       | SUPPRESSION → 0 | fail-open (0)
+    #  absente            | n/a                | VIOLATION (1)       | propre (0)      | fail-open (0)
+    #  non mesurée        | fail-open (0)      | fail-open (0)       | fail-open (0)   | fail-open (0)
+    #
+    # La ligne « non mesurée » est ENTIÈREMENT fail-open, et son terme est
+    # évalué AVANT la lecture post-vol : sans pré-vol il n'y a pas de
+    # comparaison à faire, donc pas de round-trip réseau à dépenser. C'est la
+    # moitié symétrique du même défaut — `PRE_RUN_REMOTE_HEAD` était vide dans
+    # DEUX cas, « pas sur le distant » et « l'`ls-remote` n'a pas répondu »,
+    # donc un échec réseau d'avant-vol faisait lire « la branche est apparue ⇒
+    # violation » à une branche présente depuis le début. Règle maison
+    # mika#2277 : un signal qu'on ne peut pas lire n'est jamais un terme
+    # satisfait.
+    #
+    # Ce que ce vol NE touche pas : lire l'AUTEUR de la suppression. Un
+    # `ls-remote` n'en porte aucun, et le lire demanderait l'API des événements
+    # du dépôt sur le chemin de la boucle — pour une décision déjà prise par la
+    # forme du fait. On n'a pas besoin de savoir *qui* a supprimé pour savoir
+    # qu'une suppression n'est pas un push.
 
     # Skill scope: dev-groom only (R5). Dev-pilot's push is legitimate.
     [ "$SKILL" = "dev-groom" ] || return 0
@@ -8855,26 +8932,85 @@ _check_pilot_force_push() {
     # Guard: repo#number mode only (worktree must exist).
     [ -n "$WORKTREE_DIR" ] && [ -n "$BRANCH" ] || return 0
 
-    # Query current remote HEAD. Fail-open on network error — a network
-    # failure shouldn't block a legitimate dispatch; _push_branch will fail
-    # independently if the remote is truly unreachable.
-    local ls_remote_out post_remote_head
-    if ! ls_remote_out=$(git -C "$WORKTREE_DIR" ls-remote origin "refs/heads/$BRANCH" 2>/dev/null); then
+    # Terme du pré-vol d'abord — la ligne « non mesurée » de la matrice. Le vide
+    # d'un état jamais initialisé (mode texte libre) tombe ici aussi : un état
+    # qu'on n'a pas posé n'accuse personne.
+    local pre_state="${PRE_RUN_REMOTE_STATE:-}"
+    if [ "$pre_state" != "present" ] && [ "$pre_state" != "absent" ]; then
+        echo "pilot_push_guard.clean: pre-flight remote state was not measured (state='$pre_state') — fail-open, nothing attributed to the pilot (branch=$BRANCH)" >&2
+        return 0
+    fi
+
+    # UN SEUL appel pour les deux questions — existence par le rc, SHA par le
+    # `REMOTE_BRANCH_SHA` que le lecteur publie. Deux appels ouvriraient une
+    # fenêtre TOCTOU entre « existe-t-elle ? » et « à quel SHA ? », sur
+    # exactement la race que ce ticket corrige.
+    local post_state post_remote_head="" remote_rc=0
+    _remote_branch_exists "$WORKTREE_DIR" "$BRANCH" || remote_rc=$?
+    case "$remote_rc" in
+        0) post_state="present"; post_remote_head="$REMOTE_BRANCH_SHA" ;;
+        1) post_state="absent" ;;
+        *) post_state="unread" ;;
+    esac
+
+    # Fail-open réseau post-vol : un distant qui n'a pas répondu ne bloque pas
+    # un dispatch légitime, et `_push_branch` échouera de son côté s'il est
+    # vraiment injoignable.
+    if [ "$post_state" = "unread" ]; then
         echo "pilot_push_guard.clean: ls-remote failed (network?) — fail-open (branch=$BRANCH)" >&2
         return 0
     fi
-    post_remote_head=$(printf '%s' "$ls_remote_out" | cut -f1)
 
-    # Compare: if remote state changed between pre-run and post-run, the
-    # pilot pushed (any push, not just force-push, is a violation for dev-groom).
-    if [ "${PRE_RUN_REMOTE_HEAD:-}" = "${post_remote_head:-}" ]; then
+    if [ "$post_state" = "absent" ]; then
+        if [ "$pre_state" = "present" ]; then
+            # LE BRAS DE #3004 : rendre 0, et NOMMER le fait.
+            #
+            # DEUX surfaces, et la seconde porte seule. Le stderr de cette
+            # fonction est le `Stdio::piped()` de `spawn_long_running_exec`, que
+            # l'exécuteur ne lit QUE dans `if !status.success()` — sur un
+            # dispatch qui réussit le tube est jeté sans être lu (Signal M,
+            # mesuré par mika#2050). Un fait qui ne vivrait que là ne serait lu
+            # par personne : il va donc dans le `RESULT`, à côté des lignes
+            # `Stale-ref:` et `Remote-probe:` que `_push_branch` y écrit pour
+            # cette raison précise.
+            #
+            # Prose, et aucun token machine : les deux lecteurs du `RESULT` sont
+            # `grep -qF "PIPELINE FAILURE:"` et `^Outcome: `, et le `RE_NO_PR`
+            # de `dispatcher.rs` ne match ni `PR:` ni `NO_PR:` — une ligne de
+            # prose ne touche aucun des trois.
+            #
+            # CE QUE LA LIGNE NE FAIT PAS : juger s'il faut recréer la branche.
+            # C'est la décision de `_push_branch`, qui la prend déjà sur
+            # `remote_known_absent` + l'arbre (mika#2626, mika#3038). Laisser le
+            # vol continuer l'amène donc dans un chemin DÉJÀ CONÇU, pas dans un
+            # trou ; dupliquer ce jugement ici créerait les deux prédicats
+            # divergents que mika#2626 a passé un ticket entier à réunir.
+            echo "pilot_push_guard.branch_deleted: the remote ref for $BRANCH vanished during the pilot session (it was at $PRE_RUN_REMOTE_HEAD at launch) — a deletion produces no content, so nothing is attributed to the pilot (mika#3128)" >&2
+            RESULT="${RESULT}
+Vanished-ref: origin/$BRANCH was present at $PRE_RUN_REMOTE_HEAD when the pilot launched and the remote no longer carries it — a deletion produces no commit to attribute, so this is NOT counted as a pilot push (mika#3128); the flight continues and _push_branch decides on its own whether anything is left to publish"
+            return 0
+        fi
+        # pré=absente, post=absente : la branche n'a jamais été poussée. Vol
+        # nominal d'un premier groom.
+        echo "pilot_push_guard.clean: branch $BRANCH absent from the remote before and after the pilot session" >&2
+        return 0
+    fi
+
+    # post=présente. L'égalité des SHA est le seul terme propre, et elle exige
+    # un pré-vol PRÉSENT : `pre=absente` + `post=présente`, c'est le pilote qui
+    # a créé la branche, et ça reste une violation.
+    if [ "$pre_state" = "present" ] && [ "${PRE_RUN_REMOTE_HEAD:-}" = "$post_remote_head" ]; then
         echo "pilot_push_guard.clean: no remote-ref change during pilot session (branch=$BRANCH)" >&2
         return 0
     fi
 
-    # Violation detected.
+    # Violation detected. `post_remote` porte TOUJOURS un SHA ici — ce bras
+    # n'est atteignable que sur `post_state=present` — et c'est l'assertion qui
+    # dit que le défaut de #3004 est fermé : la chaîne `post_remote=<none>` ne
+    # peut plus se former. Le `pre_remote=<none>` du côté GAUCHE, lui, reste :
+    # il désigne la branche créée par le pilote, qui est une vraie violation.
     PUSH_VIOLATION_DETECTED=1
-    PUSH_VIOLATION_EVIDENCE="pre_remote=${PRE_RUN_REMOTE_HEAD:-<none>} post_remote=${post_remote_head:-<none>}"
+    PUSH_VIOLATION_EVIDENCE="pre_remote=${PRE_RUN_REMOTE_HEAD:-<none>} post_remote=${post_remote_head}"
     echo "pilot_push_guard.violation: pilot pushed to remote during session (branch=$BRANCH, $PUSH_VIOLATION_EVIDENCE)" >&2
     return 1
 }
@@ -8924,18 +9060,45 @@ _check_pilot_force_push() {
 # first-push sur une branche que le distant porte peut-être. Le coût du repli
 # est borné, et il est exactement le comportement courant.
 #
-# Le répertoire est un ARGUMENT : les deux appelants n'opèrent pas sur le même
-# ($SUB_REPO_DIR pour le setup du worktree, $WORKTREE_DIR pour le push).
+# Le répertoire est un ARGUMENT : les appelants n'opèrent pas tous sur le même
+# ($SUB_REPO_DIR pour le setup du worktree, $WORKTREE_DIR pour le push, pour la
+# capture d'avant-vol et pour la garde post-vol).
 #
-# NE PAS unifier avec les deux autres `ls-remote` du fichier
+# LE SHA PASSE PAR ICI AUSSI, depuis mika#3128 — et c'est la réécriture d'un
+# « ne pas faire » dont la raison a cessé d'être vraie. Il y avait à cette place
+# : « NE PAS unifier avec les deux autres `ls-remote` du fichier
 # (`PRE_RUN_REMOTE_HEAD`, `_check_pilot_force_push`) : ils lisent le SHA, pas
-# l'existence. Question différente, prédicat différent.
+# l'existence. Question différente, prédicat différent. » Le 2026-11-01, #3004 a
+# démenti la prémisse : la garde de mika#1318 a eu besoin des DEUX faits à la
+# fois, parce que distinguer « la ref a avancé » (SHA) de « la ref a disparu »
+# (existence) est précisément ce qui lui manquait pour ne pas attribuer au
+# pilote une suppression faite par un humain.
+#
+# Deux appels — celui-ci puis un `ls-remote` pour le SHA — auraient rouvert une
+# fenêtre TOCTOU entre « existe-t-elle ? » et « à quel SHA ? », sur exactement
+# la race que #3004 a produite. Or un `ls-remote --exit-code` répond aux deux en
+# UNE lecture : ce lecteur publie donc le SHA qu'il tenait déjà et jetait. Ce
+# n'est pas l'unification que l'ancien commentaire interdisait (deux prédicats
+# divergents sur un même fait), c'est son contraire — les deux sites qui
+# lisaient le SHA par leur propre `ls-remote` délèguent maintenant ici, et le
+# fichier revient à UN lecteur pour les deux faits.
+#
+# `REMOTE_BRANCH_SHA` n'est valide QUE juste après un appel, et il est remis à
+# vide à CHAQUE entrée : un appelant qui le lirait sans avoir appelé lit le
+# vide, jamais la mesure du voisin. Les appelants qui ne veulent que le
+# prédicat l'ignorent sans rien changer.
+#
+# Ce qu'il ne faut toujours PAS faire : répondre à cette question par la ref de
+# suivi locale (les cellules du haut disent pourquoi), ou poser un second
+# `ls-remote --exit-code` ailleurs dans le fichier — le scan V5 de
+# `test-dispatch-lib.sh` refuse le second et compte les appelants du premier.
 _remote_branch_exists() {
     local repo_dir="$1" branch="$2"
-    local rc=0
-    git -C "$repo_dir" ls-remote --exit-code origin "refs/heads/$branch" >/dev/null 2>&1 || rc=$?
+    local rc=0 out=""
+    REMOTE_BRANCH_SHA=""
+    out=$(git -C "$repo_dir" ls-remote --exit-code origin "refs/heads/$branch" 2>/dev/null) || rc=$?
     case "$rc" in
-        0) return 0 ;;
+        0) REMOTE_BRANCH_SHA=$(printf '%s' "$out" | cut -f1); return 0 ;;
         2) return 1 ;;
         *) return 2 ;;
     esac
