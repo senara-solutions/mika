@@ -8196,6 +8196,99 @@ _pilot_had_no_shipping_tail() {
 }
 
 # ---------------------------------------------------------------------------
+# mika#3142 — a halt the pilot DECLARED, read from the session log's tail
+# ---------------------------------------------------------------------------
+#
+# When the per-flight line budget of mika#2693 is exceeded, the pilot stops on
+# purpose: no commit, no push, no PR, and a last message of the form
+# «**HALTE borne : N lignes … pour `M`**». Nothing in this file could see that.
+# `_run_claude_pilot` reads exactly eight fields out of claude-pilot's JSON
+# (6691-6722) and NOT ONE of them carries the pilot's last message — that is the
+# root. The observable signature of a clean turn with no shipping tail is then
+# exactly what `_pilot_had_no_shipping_tail` above recognises, i.e. the
+# `no-shipping-tail` class of mika#2492, the NOMINAL path of the autonomous loop
+# under the lean tails of mika#2694. So the rescue pushed the branch and opened
+# a draft on work the pilot had deliberately not finished: measured on #3081,
+# #3092, #3100, #3108. On #3081 the draft even carried
+# `rescue-pipeline-verified: yes`, after which `auto_resume_wip_rescue_drafts`
+# (mika#1852) un-drafted it — halted work went to review with no decision.
+#
+# WHERE THE DECLARATION LIVES, and the one reason it is cheap to read: only in
+# the session log, already addressed by the global `_SESSION_LOG_PATH` posed at
+# 6678 inside `_run_claude_pilot`, which `dispatch_claude_pilot` calls WITHOUT a
+# subshell (14633). No `gh` call, no network round-trip, no re-derivation.
+#
+# WHY A BARE `grep "HALTE borne"` WOULD BE A GUARANTEED FALSE POSITIVE. The rule
+# is QUOTED in the plan injected into the pilot's prompt, so it sits near the
+# HEAD of every session log — `grep -rn "HALTE borne"` over `skills/`, `.claude/`
+# and `docs/` finds the string in `docs/plans/*.md` and nowhere else, eighteen
+# plan files each writing the rule. Measured on the two logs of mika#3119
+# § Défaut B:
+#
+#   log          rule quoted at   declared at              lines after   size
+#   4492a670-…   l. 100           l. 9630 (`379 lignes`)   24            9 654
+#   5813f896-…   l.  88           l. 7268 (`455 lignes`)   26            7 294
+#
+# Hence TWO independent anchors, and neither one alone would do:
+#   * DIGITS right after `HALTE borne :` — the eighteen quotations write the
+#     literal `N` at that spot, never a number;
+#   * a TAIL WINDOW — because a plan *may* quote the rule with a real number in
+#     place of `N`, and the quotations live 88-100 lines from the head while the
+#     declarations live 24-26 lines from EOF.
+# `tests/test_pilot_halt_declared.sh` attests each anchor in isolation (V3, V4).
+#
+# DIRECTION OF THE FAIL-SAFE, and it is NOT symmetric. A predicate true by
+# mistake would WITHHOLD an artefact — at flight 2b a push and a draft — which is
+# precisely the loss mika#1282 exists to prevent, and this file's doctrine on a
+# refusal that TAKES SOMETHING AWAY is already written (mika#3038 refuses
+# nothing on `_tree_rc=2`; `_pilot_had_no_shipping_tail` answers false on any
+# indeterminacy). So every indeterminacy here answers "no halt": variable unset,
+# file absent, empty, unreadable, `tail` failing.
+#
+# A here-string and NOT a pipe — a measured fix, not a preference (mika#2055).
+# `grep -q` exits at the first match and closes the pipe; a producer still
+# writing takes SIGPIPE and exits 141, and under the `pipefail` this library is
+# sourced into that 141 becomes the pipeline's status — the predicate would
+# answer "no halt" for a log that carries one. `scripts/verify-no-sigpipe-grep.sh`
+# would NOT catch it: its producer vocabulary is `printf|echo` only, so a
+# `tail | grep -q` passes under the lint while carrying the regression. And on a
+# 120-line window, exceeding the 64 KiB pipe buffer depends on line length, so
+# the false negative would be INTERMITTENT. Case V8 of the suite exists for that
+# and for nothing else.
+#
+# NO CONSUMER IN THIS FLIGHT. The detector is armed — its suite runs in the
+# `dispatch-lib-offline-suites` job and goes red on a regression — but neither
+# `_push_branch` nor the recovery block consults it yet: the refusal and the
+# push abstention depend on an arbitration reserved to the operator and ship
+# under `Tracked in: senara-solutions/mika#3142`.
+
+# The tail window, in lines. 120 is five times the largest measured distance
+# (26 lines on `5813f896-…`) and well below the 88 lines of the lowest measured
+# head quotation. Recalibration note: the distance is bounded by the length of
+# the shipping tail, never by the size of the log.
+_PILOT_HALT_TAIL_WINDOW=120
+# Deliberately SHORT, and tolerant of the Markdown emphasis on either side: the
+# words, free spacing, the colon, free spacing, then a digit. A form it does not
+# match answers "no halt", which is the safe direction.
+_PILOT_HALT_DECL_RE='HALTE borne[[:space:]]*:[[:space:]]*[0-9]'
+
+# _pilot_declared_halt — true when the pilot's last word was a declared halt.
+#
+# Structural model: `_pilot_had_no_shipping_tail` above — a conjunction of
+# guards that `return 1`, a final `return 0`, nothing else. The `--` before the
+# path and before the pattern keeps a leading `-` from becoming an option.
+_pilot_declared_halt() {
+    local _tail
+    [ -n "${_SESSION_LOG_PATH:-}" ]                                   || return 1
+    [ -s "$_SESSION_LOG_PATH" ]                                       || return 1
+    _tail=$(tail -n "$_PILOT_HALT_TAIL_WINDOW" -- "$_SESSION_LOG_PATH" 2>/dev/null) \
+                                                                      || return 1
+    [ -n "$_tail" ]                                                   || return 1
+    grep -qE -- "$_PILOT_HALT_DECL_RE" <<<"$_tail"                    || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # mika#2493 — reading a policy deny: its LETHALITY and its full EVENT.
 #
 # Two functions, two questions, deliberately separate. The verb "halted" belongs
