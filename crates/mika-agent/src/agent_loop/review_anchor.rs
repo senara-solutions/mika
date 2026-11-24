@@ -741,6 +741,108 @@ fn body_lines<'a>(text: &'a str, required_suffix_lines: &[String]) -> Vec<&'a st
     lines[..scan_end].to_vec()
 }
 
+/// Longest annotation, in characters, a label may carry between its own characters (mika#3127).
+///
+/// The forms measured are short — `(déjà acceptée, conservée)` is 25 characters, `(nouvelle)` is
+/// 10 — and the bound exists to keep the tolerance from swallowing a sentence. At 64 the realistic
+/// annotation fits several times over, while a parenthetical holding a 40-character quote cannot
+/// hide behind "it is only a label" for long: past the bound the line is simply **not read as an
+/// anchor** rather than read with a wider label. Fail-closed is the right side to err on here —
+/// a label not read costs a `NoAnchorLine` the reviewer can fix by writing a plainer label, where
+/// a label read too wide would eat a real quote and refuse an attestation that was correct.
+const LABEL_ANNOTATION_MAX_CHARS: usize = 64;
+
+/// Consume the declared `prefix` at the head of `line`, tolerantly, and return what follows.
+///
+/// The pre-mika#3127 reading was `line.trim_start().trim_start_matches('*')` followed by
+/// `strip_prefix`: only **leading** `*` fell, so `**A1:** "…"` was read (mika#2786) while
+/// `**A1** : "…"` and `**A1** (déjà acceptée, conservée) : "…"` were not — a correct quote
+/// counted as absent (comment 18 of mika#3022). The fix consumes the prefix character by
+/// character and, **between** two of its characters, skips what markdown and the reviewer's own
+/// habits put there:
+///
+/// - markup and spacing noise: `*`, backtick, `_`, space, tab;
+/// - **at most one** balanced `(…)` or `[…]` group of at most [`LABEL_ANNOTATION_MAX_CHARS`]
+///   characters.
+///
+/// Four bounds keep this from reading an anchor into ordinary prose, and each has a negative
+/// control in `mika3127_libelles`:
+///
+/// 1. **Anchored at the line's head.** The walk never skips a character that is neither noise nor
+///    an annotation, so `**Attention** : 1 : …` dies on the `t` and never reaches the `1 :`.
+/// 2. **No group before the first prefix character matches** (`matched > 0`), or every
+///    parenthesis opening a line would open an anchor — `(A1) : …` stays a non-anchor.
+/// 3. **One group only**, and bounded.
+/// 4. **The group leaves with the label.** It is consumed as part of the prefix, so it never
+///    enters the quote — the mika#2786 invariant ("a longer prefix must not buy a shorter quote")
+///    extended to the annotation. A 40-character verbatim fragment written *inside* the
+///    parenthesis therefore buys nothing.
+///
+/// Deliberately regex-free, like the rest of this module (mika#864: "regex is a footgun — silent
+/// failure to fire"). The returned `&str` is cut at a boundary produced by `Chars::as_str` and
+/// `str::split_once`, never by arithmetic on an index: `scripts/check-byte-slices.sh` is the floor,
+/// and a French label is multi-byte by default.
+///
+/// Nesting is not handled: `split_once` stops at the first closing character, so `(a (b) c)` ends
+/// the group early and the next character fails the walk. That is the fail-closed side of bound 3.
+fn match_anchor_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    /// Markup and spacing a reviewer may put between two characters of a label.
+    const NOISE: [char; 5] = ['*', '`', '_', ' ', '\t'];
+
+    let mut rest = line;
+    let mut matched = 0usize;
+    let mut annotation_used = false;
+    let mut expected = prefix.chars();
+    let mut want = expected.next();
+
+    while let Some(c_want) = want {
+        let mut chars = rest.chars();
+        // `as_str` yields the remainder after one character, so the cut is on a character
+        // boundary by construction.
+        let c = chars.next()?;
+        let after = chars.as_str();
+
+        if c == c_want {
+            rest = after;
+            matched += 1;
+            want = expected.next();
+            continue;
+        }
+        if NOISE.contains(&c) {
+            rest = after;
+            continue;
+        }
+        if matched > 0
+            && !annotation_used
+            && let Some(tail) = skip_label_annotation(rest)
+        {
+            rest = tail;
+            annotation_used = true;
+            continue;
+        }
+        return None;
+    }
+
+    Some(rest)
+}
+
+/// Skip one balanced `(…)` or `[…]` group at the head of `rest`, bounded by
+/// [`LABEL_ANNOTATION_MAX_CHARS`]. `None` when `rest` does not open a group, when the group is
+/// unterminated, or when it is longer than the bound.
+fn skip_label_annotation(rest: &str) -> Option<&str> {
+    let mut chars = rest.chars();
+    let closing = match chars.next()? {
+        '(' => ')',
+        '[' => ']',
+        _ => return None,
+    };
+    let (annotation, tail) = chars.as_str().split_once(closing)?;
+    if annotation.chars().count() > LABEL_ANNOTATION_MAX_CHARS {
+        return None;
+    }
+    Some(tail)
+}
+
 /// Find a span of at least `min_quote_chars` characters of `line` that occurs verbatim in
 /// `brief`, returning its byte range within `brief`.
 ///
@@ -883,26 +985,30 @@ pub(crate) fn verify_review_anchors(
     // that identifies the line, never part of the quote — counting it toward
     // `min_quote_chars` would let a longer prefix buy a shorter quote.
     //
-    // Leading `*` are skipped before the prefix is looked for (mika#2786): a reviewer who
-    // writes the label in bold (`**A1:** "…"`) has still written an anchor line. Measured on
-    // mika#2762's third withheld pass (2026-10-18, session `8c9da828`): every label was bold,
-    // so the guard saw `NoAnchorLine`; replayed with the label recognized, the response
-    // carried three verbatim quotes at three disjoint regions of the brief. This tolerance is
-    // on *finding* the line only. The `**` left after the prefix goes through
-    // [`normalize_for_anchor_match`] like any other emphasis marker, so the quote is held to
-    // exactly the same verbatim test as an unbolded one.
+    // Markup around the label is skipped before the prefix is looked for — see
+    // [`match_anchor_prefix`] for the exact tolerance and its four bounds. A reviewer who writes
+    // the label in bold (`**A1:** "…"`, mika#2786), who puts the colon outside the bold
+    // (`**A1** : "…"`), or who annotates it (`**A1** (déjà acceptée, conservée) : "…"`,
+    // mika#3127) has still written an anchor line. Both were measured as `NoAnchorLine` on
+    // responses that did carry three verbatim quotes at three disjoint regions of the brief:
+    // mika#2762's third withheld pass (2026-10-18, session `8c9da828`) for the bold label,
+    // comment 18 of mika#3022 (trace `f5eae27d`) for the annotated one.
+    //
+    // This tolerance is on *finding* the line only. Whatever markup survives the prefix goes
+    // through [`normalize_for_anchor_match`] like any other emphasis marker, so the quote is held
+    // to exactly the same verbatim test as an unbolded one — and the annotation leaves *with* the
+    // label, so it can never be counted as quoted characters.
     //
     // The prefix is kept *alongside* the content, not discarded: it is the name the corrective
-    // re-prompt calls the line by (mika#2794). It still does not enter the quote.
+    // re-prompt calls the line by (mika#2794). It is the **declared** prefix rather than the
+    // graphy read, so `accepted_labels` and `refused_labels` keep one population per label. It
+    // still does not enter the quote.
     let anchor_lines: Vec<(&str, &str)> = body_lines(text, required_suffix_lines)
         .into_iter()
         .filter_map(|line| {
-            let trimmed = line.trim_start().trim_start_matches('*');
-            prefixes.iter().find_map(|p| {
-                trimmed
-                    .strip_prefix(p.as_str())
-                    .map(|rest| (p.as_str(), rest))
-            })
+            prefixes
+                .iter()
+                .find_map(|p| match_anchor_prefix(line, p.as_str()).map(|rest| (p.as_str(), rest)))
         })
         .collect();
 
@@ -3323,5 +3429,248 @@ mod mika3127 {
                 .contains("lengthen"),
             "le verbe du correctif est explicite dans la relance"
         );
+    }
+}
+
+/// Le second geste de mika#3127 : le libellé en gras suivi d'une annotation reste un libellé.
+///
+/// Défaut B, mesuré au commentaire 18 (mika#3022, trace `f5eae27d`, session `e59ab2dc`) :
+/// `verify_review_anchors` cherchait le préfixe sur `line.trim_start().trim_start_matches('*')`,
+/// donc seuls les `*` **de tête** tombaient. `**A1:** "…"` passait depuis mika#2786, mais
+/// `**A1** : "…"` et `**A1** (déjà acceptée, conservée) : "…"` rendaient `anchors_found: 0`,
+/// donc `NoAnchorLine` — une citation parfaitement juste comptée comme absente, un groom mort
+/// en `Verdict: ESCALATE` au bout de 50 tours et 5,28 $, et une main humaine pour re-poser
+/// `ready`.
+#[cfg(test)]
+mod mika3127_libelles {
+    use super::*;
+
+    /// Le même brief que [`super::mika3127`] — les aides d'un module de test lui sont privées,
+    /// et `matrix` redéclare déjà les siennes.
+    const BRIEF: &str = "Le plan de ce ticket tient en un geste, et le coût en est dérisoire.\n\
+        Une ligne ajoutée, aucun code. Total estimé : 358 lignes pour le vol entier.\n\
+        La propriété de sûreté est que la sonde de présence ne peut faire accepter aucune ancre.\n\
+        La priorité d'agrégation insère la nouvelle cause entre l'absence et la brièveté.\n\
+        Le registre de lecture du tour n'ouvre sa porte que sur une citation absente du brief.\n";
+
+    /// Trois citations verbatim du brief, chacune au-delà du seuil de 40 et sur trois régions
+    /// disjointes : de quoi construire l'attestation que le commentaire 18 avait écrite.
+    const C1: &str = "Le plan de ce ticket tient en un geste, et le coût en est dérisoire";
+    const C2: &str = "La propriété de sûreté est que la sonde de présence";
+    const C3: &str = "Le registre de lecture du tour n'ouvre sa porte";
+
+    fn prefixes() -> Vec<String> {
+        (1..=10).map(|n| format!("A{n}:")).collect()
+    }
+
+    fn suffix_lines() -> Vec<String> {
+        vec![
+            "Disposition: READY".to_string(),
+            "Verdict: GROOMED".to_string(),
+        ]
+    }
+
+    /// Au seuil de production des trois manifestes arch : trois ancres, 40 caractères.
+    fn verifie(text: &str) -> AnchorVerdict {
+        verify_review_anchors(text, BRIEF, &prefixes(), &suffix_lines(), 3, 40)
+    }
+
+    /// Le même texte lu avec un seuil de comptage volontairement hors d'atteinte : le verdict
+    /// reste un `Missing`, donc `anchors_found` est exposé. C'est la seule façon de lire le
+    /// compte — un `Satisfied` ne le porte pas.
+    fn trouvees(text: &str) -> usize {
+        match verify_review_anchors(text, BRIEF, &prefixes(), &suffix_lines(), 11, 40) {
+            AnchorVerdict::Missing { anchors_found, .. } => anchors_found,
+            AnchorVerdict::Satisfied => unreachable!("onze ancres ne sont jamais atteintes ici"),
+        }
+    }
+
+    fn fates(verdict: &AnchorVerdict) -> Vec<(String, Option<AnchorMissReason>)> {
+        match verdict {
+            AnchorVerdict::Missing { per_anchor, .. } => per_anchor
+                .iter()
+                .map(|outcome| (outcome.label.clone(), outcome.refused))
+                .collect(),
+            AnchorVerdict::Satisfied => Vec::new(),
+        }
+    }
+
+    /// L'attestation du commentaire 18, dans sa forme exacte : libellé en gras, deux-points
+    /// **hors** du gras, et sur la première ancre l'annotation que l'architecte ajoute quand il
+    /// conserve une ancre d'une passe antérieure.
+    fn attestation_du_commentaire_18() -> String {
+        format!(
+            "**A1** (déjà acceptée, conservée) : \"{C1}\" — je la conserve telle quelle.\n\
+             **A2** : \"{C2}\" — la propriété de sûreté tient.\n\
+             **A3** (nouvelle) : \"{C3}\" — la porte du registre reste fermée.\n\n\
+             Disposition: READY\n"
+        )
+    }
+
+    /// AC5 — le cas mesuré, réparé. Les trois libellés sont lus, et les trois citations qu'ils
+    /// portaient depuis le début suffisent : le verdict est `Satisfied`, pas un `NoAnchorLine`.
+    #[test]
+    fn mika3127_les_trois_libelles_du_commentaire_18_sont_lus() {
+        let text = attestation_du_commentaire_18();
+        assert_eq!(
+            verifie(&text),
+            AnchorVerdict::Satisfied,
+            "trois citations verbatim à trois régions disjointes : l'attestation est valide"
+        );
+        assert_eq!(
+            trouvees(&text),
+            3,
+            "le compte mesuré au commentaire 18 était 0 ; c'est lui que ce vol déplace"
+        );
+    }
+
+    /// AC5, la table des formes. Elle est table-écrite à dessein : la borne de taille du plan
+    /// est que chaque forme nouvelle s'ajoute en une ligne, et que les deux contrôles négatifs
+    /// vivent dans le **même** tableau que les formes acceptées — une famille et son
+    /// complément séparés en deux tests, c'est la moitié qu'on oublie de relire.
+    ///
+    /// Les lignes ne citent rien du brief : ce test mesure la lecture du **libellé**, et un
+    /// `anchors_found` ne se lit que sur un `Missing`.
+    #[test]
+    fn mika3127_la_table_des_formes_de_libelle() {
+        let annotation_trop_longue = C1;
+        assert!(
+            annotation_trop_longue.chars().count() > LABEL_ANNOTATION_MAX_CHARS,
+            "la prémisse du dernier cas : {} caractères",
+            annotation_trop_longue.chars().count()
+        );
+
+        let cas: Vec<(&str, String, usize)> = vec![
+            ("le libellé nu", "A1: x".to_string(), 1),
+            // mika#2786, non-régression : la forme que ce vol ne doit pas perdre.
+            ("le libellé tout en gras", "**A1:** x".to_string(), 1),
+            // Le cas du commentaire 18 : les deux-points sortis du gras.
+            ("les deux-points hors du gras", "**A1** : x".to_string(), 1),
+            (
+                "le gras et une annotation",
+                "**A1** (déjà acceptée, conservée) : x".to_string(),
+                1,
+            ),
+            // La puce de liste et l'indentation sont du bruit comme le reste.
+            (
+                "la puce, l'indentation et le gras",
+                "  * **A10** [conservée] : x".to_string(),
+                1,
+            ),
+            // L'ordre d'essai reste l'ordre de déclaration, et reste juste : `A1:` échoue sur
+            // le `0` de `A10` — un `0` n'est ni du bruit ni un groupe — puis `A10:` apparie.
+            ("le dixième libellé", "A10: x".to_string(), 1),
+            // Contrôle négatif : aucun groupe n'est toléré AVANT qu'un caractère du préfixe
+            // ait apparié, sinon toute parenthèse de début de ligne ouvrirait une ancre.
+            ("le libellé entre parenthèses", "(A1) : x".to_string(), 0),
+            // Contrôle négatif : l'appariement est ancré au début de la ligne, donc il meurt
+            // sur le `t` d'« Attention » et ne va pas chercher le `1 :` plus loin.
+            (
+                "le faux libellé d'une phrase en gras",
+                "**Attention** : 1 : x".to_string(),
+                0,
+            ),
+            // Contrôle négatif : une annotation plus longue que la borne n'est plus une
+            // annotation. Fail-closed — le libellé n'est pas lu plutôt que lu trop large.
+            (
+                "l'annotation plus longue que la borne",
+                format!("**A1** ({annotation_trop_longue}) : x"),
+                0,
+            ),
+        ];
+
+        for (nom, ligne, attendu) in cas {
+            let text = format!("{ligne}\n\nDisposition: READY\n");
+            assert_eq!(
+                trouvees(&text),
+                attendu,
+                "{nom} : « {ligne} » devait donner {attendu} ancre(s)"
+            );
+        }
+    }
+
+    /// AC5, suite — le libellé rendu reste le préfixe **déclaré**, jamais la graphie lue.
+    /// `accepted_labels` et `refused_labels` sont des champs de log (mika#2794) : si l'annotation
+    /// ou le gras y entraient, deux graphies du même libellé deviendraient deux populations et
+    /// cesseraient d'être soustractibles (mika#2205).
+    #[test]
+    fn mika3127_le_libelle_journalise_reste_le_prefixe_declare() {
+        // Le reste est assez long pour passer le bras décisionnel et n'emprunte au brief aucune
+        // fenêtre de seize caractères : la cause est l'absence, et le libellé est ce qu'on lit.
+        let text = "**A1** (déjà acceptée, conservée) : une phrase entièrement de mon invention \
+                    qui ne figure nulle part\n\nDisposition: READY\n";
+
+        let verdict = verifie(text);
+        assert_eq!(
+            fates(&verdict),
+            vec![("A1:".to_string(), Some(AnchorMissReason::QuoteNotInBrief))],
+            "le libellé journalisé est « A1: », pas « **A1** (déjà acceptée, conservée) : »"
+        );
+    }
+
+    /// AC6 — le négatif que la table ne peut pas porter : la ligne n'est pas une ancre, donc le
+    /// verdict est `NoAnchorLine` et non une cause de l'axe citation. Les deux noms partent dans
+    /// `miss_reason` et commandent deux correctifs opposés (« écrivez des lignes d'ancrage » vs
+    /// « allongez la citation »), donc leur distinction se vérifie, pas seulement le compte.
+    #[test]
+    fn mika3127_un_faux_libelle_reste_une_absence_de_ligne_dancrage() {
+        for ligne in ["(A1) : x", "**Attention** : 1 : x"] {
+            let text = format!("{ligne}\n\nDisposition: READY\n");
+            let verdict = verifie(&text);
+            match verdict {
+                AnchorVerdict::Missing { reason, .. } => assert_eq!(
+                    reason,
+                    AnchorMissReason::NoAnchorLine,
+                    "« {ligne} » n'est pas une ligne d'ancrage du tout"
+                ),
+                AnchorVerdict::Satisfied => panic!("« {ligne} » ne vaut aucune attestation"),
+            }
+        }
+    }
+
+    /// AC7 — l'annotation n'achète aucune longueur de citation. C'est l'invariant de mika#2786
+    /// étendu : le libellé ne compte jamais dans la citation, et l'annotation part **avec** le
+    /// libellé. Ici elle porte 45 caractères verbatim du brief, au-delà du seuil de 40 : si
+    /// elle entrait dans l'extrait, l'ancre serait acceptée sur une citation que personne n'a
+    /// écrite comme citation.
+    #[test]
+    fn mika3127_lannotation_nachete_aucune_longueur() {
+        let dans_la_parenthese = "Le plan de ce ticket tient en un geste, et le";
+        let n = dans_la_parenthese.chars().count();
+        assert_eq!(n, 45, "la prémisse : au-delà du seuil de 40");
+        assert!(
+            n <= LABEL_ANNOTATION_MAX_CHARS,
+            "et en-deçà de la borne, sinon c'est le libellé qui serait refusé"
+        );
+        assert!(
+            BRIEF.contains(dans_la_parenthese),
+            "et verbatim dans le brief, sinon le test ne mesure rien"
+        );
+
+        let text = format!("**A1** ({dans_la_parenthese}) :\n\nDisposition: READY\n");
+
+        let verdict = verifie(&text);
+        assert_eq!(
+            trouvees(&text),
+            1,
+            "la ligne EST lue comme une ancre — le refus doit venir de la citation"
+        );
+        match &verdict {
+            AnchorVerdict::Missing {
+                anchors_valid,
+                per_anchor,
+                ..
+            } => {
+                assert_eq!(*anchors_valid, 0, "aucune ancre valide : {verdict:?}");
+                assert!(
+                    !per_anchor[0].excerpt.contains("tient en un geste"),
+                    "l'annotation est partie avec le libellé : {:?}",
+                    per_anchor[0].excerpt
+                );
+            }
+            AnchorVerdict::Satisfied => {
+                panic!("l'annotation aurait acheté la citation : {verdict:?}")
+            }
+        }
     }
 }
