@@ -373,8 +373,41 @@ Behavior depends on the key's backend:
 |---------|----------|
 | `File` | Writes to `{agent_home}/config.toml` (preserves comments, atomic write). Validates value format. |
 | `Env` | Writes to `~/.mika/.env`. Secret keys prompt interactively via masked input (never accepts CLI arguments). Non-secret keys accept a CLI value or prompt with visible input. |
-| `Database` | Writes to the `customer_config` table in SQLite. |
+| `Database` | Writes to the `customer_config` table in SQLite. Accepts a CLI value, a value on stdin, or prompts when run on a terminal (see below). |
 | `ReadOnly` | Rejected with an error. |
+
+#### Per-tenant keys, and where their value may come from (mika#3132)
+
+Six keys are per-tenant (`Database` backend, `customer_config` table) and settable
+both by `mika config set` and by the agent's own `set_config` tool:
+
+| Key | Accepted values | Neutral / default |
+|-----|-----------------|-------------------|
+| `chat_id` | Telegram chat id (integer) | unset |
+| `timezone` | IANA timezone (`Europe/Paris`) | unset |
+| `thinking_level` | `low` \| `medium` \| `high` \| `off` | unset |
+| `proactive_daily_budget` | integer `0`–`24` (`0` = no wake-up at all) | engine default (3) |
+| `proactive_pause_until` | RFC 3339 instant, or `none` to resume | `none` |
+| `language` | `fr` \| `en` | unset (poses nothing) |
+
+`context_history_scope` and `context_history_max_tokens` are also per-tenant but
+are deliberately **not** in the tool surface — see
+[Per-tenant conversation window](#per-tenant-conversation-window-mika2425).
+
+The value may arrive by three channels:
+
+```sh
+mika config set chat_id 123456789 --agent <tenant>        # command line
+printf '%s' 123456789 | mika config set chat_id --agent <tenant>   # stdin, to EOF
+mika config set chat_id --agent <tenant>                  # on a terminal: prompts
+```
+
+A value given on the command line behaves exactly as before — nothing reads stdin
+and nothing prompts. Stdin exists so a value can stay out of the shell history and
+out of the process table; it is read to EOF and trimmed. Two refusals are named
+rather than silently written: an empty value (a key present at the empty string
+does not read like a key that was never set) and a multi-line value (the producer
+is at fault, not the value — use `printf '%s'` rather than `echo`).
 
 ### `mika config list`
 
