@@ -263,6 +263,16 @@ où vit déjà l'interdiction de lecture (ligne 46) :
 Le prompt change pour la seule raison qui tient : il est le canal par lequel le
 modèle évite le refus **avant** de le payer. La fermeture reste la garde.
 
+**Reporté à mika#3166, et pourquoi c'est dicible :** cette moitié prompt n'est pas
+livrée par ce vol, faute de budget — `system_prompt.md` a 42 octets de marge avant
+la panique de `bundled_skills_approaching_max_prompt_size_warns` (95 % du max
+effectif, lui-même plafonné par `MAX_PROMPT_SIZE_CEILING`), et les deux puces en
+pèsent 1 296. En attendant, c'est le **refus de la garde** qui porte la ligne
+canonique `CI-Status: pending at review time — <checks>` : le modèle apprend la
+règle à l'instant où elle mord, en bande. Le report coûte un aller-retour moteur
+par occurrence, jamais un défaut qui passe — « la fermeture reste la garde » est
+exactement la phrase ci-dessus.
+
 ---
 
 ## Périmètre — ce vol et ce qu'il laisse
@@ -346,7 +356,10 @@ amende mika#2455 R6, pas par un élargissement de ce détecteur.
 3. Le vocabulaire d'audit est **étendu** et non renommé ; les quatre outcomes
    existants gardent leur orthographe.
 4. Deux tests de câblage eval (refus attesté, muet laissé passer) verts.
-5. Le prompt `qa-review` porte la règle d'abstention et la ligne canonique.
+5. La règle d'abstention (les deux puces du prompt `qa-review`) et la ligne
+   canonique `CI-Status:` sont **reportées à mika#3166** — condition de réveil :
+   une marge du prompt `qa-review` supérieure à 1 296 octets. En attendant, c'est
+   le refus de la garde qui porte la ligne canonique (D6).
 6. Section `## Fire-Disposition` du présent plan appliquée.
 7. `cargo test -p mika-agent`, `cargo fmt --check`, `cargo clippy -D warnings`,
    `make verify-bundled-skills` et `scripts/verify-pipeline.sh origin/main`
@@ -386,8 +399,10 @@ critères ci-dessous sont dérivés de son « Attendu » et du Verification Cont
   orthographe exacte, épinglée par le test de format de fil existant.
 - **AC9** — `MIKA_QA_CI_COHERENCE_GATE=0` désarme ce terme avec le reste du gate ;
   aucune nouvelle variable d'environnement n'est introduite.
-- **AC10** — Le prompt `qa-review` porte la règle d'abstention CI et la ligne
-  canonique, et `make verify-bundled-skills` reste vert.
+- **AC10** — La règle d'abstention CI (les deux puces du prompt `qa-review`) et la
+  ligne canonique `CI-Status:` sont **reportées à mika#3166**. Condition de
+  réveil : une marge du prompt `qa-review` supérieure à 1 296 octets. En
+  attendant, c'est le refus de la garde qui porte la ligne canonique (D6).
 
 ---
 
