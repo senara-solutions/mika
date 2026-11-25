@@ -3925,7 +3925,7 @@ pub fn body_attests_ci_concluded(body: &str) -> Option<String> {
 // | étage | site | mergé |
 // |---|---|---|
 // | garde exécutable | `scripts/verify-pipeline.sh` mécanisme 4, sur `.pull_request.user.login` | 2026-09-21 (mika#2419) |
-// | prompt QA | `qa-review/system_prompt.md` Step 1.6, *« Do NOT run Steps 2/2.5/3e for a Dependabot PR »* | 2026-08-26 (mika#1729) |
+// | prompt QA | `qa-review-dependabot/system_prompt.md` Step 1.6, *« Do NOT run Steps 2/2.5 for a Dependabot PR »* (extrait de `qa-review/system_prompt.md` par mika#3166, qui n'en garde qu'un renvoi) | 2026-08-26 (mika#1729) |
 //
 // Écrire une troisième copie serait la classe que mika#2172 a fermée sur ce
 // prompt précis : une règle posée à un troisième endroit dérive des deux
@@ -8944,6 +8944,40 @@ mod tests {
         const PROMPT_QA_REVIEW: &str =
             include_str!("../../../../skills/bundled/qa-review/system_prompt.md");
 
+        /// Le shard extrait de `qa-review` par mika#3166 — même corpus de
+        /// gabarits, même tour de revue.
+        ///
+        /// **Pourquoi il est là.** Le scan ci-dessous raisonne sur « le texte que
+        /// le modèle recopie pendant une revue ». Jusqu'à mika#3166 ce texte
+        /// tenait dans un seul fichier, donc un seul `include_str!` suffisait et
+        /// le scan était complet par accident de topologie. Le Step 1.6 ayant
+        /// déménagé, ces ~11 Ko de prompt seraient sortis du périmètre sans
+        /// qu'aucune assertion ne change de couleur : un scan dont la cible a
+        /// déménagé se lit **exactement** comme un arbre propre (doctrine
+        /// mika#2103 / mika#2205). Déclarer le shard ici est ce qui empêche le
+        /// découpage d'avoir désarmé le détecteur en silence.
+        ///
+        /// La résolution de dépendances n'étant pas conditionnelle, ce fichier
+        /// est injecté sur **tout** tour qa-review et non seulement sur une revue
+        /// Dependabot : il est donc dans le périmètre au sens plein, pas par
+        /// prudence.
+        const PROMPT_QA_REVIEW_DEPENDABOT: &str =
+            include_str!("../../../../skills/bundled/qa-review-dependabot/system_prompt.md");
+
+        /// Les prompts que le scan d'armement parcourt, nommés pour que le refus
+        /// dise **quel** fichier corriger.
+        ///
+        /// Une entrée s'ajoute ici au moment où un morceau du prompt de revue est
+        /// extrait dans un skill frère — c'est le geste qui garde le scan complet
+        /// à travers un découpage (mika#3166).
+        const PROMPTS_SCANNES: &[(&str, &str)] = &[
+            ("qa-review/system_prompt.md", PROMPT_QA_REVIEW),
+            (
+                "qa-review-dependabot/system_prompt.md",
+                PROMPT_QA_REVIEW_DEPENDABOT,
+            ),
+        ];
+
         /// Lignes du prompt soustraites au scan d'armement.
         ///
         /// **LIVRÉE VIDE**, et son vide est asserté : le détecteur atterrit
@@ -8968,25 +9002,46 @@ mod tests {
         /// gabarits que le modèle recopie : une ligne de gabarit qui atteste
         /// une CI verte produit un refus sur **chaque** revue conforme, et le
         /// refus serait alors indistinguable du défaut qu'il corrige.
+        ///
+        /// Depuis mika#3166 le corpus est en **deux** fichiers et le scan les
+        /// parcourt tous les deux ([`PROMPTS_SCANNES`]) : le texte recopié n'a
+        /// pas changé, seule la frontière de fichier l'a fait.
         #[test]
         fn le_prompt_de_qa_review_ne_declenche_pas_le_detecteur() {
-            let fautives: Vec<(usize, String)> = PROMPT_QA_REVIEW
-                .lines()
-                .enumerate()
-                .filter(|(_, ligne)| {
-                    !CI_ATTESTATION_PROMPT_ALLOWLIST
-                        .iter()
-                        .any(|(exc, _)| ligne.contains(exc))
+            // Sans cette borne, un `include_str!` pointant un chemin devenu vide
+            // rendrait le scan vert en ne lisant rien (classe mika#2103).
+            for (nom, prompt) in PROMPTS_SCANNES {
+                assert!(
+                    prompt.len() > 1024,
+                    "{nom} fait {} octets — population quasi vide, le scan ne \
+                     compte plus rien",
+                    prompt.len()
+                );
+            }
+
+            let fautives: Vec<(&str, usize, String)> = PROMPTS_SCANNES
+                .iter()
+                .flat_map(|(nom, prompt)| {
+                    prompt
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, ligne)| {
+                            !CI_ATTESTATION_PROMPT_ALLOWLIST
+                                .iter()
+                                .any(|(exc, _)| ligne.contains(exc))
+                        })
+                        .filter_map(move |(i, ligne)| {
+                            body_attests_ci_concluded(ligne).map(|cite| (*nom, i + 1, cite))
+                        })
                 })
-                .filter_map(|(i, ligne)| body_attests_ci_concluded(ligne).map(|cite| (i + 1, cite)))
                 .collect();
 
             assert!(
                 fautives.is_empty(),
                 "ces lignes du prompt qa-review déclenchent le détecteur — \
-                 corrige la LIGNE DU PROMPT (ajoute un négateur, ou passe par \
-                 la ligne canonique `CI-Status:`), n'inscris pas d'exception : \
-                 {fautives:#?}"
+                 corrige la LIGNE DU PROMPT dans le fichier nommé (ajoute un \
+                 négateur, ou passe par la ligne canonique `CI-Status:`), \
+                 n'inscris pas d'exception : {fautives:#?}"
             );
         }
 
@@ -9007,18 +9062,19 @@ mod tests {
         }
 
         /// L'auto-nettoyage : une exception que le détecteur ne touche plus est
-        /// refusée, dans les deux sens — la ligne doit être encore dans le
-        /// prompt, **et** elle doit encore déclencher.
+        /// refusée, dans les deux sens — la ligne doit être encore dans l'un des
+        /// prompts scannés, **et** elle doit encore déclencher.
         #[test]
         fn chaque_entree_de_lallowlist_declenche_encore() {
             for (ligne, ticket) in CI_ATTESTATION_PROMPT_ALLOWLIST {
-                let trouvee = PROMPT_QA_REVIEW
-                    .lines()
+                let trouvee = PROMPTS_SCANNES
+                    .iter()
+                    .flat_map(|(_, prompt)| prompt.lines())
                     .find(|l| l.contains(ligne))
                     .unwrap_or_else(|| {
                         panic!(
-                            "l'exception {ligne:?} ({ticket}) ne correspond à aucune ligne du \
-                             prompt — retire-la"
+                            "l'exception {ligne:?} ({ticket}) ne correspond à aucune ligne des \
+                             prompts scannés — retire-la"
                         )
                     });
                 assert!(
