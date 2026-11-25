@@ -11,18 +11,6 @@ pub async fn run(command: WebhookCommand, format: &OutputFormat) -> Result<()> {
     }
 }
 
-/// Resolve the gateway base URL from env or default.
-fn gateway_url() -> String {
-    if let Ok(url) = std::env::var("MIKA_GATEWAY_URL") {
-        return url;
-    }
-    // Load dotenv so env vars from ~/.mika/.env are available
-    if let Ok(home) = mika_common::home::resolve_home_dir() {
-        mika_common::dotenv::load_dotenv(&home);
-    }
-    std::env::var("MIKA_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:3001".to_string())
-}
-
 /// Read the internal token for gateway auth.
 fn auth_token() -> Result<String> {
     if let Ok(home) = mika_common::home::resolve_home_dir() {
@@ -54,7 +42,7 @@ async fn list_dead(
     limit: Option<i64>,
     format: &OutputFormat,
 ) -> Result<()> {
-    let base = gateway_url();
+    let base = mika_common::gateway_endpoint::gateway_base_url();
     let token = auth_token()?;
     let client = build_client(&token);
 
@@ -141,7 +129,7 @@ async fn list_dead(
 
 /// Replay a single DLQ entry.
 async fn replay(delivery_id: &str, format: &OutputFormat) -> Result<()> {
-    let base = gateway_url();
+    let base = mika_common::gateway_endpoint::gateway_base_url();
     let token = auth_token()?;
     let client = build_client(&token);
 
@@ -192,7 +180,7 @@ async fn replay(delivery_id: &str, format: &OutputFormat) -> Result<()> {
 
 /// Replay all dead DLQ entries.
 async fn replay_all(format: &OutputFormat) -> Result<()> {
-    let base = gateway_url();
+    let base = mika_common::gateway_endpoint::gateway_base_url();
     let token = auth_token()?;
     let client = build_client(&token);
 

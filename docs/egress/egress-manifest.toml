@@ -427,7 +427,7 @@ owner              = "@samidarko"
 
 [[sink]]
 id                 = "cli-gateway-webhook"
-destination        = "MIKA_GATEWAY_URL (défaut http://localhost:3001)"
+destination        = "MIKA_GATEWAY_URL, ou MIKA_GATEWAY_PORT (défaut http://localhost:8080)"
 destination_source = "config"
 class              = "internal"
 data               = "lecture et rejeu de la dead-letter queue de webhooks : identifiants de livraison et jeton interne"
@@ -438,7 +438,7 @@ owner              = "@samidarko"
 
 [[sink]]
 id                 = "cli-gateway-notify"
-destination        = "MIKA_GATEWAY_URL (défaut http://localhost:3001)"
+destination        = "MIKA_GATEWAY_URL, ou MIKA_GATEWAY_PORT (défaut http://localhost:8080)"
 destination_source = "config"
 class              = "internal"
 data               = "le TEXTE DE LA NOTIFICATION à livrer à l'opérateur — il ressort ensuite par telegram-bot-api"

@@ -932,7 +932,23 @@ persistance des tours par `tui/app.rs`.
 `mika webhook replay <delivery_id>` — replay a single dead entry.
 `mika webhook replay-all` — replay all dead entries.
 
-Requires `MIKA_GATEWAY_URL` (default: `http://localhost:3001`) and `MIKA_INTERNAL_TOKEN` for gateway auth.
+Requires `MIKA_INTERNAL_TOKEN` for gateway auth, and resolves the gateway address like every other caller of this crate — see below.
+
+## L'adresse du gateway a un seul résolveur (mika#3125)
+
+`mika_common::gateway_endpoint::gateway_base_url()` est l'**unique** site qui répond à « quelle adresse de gateway ce CLI vise-t-il ? ». Ordre : `MIKA_GATEWAY_URL` → `MIKA_GATEWAY_PORT` → `DEFAULT_GATEWAY_PORT` (`8080`), une valeur vide traitée comme absente et un port illisible retombant sur le défaut avec un WARN plutôt qu'une panique. Quatre appelants le traversent : `send_via_gateway` (`commands/notify.rs`) et les trois sites de `commands/webhook.rs`.
+
+**Le défaut est celui que le gateway applique, et c'est la même constante.** Les deux `fn gateway_url()` de ce crate servaient un port qui n'était le défaut de rien — le gateway a toujours écouté sur `8080` — donc sans `MIKA_GATEWAY_URL` la livraison échouait sur « gateway unreachable », là où le même envoi vers `:8080` rendait 200 (mesuré, commentaire 61 du parking #2983 ; le port fautif est nommé par le doc-comment de `gateway_endpoint.rs`, seul endroit du dépôt qui a encore une raison de le citer). `GatewaySettings::default_port` lit désormais `DEFAULT_GATEWAY_PORT` elle aussi : un changement de port ne peut plus laisser le client derrière.
+
+**Un second résolveur est refusé, pas listé.** `mika3125_le_crate_cli_ne_resout_plus_ladresse_du_gateway` (module `tests` de `commands/notify.rs`) balaie la moitié production du **crate entier** par `ProductionScanner` et refuse `MIKA_GATEWAY_URL` comme `MIKA_GATEWAY_PORT` partout — allowlist livrée vide et assertie vide. Portée sur le crate et non sur un fichier, elle couvre un troisième site dans un fichier qui n'existe pas encore. Quand elle rougit, le remède est `gateway_base_url()`, jamais une entrée. Témoin et contre-témoin l'accompagnent : le masquage des régions `#[cfg(test)]` est ce qui empêche les deux aiguilles citées par le test lui-même de faire rougir la garde.
+
+**`mika notify --channel telegram` sort non-zéro quand la livraison échoue.** Avant mika#3125 l'échec faisait un `eprintln!` et `run` rendait `Ok(())` : la commande sortait en 0 et aucun appelant ne pouvait distinguer *livré* de *perdu*. `delivery_verdict` — fonction pure, attestable sans base ni réseau — porte la décision, et son `bail!` nomme quatre faits : la cause, l'**adresse visée** (le seul moyen de voir un port faux sans lire le code), le geste de configuration (par `gateway_endpoint::CONFIG_HINT`, de sorte que `notify.rs` ne nomme lui-même aucune variable — ce qui est aussi ce qui garde la garde verte) et le fait que la notification **est** en base avec sa session, ce qui sépare « le gateway est mort » de « l'appel n'a pas eu lieu ».
+
+- **`✓ Notification saved` se dit avant la tentative d'envoi.** L'écriture en base a eu lieu avant, donc elle s'annonce avant — et surtout avant un `bail!` qui, sinon, emporterait la confirmation d'un fait acquis (discipline des trois sorties de mika#1727 vol V2d-4c).
+- **Pas de code de sortie dédié, délibérément.** `anyhow` sort en 1, comme un échec d'écriture. Aucun appelant mesuré ne décide sur le code ; en inventer un que personne ne lit reproduirait le défaut qu'on corrige — une surface qui affirme sans destinataire. La distinction est portée par le message, qui a un lecteur.
+- **`--channel cli` est inchangé** : il ne demande aucune livraison et ne traverse `delivery_verdict` qu'avec `None`.
+- **Aucun test n'atteste une livraison Telegram réelle** — elle dépend d'un `chat_id` appairé et d'un gateway vivant, états de l'hôte hors du harness. La limite est écrite dans le module de test pour qu'un futur lecteur ne prenne pas son vert pour une preuve de livraison.
+- **`_pilot_egress_notify` (`skills/bundled/_shared/dispatch-lib.sh`) garde ses `|| true` et `>/dev/null 2>&1`** : le signal existe maintenant, ce site choisit de ne pas le lire, parce qu'une alerte en échec ne doit jamais rendre le lancement au pilote (mika#2049). Le silence s'y lit « personne n'a demandé », jamais « il n'y a rien à demander » — un opérateur rejoue la commande à la main et obtient la cause.
 
 ## Skills CLI
 
