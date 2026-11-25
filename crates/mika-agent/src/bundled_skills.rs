@@ -1994,6 +1994,82 @@ mod tests {
         );
     }
 
+    /// mika#3166 — le shard extrait de `qa-review` est atteignable là où vit la
+    /// revue, pas seulement déclaré.
+    ///
+    /// Le détecteur de classe au-dessus ne peut structurellement pas le voir :
+    /// son heuristique est « le nom finit par `-callback` », et
+    /// `qa-review-dependabot` n'est pas un handler de callback — c'est un morceau
+    /// du prompt de revue, extrait parce que le prompt de `qa-review` n'avait plus
+    /// que 42 octets sous la jauge `bundled_skills_approaching_max_prompt_size_warns`
+    /// et que `max_prompt_size` était déjà à `MAX_PROMPT_SIZE_CEILING`.
+    ///
+    /// **Ce qu'il mesure, et pourquoi une déclaration ne suffit pas.** Une arête
+    /// ENTRANTE ne porte aucune joignabilité (mika#2355 B1) : `match_skills()` et
+    /// `callback_safe_skills()` amorcent sur les `always_on` puis suivent les
+    /// dépendances **sortantes**. Un shard qui déclarerait `dependencies =
+    /// ["qa-review"]` et rien d'autre serait donc invisible pour toujours, et un
+    /// test qui lirait `qa-review-dependabot/skill.toml` resterait vert en le
+    /// lisant. Ce test lit donc le registre réellement embarqué et interroge le
+    /// vrai BFS : il rougit si quelqu'un retire la ligne
+    /// `"qa-review-dependabot"` des `dependencies` de `qa-review`, ou si le shard
+    /// cesse d'être découvert.
+    ///
+    /// **Ce qu'il ne mesure pas, dit plutôt que sous-entendu.** Il ne dit pas que
+    /// le texte du shard est juste, ni que son en-tête de portée est lu — la
+    /// résolution de dépendances n'est pas conditionnelle, donc le prompt est
+    /// injecté sur **tout** tour qa-review, Dependabot ou non. C'est l'en-tête de
+    /// portée en tête du fichier qui porte ce risque, et les sept épinglages de
+    /// `tests/qa_review_executes_repo_guards.rs` qui portent son contenu.
+    #[test]
+    fn mika3166_le_shard_dependabot_est_atteignable_depuis_qa_review() {
+        const SHARD: &str = "qa-review-dependabot";
+        const PARENT: &str = "qa-review";
+
+        let registry = registry_from_bundled_manifests();
+
+        let parent = registry
+            .skills()
+            .iter()
+            .find(|e| e.manifest.skill.name.eq_ignore_ascii_case(PARENT))
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{PARENT}' est absent des manifestes embarqués — population \
+                     vide, vérifier la découverte au build avant de croire ce test"
+                )
+            })
+            .clone();
+
+        assert!(
+            parent
+                .manifest
+                .skill
+                .dependencies
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(SHARD)),
+            "'{PARENT}' ne déclare plus '{SHARD}' dans ses `dependencies`. Une \
+             arête ENTRANTE ne porte aucune joignabilité (mika#2355 B1) : le \
+             chemin Dependabot deviendrait silencieusement inatteignable, et une \
+             revue de PR Dependabot repartirait sur le prompt de base avec un \
+             Step 1.6 qui renvoie à un fichier que le tour ne voit pas. \
+             Dépendances déclarées : {:?}",
+            parent.manifest.skill.dependencies
+        );
+
+        let reachable: Vec<String> = registry
+            .callback_safe_skills()
+            .iter()
+            .map(|e| e.manifest.skill.name.to_ascii_lowercase())
+            .collect();
+
+        assert!(
+            reachable.iter().any(|n| n == SHARD),
+            "'{SHARD}' est déclaré par '{PARENT}' mais le BFS ne l'atteint pas : \
+             l'arête existe, la résolution ne la suit pas. Atteignables \
+             aujourd'hui : {reachable:?}"
+        );
+    }
+
     /// mika#2961 — un marqueur de contexte déclaré est injecté EXACTEMENT une fois.
     ///
     /// `apply_context_replacements` (`skills/context.rs`) est un `replace_all` :

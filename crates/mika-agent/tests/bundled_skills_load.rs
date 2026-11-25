@@ -165,3 +165,85 @@ fn bundled_skills_approaching_max_prompt_size_warns() {
         panic!("{}", report);
     }
 }
+
+/// The margin a skill has left under the mika#852 gauge, in bytes.
+///
+/// Same arithmetic as the gauge above — `0.95 × effective_prompt_limit` — so a
+/// floor expressed in these units is literally "measured by the gauge test"
+/// (mika#3166 AC1) rather than by a second, drifting notion of margin.
+fn gauge_margin_bytes(skill: &str) -> (u64, u64, u64) {
+    let dir = bundled_skills_dir().join(skill);
+    let manifest_path = dir.join("skill.toml");
+    let prompt_path = dir.join("system_prompt.md");
+
+    let toml_str = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", manifest_path.display()));
+    let manifest: SkillManifest = toml::from_str(&toml_str)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", manifest_path.display()));
+
+    let effective_cap = effective_prompt_limit(manifest.skill.max_prompt_size);
+    let gate = (effective_cap as f64 * 0.95).floor() as u64;
+    let actual = fs::metadata(&prompt_path)
+        .unwrap_or_else(|e| panic!("failed to stat {}: {e}", prompt_path.display()))
+        .len();
+
+    (actual, gate, gate.saturating_sub(actual))
+}
+
+/// The margin #3164 had to pay for, and the floor it names (mika#3166 AC1).
+///
+/// 1 296 bytes is not a round number: it is the exact weight of the two
+/// Data-Integrity rules PR #3164 **removed** from `qa-review/system_prompt.md`
+/// because the prompt had 42 bytes left under the gauge — the CI-abstention rule
+/// and the canonical `CI-Status:` line of mika#3137. That is the first
+/// measurement of what the gauge costs in *behaviour* rather than in comfort,
+/// so it is the floor worth holding: below it, the next rule that has to reach
+/// mika-qa cannot.
+const QA_REVIEW_MARGIN_FLOOR_BYTES: u64 = 1_296;
+
+/// # Why this is named on `qa-review` and not asserted class-wide
+///
+/// Not timidity — a class-wide floor would redden on a prompt this flight does
+/// not touch. `self-dev` carries 68 696 bytes against a 73 728 cap, i.e. 1 345
+/// bytes of margin: **49 bytes** above this floor. A class-wide assertion would
+/// therefore make mika#3166's gate depend on `self-dev`'s next edit, and the
+/// natural response to that red — raising `self-dev`'s floor exemption — is how
+/// an allowlist is born (mika#2309). `self-dev` deserves its own shard ticket
+/// with its own seam analysis; it does not deserve to be dragged into this one.
+///
+/// # What reddens it
+///
+/// Any addition to `qa-review/system_prompt.md` that eats the margin mika#3166
+/// bought back. The message says what to do, and the order matters: the third
+/// remediation is now *primed* — `qa-review-dependabot` exists, the outgoing
+/// edge is declared, the scope-header idiom is established and the reachability
+/// detector is in place — so sharding is no longer the expensive option it was
+/// when `skill.toml` declined it twice.
+#[test]
+fn mika3166_le_prompt_qa_review_garde_la_marge_que_3164_a_payee() {
+    let (actual, gate, margin) = gauge_margin_bytes("qa-review");
+
+    assert!(
+        margin >= QA_REVIEW_MARGIN_FLOOR_BYTES,
+        "\nqa-review/system_prompt.md has {margin} bytes of margin under the \
+         mika#852 gauge ({actual} bytes against a gate at {gate}), below the \
+         {QA_REVIEW_MARGIN_FLOOR_BYTES}-byte floor of mika#3166.\n\n\
+         {QA_REVIEW_MARGIN_FLOOR_BYTES} bytes is the weight of the two \
+         Data-Integrity rules PR #3164 had to REMOVE from this prompt for lack \
+         of room (CI abstention + the canonical `CI-Status:` line, mika#3137). \
+         A margin below that means the next rule that must reach mika-qa \
+         cannot, and the engine guard is left alone to carry it.\n\n\
+         Remediation, in order:\n\
+         \x20 - Shard the addition into a sibling skill. This is now the cheap \
+         option: `qa-review-dependabot` (mika#3166) is the worked example — \
+         outgoing edge in `qa-review/skill.toml`, scope header at the top of \
+         the shard's prompt, identity allowlist entry, reachability detector in \
+         `src/bundled_skills.rs`.\n\
+         \x20 - Trim, and say in the commit what the removed text was holding.\n\
+         \x20 - Raising `max_prompt_size` is NOT an option: it is already at \
+         `MAX_PROMPT_SIZE_CEILING` (81 920), which `effective_prompt_limit` \
+         applies through a `.min()`.\n\n\
+         Lowering this floor is not a remediation — it is deleting the \
+         measurement that says the gauge has started costing behaviour."
+    );
+}
