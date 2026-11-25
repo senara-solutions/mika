@@ -23,6 +23,16 @@
 #   `tail -n 120`, so the window holds exactly `d <= 119` — V6 at d=119 (inside),
 #   V7 at d=120 (outside). The two measured logs are d=24 and d=26.
 #
+#   TWO HALVES, AND V1-V11 ARE ONLY THE FIRST. V1-V11 attest the PREDICATE,
+#   against real log files. W1-W8 (added by flight 2b, mika#3142) attest its
+#   CONSUMER — the first of the three structural refusals of the Unit 2 rescue
+#   block — and they attest it STATICALLY, by `grep`/`sed` over the shipped
+#   `dispatch-lib.sh`, because that block lives inline in `dispatch_claude_pilot`
+#   and is not callable from a suite. Their limit is named at the section itself:
+#   they prove the refusal is at the right place and says the right thing, never
+#   that it fired on a real flight. A correct predicate nobody calls is the exact
+#   defect flight 2b closed.
+#
 # Offline: the REAL function out of the shipped `dispatch-lib.sh`, against real
 # log files. No git repository, no `gh`, no network, no cargo — the predicate is
 # a pure function over a text file, so the hermeticity condition of mika#2793
@@ -303,6 +313,132 @@ assert_eq "S2c ...through a NAMED step, so a red run says what broke" "1" \
 # red (direction D2), so the right number of entries is zero.
 assert_eq "S2d the suite is absent from scripts/suite-wiring.tsv" "0" \
     "$(grep -cF -- "$SUITE_REL" "$REPO_ROOT/scripts/suite-wiring.tsv" || true)"
+
+section "W — the CONSUMER: the Unit 2 refusal that reads the predicate (mika#3142)"
+
+# WHY THIS HALF IS ATTESTED STATICALLY, and it is the precedent rather than a
+# shortcut. The Unit 2 rescue block lives inline inside `dispatch_claude_pilot`:
+# it is not callable from a suite. mika#2503 (its V14-V18) and mika#3038 both
+# attested their refusal by `grep` and `sed` over `dispatch-lib.sh`. This does
+# the same, and names the limit: these assertions prove the refusal IS AT THE
+# RIGHT PLACE AND SAYS THE RIGHT THING — never that it fired on a real flight.
+#
+# The witness / counter-witness pair, same shape as V1-V11 above but on the
+# WIRING: W2/W5/W6 are the witnesses (the refusal is there and it speaks),
+# W1/W3/W4/W7/W8 the counter-witnesses (it withholds nothing beyond its object).
+# Without the first group a diff that adds nothing passes the second; without the
+# second a refusal laid across the whole block — withholding every draft — passes
+# the first.
+
+# The refusal's region: from its own `if` to the `fi` that closes it. Its body
+# carries no nested `if`, so the first `fi` at this indent is its own.
+HALT_REFUSAL="$(sed -n '/^    if \[ "\$_recovery_pr_due" = "1" \] && _pilot_declared_halt; then$/,/^    fi$/p' "$DISPATCH_LIB")"
+PUSH_BRANCH_BLOCK="$(sed -n '/^_push_branch() {/,/^}$/p' "$DISPATCH_LIB")"
+HALT_HEADER="$(sed -n '/^# mika#3142 — a halt the pilot DECLARED/,/^_pilot_declared_halt() {$/p' "$DISPATCH_LIB")"
+
+case_of "W1: the four conditions are stated ONCE, and the opening block is gated on that one flag"
+# A second arm restating the four terms would route around every refusal keyed on
+# the flag — the structural argument of mika#2503, whose V14 already holds it for
+# the neighbouring refusal.
+assert_eq "W1a the four conditions of _recovery_pr_due appear exactly once" "1" \
+    "$(grep -cF -- '[ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]' "$DISPATCH_LIB" || true)"
+assert_eq "W1b the draft-opening block is gated on the flag alone, exactly once" "1" \
+    "$(grep -cF -- '    if [ "$_recovery_pr_due" = "1" ]; then' "$DISPATCH_LIB" || true)"
+
+case_of "W2: the refusal consults the predicate and extinguishes the flag"
+# The defect this flight closes is a detector nobody calls: armed at flight 2a,
+# inert in production. These two lines are the whole fix.
+assert_eq "W2a the refusal region was really extracted" "1" \
+    "$([ -n "$HALT_REFUSAL" ] && echo 1 || echo 0)"
+assert_contains "W2b it consults the predicate as a conjunctive term" \
+    '[ "$_recovery_pr_due" = "1" ] && _pilot_declared_halt; then' "$HALT_REFUSAL"
+assert_eq "W2c it clears the flag on the line right after the test" "_recovery_pr_due=0" \
+    "$(sed -n '2p' <<<"$HALT_REFUSAL" | tr -d '[:space:]')"
+
+case_of "W3: the refusal is keyed on NO rescue class (AC6)"
+# A halted flight is reachable in two of the three classes — committed before
+# measuring, or halted before committing — so a refusal keyed on either would
+# leave the other open. mika#2503 measured that a fix at the class-flag site
+# "would pass every local test and change NOTHING in production".
+for _klass in 'RESCUED_DIRTY_WORKTREE' 'RECOVERY_CLASS' 'no-shipping-tail' \
+              'dirty-worktree' 'commit-pushed-no-pr'; do
+    assert_eq "W3 the refusal does not mention $_klass" "0" \
+        "$(grep -cF -- "$_klass" <<<"$HALT_REFUSAL" || true)"
+done
+
+case_of "W4: the ORDER of the three refusals — halt first, then mika#3038, then mika#2503"
+# The three are mutually exclusive through the flag the first to fire
+# extinguishes, so whichever runs first is the one that names the reason. A
+# declared halt is the most specific: a declaration by the pilot where the other
+# two are inferences on the content. An "harmonisation" that reordered them would
+# have the loop name the wrong reason.
+W4_HALT="$(grep -nF -- '[ "$_recovery_pr_due" = "1" ] && _pilot_declared_halt; then' "$DISPATCH_LIB" | cut -d: -f1)"
+W4_3038="$(grep -nF -- '[ "$_recovery_pr_due" = "1" ] && [ "$_tree_rc" -eq 0 ]; then' "$DISPATCH_LIB" | cut -d: -f1)"
+W4_2503="$(grep -nF -- '[ "$_recovery_pr_due" = "1" ] && ! _rescue_touches_tracked_tree "$WORKTREE_DIR"; then' "$DISPATCH_LIB" | cut -d: -f1)"
+assert_eq "W4a each of the three refusals is found exactly once" "1 1 1" \
+    "$(wc -w <<<"$W4_HALT") $(wc -w <<<"$W4_3038") $(wc -w <<<"$W4_2503")"
+# The `=~ ^[0-9]+$` triple is not belt-and-braces: a needle that matched twice
+# yields a two-line value, and `[ -lt ]` on it prints `integer expected` on
+# stderr and reads, in a suite's output, like a bug in the suite rather than the
+# duplicate W4a already named.
+W4_ORDERED=0
+if [[ "$W4_HALT" =~ ^[0-9]+$ && "$W4_3038" =~ ^[0-9]+$ && "$W4_2503" =~ ^[0-9]+$ ]] \
+   && [ "$W4_HALT" -lt "$W4_3038" ] && [ "$W4_3038" -lt "$W4_2503" ]; then
+    W4_ORDERED=1
+fi
+assert_eq "W4b halt < mika#3038 < mika#2503" "1" "$W4_ORDERED"
+
+case_of "W5: the three canonical lines, in the format the parser accepts (AC2, AC3, AC4)"
+assert_contains "W5a the refusal writes its prose into RESULT" 'RESULT="${RESULT}' "$HALT_REFUSAL"
+assert_contains "W5b the prose names the ticket" 'mika#3142' "$HALT_REFUSAL"
+assert_contains "W5c the prose names the branch" '${BRANCH}' "$HALT_REFUSAL"
+assert_contains "W5d the prose names the manual publication gesture" \
+    'gh pr create --repo senara-solutions/${REPO} --head ${BRANCH} --base main --draft' "$HALT_REFUSAL"
+# `RE_NO_PR` is `(?m)^NO_PR:\s+([a-z_]+)`: prose on that line would have the
+# parser record the first lowercase word of the sentence as the reason.
+assert_eq "W5e exactly one status line, a bare snake_case token through the helper" "1" \
+    "$(grep -cE '_set_pr_status_line "NO_PR: [a-z_]+"$' <<<"$HALT_REFUSAL" || true)"
+assert_contains "W5f ...and the token is pilot_halt_declared" \
+    '_set_pr_status_line "NO_PR: pilot_halt_declared"' "$HALT_REFUSAL"
+assert_eq "W5g exactly one Outcome line, through the helper" "1" \
+    "$(grep -c '_set_outcome_line' <<<"$HALT_REFUSAL" || true)"
+assert_eq "W5h ...and it names both PIPELINE_INCOMPLETE and the motive" "1" \
+    "$(grep -cE '_set_outcome_line "Outcome: PIPELINE_INCOMPLETE .*pilot_halt_declared' <<<"$HALT_REFUSAL" || true)"
+# AC3: the stderr line is a convenience, deliberately not announced as a probe —
+# on a dispatch that succeeds `spawn_long_running_exec`'s pipe is dropped unread
+# (Signal M, mika#2050 class). RESULT is the operator surface.
+assert_contains "W5i no probe is announced on the stderr echo" 'never a probe' "$HALT_REFUSAL"
+
+case_of "W6: the detector's header names its consumer and promises no deferral (AC7)"
+assert_eq "W6a the header was really extracted" "1" \
+    "$([ -n "$HALT_HEADER" ] && echo 1 || echo 0)"
+assert_eq "W6b 'NO CONSUMER IN THIS FLIGHT' is gone" "0" \
+    "$(grep -cF -- 'NO CONSUMER IN THIS FLIGHT' <<<"$HALT_HEADER" || true)"
+# The discarded option is DISCARDED, not deferred: a `Tracked in:` would have the
+# next reader expect a flight 2c, and the next groom pick it up as leftover scope.
+assert_eq "W6c no 'Tracked in:' survives for a push abstention that will not come" "0" \
+    "$(grep -cF -- 'Tracked in:' <<<"$HALT_HEADER" || true)"
+assert_contains "W6d the header names the flag its consumer clears" '_recovery_pr_due' "$HALT_HEADER"
+
+case_of "W7: the three refusals stay three distinct predicates"
+# Merging them into one test would answer one motive for three different facts.
+for _neighbour in '_branch_tree_equals_main' '_rescue_touches_tracked_tree'; do
+    assert_eq "W7 the halt refusal does not consult $_neighbour" "0" \
+        "$(grep -cF -- "$_neighbour" <<<"$HALT_REFUSAL" || true)"
+done
+
+case_of "W8: the decision of 2026-11-25, held in BOTH halves (AC8)"
+# A pair, and that is the point: an absence (`_push_branch` untouched, so the
+# branch does reach origin) and a presence (the prose that promises it). Taken
+# together they go red the day someone adds the push guard without rewriting the
+# prose — exactly the day the discarded option returns by inadvertence, and the
+# only place where the decision is executable rather than documentary.
+assert_eq "W8a the _push_branch body was really extracted" "1" \
+    "$([ -n "$PUSH_BRANCH_BLOCK" ] && echo 1 || echo 0)"
+assert_eq "W8b _push_branch does not consult the predicate" "0" \
+    "$(grep -cF -- '_pilot_declared_halt' <<<"$PUSH_BRANCH_BLOCK" || true)"
+assert_contains "W8c ...and the refusal's prose promises that pushed branch" \
+    'Nothing was lost — branch ${BRANCH} is pushed.' "$HALT_REFUSAL"
 
 echo ""
 echo "Passed: $PASS   Failed: $FAIL"
