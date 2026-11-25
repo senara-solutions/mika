@@ -6869,12 +6869,21 @@ pub(crate) fn extract_callback_fields(result: &str) -> serde_json::Value {
 /// mention never matches, and the reason is constrained to the lowercase-token
 /// charset the `dispatch-lib.sh` emission sites produce (`no_pr_on_branch`,
 /// `gh_query_failed`, `branch_unset`, `repo_unset`, `rescue_pr_create_failed` —
-/// KTD2 — plus the two refusals the rescue can pronounce: `rescue_scratch_only`,
-/// mika#2503, and `rescue_adds_nothing_to_main`, mika#3038). This list is the
-/// only enumeration an operator reads to know what the loop can answer, so a
-/// reason the parser accepts but nothing here names is a reason nobody can look
-/// up: `rescue_scratch_only` was such a reason until mika#3038 added its
-/// neighbour and found it missing.
+/// KTD2 — plus the three refusals the rescue can pronounce:
+/// `rescue_scratch_only`, mika#2503, `rescue_adds_nothing_to_main`, mika#3038,
+/// and `pilot_halt_declared`, mika#3142). This list is the only enumeration an
+/// operator reads to know what the loop can answer, so a reason the parser
+/// accepts but nothing here names is a reason nobody can look up:
+/// `rescue_scratch_only` was such a reason until mika#3038 added its neighbour
+/// and found it missing.
+///
+/// `pilot_halt_declared` is NOT a member of the `pilot_terminated_*` family that
+/// `_no_pr_reason_from_halt_subtype` produces: that family lives on the
+/// `terminated` path and says the SUBSTRATE stopped the session, whereas a
+/// declared halt arrives with `STATUS=success` and says the PILOT measured its
+/// perimeter against the per-flight bound of mika#2693 and declined to ship it.
+/// The two can never contend for the line, and merging them would make the
+/// subtype normalisation lie.
 /// Returns `None` when no `NO_PR:` line is present, which is the AC-G2
 /// contract: a callback carrying neither `PR:` nor `NO_PR:` (a producer that
 /// predates U1) leaves the generic `callback_delivered_without_pr_url` motif
@@ -8289,6 +8298,7 @@ mod tests {
             "rescue_pr_create_failed",
             "rescue_scratch_only",
             "rescue_adds_nothing_to_main",
+            "pilot_halt_declared",
         ] {
             let result = format!("Outcome: PIPELINE_INCOMPLETE\nNO_PR: {reason}");
             assert_eq!(parse_no_pr_reason(&result).as_deref(), Some(reason));
