@@ -52,6 +52,21 @@ fn qa_review_prompt() -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Step 1.6 lives here since mika#3166 — the Dependabot path was extracted from
+/// `qa-review/system_prompt.md` into its own skill, because that prompt had 42
+/// bytes left under the `bundled_skills_approaching_max_prompt_size_warns`
+/// gauge and `max_prompt_size` was already at `MAX_PROMPT_SIZE_CEILING`.
+///
+/// The seven mika#2519 / mika#2565 assertions below read **this** file and not
+/// a word of them changed: the block was moved verbatim, which is the whole
+/// reason the move is not a weakening of the pinning (mika#3166 AC3). Sibling
+/// of `qa_review_build_callback_prompt()` further down, same shape.
+fn qa_review_dependabot_prompt() -> String {
+    let path = workspace_root().join("skills/bundled/qa-review-dependabot/system_prompt.md");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+}
+
 /// The two guard paths the prompt must discover. These are file paths, not
 /// rules — a list of files can only ever drift in *coverage* (a repo ships a
 /// guard under a third name), which the prompt reports as
@@ -214,13 +229,20 @@ fn prompt_requires_the_guard_output_to_be_quoted_verbatim() {
 /// Every scan below aims at Step 1.6. A scan that aims at a section which no
 /// longer exists reads **exactly** like a scan on a clean tree (mika#2103 /
 /// mika#2205), so each one calls this first.
+///
+/// Since mika#3166 the section lives in `qa-review-dependabot/system_prompt.md`
+/// and the callers read that file. The anti-vacuity term is what made the move
+/// safe to perform: had it been absent, extracting the block would have left
+/// seven green tests asserting nothing about a path nobody could reach.
 fn assert_step_1_6_exists(prompt: &str) {
     assert!(
         prompt.contains("**Step 1.6 — Dependabot dependency-PR path"),
-        "qa-review/system_prompt.md no longer carries Step 1.6 at all.\n\
+        "qa-review-dependabot/system_prompt.md no longer carries Step 1.6 at \
+         all.\n\
          Every mika#2519 scan in this file targets that section; with the \
          section gone they would all pass while asserting nothing. Establish \
-         where the Dependabot path lives now BEFORE touching these tests."
+         where the Dependabot path lives now BEFORE touching these tests \
+         (it moved once already, from `qa-review/system_prompt.md` — mika#3166)."
     );
 }
 
@@ -235,7 +257,7 @@ fn assert_step_1_6_exists(prompt: &str) {
 /// PR simply goes down the plan-AC path it has no plan for.
 #[test]
 fn mika2519_step_1_6_reads_the_author_login_and_not_the_author_object() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     assert!(
@@ -270,7 +292,7 @@ fn mika2519_step_1_6_reads_the_author_login_and_not_the_author_object() {
 /// read before asserting it.
 #[test]
 fn mika2519_step_1_6_names_the_major_jump_and_the_api_surface_line() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     assert!(
@@ -316,7 +338,7 @@ fn mika2519_step_1_6_names_the_major_jump_and_the_api_surface_line() {
 /// for it.
 #[test]
 fn mika2519_step_1_6_still_delegates_the_plan_exemption_it_already_had() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     assert!(
@@ -349,7 +371,7 @@ fn mika2519_step_1_6_still_delegates_the_plan_exemption_it_already_had() {
 /// the build (R1 of the plan).
 #[test]
 fn mika2565_step_1_6_no_longer_prescribes_an_unconditional_build_skip() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     assert!(
@@ -374,7 +396,7 @@ fn mika2565_step_1_6_no_longer_prescribes_an_unconditional_build_skip() {
 /// and checkable: the label and the build must not be tied together.
 #[test]
 fn mika2565_step_1_6_does_not_present_the_label_as_a_build_exemption() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     assert!(
@@ -394,7 +416,7 @@ fn mika2565_step_1_6_does_not_present_the_label_as_a_build_exemption() {
 /// in that list would make the new step contradict its own section.
 #[test]
 fn mika2565_step_1_6_no_longer_forbids_step_3e() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     assert!(
@@ -420,7 +442,7 @@ fn mika2565_step_1_6_no_longer_forbids_step_3e() {
 /// expected path)" for a Dependabot PR, because the loop never dispatched one.
 #[test]
 fn mika2565_step_1_6_names_the_build_tool_and_creates_its_worktree() {
-    let prompt = qa_review_prompt();
+    let prompt = qa_review_dependabot_prompt();
     assert_step_1_6_exists(&prompt);
 
     let step_5c = prompt
