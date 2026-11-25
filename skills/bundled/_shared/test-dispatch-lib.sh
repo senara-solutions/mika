@@ -9963,13 +9963,14 @@ assert_not_contains "U3c: le commit marqueur wip(mika#1383) n'atteint pas la cla
 # L'intention de cette assertion est que la réécriture en PR_OPENED n'ait qu'un
 # site — c'est la valeur, non l'helper, qui doit être unique. Le prédicat comptait
 # sur le fichier entier parce qu'il n'existait alors qu'un seul appel ; mika#2545
-# en a ajouté un second, pour `Outcome: ESCALATE`, et mika#2590 un troisième pour
-# `Outcome: PLAN_GROOMED`. Chaque valeur est donc nommée et comptée à un site, ce
-# qui est plus fort que l'ancien compte global : une quatrième valeur écrite par
-# un helper partagé fait rougir la cardinalité ci-dessous au lieu de passer
-# inaperçue. **La cardinalité a mordu à l'arrivée de la troisième** — c'est ce
-# qui la rend crédible, et le geste juste est de nommer la valeur neuve, jamais
-# de relâcher le compte.
+# en a ajouté un second, pour `Outcome: ESCALATE`, mika#2590 un troisième pour
+# `Outcome: PLAN_GROOMED`, et mika#3142 un quatrième pour
+# `Outcome: PIPELINE_INCOMPLETE — pilot_halt_declared`. Chaque valeur est donc
+# nommée et comptée à un site, ce qui est plus fort que l'ancien compte global :
+# une cinquième valeur écrite par un helper partagé fait rougir la cardinalité
+# ci-dessous au lieu de passer inaperçue. **La cardinalité a mordu à l'arrivée de
+# la troisième, puis de la quatrième** — c'est ce qui la rend crédible, et le
+# geste juste est de nommer la valeur neuve, jamais de relâcher le compte.
 assert_eq "U3c: la réécriture Outcome: PR_OPENED n'est appelée qu'au seul bras de la classe nouvelle" \
     "1" "$(grep -c '_set_outcome_line "Outcome: PR_OPENED' "$DISPATCH_LIB" || true)"
 assert_eq "U3c (mika#2545): Outcome: ESCALATE n'est estampillé qu'à un site" \
@@ -9983,8 +9984,13 @@ assert_eq "U3c (mika#2545): Outcome: ESCALATE n'est estampillé qu'à un site" \
 # valeur là où elle est écrite, jamais de relâcher le compte.
 assert_eq "U3c (mika#2590): Outcome: PLAN_GROOMED n'est estampillé qu'à un site" \
     "1" "$(grep -c '_groomed_outcome="Outcome: PLAN_GROOMED' "$DISPATCH_LIB" || true)"
-assert_eq "U3c: et _set_outcome_line n'a que ces trois valeurs déclarées" \
-    "3" "$(grep -cE '_set_outcome_line "Outcome:|_groomed_outcome="Outcome:' "$DISPATCH_LIB" || true)"
+# mika#3142 — le refus de halte nomme son motif dans la ligne d'outcome elle-même
+# (`PIPELINE_INCOMPLETE — pilot_halt_declared`), posée au seul site du troisième
+# refus structurel du bloc Unit 2. Comptée comme les trois autres : sur la valeur.
+assert_eq "U3c (mika#3142): Outcome: PIPELINE_INCOMPLETE n'est estampillé qu'à un site" \
+    "1" "$(grep -c '_set_outcome_line "Outcome: PIPELINE_INCOMPLETE' "$DISPATCH_LIB" || true)"
+assert_eq "U3c: et _set_outcome_line n'a que ces quatre valeurs déclarées" \
+    "4" "$(grep -cE '_set_outcome_line "Outcome:|_groomed_outcome="Outcome:' "$DISPATCH_LIB" || true)"
 
 # --- D5 : la classe nouvelle passe par le même producteur de marqueur ---
 assert_contains "D5: _measure_pipeline_verified couvre toutes les classes de Path B" \

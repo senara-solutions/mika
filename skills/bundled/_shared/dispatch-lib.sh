@@ -8256,11 +8256,18 @@ _pilot_had_no_shipping_tail() {
 # the false negative would be INTERMITTENT. Case V8 of the suite exists for that
 # and for nothing else.
 #
-# NO CONSUMER IN THIS FLIGHT. The detector is armed — its suite runs in the
-# `dispatch-lib-offline-suites` job and goes red on a regression — but neither
-# `_push_branch` nor the recovery block consults it yet: the refusal and the
-# push abstention depend on an arbitration reserved to the operator and ship
-# under `Tracked in: senara-solutions/mika#3142`.
+# ITS ONE CONSUMER IS THE FIRST OF THE THREE STRUCTURAL REFUSALS OF THE Unit 2
+# RESCUE BLOCK (15018), which consults it and clears `_recovery_pr_due`: on a
+# declared halt the draft PR is withheld and the callback carries
+# `NO_PR: pilot_halt_declared`.
+#
+# `_push_branch` does NOT consult it, and never will — by the decision rendered
+# 2026-11-25 (ticket body), not by a deferral. Withholding the push would leave
+# the halted work local to a worktree the next dispatch force-removes, and a
+# halt is a pause on the work, not a rejection of it; a pushed branch nobody
+# claims is a cost the decision accepts by name. Case W8 of the suite asserts
+# both halves at once, so adding that guard without rewriting the refusal's
+# prose — which promises a pushed branch — goes red.
 
 # The tail window, in lines. 120 is five times the largest measured distance
 # (26 lines on `5813f896-…`) and well below the 88 lines of the lowest measured
@@ -14955,6 +14962,72 @@ Push: SKIPPED — session terminated with no new commits; there is nothing to pu
     local _recovery_pr_due=0
     if [ -n "$RECOVERY_CLASS" ] && [ -n "$REPO" ] && [ -n "$BRANCH" ] && [ -z "$PR_URL" ]; then
         _recovery_pr_due=1
+    fi
+
+    # mika#3142: refuse to open a draft PR when the pilot DECLARED a halt.
+    #
+    # Four drafts — #3081, #3092, #3100, #3108 — opened on a perimeter the pilot
+    # had measured against the per-flight line bound of mika#2693 and
+    # deliberately refused to ship, its last word being
+    # «**HALTE borne : N lignes … pour `M`**». On #3081 the draft even carried
+    # `rescue-pipeline-verified: yes`, after which `auto_resume_wip_rescue_drafts`
+    # (mika#1852) un-drafted it: halted work went to review with no decision.
+    # `_pilot_declared_halt` (8287) is the predicate; this is its consumer.
+    #
+    # IT COMES FIRST OF THE THREE REFUSALS, AND THE ORDER IS LOAD-BEARING, by
+    # the rule the mika#3038 comment below already writes: the three are
+    # mutually exclusive through the flag the first to fire extinguishes, so
+    # whichever runs first is the one that names the reason, and the most
+    # specific diagnosis goes first. A declared halt is the most specific of the
+    # three because it is a DECLARATION BY THE PILOT where the other two are
+    # INFERENCES ON THE CONTENT. On a halted flight whose tree happened to equal
+    # main's, or whose content happened to be scratch, either of the other two
+    # would send the operator to examine a property of the content when the fact
+    # is a decision.
+    #
+    # KEYED ON `_recovery_pr_due`, NEVER ON A RESCUE CLASS, and that is the
+    # right perimeter rather than a convenience: a halted flight is reachable in
+    # two of the classes computed above — a pilot that committed before
+    # measuring lands in one (14949-14951), a pilot that halted before
+    # committing in the other (14947-14948) — so a refusal keyed on either would
+    # leave the other open. That is the argument of mika#2503 at 15080-15087,
+    # where a fix at the class-flag site "would pass every local test and change
+    # NOTHING in production".
+    #
+    # THE PUSH IS NOT WITHHELD, BY A DECISION AND NOT BY AN OVERSIGHT. Asked at
+    # flight 2a, rendered 2026-11-25 in the ticket body: withhold the draft
+    # alone, because a pushed branch nobody claims costs nothing and stays
+    # recoverable, whereas leaving the work local would have the next dispatch
+    # destroy it (`_set_up_worktree` force-removes the worktree — mika#1282's
+    # founding fact). A halt is a pause on the work, not a rejection of it. So
+    # `_push_branch` has already run (14918) and is deliberately NOT guarded —
+    # which is what lets the prose below promise a pushed branch. Case W8 of the
+    # suite attests the pair together: the absence of that guard, and the
+    # promise that depends on it.
+    #
+    # AND IT POSES AN `Outcome:` LINE WHERE THE OTHER TWO DO NOT. Two structural
+    # reasons. `^Outcome: PIPELINE_INCOMPLETE` is in the alternation of the
+    # `empty_completion` guard (7254): a halted flight that opens no draft is
+    # exactly the lean cycle that guard would banner "this cycle produced
+    # nothing" (7259), which would be false — the cycle produced work, the pilot
+    # declined to ship it. And on the nominal path it is the draft OPENING that
+    # rewrites the line (15283), so a refusal that withholds the draft withholds
+    # that rewrite too and would leave the transitory line `_post_flight_recovery`
+    # posed upstream (9029-9041). This line replaces the rewrite that will not
+    # happen.
+    if [ "$_recovery_pr_due" = "1" ] && _pilot_declared_halt; then
+        _recovery_pr_due=0
+        # Convenience, never a probe: on a dispatch that succeeds
+        # `spawn_long_running_exec`'s pipe is dropped unread — Signal M,
+        # mika#2050 class. The operator surface is RESULT.
+        echo "rescue_halt_refused: the pilot declared a halt — draft PR withheld (branch=$BRANCH, mika#3142)" >&2
+        RESULT="${RESULT}
+Draft PR withheld (mika#3142): the pilot declared a per-flight-bound halt as its last word, so it chose not to ship this perimeter — the absent shipping tail is a decision, not a truncated run.
+Nothing was lost — branch ${BRANCH} is pushed.
+The perimeter needs splitting before another flight: regroom the ticket into flights that fit the bound.
+To publish it anyway: gh pr create --repo senara-solutions/${REPO} --head ${BRANCH} --base main --draft"
+        _set_pr_status_line "NO_PR: pilot_halt_declared"
+        _set_outcome_line "Outcome: PIPELINE_INCOMPLETE — pilot_halt_declared: the pilot declared a per-flight-bound halt; the perimeter needs splitting before another flight."
     fi
 
     # mika#3038: refuse to open a PR whose head tree is ALREADY `origin/main`'s.
