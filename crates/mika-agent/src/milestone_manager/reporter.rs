@@ -1141,6 +1141,9 @@ pub(crate) fn flight_issue_label(issue: &FlightIssue) -> String {
             DeathCause::PipelineFailure => "mort — panne de pipeline".to_string(),
             DeathCause::LauncherDead => "mort — lanceur mort".to_string(),
             DeathCause::Escalated => "mort — escalade".to_string(),
+            // Le libellé ne dit pas « mort au plafond » : le plafond n'a pas été
+            // atteint, il a été anticipé (mika#3171).
+            DeathCause::HaltDeclared => "mort — halte de borne déclarée".to_string(),
             // La famille non classée se lit telle que le producteur l'a écrite.
             DeathCause::Unknown(family) => format!("mort — cause non classée ({family})"),
         },
@@ -1438,6 +1441,7 @@ mod tests {
             (DeathCause::PipelineFailure, "mort — panne de pipeline"),
             (DeathCause::LauncherDead, "mort — lanceur mort"),
             (DeathCause::Escalated, "mort — escalade"),
+            (DeathCause::HaltDeclared, "mort — halte de borne déclarée"),
             (
                 DeathCause::Unknown("zorglub".into()),
                 "mort — cause non classée (zorglub)",

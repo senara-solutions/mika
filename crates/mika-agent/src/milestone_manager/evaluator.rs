@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::reader::{HeadReview, RepoPrRead};
 use super::types::{CiState, MilestoneState, SubIssue};
+use crate::task_engine::dispatcher::{NO_PR_PILOT_HALT_DECLARED, parse_no_pr_reason};
 
 // ---- Le verdict ------------------------------------------------------------
 
@@ -114,6 +115,17 @@ pub enum DeathCause {
     LauncherDead,
     /// `Outcome: ESCALATE` — une étape a escaladé vers l'opérateur.
     Escalated,
+    /// `NO_PR: pilot_halt_declared` — le pilote a déclaré une halte de borne
+    /// par vol (mika#3171).
+    ///
+    /// Distincte de [`DeathCause::CeilingReached`], qui est un plafond
+    /// **atteint** — le pilote a consommé ses tours ou son budget et a été
+    /// arrêté. Ici il n'a rien consommé de trop : il a *mesuré* son périmètre
+    /// au-dessus de la borne par vol et a obéi avant de commencer. Les deux
+    /// rendent `Regroom`, mais la cause lue dans le rapport n'est pas la même,
+    /// et une halte déclarée n'est pas non plus un
+    /// [`DeathCause::PipelineFailure`] : le substrat a parfaitement fonctionné.
+    HaltDeclared,
     /// Famille de halte non classée — **nommée**, pas avalée.
     Unknown(String),
 }
@@ -953,11 +965,18 @@ fn recommend(
         // la PR : c'est un brouillon que le pipeline n'a pas fini.
         FlightIssue::RescuePr { .. } => FlightRecommendation::ManualResumption,
         FlightIssue::Dead { cause } => match cause {
-            // Plafond, refus, escalade : le vol dit quelque chose sur le ticket
-            // lui-même — trop gros, mal posé, ou hors périmètre. Re-groom.
-            DeathCause::CeilingReached | DeathCause::Refusal | DeathCause::Escalated => {
-                FlightRecommendation::Regroom
-            }
+            // Plafond, refus, escalade, halte déclarée : le vol dit quelque
+            // chose sur le ticket lui-même — trop gros, mal posé, ou hors
+            // périmètre. Re-groom.
+            //
+            // La halte déclarée (mika#3171) est le cas le plus net des quatre :
+            // le pilote a mesuré son périmètre au-dessus de la borne par vol et
+            // a obéi. Rien n'est cassé, il n'y a rien à reprendre à la main —
+            // le ticket est trop gros, et c'est tout ce que le vol a dit.
+            DeathCause::CeilingReached
+            | DeathCause::Refusal
+            | DeathCause::Escalated
+            | DeathCause::HaltDeclared => FlightRecommendation::Regroom,
             // Panne, lanceur mort, cause non classée : le ticket n'est pas en
             // cause, le substrat l'est. Un humain regarde avant de re-groomer.
             DeathCause::PipelineFailure | DeathCause::LauncherDead | DeathCause::Unknown(_) => {
@@ -1067,12 +1086,26 @@ fn hit_ceiling(result: &str) -> bool {
 /// `PIPELINE FAILURE:`, et un refus structurel aussi — donc tester la bannière
 /// d'abord classerait les trois en `PipelineFailure` et perdrait précisément la
 /// distinction que le ticket demande.
+///
+/// La halte déclarée (mika#3171) relève du même ordre, et pour la même raison :
+/// `dispatch-lib.sh` l'émet avec une ligne `Outcome: PIPELINE_INCOMPLETE —
+/// pilot_halt_declared: …`, donc le bras `PIPELINE_INCOMPLETE` du `match` plus
+/// bas l'avalerait. Le `return` en amont est ce qui tient l'ordre — une
+/// convention vérifiée par relecture ne tiendrait pas le jour où quelqu'un
+/// réordonne les bras.
 fn death_cause(result: &str, outcome: Option<&str>) -> DeathCause {
     if hit_ceiling(result) {
         return DeathCause::CeilingReached;
     }
     if result.contains("STRUCTURAL VIOLATION:") {
         return DeathCause::Refusal;
+    }
+    // Le motif se lit par le parseur du producteur, jamais par un `contains` :
+    // `NO_PR:` est ancré en début de ligne, donc la prose de la halte — qui
+    // nomme `pilot_halt_declared` dans sa ligne `Outcome:` comme dans son
+    // explication — ne peut pas se faire passer pour la déclaration.
+    if parse_no_pr_reason(result).as_deref() == Some(NO_PR_PILOT_HALT_DECLARED) {
+        return DeathCause::HaltDeclared;
     }
     match outcome {
         Some("LAUNCHER_DEAD") => DeathCause::LauncherDead,
@@ -1642,6 +1675,15 @@ mod tests {
             DeathCause::Escalated
         );
         assert_eq!(
+            dead_cause_of(
+                "NO_PR: pilot_halt_declared\n\
+                 Outcome: PIPELINE_INCOMPLETE — pilot_halt_declared: the pilot declared a \
+                 per-flight-bound halt; the perimeter needs splitting before another flight.\n"
+            ),
+            DeathCause::HaltDeclared,
+            "une halte déclarée est testée avant le bras PIPELINE_INCOMPLETE (mika#3171)"
+        );
+        assert_eq!(
             dead_cause_of("Outcome: PLAN_COMMITTED — docs/plans/x.md\n"),
             DeathCause::Unknown("PLAN_COMMITTED".to_string()),
             "une famille non classée se nomme dans le verdict"
@@ -1650,6 +1692,67 @@ mod tests {
             dead_cause_of("the pilot wrote nothing the engine recognises\n"),
             DeathCause::Unknown("no_outcome_line".to_string()),
             "un résultat muet est une absence nommée, pas une absence de cause"
+        );
+    }
+
+    /// Le RESULT d'un vol halté, tel que le producteur l'émet (mika#3171).
+    ///
+    /// Recopié de `skills/bundled/_shared/dispatch-lib.sh:15024-15030` — la
+    /// prose du refus de secours, puis les deux lignes que
+    /// `_set_pr_status_line` et `_set_outcome_line` posent. **Pas une forme
+    /// réduite** : les trois propriétés que ce test tient sont des propriétés
+    /// de cette forme-là, et un fixture minimal les rendrait toutes les trois
+    /// vraies pour de mauvaises raisons.
+    const HALTE_DECLAREE: &str = "claude-pilot completed.\n\
+         Turns: 184\n\
+         Draft PR withheld (mika#3142): the pilot declared a per-flight-bound halt as its last \
+         word, so it chose not to ship this perimeter — the absent shipping tail is a decision, \
+         not a truncated run.\n\
+         Nothing was lost — branch fix/3142/x is pushed.\n\
+         The perimeter needs splitting before another flight: regroom the ticket into flights \
+         that fit the bound.\n\
+         To publish it anyway: gh pr create --repo senara-solutions/mika --head fix/3142/x \
+         --base main --draft\n\
+         NO_PR: pilot_halt_declared\n\
+         Outcome: PIPELINE_INCOMPLETE — pilot_halt_declared: the pilot declared a \
+         per-flight-bound halt; the perimeter needs splitting before another flight.\n";
+
+    /// Sur un vol halté réel, le ticket est en cause — pas le substrat.
+    ///
+    /// Avant mika#3171 ce `result` rendait `Dead { PipelineFailure }` et
+    /// `ManualResumption`, produits par le bras `Some("PIPELINE_INCOMPLETE")`
+    /// de [`death_cause`] : la ligne `Outcome:` du producteur nomme bien
+    /// `pilot_halt_declared`, mais rien ne la lisait.
+    #[test]
+    fn mika3171_une_halte_declaree_recommande_un_regroom() {
+        let verdict = verdict_of(HALTE_DECLAREE);
+        assert_eq!(
+            verdict.issue,
+            FlightIssue::Dead {
+                cause: DeathCause::HaltDeclared
+            },
+            "le vol est mort d'une halte déclarée, pas d'une panne de pipeline"
+        );
+        assert_eq!(
+            verdict.recommendation,
+            FlightRecommendation::Regroom,
+            "le pilote a obéi à la borne : le périmètre est à re-groomer, il n'y a rien \
+             à reprendre à la main"
+        );
+        // Le fixture porte une ligne `gh pr create --repo …`. `pr_reference` ne
+        // cherche un `https://` que dans la ligne `Outcome:`, donc cette
+        // suggestion de publication ne devient pas une référence de PR — sans
+        // quoi le vol serait classé `RescuePr` et n'atteindrait jamais
+        // [`death_cause`].
+        assert_eq!(
+            pr_reference(HALTE_DECLAREE, &PilotFields::default()),
+            (None, None),
+            "une commande de publication suggérée n'est pas une PR"
+        );
+        assert!(
+            !verdict.hit_ceiling,
+            "une halte déclarée n'est pas une halte `budget_exhausted` : le pilote a \
+             anticipé la borne, il ne l'a pas atteinte"
         );
     }
 
@@ -1794,6 +1897,25 @@ mod tests {
             ),
             (
                 "PIPELINE FAILURE: no shipping tail\n\
+                 Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n",
+                DeathCause::PipelineFailure,
+                FlightRecommendation::ManualResumption,
+            ),
+            // mika#3171, AC2 : un `PIPELINE_INCOMPLETE` **sans** ligne `NO_PR:`
+            // ne bascule pas. Sans cette ligne, « la halte est lue » et « toute
+            // panne de pipeline est devenue un re-groom » rendraient le même
+            // vert.
+            (
+                "Outcome: PIPELINE_INCOMPLETE — no_shipping_tail: nothing pushed\n",
+                DeathCause::PipelineFailure,
+                FlightRecommendation::ManualResumption,
+            ),
+            // Et un `PIPELINE_INCOMPLETE` qui porte un **autre** motif `NO_PR:`
+            // ne bascule pas davantage : c'est le prédicat sur la valeur du
+            // motif qui décide, jamais la présence de la ligne.
+            (
+                "Draft PR withheld (mika#2503): the branch holds only `.pilot-scratch/`.\n\
+                 NO_PR: rescue_scratch_only\n\
                  Outcome: PIPELINE_INCOMPLETE — manual recovery needed.\n",
                 DeathCause::PipelineFailure,
                 FlightRecommendation::ManualResumption,
@@ -1964,6 +2086,20 @@ mod tests {
                 dead(DeathCause::Unknown("x".to_string())),
                 lu(None),
                 FlightRecommendation::ManualResumption,
+            ),
+            // mika#3171 — la halte déclarée, dans les deux états de
+            // connaissance. Comme pour les trois autres causes qui re-groomment,
+            // l'état de la PR n'entre pas dans la décision : il n'y a pas de PR,
+            // et c'est précisément ce que le pilote a décidé.
+            (
+                dead(DeathCause::HaltDeclared),
+                lu(None),
+                FlightRecommendation::Regroom,
+            ),
+            (
+                dead(DeathCause::HaltDeclared),
+                non_lu(),
+                FlightRecommendation::Regroom,
             ),
             // mika#2946 — les trois motifs de non-vol, et les deux états de
             // connaissance qui leur sont atteignables. L'état de la PR n'entre

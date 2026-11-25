@@ -391,6 +391,7 @@ fn cause_term(cause: &DeathCause) -> String {
         DeathCause::PipelineFailure => "pipeline_failure".to_string(),
         DeathCause::LauncherDead => "launcher_dead".to_string(),
         DeathCause::Escalated => "escalated".to_string(),
+        DeathCause::HaltDeclared => "halt_declared".to_string(),
         DeathCause::Unknown(token) => format!("unknown:{token}"),
     }
 }
@@ -645,6 +646,7 @@ fn judgeable_cause_terms() -> Vec<String> {
         DeathCause::PipelineFailure,
         DeathCause::LauncherDead,
         DeathCause::Escalated,
+        DeathCause::HaltDeclared,
     ]
     .iter()
     .map(cause_term)
@@ -1890,11 +1892,11 @@ mod tests {
             }
         }
         assert_eq!(
-            analyses, 40,
+            analyses, 44,
             "6 issues — `pr_opened`, `rescue_pr`, `dead` et les trois motifs de \
-             non-vol de mika#2946 — dont la seule `dead` porte 5 causes, × 4 \
-             recommandations : (5 × 4) + (5 × 1 × 4) = 40 jugements saisissables ; \
-             un autre compte veut dire que l'énumération a bougé"
+             non-vol de mika#2946 — dont la seule `dead` porte 6 causes depuis \
+             mika#3171, × 4 recommandations : (6 × 4) + (5 × 1 × 4) = 44 jugements \
+             saisissables ; un autre compte veut dire que l'énumération a bougé"
         );
 
         // MPC juge un vol, pas une PR : les deux champs sont `null` et non 0 ni

@@ -6895,6 +6895,16 @@ pub(crate) fn parse_no_pr_reason(result: &str) -> Option<String> {
     RE_NO_PR.captures(result).map(|cap| cap[1].to_string())
 }
 
+/// Le motif `NO_PR:` d'une halte de borne déclarée par le pilote (mika#3142).
+///
+/// Nommé une seule fois pour les lecteurs en aval de [`parse_no_pr_reason`] —
+/// l'évaluateur de milestone en tire `DeathCause::HaltDeclared` (mika#3171). Le
+/// littéral vit ici, à côté du parseur dont il est une valeur de retour
+/// possible, parce que c'est le seul endroit où la famille de motifs est
+/// énumérée : un consommateur qui réécrirait la chaîne chez lui divergerait en
+/// silence le jour où le producteur la renomme.
+pub(crate) const NO_PR_PILOT_HALT_DECLARED: &str = "pilot_halt_declared";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8303,6 +8313,24 @@ mod tests {
             let result = format!("Outcome: PIPELINE_INCOMPLETE\nNO_PR: {reason}");
             assert_eq!(parse_no_pr_reason(&result).as_deref(), Some(reason));
         }
+    }
+
+    /// La const en aval porte le littéral que le producteur émet (mika#3171).
+    ///
+    /// `NO_PR_PILOT_HALT_DECLARED` est lue par l'évaluateur de milestone pour en
+    /// tirer `DeathCause::HaltDeclared`. Si elle divergeait du littéral de la
+    /// table ci-dessus, le parseur continuerait d'accepter le motif et
+    /// l'évaluateur cesserait de le reconnaître — sans qu'une seule assertion de
+    /// `dispatcher.rs` ne rougisse. C'est cette divergence-là que ce test refuse.
+    #[test]
+    fn mika3171_la_const_du_motif_de_halte_vaut_le_litteral_du_producteur() {
+        assert_eq!(NO_PR_PILOT_HALT_DECLARED, "pilot_halt_declared");
+        let result = format!("Outcome: PIPELINE_INCOMPLETE\nNO_PR: {NO_PR_PILOT_HALT_DECLARED}");
+        assert_eq!(
+            parse_no_pr_reason(&result).as_deref(),
+            Some(NO_PR_PILOT_HALT_DECLARED),
+            "la const traverse le parseur qui l'a vue naître"
+        );
     }
 
     #[test]
