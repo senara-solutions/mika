@@ -147,6 +147,32 @@ timeout_secs = 30
 # identical 64-byte command, and are now one row whose label still enumerates
 # all four classes. **Net +316 bytes, so 77 608 and 215 bytes of headroom** —
 # the next addition has no trim this cheap left and should expect to shard.
+#
+# **Celle-là a sharded (mika#3166).** Les 215 octets sont devenus 42 quand
+# mika#3137 a dû REPRENDRE deux règles déjà écrites : PR #3164 a retiré
+# l'abstention CI et la ligne canonique `CI-Status:` (1 296 octets) faute de
+# place, laissant le refus moteur seul à porter la règle. C'est le premier client
+# qui ait payé la jauge en fonctionnalité, et il a nommé le seuil : toute
+# addition suivante rougissait, quel que soit son sujet.
+#
+# Step 1.6 est donc parti dans `qa-review-dependabot`, verbatim — la couture que
+# les deux paragraphes ci-dessus avaient nommée deux fois. Elle l'était pour une
+# raison structurelle : c'est le seul bloc de ce prompt dont la portée est une
+# classe de PR entière, donc le seul dont le départ ne retire rien aux revues
+# ordinaires. Les sept épinglages de mika#2519 et mika#2565 suivent le texte
+# sans qu'une aiguille change (`tests/qa_review_executes_repo_guards.rs`), et un
+# stub de ~700 octets garde ici la condition d'entrée et le nom du fichier à
+# lire.
+#
+# **Prompt now 69 481 bytes, 84.8 % of the cap, 8 343 bytes of gate headroom** —
+# et les 1 296 octets de mika#3137 sont dedans. Ce qui a changé pour la prochaine
+# addition n'est pas seulement le chiffre : la troisième remédiation de la jauge
+# est désormais *amorcée*. Un bloc dont la portée est une classe de tour a un
+# shard où aller, et la mécanique (arête sortante + en-tête de portée + détecteur
+# d'atteignabilité) est en place et testée. La marge, elle, n'est pas un budget :
+# la mesurer est le travail du plancher de marge de `bundled_skills_load.rs`, qui
+# refuse désormais de la laisser retomber sous les 1 296 octets que ce vol a
+# rendus.
 max_prompt_size = 81920
 # `qa-review-build-callback` est listé ici pour une raison précise et
 # contre-intuitive (mika#2355 B1). Ce skill déclare déjà `dependencies =
@@ -172,7 +198,20 @@ max_prompt_size = 81920
 # l'en-tête de portée en tête de `qa-review-build-callback/system_prompt.md` :
 # sans lui, le tour d'OUVERTURE d'une revue lirait « Steps 1–3d were completed
 # in the previous turn — do NOT re-run them » et sauterait la revue de diff.
-dependencies = ["github", "build-mika", "qa-review-build-callback"]
+#
+# `qa-review-dependabot` est ici pour exactement la même raison (mika#3166). Le
+# shard déclare `dependencies = ["qa-review"]`, arête ENTRANTE : elle ne porte
+# aucune atteignabilité. C'est cette ligne-ci qui rend son prompt présent sur le
+# tour où une PR Dependabot est revue, et le même garde-fou s'applique — son
+# en-tête de portée, parce que la résolution n'est pas conditionnelle et que son
+# étape 2 (« Skip Step 2 pipeline checks and Step 2.5 plan-AC verification »),
+# lue hors contexte, autoriserait un `pass` sans qu'aucune garde n'ait tourné.
+dependencies = [
+  "github",
+  "build-mika",
+  "qa-review-build-callback",
+  "qa-review-dependabot",
+]
 
 [triggers]
 keywords = ["review", "pr", "qa", "pull request"]

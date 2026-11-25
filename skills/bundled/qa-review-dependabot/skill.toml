@@ -1,0 +1,35 @@
+[skill]
+name = "qa-review-dependabot"
+description = "Dependabot dependency-PR review path for qa-review (mika#1729)"
+version = "0.1.0"
+always_on = false
+max_prompt_size = 32768
+dependencies = ["qa-review"]
+
+[triggers]
+keywords = ["dependabot", "dependency bump", "advisory"]
+
+# Pourquoi ce shard existe (mika#3166). Step 1.6 vivait dans
+# `qa-review/system_prompt.md` jusqu'à ce que ce prompt atteigne 77 782 octets
+# contre une jauge qui panique à 77 824 — 42 octets de marge, et
+# `max_prompt_size = 81920` déjà à `MAX_PROMPT_SIZE_CEILING` : plus aucun
+# nombre à relever. `qa-review/skill.toml` nommait ce découpage deux fois comme
+# « the natural seam », Step 1.6 étant le seul bloc du prompt dont la portée est
+# une classe de PR entière. Le texte déplacé ici est verbatim : les sept tests
+# d'épinglage de mika#2519 et mika#2565 lisent ce fichier sans changer une
+# aiguille.
+#
+# Pas de `required_tools` ici, et pas de `[context.pr_diff]` (mika#3166 D3).
+# Les quatre outils de ce chemin — `qa_pr_view`, `run_gh`, `run_shell`,
+# `build_mika` — sont déjà déclarés par `qa-review`, qui est présent sur tout
+# tour qui atteint celui-ci. Les déclarer ici n'ajouterait aucune capacité et
+# exigerait `build_mika` sur les revues ordinaires : la résolution de
+# dépendances n'est pas conditionnelle, donc ce manifeste est lu sur chaque tour
+# mika-qa, Dependabot ou non.
+#
+# `always_on = false` : la portée est atteinte par l'arête sortante de
+# `qa-review` (`dependencies`), comme `qa-review-build-callback`. Une arête
+# entrante ne porte pas l'atteignabilité (mika#2355 B1) — c'est `qa-review` qui
+# nomme ce shard, jamais l'inverse. Les cinq déclencheurs silencieux servis par
+# `safe_always_on_skills()` ne portent aucun tour de revue, donc `always_on`
+# n'achèterait rien.
