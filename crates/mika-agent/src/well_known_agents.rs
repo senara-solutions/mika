@@ -320,6 +320,7 @@ nudge_enabled = false\n\
 allowlist = [\n\
   \"qa-review\",\n\
   \"qa-review-build-callback\",\n\
+  \"qa-review-dependabot\",\n\
   \"qa-review-webhook-success\",\n\
   \"qa-review-webhook-ready\",\n\
   \"skill-review\",\n\
@@ -2731,6 +2732,12 @@ mod tests {
         // QA skills that front pr_merge/run_gh-write
         "qa-review",
         "qa-review-build-callback",
+        // mika#3166 — ce shard ne DÉCLARE aucun outil (les quatre sont sur
+        // `qa-review`, présent sur tout tour qui l'atteint), mais son texte
+        // prescrit `run_gh pr review`, `run_shell … worktree add` et
+        // `build_mika` : il a sa place dans une liste dont le critère est ce
+        // qu'un skill fait faire, pas ce que son manifeste énumère.
+        "qa-review-dependabot",
         // Skill management
         "skill-review",
     ];
@@ -3081,6 +3088,13 @@ mod tests {
         let qa_only = [
             "qa-review",
             "qa-review-build-callback",
+            // mika#3166 — le shard qui porte le chemin Dependabot (Step 1.6).
+            // Même silence que `qa-review-webhook-ready` ci-dessous s'il manque
+            // ici : le skill existe, il est semé dans la bibliothèque, et il
+            // n'est JAMAIS lié sous `{global_home}/agents/mika-qa/skills/`. Le
+            // stub de `qa-review` pointerait alors vers un prompt que personne
+            // n'injecte, et une revue de PR Dependabot repartirait sur Step 2.
+            "qa-review-dependabot",
             "qa-review-webhook-success",
             // mika#2212 — handler for `pull_request.ready_for_review`. Missing
             // it from the identity allowlist above produces a skill that
@@ -3288,8 +3302,8 @@ mod tests {
             .expect("mika-qa must have allowlist");
         assert_eq!(
             allowlist.len(),
-            19,
-            "mika-qa allowlist should have 19 skills (+qa-review-webhook-ready, mika#2212)"
+            20,
+            "mika-qa allowlist should have 20 skills (+qa-review-dependabot, mika#3166)"
         );
     }
 
