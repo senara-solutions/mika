@@ -1877,7 +1877,11 @@ mod tests {
             );
         }
 
-        // --- AC2 : le contrôle négatif, trois morts qui restent des morts ---
+        // --- AC2 : le contrôle négatif, cinq morts qui restent des morts ---
+        //
+        // Les deux dernières sont celles de mika#3171 : elles tiennent l'ordre
+        // de spécificité de [`death_cause`] par le bas, là où les cinq premières
+        // le tiennent par le haut.
 
         for (result, cause, recommandation) in [
             (

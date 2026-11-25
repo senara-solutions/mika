@@ -1427,7 +1427,7 @@ mod tests {
         );
     }
 
-    /// Les six causes de mort, les trois motifs de non-vol et les quatre
+    /// Les sept causes de mort, les trois motifs de non-vol et les quatre
     /// recommandations ont chacun leur libellé : un `match` muet rendrait deux
     /// causes distinctes identiques à l'écran.
     #[test]

@@ -629,7 +629,7 @@ fn dead_issue_term() -> &'static str {
     })
 }
 
-/// Les termes de cause qu'un jugement peut porter : les cinq causes **classées**.
+/// Les termes de cause qu'un jugement peut porter : les six causes **classées**.
 ///
 /// [`DeathCause::Unknown`] n'est délibérément pas offerte. C'est ce que le
 /// manager écrit quand il ne **sait pas** classer une halte, en portant le jeton
