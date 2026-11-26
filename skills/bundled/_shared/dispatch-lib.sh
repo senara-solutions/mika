@@ -11853,9 +11853,59 @@ _write_canonical_callout() {
     # widens acceptance and so cannot produce a false negative.)
     has_verdict=$(printf '%s' "$current_body" | grep -cE 'second-pass \(GROOMED[[:space:]).,;:—-]|second-pass \(READY, paraphrased GROOMED|first-pass \(READY, single-pass GROOMED' || true)
 
-    if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
+    # mika#3174 — QUATRIÈME prédicat : le callout présent nomme-t-il CE plan ?
+    #
+    # Les trois signaux ci-dessus répondent correctement à « la porte de dispatch
+    # passerait-elle sur ce corps ? » — c'est leur raison d'être, et leur lockstep
+    # avec `executor.rs::check_grooming_markers` est ce qui les garde justes. Ils
+    # répondent MAL à « ai-je déjà écrit CE callout ? ». Les deux questions
+    # coïncident tant qu'un ticket n'a qu'un vol ; elles divergent dès le second.
+    #
+    # Mesuré sur le vol 2 de mika#3118 : le corps portait encore le callout
+    # COMPLET du vol 1 — même branche, plan `2026-11-22-002`, marqueur
+    # `second-pass (GROOMED)`. Les trois signaux étaient là, aucun ne nomme un
+    # plan en particulier (`has_plan` compte la sous-chaîne `docs/plans/`, pas le
+    # plan courant), et le producteur s'est tu en annonçant un succès idempotent.
+    # Aucun callout n'a été écrit pour le plan que ce groom venait de valider.
+    #
+    # ON DÉLÈGUE LA LECTURE, on n'ajoute pas un grep. Grepper ici le jeton du
+    # callout contre `plan_relpath` créerait un SECOND site de correspondance
+    # d'un jeton dont mika#2608 a fermé l'inventaire à un, et ré-introduirait en
+    # bash la seconde implémentation que mika#2194 a retirée.
+    # `_extract_plan_path` passe le corps par fichier (jamais argv) et rend la
+    # forme normalisée, relative à la racine du dépôt — la même que
+    # `plan_relpath`, donc la comparaison est une égalité de chaînes et aucune
+    # renormalisation locale n'est ajoutée (en ajouter une serait une seconde
+    # politique de chemins).
+    #
+    # DIRECTION DU FAIL-SAFE : sur `rc = 1` (aucun callout lisible) comme sur
+    # `rc ≥ 2` (« je n'ai pas pu regarder »), ON ÉCRIT. Les deux erreurs ne
+    # coûtent pas le même prix : écrire est idempotent — le chemin REPLACE
+    # ci-dessous strippe le préambule et repose un bloc unique, donc une écriture
+    # de trop coûte une édition d'issue et produit un corps correct. Un
+    # court-circuit de trop est exactement le défaut mesuré : un corps qui garde
+    # le callout d'un autre vol, et un dispatch que la porte de provenance laisse
+    # partir sur la mauvaise preuve.
+    #
+    # `_extract_plan_path` écrit déjà son propre diagnostic bruyant sur `rc ≥ 2` :
+    # on ne le double pas, on ne l'avale pas.
+    local body_plan body_plan_rc=0
+    body_plan=$(_extract_plan_path "$current_body") || body_plan_rc=$?
+
+    if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ] \
+       && [ "$body_plan_rc" -eq 0 ] && [ "$body_plan" = "$plan_relpath" ]; then
         echo "write_canonical_callout: dispatch-gate signals already present in $REPO#$ISSUE_NUM body — skipping (idempotent)" >&2
         return 0
+    fi
+
+    # Purement diagnostique : ne décide rien, ne rend rien, dit seulement pourquoi
+    # on ne s'est pas arrêté. Placé APRÈS la conjonction, donc il ne tire que sur
+    # un corps complet qui nomme un autre plan (ou illisible) — jamais sur un
+    # corps partiel, pour lequel le commentaire REPLACE ci-dessous dit déjà le
+    # motif. Sans les deux plans dans la ligne, l'opérateur voit une écriture sans
+    # savoir ce qu'elle remplace.
+    if [ "$has_branch" -gt 0 ] && [ "$has_plan" -gt 0 ] && [ "$has_verdict" -gt 0 ]; then
+        echo "write_canonical_callout_stale_plan: repo=${REPO} issue=${ISSUE_NUM} body_plan=${body_plan:-<unreadable>} rc=${body_plan_rc} current_plan=${plan_relpath} — complete callout names another plan, replacing (mika#3174)" >&2
     fi
 
     local head_sha
@@ -14096,7 +14146,7 @@ _deliver_callback() {
 # `|| return 0`, donc une erreur de lecture se lisait comme « pas de plan ».
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# TROIS APPELANTS DEPUIS mika#2608, ET LE FAN-IN N'ENFREINT PAS C2
+# QUATRE APPELANTS DEPUIS mika#3174, ET LE FAN-IN N'ENFREINT PAS C2
 #
 #   1. `_detect_plan_on_branch` — « quel fichier ouvrir ? » (phase 1) : résout
 #      `"$WORKTREE_DIR/$PLAN_PATH"` et bascule `ENTRY_COMMAND` sur `/ce-work`.
@@ -14107,6 +14157,12 @@ _deliver_callback() {
 #   3. le `elif` de `_set_up_worktree` — « ce corps porte-t-il un callout ? »
 #      (phase 2) : une ligne de journal, `dispatch_gate_groom_allowed_stale_callout`.
 #      La distinction 0/1 EST sa réponse booléenne ; il jette le chemin.
+#   4. le court-circuit d'idempotence de `_write_canonical_callout` — « le
+#      callout déjà présent nomme-t-il le plan que CE groom vient de valider ? »
+#      (mika#3174) : compare le chemin rendu à `plan_relpath` et n'escamote
+#      l'écriture que sur égalité. Traite `1` ET `≥2` par l'ÉCRITURE — écrire
+#      est idempotent (le chemin REPLACE repose un bloc unique), un
+#      court-circuit de trop est le défaut mesuré.
 #
 # C2 du § 3 de `docs/architecture/dispatch-lib-migration.md` (« un seul
 # appelant ») est un critère de SÉLECTION d'un maillon à migrer, pas une
@@ -14116,15 +14172,21 @@ _deliver_callback() {
 # appelant de plus étant une copie de moins. Sans cette note, un futur lecteur
 # croirait C2 enfreint et re-dupliquerait le motif pour le « respecter ».
 #
-# COÛT, CHIFFRÉ. Un dispatch dev-groom paie au plus TROIS démarrages de `mika` :
+# COÛT, CHIFFRÉ. Un dispatch dev-groom paie au plus QUATRE démarrages de `mika` :
 # l'appelant 2 depuis `_set_up_worktree`, l'appelant 3 sur la branche `elif`,
-# puis l'appelant 2 depuis la composition du `RESULT` d'un groom non convergé.
+# l'appelant 2 depuis la composition du `RESULT` d'un groom non convergé, puis
+# l'appelant 4 sur le chemin GROOMED — une seule fois par groom convergent,
+# puisque `_write_canonical_callout` n'est appelé que là. Un inventaire qui ne
+# compte pas son dernier entrant mentirait avec l'autorité d'un inventaire
+# (mika#2608), d'où la révision du plafond de TROIS à QUATRE.
 # Contre un dispatch qui dure des minutes à des heures, c'est l'arithmétique du
 # § 2 du document de migration. La sonde S3 (le coût réel d'un démarrage, NON
 # mesuré depuis le bac à sable) reste la précondition : si un démarrage dépasse
-# ce que trois tolèrent, c'est le PLACEMENT dans `main.rs` qu'il faut réparer,
+# ce que quatre tolèrent, c'est le PLACEMENT dans `main.rs` qu'il faut réparer,
 # jamais un cache — un cache sur un prédicat pur est une seconde source de
-# vérité, c'est-à-dire la duplication qu'on vient de retirer.
+# vérité, c'est-à-dire la duplication qu'on vient de retirer. Le coût croît avec
+# les MAILLONS vers le lecteur unique, jamais avec le nombre d'appelants d'un
+# seul lecteur.
 _extract_plan_path() {
     local body="$1" tmp path rc=0
 
