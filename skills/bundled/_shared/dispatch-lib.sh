@@ -11554,6 +11554,95 @@ _halt_groom_on_reader_refusal() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# mika#3118 — LA GRAMMAIRE DE HALTE, MESURÉE ET NON PRESCRITE.
+#
+# Les deux incidents écrivent la halte de la même façon : un TITRE H2 dont le
+# premier mot est `HALTE`.
+#
+#   ## HALTE — la borne du groom est dépassée              (l. 11, plan du 19/11)
+#   ## HALTE BORNE — le périmètre ne tient pas, …          (l.  9, plan du 17/11)
+#
+# Mesure sur les 1331 fichiers de `docs/plans/` : `^## *HALTE` apparie EXACTEMENT
+# UN fichier — le vrai positif. Le second vit sur `59c94bb1` et n'a jamais été
+# mergé. L'ancre H2 est ce qui exclut les trois classes de faux positifs
+# réalistes, toutes mesurées :
+#
+#   forme                              où                          pourquoi non
+#   `**HALTE 1 —**` … `**HALTE 4 —**`  plans 2420/2518, l. 572-700  gras, pas un titre
+#   `HALTE borne : N lignes`           45+ citations de mika#2693    jamais en `^## `
+#   `HALTE borne[[:space:]]*:`         dispatch-lib.sh et ses suites hors docs/plans/
+#
+# PAS DE FENÊTRE DE TÊTE, et c'est une décision plutôt qu'un oubli. Un titre H2
+# `HALTE` au milieu d'un plan est un VRAI positif : la mesure sur 1331 fichiers
+# n'a pas eu besoin d'une fenêtre pour n'apparier qu'un fichier, et ajouter une
+# borne ne pourrait que fabriquer des faux négatifs dans la direction coûteuse.
+# C'est l'inverse de `_pilot_declared_halt`, dont la fenêtre de 120 lignes est
+# obligatoire parce que la règle y est CITÉE près de la tête de chaque log.
+#
+# LA GRAMMAIRE N'EST PAS PRESCRITE DANS LES PROMPTS, et c'est un choix argumenté.
+# (i) Prescrire une forme ne protège pas de la dérive d'un LLM — le détecteur
+# doit mordre sur l'observé, pas sur le prescrit, et mika#3142 a tranché la même
+# question dans le même sens. (ii) Le prompt de groom porte depuis mika#3122 une
+# contrainte lexicale PORTANTE : `_OPERATOR_RESERVED_RULE` ne doit épeler ni
+# `## Fire-Disposition` ni `## Taille estimée`, sans quoi les deux rattrapages
+# `_fd_retry_if_section_still_missing` et `_plan_size_retry_if_section_still_missing`
+# relanceraient un pilote de revise à chaque ITERATE sur un finding synthétique
+# faux. Y ajouter une grammaire de halte, c'est un littéral de plus à tenir en
+# phase dans la zone la plus fragile du fichier, pour un gain nul sur le
+# détecteur. Le risque résiduel — une halte écrite en H3, en anglais — est nommé
+# au § Risques du plan, non résolu, et le filet de jugement de mika#3122 reste en
+# première ligne.
+#
+# TROIS CODES ET NON DEUX, parce que la direction du fail-safe l'exige. Ici un
+# faux négatif LANCE un vol sur un plan en halte (1,34 $ / zéro commit le 19/11 ;
+# un pilote tué à la main le 17/11) quand un faux positif ne coûte qu'un dispatch
+# retenu, le plan poussé et un repose de label. L'indétermination penche donc
+# vers la halte — mais `plan_halt_declared` et `plan_halt_unreadable` sont deux
+# populations (mika#2205), donc l'indétermination a son propre code plutôt que
+# d'emprunter celui de la halte.
+#
+# UNE HERE-STRING ET JAMAIS UN TUBE — correctif mesuré de mika#2055, pas une
+# préférence. `grep -q` sort au premier match et ferme son entrée ; un producteur
+# encore en écriture prend SIGPIPE et sort en 141, que le `pipefail` de cette
+# bibliothèque promeut en statut du pipeline — le prédicat répondrait « pas de
+# halte » pour un plan qui en porte une. `scripts/verify-no-sigpipe-grep.sh` ne
+# le verrait pas : son vocabulaire de producteurs est `printf|echo` seulement.
+# Et sur un fichier de plan le dépassement du tampon de 64 KiB dépend de la
+# taille, donc le faux négatif serait INTERMITTENT.
+# ---------------------------------------------------------------------------
+
+# Le motif, délibérément COURT : deux dièses en début de ligne, espaces libres,
+# puis le mot. `HALTE BORNE` passe par `HALTE` ; une forme qu'il n'apparie pas
+# répond « pas de halte », et c'est le risque nommé plus haut.
+_PLAN_HALT_DECL_RE='^##[[:space:]]*HALTE'
+
+# _plan_declared_halt <chemin> — le plan déclare-t-il une halte ?
+#
+# Prédicat pur : UN argument, aucune variable globale lue, aucun effet de bord.
+# Structurellement calqué sur `_pilot_declared_halt` (8293), à la direction du
+# fail-safe près.
+#
+# Rend :
+#   0 — le plan porte un titre de halte
+#   1 — le plan a été LU et ne porte aucun motif. L'absence de motif dans un
+#       fichier lu n'est pas une indétermination : c'est une réponse négative.
+#   2 — INDÉTERMINÉ : chemin vide, fichier absent, non lisible, lecture en échec,
+#       ou contenu vide. Un contenu vide est bien une indétermination et non une
+#       réponse négative : `_find_issue_plan` filtre à >500 octets, donc un plan
+#       qu'il a rendu et qui se lit vide est une anomalie de LECTURE.
+#       L'appelant en fait `plan_halt_unreadable`, jamais `plan_halt_declared`.
+_plan_declared_halt() {
+    local _path="${1:-}" _body
+    [ -n "$_path" ]                                 || return 2
+    [ -f "$_path" ]                                 || return 2
+    [ -r "$_path" ]                                 || return 2
+    _body=$(cat -- "$_path" 2>/dev/null)            || return 2
+    [ -n "$_body" ]                                 || return 2
+    grep -qE -- "$_PLAN_HALT_DECL_RE" <<<"$_body"   || return 1
+    return 0
+}
+
 _write_canonical_callout() {
     # Phase D canonical body-callout writer (mika#1271). Called from
     # _iterate_groom_loop on GROOMED success. Prepends the canonical 3-line
