@@ -12322,6 +12322,13 @@ no architect retry; the architect was not asked again"
             case "$route2" in
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    # mika#3118 — AVANT le callout, et c'est tout le correctif :
+                    # une fois le body stampé, `check_grooming_markers` (Pin B)
+                    # laisse un `ready` réappliqué dispatcher le pilote par la
+                    # porte webhook. La porte rend 1 quand elle a détourné la
+                    # convergence ; `_escalate_groom` a alors déjà stampé
+                    # `RESULT`, et les constats restent préservés.
+                    _groom_plan_halt_gate "second-pass-after-ready" "$forensic2" "$session_id" || return 1
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
                         echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings
@@ -12490,6 +12497,11 @@ no architect retry; the architect was not asked again"
             case "$route2i" in
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    # mika#3118 — voir le bras after-ready. Les DEUX bras et pas
+                    # seulement celui-là : les traces des deux incidents ne
+                    # disent pas par lequel la convergence est passée, et une
+                    # porte posée sur un seul laisserait l'autre entier.
+                    _groom_plan_halt_gate "second-pass-after-iterate" "$forensic2i" "$session_id" || return 1
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
                         echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings

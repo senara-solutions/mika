@@ -5920,9 +5920,13 @@ assert_contains "plan line consults the worktree measurement before the remote o
 # Reason coverage, per site rather than by total. The earlier count comparison
 # carried four units of slack, so four future un-reasoned exits could land
 # without tripping it.
+# mika#3118: le corps à scanner devient un ARGUMENT, défaut inchangé. Un seul
+# prédicat pour les deux corps — la boucle et la porte qu'elle délègue —, parce
+# que deux sondes recopiées divergeraient (mika#2158) et que c'est précisément la
+# délégation qu'il faut vérifier plutôt que promettre.
 _reason_pairing_check() {
     local body line prev1="" prev2="" bad=0 n=0
-    body=$(printf '%s\n' "$ITERATE_SRC_1772")
+    body=$(printf '%s\n' "${1:-$ITERATE_SRC_1772}")
     while IFS= read -r line; do
         case "$line" in
             *"return 1"*)
@@ -5934,7 +5938,13 @@ _reason_pairing_check() {
                     # the reason — but a wildcard prefix would also accept any
                     # future `_groom_warn_*` that does not, which is how a
                     # detector stops detecting.
-                    *_groom_warn\ *|*_groom_warn_empty_content\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
+                    # mika#3118: `_groom_plan_halt_gate` est listée par son NOM,
+                    # pour la même raison et avec la même dette : elle pose
+                    # `GROOM_LOOP_FAILURE_REASON` sur chacun de ses deux chemins
+                    # de refus, et l'assertion qui suit ce scan le VÉRIFIE sur
+                    # son corps au lieu de le croire sur parole. Un nom ajouté
+                    # ici sans cette contrepartie est un trou dans le scan.
+                    *_groom_warn\ *|*_groom_warn_empty_content\ *|*_groom_plan_halt_gate\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
                     *) bad=$((bad + 1)); echo "    unreasoned exit: $(printf '%s' "$line" | sed 's/^ *//')" >&2 ;;
                 esac
                 ;;
@@ -5949,6 +5959,21 @@ _reason_pairing_check() {
 REASON_PAIRING=$(_reason_pairing_check 2>/dev/null)
 assert_eq "every return 1 in the loop has a reason setter within two lines" \
     "0/${REASON_PAIRING#*/}" "$REASON_PAIRING"
+
+# mika#3118 — la contrepartie du nom ajouté à la liste ci-dessus. Le scan de la
+# boucle accepte désormais une sortie dont la raison est posée AILLEURS ; ce
+# qu'il accepte doit donc être mesuré là où ça vit, sinon le nom est un trou.
+# Le MÊME prédicat, appliqué au corps de la porte.
+GATE_SRC_3118=$(declare -f _groom_plan_halt_gate)
+assert_contains "mika#3118: le corps de la porte a été extrait (jamais une chaîne vide)" \
+    "_find_issue_plan" "$GATE_SRC_3118"
+GATE_PAIRING=$(_reason_pairing_check "$GATE_SRC_3118" 2>/dev/null)
+assert_eq "mika#3118: chaque return 1 de la porte pose sa raison à moins de deux lignes" \
+    "0/${GATE_PAIRING#*/}" "$GATE_PAIRING"
+# Et la cardinalité, parce qu'un corps qui aurait perdu un de ses deux refus
+# passerait le pairing en ne refusant plus rien (classe mika#2205).
+assert_eq "mika#3118: la porte a exactement deux chemins de refus" \
+    "2" "${GATE_PAIRING#*/}"
 
 # ===========================================================================
 # mika#1772 — the 2026-07-04 signature, replayed against the real loop
