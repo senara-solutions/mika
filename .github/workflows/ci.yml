@@ -760,6 +760,14 @@ jobs:
       # files, no git repository and no `gh`.
       - name: A pilot-declared halt is read from the session log's tail (mika#3142)
         run: bash skills/bundled/_shared/tests/test_pilot_halt_declared.sh
+      # A halt the PLAN declares is not a green light either, and the direction of
+      # the fail-safe is the INVERSE of mika#3142's: there a false positive
+      # withholds an artefact, here a false negative launches a flight on a halted
+      # plan — groom 93828860 on 19/11 wrote the GROOMED callout over a plan whose
+      # l. 11 was `## HALTE`, and pilot 137111d7 burned 1,34 $ for zero commits.
+      # Offline: real plan files, no git repository and no `gh`.
+      - name: A plan-declared halt does not converge on GROOMED (mika#3118)
+        run: bash skills/bundled/_shared/tests/test_plan_halt_declared.sh
       # The two invariants of worktree command seeding: never overwrite a
       # command the branch tracks, never dirty `git status`. Their breach was
       # the dirty-worktree cause behind mika#1414.

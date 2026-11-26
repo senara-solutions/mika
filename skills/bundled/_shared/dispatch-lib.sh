@@ -11298,6 +11298,41 @@ GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE="architect_unreadable"
 # appose. Un lecteur viendra si la cause apparaît en production.
 GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED="disposition_reader_refused"
 
+# mika#3118 — LE PLAN LUI-MÊME déclare une halte, et la convergence du groom la
+# porte jusqu'au moteur au lieu d'écrire un feu vert par-dessus.
+#
+# Le 19/11, le groom `93828860` est sorti en `status: success` sur un plan dont
+# la ligne 11 était `## HALTE — la borne du groom est dépassée`, suivie de
+# « La décision appartient à Vincent … Le groom n'en choisit aucune. » Le callout
+# `second-pass (GROOMED)` a été écrit, l'auto-fire a lancé le pilote `137111d7` :
+# 1,34 $ et zéro commit. Le 17/11, la même classe a coûté un pilote tué à la main
+# (`be5cca2e`, plan portant `## HALTE BORNE — le périmètre ne tient pas`).
+#
+# DEUX VALEURS ET JAMAIS UNE (mika#2205). « Le plan déclare une halte » et « je
+# n'ai pas pu lire si le plan déclare une halte » sont deux populations, et une
+# population fusionnée n'est plus soustractible — c'est la discipline que le vol 1
+# a appliquée à `ready_absent_at_autofire` contre `consent_unreadable_at_autofire`.
+#
+# AUCUNE CONSTANTE RUST NE LEUR RÉPOND, et c'est mesuré plutôt que supposé : le
+# parseur `groom_halt_cause` (`task_engine/dispatcher.rs`) lit une cause
+# QUELCONQUE — son test `some_future_cause` le pin — et les quatre scans
+# `mika2641_*` de `canonical_tokens.rs` sont ancrés nommément sur
+# `GROOM_HALT_CAUSE_LINE_PREFIX` et `GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE`, donc
+# ils ne demandent rien aux valeurs voisines. Les deux causes voyagent dans la
+# même colonne `tasks.result` que le `Outcome: PLAN_GROOMED` d'un groom sain : le
+# recensement a son dénominateur sans ligne de sonde neuve (mika#3050).
+
+# Le plan porte un titre de halte. C'est une décision que le groom n'a pas prise
+# et qu'il ne peut pas prendre : la convergence route vers `_escalate_groom`.
+GROOM_HALT_CAUSE_PLAN_HALT_DECLARED="plan_halt_declared"
+
+# Le plan a été trouvé mais n'a pas pu être LU. Fail-closed, et la direction est
+# l'INVERSE de celle de `_pilot_declared_halt` (mika#3142) — là-bas un faux
+# positif RETIENT un artefact (la perte que mika#1282 existe pour empêcher), ici
+# un faux négatif LANCE un vol sur un plan en halte. Un vol ne part jamais *parce
+# que* la lecture a échoué (mika#2981).
+GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE="plan_halt_unreadable"
+
 _escalate_groom() {
     # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
     # when the architect returns ESCALATE (first-pass or second-pass). Writes the
@@ -11355,7 +11390,13 @@ _escalate_groom() {
     #   $4: cause — "$GROOM_HALT_CAUSE_VERDICT" (défaut) |
     #       "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE" |
     #       "$GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED" (mika#2996, passée par
-    #       `_halt_groom_on_reader_refusal`). Les SIX sites d'appel la
+    #       `_halt_groom_on_reader_refusal`) |
+    #       "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED" |
+    #       "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE" (mika#3118, passées par
+    #       `_groom_plan_halt_gate`, un site par cause — une variable
+    #       `$_gate_cause` partagée économiserait un appel mais ferait perdre au
+    #       scan S-c son prédicat le plus fort, « chaque site nomme sa cause PAR
+    #       LA CONSTANTE »). Les HUIT sites d'appel la
     #       passent explicitement ; le défaut existe pour qu'un appelant inconnu
     #       reproduise le comportement d'hier, et le scan de cardinalité
     #       (`test-dispatch-lib.sh`, S-c) refuse qu'un site l'omette — un appel
@@ -11415,6 +11456,34 @@ Architect findings preserved at: ${findings_file}"
             RESULT="${RESULT}
 GROOM ESCALATED (terminal): the engine's disposition reader refused the architect's response at ${stage}.
 ${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED} ${stage} — \`mika arch-disposition\` could not read the response (exit ≥2, or a local mktemp/write failure). The architect was NOT asked again: this is a local refusal, not a missing verdict line. The engine's own motive is annexed to this result below, under the arch-disposition refusal marker of mika#2194.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+        "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED")
+            echo "iterate_groom_loop: ${GROOM_HALT_CAUSE_PLAN_HALT_DECLARED} at ${stage} — the plan declares a halt in a heading; the convergence is NOT a green light (mika#3118; findings at ${findings_file})" >&2
+            # AUCUNE ligne `Verdict:` — l'architecte a bien rendu `GROOMED`, et
+            # c'est précisément ce que ce bras refuse de propager : écrire
+            # `Verdict: ESCALATE` attribuerait à l'architecte un refus qu'il n'a
+            # pas prononcé (classe mika#1772). Le refus vient du PLAN.
+            #
+            # Deux champs positionnels — la cause puis l'étape — comme les deux
+            # bras ci-dessus : un seul format de fil.
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): the plan converged on GROOMED but declares a halt of its own at ${stage}.
+${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_PLAN_HALT_DECLARED} ${stage} — the plan carries a halt heading, so it reserves a decision for the operator that grooming cannot take. mika-arch answered GROOMED; the plan's own halt overrides it. No GROOMED callout was written, so no dispatch gate reads this ticket as groomed. The plan is committed and pushed: read it, take the decision, then re-apply the \`ready\` label.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+        "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE")
+            echo "iterate_groom_loop: ${GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE} at ${stage} — the plan was found but could not be read; refusing the green light (mika#3118; findings at ${findings_file})" >&2
+            # La population SŒUR de celle du dessus, et jamais la même ligne :
+            # « le plan déclare une halte » et « je n'ai pas pu lire si le plan
+            # déclare une halte » sont deux faits, et un `GROUP BY` qui les
+            # fusionnerait ne pourrait plus soustraire l'un de l'autre
+            # (mika#2205).
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): the plan for this ticket was found but could not be read at ${stage}.
+${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE} ${stage} — whether the plan declares a halt is UNKNOWN, and a flight never departs because a read failed (mika#2981). This is NOT a halt the plan declared: do not read it as one. mika-arch answered GROOMED. Check the plan file's permissions and presence in the worktree, then re-apply the \`ready\` label.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
             ;;
@@ -11485,6 +11554,174 @@ _halt_groom_on_reader_refusal() {
     # `READY-after-retry` et `GROOMED-after-retry`.
     _trail_append "$trail_skill" "$session_id" "REFUSED-reader"
     _escalate_groom "$stage" "$content" "$session_id" "$GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# mika#3118 — LA GRAMMAIRE DE HALTE, MESURÉE ET NON PRESCRITE.
+#
+# Les deux incidents écrivent la halte de la même façon : un TITRE H2 dont le
+# premier mot est `HALTE`.
+#
+#   ## HALTE — la borne du groom est dépassée              (l. 11, plan du 19/11)
+#   ## HALTE BORNE — le périmètre ne tient pas, …          (l.  9, plan du 17/11)
+#
+# Mesure sur les 1331 fichiers de `docs/plans/` : `^## *HALTE` apparie EXACTEMENT
+# UN fichier — le vrai positif. Le second vit sur `59c94bb1` et n'a jamais été
+# mergé. L'ancre H2 est ce qui exclut les trois classes de faux positifs
+# réalistes, toutes mesurées :
+#
+#   forme                              où                          pourquoi non
+#   `**HALTE 1 —**` … `**HALTE 4 —**`  plans 2420/2518, l. 572-700  gras, pas un titre
+#   `HALTE borne : N lignes`           45+ citations de mika#2693    jamais en `^## `
+#   `HALTE borne[[:space:]]*:`         dispatch-lib.sh et ses suites hors docs/plans/
+#
+# PAS DE FENÊTRE DE TÊTE, et c'est une décision plutôt qu'un oubli. Un titre H2
+# `HALTE` au milieu d'un plan est un VRAI positif : la mesure sur 1331 fichiers
+# n'a pas eu besoin d'une fenêtre pour n'apparier qu'un fichier, et ajouter une
+# borne ne pourrait que fabriquer des faux négatifs dans la direction coûteuse.
+# C'est l'inverse de `_pilot_declared_halt`, dont la fenêtre de 120 lignes est
+# obligatoire parce que la règle y est CITÉE près de la tête de chaque log.
+#
+# LA GRAMMAIRE N'EST PAS PRESCRITE DANS LES PROMPTS, et c'est un choix argumenté.
+# (i) Prescrire une forme ne protège pas de la dérive d'un LLM — le détecteur
+# doit mordre sur l'observé, pas sur le prescrit, et mika#3142 a tranché la même
+# question dans le même sens. (ii) Le prompt de groom porte depuis mika#3122 une
+# contrainte lexicale PORTANTE : `_OPERATOR_RESERVED_RULE` ne doit épeler ni
+# `## Fire-Disposition` ni `## Taille estimée`, sans quoi les deux rattrapages
+# `_fd_retry_if_section_still_missing` et `_plan_size_retry_if_section_still_missing`
+# relanceraient un pilote de revise à chaque ITERATE sur un finding synthétique
+# faux. Y ajouter une grammaire de halte, c'est un littéral de plus à tenir en
+# phase dans la zone la plus fragile du fichier, pour un gain nul sur le
+# détecteur. Le risque résiduel — une halte écrite en H3, en anglais — est nommé
+# au § Risques du plan, non résolu, et le filet de jugement de mika#3122 reste en
+# première ligne.
+#
+# TROIS CODES ET NON DEUX, parce que la direction du fail-safe l'exige. Ici un
+# faux négatif LANCE un vol sur un plan en halte (1,34 $ / zéro commit le 19/11 ;
+# un pilote tué à la main le 17/11) quand un faux positif ne coûte qu'un dispatch
+# retenu, le plan poussé et un repose de label. L'indétermination penche donc
+# vers la halte — mais `plan_halt_declared` et `plan_halt_unreadable` sont deux
+# populations (mika#2205), donc l'indétermination a son propre code plutôt que
+# d'emprunter celui de la halte.
+#
+# UNE HERE-STRING ET JAMAIS UN TUBE — correctif mesuré de mika#2055, pas une
+# préférence. `grep -q` sort au premier match et ferme son entrée ; un producteur
+# encore en écriture prend SIGPIPE et sort en 141, que le `pipefail` de cette
+# bibliothèque promeut en statut du pipeline — le prédicat répondrait « pas de
+# halte » pour un plan qui en porte une. `scripts/verify-no-sigpipe-grep.sh` ne
+# le verrait pas : son vocabulaire de producteurs est `printf|echo` seulement.
+# Et sur un fichier de plan le dépassement du tampon de 64 KiB dépend de la
+# taille, donc le faux négatif serait INTERMITTENT.
+# ---------------------------------------------------------------------------
+
+# Le motif, délibérément COURT : deux dièses en début de ligne, espaces libres,
+# puis le mot. `HALTE BORNE` passe par `HALTE` ; une forme qu'il n'apparie pas
+# répond « pas de halte », et c'est le risque nommé plus haut.
+_PLAN_HALT_DECL_RE='^##[[:space:]]*HALTE'
+
+# _plan_declared_halt <chemin> — le plan déclare-t-il une halte ?
+#
+# Prédicat pur : UN argument, aucune variable globale lue, aucun effet de bord.
+# Structurellement calqué sur `_pilot_declared_halt` (8293), à la direction du
+# fail-safe près.
+#
+# Rend :
+#   0 — le plan porte un titre de halte
+#   1 — le plan a été LU et ne porte aucun motif. L'absence de motif dans un
+#       fichier lu n'est pas une indétermination : c'est une réponse négative.
+#   2 — INDÉTERMINÉ : chemin vide, fichier absent, non lisible, lecture en échec,
+#       ou contenu vide. Un contenu vide est bien une indétermination et non une
+#       réponse négative : `_find_issue_plan` filtre à >500 octets, donc un plan
+#       qu'il a rendu et qui se lit vide est une anomalie de LECTURE.
+#       L'appelant en fait `plan_halt_unreadable`, jamais `plan_halt_declared`.
+_plan_declared_halt() {
+    local _path="${1:-}" _body
+    [ -n "$_path" ]                                 || return 2
+    [ -f "$_path" ]                                 || return 2
+    [ -r "$_path" ]                                 || return 2
+    _body=$(cat -- "$_path" 2>/dev/null)            || return 2
+    [ -n "$_body" ]                                 || return 2
+    grep -qE -- "$_PLAN_HALT_DECL_RE" <<<"$_body"   || return 1
+    return 0
+}
+
+_groom_plan_halt_gate() {
+    # mika#3118 — UN PLAN QUI DÉCLARE UNE HALTE NE SORT PAS DU GROOM EN FEU VERT.
+    #
+    # Posée aux DEUX bras qui convergent sur `GROOMED`, et AVANT
+    # `_write_canonical_callout`. L'ordre est la moitié du correctif : une fois le
+    # callout écrit, `check_grooming_markers` (Pin B) laisse passer un `ready`
+    # réappliqué par la porte webhook, donc une porte posée après le callout
+    # laisserait la porte de derrière ouverte. C'est pourquoi la variante « après
+    # le retour de `_iterate_groom_loop` » a été pesée et refusée.
+    #
+    # LE PLAN RE-RÉSOLU, et non celui que le site tient dans `$plan_path`. Ce
+    # n'est pas une économie : `_write_canonical_callout` re-résout lui aussi, et
+    # la porte doit lire le fichier que le callout va DÉCLARER groomé, pas celui
+    # que l'architecte a lu 2000 lignes plus tôt. Au bras `iterate-to-groomed` un
+    # pilote de revise a tourné entre les deux et a pu renommer le plan : lire
+    # `$plan_path` y fabriquerait un `plan_halt_unreadable` sur un groom sain.
+    #
+    # PLAN INTROUVABLE ⇒ 0, et c'est la seule exception à la direction du
+    # fail-safe. Le reste du ticket penche vers la halte parce qu'un faux négatif
+    # lance un vol sur un plan arrêté (1,34 $ pour zéro commit le 19/11) ; ici
+    # escalader prendrait au `GROOM_PROOF_UNBOUND_GRACE` sa population. Cette
+    # grâce est comptée par `groom_proof_unbound_to_plan` (seul écrivain :
+    # `skills/executor.rs:2346`) et son chemin est le refus que
+    # `_write_canonical_callout` rend tout seul deux lignes plus loin. La porte le
+    # laisse donc intact : elle ne refuse que ce qu'elle a LU.
+    #
+    # Args: $1 = stage ("second-pass-after-ready" | "second-pass-after-iterate"),
+    #       $2 = constats de l'architecte, $3 = session_id.
+    #
+    # Rend 0 — rien à refuser : la convergence continue et le site écrit son
+    #          callout.
+    # Rend 1 — la convergence est DÉTOURNÉE : `_escalate_groom` a déjà stampé
+    #          `RESULT` avec sa cause, et le site doit sortir en 1 sans appeler
+    #          `_write_canonical_callout` ni `_cleanup_iterate_findings` — les
+    #          constats sont préservés sur une escalade, comme à tous les autres
+    #          sites.
+    local stage="$1" content="$2" session_id="$3"
+
+    local _gate_plan=""
+    _gate_plan=$(_find_issue_plan) || _gate_plan=""
+    if [ -z "$_gate_plan" ]; then
+        echo "groom_plan_halt_gate: no issue-scoped plan for $REPO#$ISSUE_NUM at ${stage} — the halt gate reads nothing and refuses nothing; _write_canonical_callout renders its own refusal (mika#3118)" >&2
+        return 0
+    fi
+
+    # `if … then … else` plutôt qu'un appel nu suivi de `$?` : le handler
+    # `dev-groom` arme `set -e`, et un prédicat qui rend 1 en position
+    # d'instruction avorterait cette fonction avant le `case`. Ça ne mord pas
+    # aujourd'hui — `_iterate_groom_loop` est appelée comme condition de `if`,
+    # donc errexit est suspendu sur toute son étendue dynamique — mais c'est
+    # l'idiome que le site de `_retry2_status` emploie déjà, et pour la même
+    # raison : la sûreté doit survivre au premier refactor de l'appelant.
+    local _gate_rc
+    if _plan_declared_halt "$_gate_plan"; then
+        _gate_rc=0
+    else
+        _gate_rc=$?
+    fi
+
+    case "$_gate_rc" in
+        0)
+            echo "groom_plan_halt_gate: ${_gate_plan##*/} declares a halt in a heading at ${stage} — routing $REPO#$ISSUE_NUM to ESCALATE instead of GROOMED (mika#3118)" >&2
+            GROOM_LOOP_FAILURE_REASON="the plan declares a halt of its own (a heading whose first word is HALTE), so the GROOMED convergence is not a green light — the decision it reserves for the operator is one grooming cannot take"
+            _escalate_groom "$stage" "$content" "$session_id" "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED"
+            return 1
+            ;;
+        2)
+            echo "groom_plan_halt_gate: ${_gate_plan} was found but could not be read at ${stage} — refusing the green light for $REPO#$ISSUE_NUM (mika#3118)" >&2
+            GROOM_LOOP_FAILURE_REASON="the plan was found but could not be read, so whether it declares a halt is UNKNOWN; a flight never departs on an unread plan (mika#2981), and this is NOT a halt the plan declared"
+            _escalate_groom "$stage" "$content" "$session_id" "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE"
+            return 1
+            ;;
+    esac
+
+    # Lu, aucun titre de halte. La réponse négative est la seule qui laisse la
+    # convergence passer, et elle la laisse passer à l'octet près.
     return 0
 }
 
@@ -12085,6 +12322,13 @@ no architect retry; the architect was not asked again"
             case "$route2" in
                 GROOMED)
                     echo "iterate_groom_loop: converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    # mika#3118 — AVANT le callout, et c'est tout le correctif :
+                    # une fois le body stampé, `check_grooming_markers` (Pin B)
+                    # laisse un `ready` réappliqué dispatcher le pilote par la
+                    # porte webhook. La porte rend 1 quand elle a détourné la
+                    # convergence ; `_escalate_groom` a alors déjà stampé
+                    # `RESULT`, et les constats restent préservés.
+                    _groom_plan_halt_gate "second-pass-after-ready" "$forensic2" "$session_id" || return 1
                     _write_canonical_callout "ready-to-groomed" "$session_id" || \
                         echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings
@@ -12253,6 +12497,11 @@ no architect retry; the architect was not asked again"
             case "$route2i" in
                 GROOMED)
                     echo "iterate_groom_loop: revised plan converged on GROOMED for $REPO#$ISSUE_NUM (session $session_id)" >&2
+                    # mika#3118 — voir le bras after-ready. Les DEUX bras et pas
+                    # seulement celui-là : les traces des deux incidents ne
+                    # disent pas par lequel la convergence est passée, et une
+                    # porte posée sur un seul laisserait l'autre entier.
+                    _groom_plan_halt_gate "second-pass-after-iterate" "$forensic2i" "$session_id" || return 1
                     _write_canonical_callout "iterate-to-groomed" "$session_id" || \
                         echo "WARN: canonical_callout_failed — dispatch gate will reject next ready unless pilot organic write or operator-direct rescue fills the body callout" >&2
                     _cleanup_iterate_findings

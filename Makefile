@@ -237,6 +237,12 @@ test-rescue-tree-equals-main: ## Verify no rescue draft opens on a head whose tr
 test-pilot-halt-declared: ## Verify a pilot-declared halt is read from the session log's tail, and the rule's quotation is not (mika#3142)
 	@bash skills/bundled/_shared/tests/test_pilot_halt_declared.sh
 
+# mika#3118 — ce target lance la suite SEULE. Sa porte de merge est l'étape
+# nommée du job `dispatch-lib-offline-suites` de ci.yml, pas ce target : un
+# target qu'aucun workflow ne nomme ne refuse rien (mika#2578).
+test-plan-halt-declared: ## Verify a plan declaring its own halt does not come out of grooming as a green light (mika#3118)
+	@bash skills/bundled/_shared/tests/test_plan_halt_declared.sh
+
 test-handler-crash-step: ## Verify a long-running handler names the step it crashed on, and arms its trap first (mika#2532)
 	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
 

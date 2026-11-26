@@ -5920,9 +5920,13 @@ assert_contains "plan line consults the worktree measurement before the remote o
 # Reason coverage, per site rather than by total. The earlier count comparison
 # carried four units of slack, so four future un-reasoned exits could land
 # without tripping it.
+# mika#3118: le corps à scanner devient un ARGUMENT, défaut inchangé. Un seul
+# prédicat pour les deux corps — la boucle et la porte qu'elle délègue —, parce
+# que deux sondes recopiées divergeraient (mika#2158) et que c'est précisément la
+# délégation qu'il faut vérifier plutôt que promettre.
 _reason_pairing_check() {
     local body line prev1="" prev2="" bad=0 n=0
-    body=$(printf '%s\n' "$ITERATE_SRC_1772")
+    body=$(printf '%s\n' "${1:-$ITERATE_SRC_1772}")
     while IFS= read -r line; do
         case "$line" in
             *"return 1"*)
@@ -5934,7 +5938,13 @@ _reason_pairing_check() {
                     # the reason — but a wildcard prefix would also accept any
                     # future `_groom_warn_*` that does not, which is how a
                     # detector stops detecting.
-                    *_groom_warn\ *|*_groom_warn_empty_content\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
+                    # mika#3118: `_groom_plan_halt_gate` est listée par son NOM,
+                    # pour la même raison et avec la même dette : elle pose
+                    # `GROOM_LOOP_FAILURE_REASON` sur chacun de ses deux chemins
+                    # de refus, et l'assertion qui suit ce scan le VÉRIFIE sur
+                    # son corps au lieu de le croire sur parole. Un nom ajouté
+                    # ici sans cette contrepartie est un trou dans le scan.
+                    *_groom_warn\ *|*_groom_warn_empty_content\ *|*_groom_plan_halt_gate\ *|*GROOM_LOOP_FAILURE_REASON=*) ;;
                     *) bad=$((bad + 1)); echo "    unreasoned exit: $(printf '%s' "$line" | sed 's/^ *//')" >&2 ;;
                 esac
                 ;;
@@ -5949,6 +5959,277 @@ _reason_pairing_check() {
 REASON_PAIRING=$(_reason_pairing_check 2>/dev/null)
 assert_eq "every return 1 in the loop has a reason setter within two lines" \
     "0/${REASON_PAIRING#*/}" "$REASON_PAIRING"
+
+# mika#3118 — la contrepartie du nom ajouté à la liste ci-dessus. Le scan de la
+# boucle accepte désormais une sortie dont la raison est posée AILLEURS ; ce
+# qu'il accepte doit donc être mesuré là où ça vit, sinon le nom est un trou.
+# Le MÊME prédicat, appliqué au corps de la porte.
+GATE_SRC_3118=$(declare -f _groom_plan_halt_gate)
+assert_contains "mika#3118: le corps de la porte a été extrait (jamais une chaîne vide)" \
+    "_find_issue_plan" "$GATE_SRC_3118"
+GATE_PAIRING=$(_reason_pairing_check "$GATE_SRC_3118" 2>/dev/null)
+assert_eq "mika#3118: chaque return 1 de la porte pose sa raison à moins de deux lignes" \
+    "0/${GATE_PAIRING#*/}" "$GATE_PAIRING"
+# Et la cardinalité, parce qu'un corps qui aurait perdu un de ses deux refus
+# passerait le pairing en ne refusant plus rien (classe mika#2205).
+assert_eq "mika#3118: la porte a exactement deux chemins de refus" \
+    "2" "${GATE_PAIRING#*/}"
+
+# ===========================================================================
+# mika#3118 — LES DEUX BRAS PORTENT LA PORTE, ET UN SCAN LE REFUSE SI L'UN LA PERD
+#
+# Sans ce scan, la porte peut disparaître d'un seul bras sans qu'aucun test
+# rougisse : les sondes comportementales ci-dessous couvrent les deux chemins
+# aujourd'hui, mais un bras ajouté demain (une troisième convergence sur
+# `GROOMED`) naîtrait nu et personne ne le verrait. C'est la Fire-Disposition du
+# plan, option (a).
+#
+# Le scan lit le FICHIER et non `declare -f` : un bras déplacé hors de
+# `_iterate_groom_loop` resterait un bras.
+echo ""
+echo "Test: mika#3118 — la cardinalité des bras GROOMED gardés"
+echo "------------------------------------------------------------"
+
+EXPECTED_PLAN_HALT_GATE_SITES=2
+
+# L'allowlist d'exceptions nommées, LIVRÉE VIDE — et son vide est asserté deux
+# lignes plus bas. Elle est VRAIMENT consommée par le scan (la boucle de
+# soustraction ci-dessous) : une allowlist que rien ne lit est du théâtre, et le
+# jour où quelqu'un y écrit un stage, il faut que ça AIT un effet mesurable.
+# Elle est soustractible parce qu'elle contient des stages, pas des fichiers —
+# c'est la différence entre une exception qui expire et l'allowlist que
+# mika#2309 condamne.
+PLAN_HALT_GATE_SITE_EXCEPTIONS=()
+
+# Rend une ligne par bras `*-to-groomed` : `gated` ou `ungated`, puis le stage.
+# Fenêtre de 10 lignes : la porte et le callout sont séparés par le commentaire
+# qui explique l'ordre, et exiger l'adjacence interdirait de l'expliquer.
+#
+# Les lignes de COMMENTAIRE sont écartées d'abord, et ce n'est pas un détail de
+# propreté : la doc d'en-tête de `_iterate_groom_loop` énumère ses cinq terminaux
+# en citant `_write_canonical_callout "ready-to-groomed"` et son jumeau (l. 12076
+# et 12078). Les compter faisait voir QUATRE bras, dont deux nus — un rouge
+# permanent sur une documentation juste, et la seule issue aurait été une
+# allowlist. Le même `next` écarte aussi une porte citée en commentaire : un
+# commentaire ne garde rien.
+_m3118_groomed_arms() {
+    awk '
+        /^[ \t]*#/ { next }
+        /_groom_plan_halt_gate[ \t]+"/ { gate = NR }
+        /_write_canonical_callout[ \t]+"[a-z-]+-to-groomed"/ {
+            stage = $0
+            sub(/^.*_write_canonical_callout[ \t]+"/, "", stage)
+            sub(/".*$/, "", stage)
+            if (gate != 0 && NR - gate <= 10) printf "gated %s\n", stage
+            else printf "ungated %s\n", stage
+        }
+    ' "$1"
+}
+
+M3118_ARMS=$(_m3118_groomed_arms "$DISPATCH_LIB")
+# Anti-vacuité d'abord : un scan qui ne voit aucun bras passerait tout le reste.
+assert_eq "mika#3118 (FD): le scan voit exactement deux bras GROOMED" \
+    "$EXPECTED_PLAN_HALT_GATE_SITES" "$(printf '%s\n' "$M3118_ARMS" | grep -c . || true)"
+assert_eq "mika#3118 (FD): l'allowlist d'exceptions est livrée VIDE" \
+    "0" "${#PLAN_HALT_GATE_SITE_EXCEPTIONS[@]}"
+
+# La soustraction de l'allowlist, écrite pour de vrai. Vide, elle est l'identité.
+_m3118_ungated_after_allowlist() {
+    local arms="$1" exc out
+    out=$(printf '%s\n' "$arms" | sed -n 's/^ungated //p')
+    for exc in ${PLAN_HALT_GATE_SITE_EXCEPTIONS[@]+"${PLAN_HALT_GATE_SITE_EXCEPTIONS[@]}"}; do
+        out=$(printf '%s\n' "$out" | grep -vFx -- "$exc" || true)
+    done
+    printf '%s\n' "$out" | grep -c . || true
+}
+assert_eq "mika#3118 (FD): aucun bras GROOMED n'est dépourvu de la porte" \
+    "0" "$(_m3118_ungated_after_allowlist "$M3118_ARMS")"
+assert_contains "mika#3118 (FD): le bras after-ready est nommément gardé" \
+    "gated ready-to-groomed" "$M3118_ARMS"
+assert_contains "mika#3118 (FD): le bras after-iterate aussi" \
+    "gated iterate-to-groomed" "$M3118_ARMS"
+
+# --- Contrôle négatif : le scan VOIT-IL un bras nu ? -----------------------
+#
+# Sans lui, un scan cassé — un `awk` qui n'apparie plus rien, une fenêtre
+# devenue infinie — rendrait `0 ungated` sur n'importe quoi et lirait exactement
+# comme un scan sain. La fabrication retire la ligne de porte du bras
+# after-iterate dans une COPIE ; le fichier livré n'est jamais touché.
+M3118_NEG_TMP=$(mktemp -d)
+sed '/_groom_plan_halt_gate "second-pass-after-iterate"/d' "$DISPATCH_LIB" \
+    > "$M3118_NEG_TMP/dispatch-lib-ungated.sh"
+M3118_NEG_ARMS=$(_m3118_groomed_arms "$M3118_NEG_TMP/dispatch-lib-ungated.sh")
+assert_eq "mika#3118 (FD): la fabrication a bien retiré une ligne, pas zéro" \
+    "1" "$(diff "$DISPATCH_LIB" "$M3118_NEG_TMP/dispatch-lib-ungated.sh" | grep -c '^< ' || true)"
+assert_contains "mika#3118 (FD): le scan REFUSE le bras fabriqué sans porte" \
+    "ungated iterate-to-groomed" "$M3118_NEG_ARMS"
+assert_eq "mika#3118 (FD): et il en compte un, soustraction de l'allowlist faite" \
+    "1" "$(_m3118_ungated_after_allowlist "$M3118_NEG_ARMS")"
+rm -rf "$M3118_NEG_TMP"
+
+# --- AC4 : les deux populations ne se touchent pas -------------------------
+#
+# Le `case` de la porte mappe le code 0 sur `plan_halt_declared` et le code 2 sur
+# `plan_halt_unreadable`. L'inverse serait un `RESULT` parfaitement plausible —
+# « le plan déclare une halte » pour une lecture en échec — et aucune sonde
+# comportementale ne le verrait, puisque les deux terminent de la même façon.
+M3118_MAP_DECL=$(printf '%s\n' "$GATE_SRC_3118" \
+    | sed -n '/^[[:space:]]*0)/,/^[[:space:]]*;;/p')
+M3118_MAP_UNRD=$(printf '%s\n' "$GATE_SRC_3118" \
+    | sed -n '/^[[:space:]]*2)/,/^[[:space:]]*;;/p')
+assert_contains "mika#3118 (AC4): le code 0 passe plan_halt_declared" \
+    'GROOM_HALT_CAUSE_PLAN_HALT_DECLARED' "$M3118_MAP_DECL"
+assert_eq "mika#3118 (AC4): et JAMAIS plan_halt_unreadable" "0" \
+    "$(printf '%s\n' "$M3118_MAP_DECL" | grep -c 'PLAN_HALT_UNREADABLE' || true)"
+assert_contains "mika#3118 (AC4): le code 2 passe plan_halt_unreadable" \
+    'GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE' "$M3118_MAP_UNRD"
+assert_eq "mika#3118 (AC4): et JAMAIS plan_halt_declared" "0" \
+    "$(printf '%s\n' "$M3118_MAP_UNRD" | grep -c 'PLAN_HALT_DECLARED' || true)"
+# AC5 — le plan introuvable rend 0. La grâce `GROOM_PROOF_UNBOUND_GRACE` garde sa
+# population, et c'est la seule exception à la direction du fail-safe.
+assert_contains "mika#3118 (AC5): un plan introuvable laisse passer, sans escalade" \
+    'the halt gate reads nothing and refuses nothing' "$GATE_SRC_3118"
+
+# ===========================================================================
+# mika#3118 — LES DEUX BRAS, REJOUÉS CONTRE LA BOUCLE RÉELLE
+#
+# Le scan ci-dessus prouve que la porte est POSÉE ; ces sondes prouvent qu'elle
+# MORD. `_arch_ask` est bouchonné à la frontière de processus, comme la sonde
+# mika#1772 : les parseurs, l'enveloppe de relance, le trail, `_escalate_groom`
+# et les terminaux restent réels.
+# ===========================================================================
+
+echo ""
+echo "Test: mika#3118 — un plan qui déclare une halte ne converge pas"
+echo "------------------------------------------------------------"
+
+# $1 = disposition du premier passage ("READY" → bras after-ready, "ITERATE" →
+#      bras after-iterate), $2 = ligne posée à la l. 11 du plan.
+_groom_plan_halt_probe_3118() {
+    local first_disposition="$1" line11="$2"
+    local tmp wt rc
+    tmp=$(mktemp -d)
+    wt="$tmp/wt"
+    mkdir -p "$wt/docs/plans"
+    {
+        echo "# Plan for the plan-halt gate"
+        echo "**Ticket:** mika issue#3118"
+        for i in $(seq 1 8); do
+            echo "Body line $i — padding padding padding padding padding."
+        done
+        printf '%s\n' "$line11"
+        for i in $(seq 12 30); do
+            echo "Body line $i — padding padding padding padding padding."
+        done
+    } > "$wt/docs/plans/2026-11-26-001-fix-3118-gate-plan.md"
+
+    (
+        # shellcheck disable=SC1090
+        source "$DISPATCH_LIB" 2>/dev/null || true
+
+        _arch_ask() {
+            local n body
+            n=$(cat "$tmp/arch-calls")
+            n=$((n + 1))
+            printf '%s' "$n" > "$tmp/arch-calls"
+            case "$n" in
+                1) body="Disposition: ${first_disposition}" ;;
+                *) body='Verdict: GROOMED' ;;
+            esac
+            jq -n --arg c "$body" \
+                '{content:$c, metadata:{session_id:"probe-session-3118"}}'
+        }
+        # Le pilote de revise ne tourne pas ici : le bras after-iterate a besoin
+        # qu'il rende 0, pas qu'il révise. Le plan reste donc celui du fixture,
+        # ce qui est exactement le cas mesuré — le plan du 19/11 portait sa halte
+        # APRÈS la révision.
+        _launch_revise_pilot() { return 0; }
+        _write_canonical_callout() { printf 'written\n' > "$tmp/callout"; return 0; }
+        printf '0' > "$tmp/arch-calls"
+
+        WORKTREE_DIR="$wt" ISSUE_NUM="3118" REPO="mika" BRANCH="probe-3118"
+        RESULT=""
+        if _iterate_groom_loop >/dev/null 2>"$tmp/err"; then rc=0; else rc=1; fi
+
+        printf 'rc=%s\n' "$rc"
+        printf 'arch_calls=%s\n' "$(cat "$tmp/arch-calls")"
+        printf 'callout=%s\n' "$([ -f "$tmp/callout" ] && echo yes || echo no)"
+        printf 'reason=%s\n' "${GROOM_LOOP_FAILURE_REASON:-<none>}"
+        # `RESULT` à plat : c'est le seul champ que l'opérateur verra dans
+        # `tasks.result`, et la ligne de cause y est ANCRÉE en début de ligne.
+        printf 'cause_line=%s\n' \
+            "$(printf '%s\n' "$RESULT" | sed -n 's/^Groom-halt-cause: //p' | head -1)"
+        printf 'outcome=%s\n' \
+            "$(printf '%s\n' "$RESULT" | sed -n 's/^Outcome: //p' | head -1)"
+    )
+    rm -rf "$tmp"
+}
+
+HALT_H2_3118='## HALTE — la borne du groom est dépassée'
+NOHALT_3118='## Contexte — rien à refuser ici'
+
+# --- AC1 : le bras after-ready --------------------------------------------
+P3118_READY=$(_groom_plan_halt_probe_3118 READY "$HALT_H2_3118") || P3118_READY=""
+assert_contains "AC1: la sonde a conduit la boucle jusqu'au second passage" \
+    "arch_calls=2" "$P3118_READY"
+assert_contains "AC1: la convergence est détournée (la boucle rend 1)" \
+    "rc=1" "$P3118_READY"
+assert_contains "AC1: AUCUN callout canonique n'est écrit" \
+    "callout=no" "$P3118_READY"
+assert_contains "AC1: la cause voyage sur le fil, par sa ligne ancrée" \
+    "cause_line=plan_halt_declared second-pass-after-ready" "$P3118_READY"
+assert_contains "AC1: et la disposition est ESCALATE, jamais un feu vert" \
+    "outcome=ESCALATE" "$P3118_READY"
+# Le motif voyage dans `tasks.result` et c'est TOUT ce que l'opérateur voit
+# (PR#2028). Il doit nommer le PLAN : dire « l'architecte a refusé » enverrait
+# lire une objection qui n'existe pas — mika-arch a répondu GROOMED (mika#1772).
+assert_contains "AC1: le motif nomme la halte DU PLAN, pas un refus d'architecte" \
+    "the plan declares a halt of its own" "$P3118_READY"
+
+# --- AC2 : le bras after-iterate ------------------------------------------
+P3118_ITER=$(_groom_plan_halt_probe_3118 ITERATE "$HALT_H2_3118") || P3118_ITER=""
+assert_contains "AC2: la sonde a conduit la boucle jusqu'au second passage" \
+    "arch_calls=2" "$P3118_ITER"
+assert_contains "AC2: la convergence est détournée (la boucle rend 1)" \
+    "rc=1" "$P3118_ITER"
+assert_contains "AC2: AUCUN callout canonique n'est écrit" \
+    "callout=no" "$P3118_ITER"
+assert_contains "AC2: la cause nomme l'autre étape, et c'est le même fil" \
+    "cause_line=plan_halt_declared second-pass-after-iterate" "$P3118_ITER"
+assert_contains "AC2: et la disposition est ESCALATE" \
+    "outcome=ESCALATE" "$P3118_ITER"
+
+# --- CONTRE-TÉMOIN : sans halte, les deux bras convergent à l'octet près ---
+#
+# C'est la moitié qui empêche la porte d'être un refus universel. Sans elle, une
+# porte qui escalade TOUJOURS passerait les six assertions ci-dessus.
+P3118_OK_READY=$(_groom_plan_halt_probe_3118 READY "$NOHALT_3118") || P3118_OK_READY=""
+assert_contains "contre-témoin (after-ready): la boucle converge" \
+    "rc=0" "$P3118_OK_READY"
+assert_contains "contre-témoin (after-ready): le callout EST écrit" \
+    "callout=yes" "$P3118_OK_READY"
+assert_contains "contre-témoin (after-ready): et aucun motif d'échec n'est posé" \
+    "reason=<none>" "$P3118_OK_READY"
+P3118_OK_ITER=$(_groom_plan_halt_probe_3118 ITERATE "$NOHALT_3118") || P3118_OK_ITER=""
+assert_contains "contre-témoin (after-iterate): la boucle converge" \
+    "rc=0" "$P3118_OK_ITER"
+assert_contains "contre-témoin (after-iterate): le callout EST écrit" \
+    "callout=yes" "$P3118_OK_ITER"
+
+# --- AC3 : les deux faux positifs mesurés convergent NORMALEMENT -----------
+#
+# Deux assertions distinctes, parce que ce sont deux grammaires mesurées
+# distinctes : le gras des plans 2420/2518 et la citation de la règle mika#2693
+# que porte TOUT plan groomé. Attestées ici sur la BOUCLE, là où elles coûtent,
+# et pas seulement sur le détecteur.
+P3118_FP_BOLD=$(_groom_plan_halt_probe_3118 READY \
+    '**HALTE 1 —** le périmètre du vol 1 ne couvre pas cette moitié') || P3118_FP_BOLD=""
+assert_contains "AC3 (a): un '**HALTE 1 —**' en prose converge en GROOMED" \
+    "callout=yes" "$P3118_FP_BOLD"
+P3118_FP_RULE=$(_groom_plan_halt_probe_3118 READY \
+    'HALTE borne : 312 lignes ajoutées, pour une borne du groom de 300.') || P3118_FP_RULE=""
+assert_contains "AC3 (b): une citation de la règle mika#2693 converge en GROOMED" \
+    "callout=yes" "$P3118_FP_RULE"
 
 # ===========================================================================
 # mika#1772 — the 2026-07-04 signature, replayed against the real loop
@@ -14767,6 +15048,14 @@ fi
 # unique appelée aux trois sites de lecture plutôt que trois escalades recopiées
 # (mika#2158), donc le scan par `declare -f` reste à 5 sans rien relâcher : les
 # cinq terminaux de la boucle y sont toujours tous.
+#
+# mika#3118 porte l'écart à 5 et 8, pour la même raison d'un cran plus loin : les
+# septième et huitième appels vivent dans `_groom_plan_halt_gate`, encore un
+# corps séparé. DEUX et non un : la porte a deux causes — `plan_halt_declared` et
+# `plan_halt_unreadable`, deux populations que mika#2205 interdit de fondre — et
+# les router par une variable `$_gate_cause` sur un appel unique ferait perdre à
+# l'assertion suivante son prédicat le plus fort. Un appel de plus coûte une
+# ligne ; une cause qui n'est plus nommée par sa constante au site coûte le scan.
 _m2641_escalate_call_sites() {
     # Les APPELS, jamais la définition ni la prose : ligne dont le premier mot
     # est `_escalate_groom` suivi d'un espace et d'un argument.
@@ -14774,16 +15063,16 @@ _m2641_escalate_call_sites() {
 }
 M2641_CALL_LINES=$(_m2641_escalate_call_sites)
 M2641_CALL_COUNT=$(printf '%s' "$M2641_CALL_LINES" | grep -c . || true)
-assert_eq "mika#2641 (S-c): exactement six sites appellent _escalate_groom (mika#2996)" \
-    "6" "$M2641_CALL_COUNT"
+assert_eq "mika#2641 (S-c): exactement huit sites appellent _escalate_groom (mika#2996, mika#3118)" \
+    "8" "$M2641_CALL_COUNT"
 # Chaque site nomme sa cause PAR LA CONSTANTE, jamais par un littéral recopié.
 # C'est le prédicat plus fort des deux : il attrape à la fois le site qui omet
 # l'argument ET celui qui retape la valeur de fil à la main — or le format de
 # fil n'est exact que tant qu'il a un site de définition unique (D4).
 M2641_CAUSED_COUNT=$(printf '%s\n' "$M2641_CALL_LINES" \
-    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE|DISPOSITION_READER_REFUSED)"[[:space:]]*$' || true)
-assert_eq "mika#2641 (S-c): les six sites passent une cause explicite, par la constante" \
-    "6" "$M2641_CAUSED_COUNT"
+    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE|DISPOSITION_READER_REFUSED|PLAN_HALT_DECLARED|PLAN_HALT_UNREADABLE)"[[:space:]]*$' || true)
+assert_eq "mika#2641 (S-c): les huit sites passent une cause explicite, par la constante" \
+    "8" "$M2641_CAUSED_COUNT"
 
 # Le format de fil a un site de définition unique de chaque côté (D4). Côté
 # shell : une affectation, pas deux.
