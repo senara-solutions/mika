@@ -11298,6 +11298,41 @@ GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE="architect_unreadable"
 # appose. Un lecteur viendra si la cause apparaît en production.
 GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED="disposition_reader_refused"
 
+# mika#3118 — LE PLAN LUI-MÊME déclare une halte, et la convergence du groom la
+# porte jusqu'au moteur au lieu d'écrire un feu vert par-dessus.
+#
+# Le 19/11, le groom `93828860` est sorti en `status: success` sur un plan dont
+# la ligne 11 était `## HALTE — la borne du groom est dépassée`, suivie de
+# « La décision appartient à Vincent … Le groom n'en choisit aucune. » Le callout
+# `second-pass (GROOMED)` a été écrit, l'auto-fire a lancé le pilote `137111d7` :
+# 1,34 $ et zéro commit. Le 17/11, la même classe a coûté un pilote tué à la main
+# (`be5cca2e`, plan portant `## HALTE BORNE — le périmètre ne tient pas`).
+#
+# DEUX VALEURS ET JAMAIS UNE (mika#2205). « Le plan déclare une halte » et « je
+# n'ai pas pu lire si le plan déclare une halte » sont deux populations, et une
+# population fusionnée n'est plus soustractible — c'est la discipline que le vol 1
+# a appliquée à `ready_absent_at_autofire` contre `consent_unreadable_at_autofire`.
+#
+# AUCUNE CONSTANTE RUST NE LEUR RÉPOND, et c'est mesuré plutôt que supposé : le
+# parseur `groom_halt_cause` (`task_engine/dispatcher.rs`) lit une cause
+# QUELCONQUE — son test `some_future_cause` le pin — et les quatre scans
+# `mika2641_*` de `canonical_tokens.rs` sont ancrés nommément sur
+# `GROOM_HALT_CAUSE_LINE_PREFIX` et `GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE`, donc
+# ils ne demandent rien aux valeurs voisines. Les deux causes voyagent dans la
+# même colonne `tasks.result` que le `Outcome: PLAN_GROOMED` d'un groom sain : le
+# recensement a son dénominateur sans ligne de sonde neuve (mika#3050).
+
+# Le plan porte un titre de halte. C'est une décision que le groom n'a pas prise
+# et qu'il ne peut pas prendre : la convergence route vers `_escalate_groom`.
+GROOM_HALT_CAUSE_PLAN_HALT_DECLARED="plan_halt_declared"
+
+# Le plan a été trouvé mais n'a pas pu être LU. Fail-closed, et la direction est
+# l'INVERSE de celle de `_pilot_declared_halt` (mika#3142) — là-bas un faux
+# positif RETIENT un artefact (la perte que mika#1282 existe pour empêcher), ici
+# un faux négatif LANCE un vol sur un plan en halte. Un vol ne part jamais *parce
+# que* la lecture a échoué (mika#2981).
+GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE="plan_halt_unreadable"
+
 _escalate_groom() {
     # Phase D escalation helper (mika#1271) — fail loudly per mika#1033 precedent
     # when the architect returns ESCALATE (first-pass or second-pass). Writes the
@@ -11355,7 +11390,10 @@ _escalate_groom() {
     #   $4: cause — "$GROOM_HALT_CAUSE_VERDICT" (défaut) |
     #       "$GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE" |
     #       "$GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED" (mika#2996, passée par
-    #       `_halt_groom_on_reader_refusal`). Les SIX sites d'appel la
+    #       `_halt_groom_on_reader_refusal`) |
+    #       "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED" |
+    #       "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE" (mika#3118, passées par
+    #       `_groom_plan_halt_gate`). Les SEPT sites d'appel la
     #       passent explicitement ; le défaut existe pour qu'un appelant inconnu
     #       reproduise le comportement d'hier, et le scan de cardinalité
     #       (`test-dispatch-lib.sh`, S-c) refuse qu'un site l'omette — un appel
@@ -11415,6 +11453,34 @@ Architect findings preserved at: ${findings_file}"
             RESULT="${RESULT}
 GROOM ESCALATED (terminal): the engine's disposition reader refused the architect's response at ${stage}.
 ${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED} ${stage} — \`mika arch-disposition\` could not read the response (exit ≥2, or a local mktemp/write failure). The architect was NOT asked again: this is a local refusal, not a missing verdict line. The engine's own motive is annexed to this result below, under the arch-disposition refusal marker of mika#2194.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+        "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED")
+            echo "iterate_groom_loop: ${GROOM_HALT_CAUSE_PLAN_HALT_DECLARED} at ${stage} — the plan declares a halt in a heading; the convergence is NOT a green light (mika#3118; findings at ${findings_file})" >&2
+            # AUCUNE ligne `Verdict:` — l'architecte a bien rendu `GROOMED`, et
+            # c'est précisément ce que ce bras refuse de propager : écrire
+            # `Verdict: ESCALATE` attribuerait à l'architecte un refus qu'il n'a
+            # pas prononcé (classe mika#1772). Le refus vient du PLAN.
+            #
+            # Deux champs positionnels — la cause puis l'étape — comme les deux
+            # bras ci-dessus : un seul format de fil.
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): the plan converged on GROOMED but declares a halt of its own at ${stage}.
+${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_PLAN_HALT_DECLARED} ${stage} — the plan carries a halt heading, so it reserves a decision for the operator that grooming cannot take. mika-arch answered GROOMED; the plan's own halt overrides it. No GROOMED callout was written, so no dispatch gate reads this ticket as groomed. The plan is committed and pushed: read it, take the decision, then re-apply the \`ready\` label.
+Session: ${session_id}
+Architect findings preserved at: ${findings_file}"
+            ;;
+        "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE")
+            echo "iterate_groom_loop: ${GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE} at ${stage} — the plan was found but could not be read; refusing the green light (mika#3118; findings at ${findings_file})" >&2
+            # La population SŒUR de celle du dessus, et jamais la même ligne :
+            # « le plan déclare une halte » et « je n'ai pas pu lire si le plan
+            # déclare une halte » sont deux faits, et un `GROUP BY` qui les
+            # fusionnerait ne pourrait plus soustraire l'un de l'autre
+            # (mika#2205).
+            RESULT="${RESULT}
+GROOM ESCALATED (terminal): the plan for this ticket was found but could not be read at ${stage}.
+${GROOM_HALT_CAUSE_LINE_PREFIX} ${GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE} ${stage} — whether the plan declares a halt is UNKNOWN, and a flight never departs because a read failed (mika#2981). This is NOT a halt the plan declared: do not read it as one. mika-arch answered GROOMED. Check the plan file's permissions and presence in the worktree, then re-apply the \`ready\` label.
 Session: ${session_id}
 Architect findings preserved at: ${findings_file}"
             ;;
