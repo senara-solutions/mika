@@ -144,6 +144,7 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
 	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
+	@bash skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
@@ -200,6 +201,11 @@ test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it 
 	@bash skills/bundled/_shared/test-dispatch-lib.sh
 	@bash skills/bundled/_shared/tests/test_dev_groom_dirty_rescue.sh
 	@bash skills/bundled/_shared/tests/test_lean_tail_regression.sh
+	# mika#3174 — la suite vit dans `tests/` et PAS dans l'agrégat ci-dessus :
+	# `test-dispatch-lib.sh` frôle le plafond `LARGE_FILE_LIMIT` de
+	# `scripts/check-secrets.sh`, et y ajouter le bloc faisait rougir `Secret Scan`
+	# sur une taille. Elle est donc câblée ICI, dans la cible que la CI appelle.
+	@bash skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh
 
 test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh

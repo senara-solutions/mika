@@ -190,17 +190,27 @@ Voir § Tests.
 
 ## Tests
 
-Les deux critères atterrissent dans **`skills/bundled/_shared/test-dispatch-lib.sh`**.
+Les deux critères atterrissent dans une suite autonome,
+**`skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh`**.
 
-> **Divergence assumée avec l'énoncé.** L'AC3 nomme
-> `skills/bundled/_shared/tests/test-dispatch-lib.sh`. **Ce fichier n'existe
-> pas** : `_shared/tests/` ne contient que des suites par sujet
-> (`test_find_issue_plan.sh`, `test_parse_disposition.sh`, …) plus les deux
-> bibliothèques `lib-*.sh`. La suite visée est
-> `skills/bundled/_shared/test-dispatch-lib.sh` (19 070 lignes), déjà câblée par
-> `make test` **et** `make test-dispatch-lib` (`Makefile:144`, `Makefile:200`,
-> mika#1772) — donc rien à déclarer dans `scripts/suite-wiring.tsv`. Le chemin
-> de l'énoncé est corrigé, pas contourné : aucune suite nouvelle n'est créée.
+> **Révision du vol 2 : la suite est sortie de l'agrégat.** Ce plan visait
+> d'abord `skills/bundled/_shared/test-dispatch-lib.sh`, au motif que l'AC3
+> nommait un `…/_shared/tests/test-dispatch-lib.sh` qui n'existe pas. Mesuré
+> sur la PR #3177 : l'ajout du bloc portait l'agrégat de 1 041 079 à
+> **1 052 961 octets**, au-delà du plafond `LARGE_FILE_LIMIT` (1 048 576) de
+> `scripts/check-secrets.sh`, et le job `Secret Scan` rougissait — sur une
+> taille, pas sur un secret. Le plafond n'est pas touché, ni
+> `LARGE_FILE_ALLOWLIST` : le bloc part dans une suite par sujet, sur le modèle
+> de `tests/test_find_issue_plan.sh`, ce qui est exactement ce que `_shared/tests/`
+> existe pour porter. `test-dispatch-lib.sh` redevient **identique octet pour
+> octet** à celui d'`origin/main`. La nouvelle suite est câblée dans `make test`
+> **et** dans `make test-dispatch-lib` — la cible que la CI appelle — donc rien
+> à déclarer dans `scripts/suite-wiring.tsv` (`check-suite-wiring.sh` la voit
+> couverte : `unwired=0`). Les helpers que le bloc tenait de l'agrégat
+> (`assert_eq`, `assert_contains`, `assert_not_contains`, les exports
+> `GIT_CONFIG_*` d'hermeticité mika#1772, `WRITER_SRC`) sont **recopiés** dans la
+> nouvelle suite sans être retirés de l'ancienne ; `mika_bin_or_skip` reste
+> **sourcé** depuis `tests/lib-mika-bin.sh`, jamais recopié (mika#2194).
 
 La couverture existante de `_write_canonical_callout` (≈ `:1211–1309`) est de la
 **forme de source** (`WRITER_SRC=$(declare -f _write_canonical_callout)`) plus
@@ -384,15 +394,20 @@ fusionnée avec l'étape 2, sinon le rouge-avant n'est plus attesté par rien.
 - La ligne de log du court-circuit idempotent est conservée mot pour mot.
 - L'en-tête de `_extract_plan_path` nomme son quatrième appelant et le plafond
   de QUATRE démarrages de `mika` par dispatch dev-groom.
-- `skills/bundled/_shared/test-dispatch-lib.sh` tient T1 (AC1), T2 (AC2), T3 et
-  T4 ; le rouge-avant de T1 contre le code actuel a été constaté et l'ordre de
-  commit le reflète.
+- `skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh` tient
+  T1 (AC1), T2 (AC2), T3 et T4 ; le rouge-avant de T1 contre le code actuel a
+  été constaté et l'ordre de commit le reflète.
+- `skills/bundled/_shared/test-dispatch-lib.sh` est **identique octet pour
+  octet** à celui d'`origin/main` (`git diff origin/main -- …` vide), donc
+  `Secret Scan` ne voit plus de franchissement de `LARGE_FILE_LIMIT`.
 - `make test`, `make test-dispatch-lib`, `make verify-bundled-skills`,
   `cargo clippy`, `cargo fmt --check` et
   `bash scripts/verify-pipeline.sh origin/main` passent.
 - Aucune entrée ajoutée à `scripts/canonical-tokens.tsv` ni à
   `scripts/suite-wiring.tsv` — le token `> - **Plan:**` garde son site unique en
-  Rust, et la suite visée est déjà câblée.
+  Rust, et la nouvelle suite est câblée dans `make test` **et** dans la cible
+  `make test-dispatch-lib` que la CI appelle (`check-suite-wiring.sh` la compte
+  couverte, `unwired=0`).
 
 ## Acceptance criteria
 
@@ -405,10 +420,13 @@ fusionnée avec l'étape 2, sinon le rouge-avant n'est plus attesté par rien.
   AC1 contre le code actuel.
 
 > Note de transcription : AC3 est tenu à
-> `skills/bundled/_shared/test-dispatch-lib.sh` — le chemin de l'énoncé
-> (`…/_shared/tests/test-dispatch-lib.sh`) ne désigne aucun fichier existant.
-> Voir § Tests pour la vérification et la conséquence (la suite réelle est déjà
-> câblée par `make test` et `make test-dispatch-lib`).
+> `skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh` — le chemin
+> de l'énoncé (`…/_shared/tests/test-dispatch-lib.sh`) ne désigne aucun fichier
+> existant, et l'agrégat `_shared/test-dispatch-lib.sh` ne peut plus accueillir
+> le bloc sans franchir le plafond `LARGE_FILE_LIMIT` de
+> `scripts/check-secrets.sh` (mesuré sur la PR #3177). La suite vit donc sous
+> `_shared/tests/`, ce que l'énoncé désignait déjà comme répertoire. Voir § Tests
+> pour la mesure et le câblage.
 
 ## Fire-Disposition
 
@@ -444,7 +462,7 @@ exception, c'est un bloc qui refuse de se lire comme un vert.
 |---|---|
 | `skills/bundled/_shared/dispatch-lib.sh` — quatrième prédicat + diagnostic + commentaire de raison | 50 |
 | `skills/bundled/_shared/dispatch-lib.sh` — en-tête de `_extract_plan_path` (quatrième appelant, plafond 3 → 4) | 12 |
-| tests (`skills/bundled/_shared/test-dispatch-lib.sh` — sonde + T1/T2/T3/T4) | 145 |
+| tests (`skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh` — en-tête + helpers recopiés + sonde + T1/T2/T3/T4) | 145 |
 
 Total estimé : 207 lignes
 Plafond de tours : 150 (défaut)
