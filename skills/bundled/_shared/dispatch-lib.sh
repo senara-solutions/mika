@@ -11393,7 +11393,10 @@ _escalate_groom() {
     #       `_halt_groom_on_reader_refusal`) |
     #       "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED" |
     #       "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE" (mika#3118, passées par
-    #       `_groom_plan_halt_gate`). Les SEPT sites d'appel la
+    #       `_groom_plan_halt_gate`, un site par cause — une variable
+    #       `$_gate_cause` partagée économiserait un appel mais ferait perdre au
+    #       scan S-c son prédicat le plus fort, « chaque site nomme sa cause PAR
+    #       LA CONSTANTE »). Les HUIT sites d'appel la
     #       passent explicitement ; le défaut existe pour qu'un appelant inconnu
     #       reproduise le comportement d'hier, et le scan de cardinalité
     #       (`test-dispatch-lib.sh`, S-c) refuse qu'un site l'omette — un appel
@@ -11640,6 +11643,85 @@ _plan_declared_halt() {
     _body=$(cat -- "$_path" 2>/dev/null)            || return 2
     [ -n "$_body" ]                                 || return 2
     grep -qE -- "$_PLAN_HALT_DECL_RE" <<<"$_body"   || return 1
+    return 0
+}
+
+_groom_plan_halt_gate() {
+    # mika#3118 — UN PLAN QUI DÉCLARE UNE HALTE NE SORT PAS DU GROOM EN FEU VERT.
+    #
+    # Posée aux DEUX bras qui convergent sur `GROOMED`, et AVANT
+    # `_write_canonical_callout`. L'ordre est la moitié du correctif : une fois le
+    # callout écrit, `check_grooming_markers` (Pin B) laisse passer un `ready`
+    # réappliqué par la porte webhook, donc une porte posée après le callout
+    # laisserait la porte de derrière ouverte. C'est pourquoi la variante « après
+    # le retour de `_iterate_groom_loop` » a été pesée et refusée.
+    #
+    # LE PLAN RE-RÉSOLU, et non celui que le site tient dans `$plan_path`. Ce
+    # n'est pas une économie : `_write_canonical_callout` re-résout lui aussi, et
+    # la porte doit lire le fichier que le callout va DÉCLARER groomé, pas celui
+    # que l'architecte a lu 2000 lignes plus tôt. Au bras `iterate-to-groomed` un
+    # pilote de revise a tourné entre les deux et a pu renommer le plan : lire
+    # `$plan_path` y fabriquerait un `plan_halt_unreadable` sur un groom sain.
+    #
+    # PLAN INTROUVABLE ⇒ 0, et c'est la seule exception à la direction du
+    # fail-safe. Le reste du ticket penche vers la halte parce qu'un faux négatif
+    # lance un vol sur un plan arrêté (1,34 $ pour zéro commit le 19/11) ; ici
+    # escalader prendrait au `GROOM_PROOF_UNBOUND_GRACE` sa population. Cette
+    # grâce est comptée par `groom_proof_unbound_to_plan` (seul écrivain :
+    # `skills/executor.rs:2346`) et son chemin est le refus que
+    # `_write_canonical_callout` rend tout seul deux lignes plus loin. La porte le
+    # laisse donc intact : elle ne refuse que ce qu'elle a LU.
+    #
+    # Args: $1 = stage ("second-pass-after-ready" | "second-pass-after-iterate"),
+    #       $2 = constats de l'architecte, $3 = session_id.
+    #
+    # Rend 0 — rien à refuser : la convergence continue et le site écrit son
+    #          callout.
+    # Rend 1 — la convergence est DÉTOURNÉE : `_escalate_groom` a déjà stampé
+    #          `RESULT` avec sa cause, et le site doit sortir en 1 sans appeler
+    #          `_write_canonical_callout` ni `_cleanup_iterate_findings` — les
+    #          constats sont préservés sur une escalade, comme à tous les autres
+    #          sites.
+    local stage="$1" content="$2" session_id="$3"
+
+    local _gate_plan=""
+    _gate_plan=$(_find_issue_plan) || _gate_plan=""
+    if [ -z "$_gate_plan" ]; then
+        echo "groom_plan_halt_gate: no issue-scoped plan for $REPO#$ISSUE_NUM at ${stage} — the halt gate reads nothing and refuses nothing; _write_canonical_callout renders its own refusal (mika#3118)" >&2
+        return 0
+    fi
+
+    # `if … then … else` plutôt qu'un appel nu suivi de `$?` : le handler
+    # `dev-groom` arme `set -e`, et un prédicat qui rend 1 en position
+    # d'instruction avorterait cette fonction avant le `case`. Ça ne mord pas
+    # aujourd'hui — `_iterate_groom_loop` est appelée comme condition de `if`,
+    # donc errexit est suspendu sur toute son étendue dynamique — mais c'est
+    # l'idiome que le site de `_retry2_status` emploie déjà, et pour la même
+    # raison : la sûreté doit survivre au premier refactor de l'appelant.
+    local _gate_rc
+    if _plan_declared_halt "$_gate_plan"; then
+        _gate_rc=0
+    else
+        _gate_rc=$?
+    fi
+
+    case "$_gate_rc" in
+        0)
+            echo "groom_plan_halt_gate: ${_gate_plan##*/} declares a halt in a heading at ${stage} — routing $REPO#$ISSUE_NUM to ESCALATE instead of GROOMED (mika#3118)" >&2
+            GROOM_LOOP_FAILURE_REASON="the plan declares a halt of its own (a heading whose first word is HALTE), so the GROOMED convergence is not a green light — the decision it reserves for the operator is one grooming cannot take"
+            _escalate_groom "$stage" "$content" "$session_id" "$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED"
+            return 1
+            ;;
+        2)
+            echo "groom_plan_halt_gate: ${_gate_plan} was found but could not be read at ${stage} — refusing the green light for $REPO#$ISSUE_NUM (mika#3118)" >&2
+            GROOM_LOOP_FAILURE_REASON="the plan was found but could not be read, so whether it declares a halt is UNKNOWN; a flight never departs on an unread plan (mika#2981), and this is NOT a halt the plan declared"
+            _escalate_groom "$stage" "$content" "$session_id" "$GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE"
+            return 1
+            ;;
+    esac
+
+    # Lu, aucun titre de halte. La réponse négative est la seule qui laisse la
+    # convergence passer, et elle la laisse passer à l'octet près.
     return 0
 }
 

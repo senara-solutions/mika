@@ -14767,6 +14767,14 @@ fi
 # unique appelée aux trois sites de lecture plutôt que trois escalades recopiées
 # (mika#2158), donc le scan par `declare -f` reste à 5 sans rien relâcher : les
 # cinq terminaux de la boucle y sont toujours tous.
+#
+# mika#3118 porte l'écart à 5 et 8, pour la même raison d'un cran plus loin : les
+# septième et huitième appels vivent dans `_groom_plan_halt_gate`, encore un
+# corps séparé. DEUX et non un : la porte a deux causes — `plan_halt_declared` et
+# `plan_halt_unreadable`, deux populations que mika#2205 interdit de fondre — et
+# les router par une variable `$_gate_cause` sur un appel unique ferait perdre à
+# l'assertion suivante son prédicat le plus fort. Un appel de plus coûte une
+# ligne ; une cause qui n'est plus nommée par sa constante au site coûte le scan.
 _m2641_escalate_call_sites() {
     # Les APPELS, jamais la définition ni la prose : ligne dont le premier mot
     # est `_escalate_groom` suivi d'un espace et d'un argument.
@@ -14774,16 +14782,16 @@ _m2641_escalate_call_sites() {
 }
 M2641_CALL_LINES=$(_m2641_escalate_call_sites)
 M2641_CALL_COUNT=$(printf '%s' "$M2641_CALL_LINES" | grep -c . || true)
-assert_eq "mika#2641 (S-c): exactement six sites appellent _escalate_groom (mika#2996)" \
-    "6" "$M2641_CALL_COUNT"
+assert_eq "mika#2641 (S-c): exactement huit sites appellent _escalate_groom (mika#2996, mika#3118)" \
+    "8" "$M2641_CALL_COUNT"
 # Chaque site nomme sa cause PAR LA CONSTANTE, jamais par un littéral recopié.
 # C'est le prédicat plus fort des deux : il attrape à la fois le site qui omet
 # l'argument ET celui qui retape la valeur de fil à la main — or le format de
 # fil n'est exact que tant qu'il a un site de définition unique (D4).
 M2641_CAUSED_COUNT=$(printf '%s\n' "$M2641_CALL_LINES" \
-    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE|DISPOSITION_READER_REFUSED)"[[:space:]]*$' || true)
-assert_eq "mika#2641 (S-c): les six sites passent une cause explicite, par la constante" \
-    "6" "$M2641_CAUSED_COUNT"
+    | grep -cE '"\$GROOM_HALT_CAUSE_(VERDICT|ARCHITECT_UNREADABLE|DISPOSITION_READER_REFUSED|PLAN_HALT_DECLARED|PLAN_HALT_UNREADABLE)"[[:space:]]*$' || true)
+assert_eq "mika#2641 (S-c): les huit sites passent une cause explicite, par la constante" \
+    "8" "$M2641_CAUSED_COUNT"
 
 # Le format de fil a un site de définition unique de chaque côté (D4). Côté
 # shell : une affectation, pas deux.
