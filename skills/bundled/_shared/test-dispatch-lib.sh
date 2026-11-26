@@ -1,4 +1,14 @@
 #!/bin/bash
+# CE FICHIER EST GELÉ (mika#3179), et sa taille est tenue par
+# `scripts/check-dispatch-lib-aggregate-frozen.sh`. Il frôle le plafond
+# `LARGE_FILE_LIMIT` (1 Mo) de `scripts/check-secrets.sh` : tout bloc ajouté ici
+# fait rougir `Secret Scan` APRÈS le push, sur un message qui parle d'un blob trop
+# gros et ne dit rien de l'endroit où placer un test (incident #3177).
+# UN NOUVEAU BLOC D'ASSERTIONS VA DANS UNE SUITE NEUVE,
+# `skills/bundled/_shared/tests/test_<sujet>_<ticket>.sh`, sur le modèle de
+# `tests/test_callout_plan_identity_3174.sh`, câblée dans les cibles `test` ET
+# `test-dispatch-lib` du Makefile. La scission de cet agrégat est #3178.
+#
 # Test suite for dispatch-lib.sh — specifically the closed-issue auto-skip path (mika#988).
 #
 # Strategy: Extract and test the closed-issue detection logic in isolation.

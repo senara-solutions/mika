@@ -46,6 +46,14 @@ An audit or log name that exactly one module is allowed to emit, so that a query
 
 Any name the module emits *instead of* the primary one under another disposition (see [gated disposition](#gated-disposition)) is a sole-writer name too, held by the same guard.
 
+### Frozen ceiling
+
+A [structural guard](#structural-guard) whose bound is a constant committed next to the predicate — a size, a count, a budget — rather than a delta measured against a base revision. One datum and no dependency: the same verdict in a shallow checkout, in `make test`, and in CI, where a diff against the default branch is mute on a fresh branch and outside a full clone.
+
+Its failure mode is not the growth it watches. Nobody can add a byte unnoticed; anybody can raise the constant. So the guard's own [anti-vacuity assertion](#anti-vacuity-assertion) extracts that constant from the guard's source — anchored at column zero, parsed and never sourced — and requires it to equal the real measurement, which is what keeps the conforming case from being a tautology; a second assertion bounds it by whatever coarser threshold already exists upstream, so a constant raised to that threshold reddens instead of leaving the freeze without effect.
+
+Its two greens are not the same green. "Conforming" and "the watched object is gone" must be distinguishable in the output, or the guard passes silently on a *renamed* subject; the message for the second one also names the guard's own removal, so it does not outlive its object. And because the merge gate is what the author reads, the failure message carries three parts rather than a verdict: the measurement, the gesture (the file to create, a precedent to copy, every wiring point), and the non-gesture — the exemption to refuse, named in full, including one another guard's message may be recommending.
+
 ## Scans
 
 ### Gated disposition
