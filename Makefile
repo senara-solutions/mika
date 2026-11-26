@@ -187,6 +187,12 @@ test: ## Run all tests
 	@bash scripts/test-check-pilot-turn-ceiling-labels.sh
 	@bash scripts/check-root-files.sh
 	@bash scripts/test-check-root-files.sh
+	# mika#3179 — `skills/bundled/_shared/test-dispatch-lib.sh` est GELÉ : le lint
+	# refuse toute croissance et dit où placer le prochain bloc (#3178 pour la
+	# scission). Les deux lignes sont aussi dans `test-dispatch-lib`, la cible
+	# que la CI nomme — ici seul, le lint ne serait pas une porte de merge.
+	@bash scripts/check-dispatch-lib-aggregate-frozen.sh
+	@bash scripts/test-check-dispatch-lib-aggregate-frozen.sh
 	@bash scripts/check-issue-comment-patch-guard.sh
 	@bash scripts/test-annotate-issue-token-comment.sh
 	@bash scripts/check-pilot-instruction-paths.sh
@@ -206,6 +212,12 @@ test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it 
 	# `scripts/check-secrets.sh`, et y ajouter le bloc faisait rougir `Secret Scan`
 	# sur une taille. Elle est donc câblée ICI, dans la cible que la CI appelle.
 	@bash skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh
+	# mika#3179 — et le gel qui rend la règle ci-dessus opposable AVANT la CI :
+	# le lint refuse toute croissance de l'agrégat et nomme le geste (une suite
+	# neuve sous `tests/`) plutôt que l'allowlist que `Secret Scan` suggère.
+	# Son harnais mesure que la constante n'a pas dérivé. Scission : #3178.
+	@bash scripts/check-dispatch-lib-aggregate-frozen.sh
+	@bash scripts/test-check-dispatch-lib-aggregate-frozen.sh
 
 test-find-issue-plan: ## Run the plan-discovery suite (mika#2038 wired it into CI)
 	@bash skills/bundled/_shared/tests/test_find_issue_plan.sh
