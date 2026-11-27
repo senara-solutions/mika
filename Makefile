@@ -148,6 +148,14 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_stamp_pr_origin.sh
 	@bash skills/bundled/_shared/tests/test_stamp_issue_seat.sh
 	@bash skills/bundled/_shared/tests/test_rescue_signal_open_pr.sh
+	# mika#3178 vol 2/7 — les cinq premières familles scindées de l'agrégat.
+	# Câblées DIRECTEMENT dans les deux cibles : `check-suite-wiring.sh` ne voit
+	# pas un appel fait depuis le corps d'une autre suite (mika#2761).
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_iterate_1271.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_escalate_1271.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_groom_gate_2811.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_push_divergence_1364.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_preflight_1472.sh
 	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
 	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
 	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
@@ -212,6 +220,13 @@ test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it 
 	# `scripts/check-secrets.sh`, et y ajouter le bloc faisait rougir `Secret Scan`
 	# sur une taille. Elle est donc câblée ICI, dans la cible que la CI appelle.
 	@bash skills/bundled/_shared/tests/test_callout_plan_identity_3174.sh
+	# mika#3178 vol 2/7 — familles 1 à 5. L'agrégat garde ses deux appels : il
+	# n'est retiré qu'au vol 7, donc les mêmes blocs tournent deux fois jusque-là.
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_iterate_1271.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_escalate_1271.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_groom_gate_2811.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_push_divergence_1364.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_preflight_1472.sh
 	# mika#3179 — et le gel qui rend la règle ci-dessus opposable AVANT la CI :
 	# le lint refuse toute croissance de l'agrégat et nomme le geste (une suite
 	# neuve sous `tests/`) plutôt que l'allowlist que `Secret Scan` suggère.
