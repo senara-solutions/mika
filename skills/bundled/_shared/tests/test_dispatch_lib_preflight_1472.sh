@@ -12,6 +12,12 @@ set -euo pipefail
 _SUITE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-dispatch-lib-suite.sh
 source "$_SUITE_DIR/lib-dispatch-lib-suite.sh"
+# La boucle de l. 4950-4988 appelle douze cas `test_groom_gate_*` définis dans la
+# famille 2 et un `_fixture_setup` défini dans la famille 4 : trois familles pour
+# une chaîne définition → fixture → appel. Sans ce `source`, cette suite rend
+# douze `rc=127` là où l'agrégat en rend zéro — mesuré au vol 2.
+# shellcheck source=lib-dispatch-lib-groom-gate-fixtures.sh
+source "$_SUITE_DIR/lib-dispatch-lib-groom-gate-fixtures.sh"
 # ============================================================================
 # Pre-flight stale-relic cleanup + dual-failure diagnostic (mika#1472)
 # ============================================================================
