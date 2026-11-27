@@ -176,6 +176,48 @@ jugement. Le découpage passe donc de 6 à 7 vols (§ *Découpage en vols*). Les
 **aucune** mention, et AC6 n'est à aucun moment transitoirement fausse : l'agrégat existe pendant
 tout le re-ciblage du vol 7 et disparaît dans le **même commit**.
 
+## Note du vol (2026-11-27) : une sixième livraison, la bibliothèque de fixtures
+
+**Mesuré en vol, pas prévu au groom.** Le § *Les trois gestes qui produisent une suite* suppose
+qu'une plage contiguë est auto-suffisante. Deux dépendances inter-familles l'ont démenti, chacune
+découverte par une exécution et non par relecture :
+
+1. **L'état de premier niveau que l'agrégat ne pose qu'une fois.** L'agrégat `source`
+   `dispatch-lib.sh` à sa l. 730 — dans la **famille 1** — et y définit trois marqueurs
+   (l. 737-739) que des blocs des familles 2 et 8 lisent. Extraite seule, la famille 2 meurt au
+   premier `_escalate_groom` : commande introuvable, `stderr` déjà vers `/dev/null` par le bloc
+   lui-même, donc une panne **silencieuse** sous `set -e`. Remède : ces quatre éléments vivent
+   désormais dans `tests/lib-dispatch-lib-suite.sh` (26 lignes ajoutées à l'ossature du vol 1),
+   et la l. 730 reste en place dans la famille 1, où un second `source` est sans effet.
+2. **La chaîne définition → fixture → appel, répartie sur trois familles.** L'agrégat l'annonce
+   lui-même à ses l. 1426-1428 : les douze cas `test_groom_gate_*` sont **définis** en
+   famille 2 (l. 1429-1827), `_fixture_setup` en **famille 4** (l. 2824-2855), et la boucle qui
+   les **appelle** en **famille 5** (l. 4950-4988). Aucun découpage en plages contiguës ne la
+   garde entière : la famille 5 extraite seule rendait **12 `rc=127`** là où l'agrégat en rend 0.
+
+**Livrable ajouté : `skills/bundled/_shared/tests/lib-dispatch-lib-groom-gate-fixtures.sh`** —
+42 lignes d'en-tête **écrites**, puis les deux plages `2824-2855` et `1426-1827` (434 lignes)
+**extraites par le `sed` de D1(a)**, dans cet ordre (le fixture d'abord, car les douze cas
+l'appellent). La famille 5 la `source` depuis son en-tête ; les familles 2 et 4 gardent les mêmes
+plages dans leur corps, où une redéfinition de fonction est sans effet — c'est ce qui laisse leur
+`diff` d'AC3 exact.
+
+**La permission de D1(a) couvre ce nom, et c'est mesuré.** `claude-pilot#328` — mergée et
+déployée — admet une seule forme de plus vers ce fichier :
+`sed -n '<N>,<M>p' <agrégat> >> skills/bundled/_shared/tests/lib-dispatch-lib-groom-gate-fixtures.sh`,
+en **ajout seulement**. Jamais `>`, jamais une autre forme, jamais un autre nom, et jamais un
+`Edit` qui recopierait les plages à la main : le mot pour mot reste prouvé **par construction**,
+comme pour les cinq suites.
+
+**Conséquence sur les deux nombres de D2(b) :** lignes écrites **84 → 132** (+42 d'en-tête de
+bibliothèque, +6 de `source` et de commentaire dans la famille 5), lignes déplacées
+**4 929 → 5 363** (+434). Les deux restent sous la borne de 429 lignes écrites par vol.
+
+**Pour les vols 3 à 6 :** les deux dépendances ci-dessus sont les seules **mesurées** à ce vol.
+La leçon générale n'est pas une liste mais une méthode — **une famille extraite se lance avant
+d'être crue**, et un `rc=127` ou une panne silencieuse nomme la dépendance. Elle est consignée
+sous `docs/solutions/`.
+
 ## Découpage en vols : 7, et le vol courant est le 2
 
 La règle de comptage est **D2(b)**, tranchée par l'opérateur le 2026-11-27 (corps de mika#3178) : la
