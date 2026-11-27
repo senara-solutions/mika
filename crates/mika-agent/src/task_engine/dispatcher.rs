@@ -6552,6 +6552,23 @@ pub(crate) const GROOM_HALT_CAUSE_LINE_PREFIX: &str = "Groom-halt-cause:";
 /// populations sous un même mot.
 pub(crate) const GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE: &str = "architect_unreadable";
 
+/// La cause « le plan groomé déclare lui-même une halte » (mika#3118, vol 2).
+///
+/// Jumeau de `GROOM_HALT_CAUSE_PLAN_HALT_DECLARED` côté shell
+/// (`skills/bundled/_shared/dispatch-lib.sh`). La porte de `_iterate_groom_loop`
+/// route cette convergence vers `_escalate_groom` : un plan qui porte sa propre
+/// halte ne sort plus du grooming en feu vert.
+pub(crate) const GROOM_HALT_CAUSE_PLAN_HALT_DECLARED: &str = "plan_halt_declared";
+
+/// La cause « le fichier de plan n'a pas pu être lu pour chercher sa halte ».
+///
+/// Jumeau de `GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE` côté shell. Sœur de la
+/// précédente et **jamais fondue avec elle** : « le plan déclare une halte » et
+/// « on n'a pas pu savoir si le plan en déclare une » sont deux populations de
+/// signe opposé, et une seule valeur de cause les rendrait non soustractibles
+/// (classe mika#2205).
+pub(crate) const GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE: &str = "plan_halt_unreadable";
+
 /// Audit `tool_name` sous lequel une seconde passe architecte illisible est
 /// enregistrée (mika#2641).
 ///
@@ -6562,6 +6579,26 @@ pub(crate) const GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE: &str = "architect_unread
 /// explicite** du ticket de suivi sur le taux de coupure architecte, qui
 /// s'ouvrirait sinon sur une intuition.
 pub(crate) const GROOM_ARCHITECT_UNREADABLE_TOOL: &str = "groom_architect_unreadable";
+
+/// Audit `tool_name` sous lequel une halte de plan au groom est enregistrée
+/// (mika#3176).
+///
+/// **Abus de nom assumé, et il est nommé ici pour qu'aucun lecteur SQL ne s'y
+/// trompe** : ce `tool_name` couvre les DEUX causes, donc une ligne
+/// d'`after_value` `plan_halt_unreadable` n'est pas une halte *déclarée* — c'est
+/// un plan dont la halte n'a pas pu être cherchée. Le nom suit le modèle
+/// `note_groom_proof_unbound_to_plan` (`skills/executor.rs`) : un nom par
+/// mécanisme, la cause en `after_value`, donc un seul `GROUP BY` sépare les deux
+/// populations. Les fondre sous deux `tool_name` distincts aurait coûté un
+/// `UNION` à toute requête qui veut le total des haltes.
+///
+/// **Une absence de lignes se lit « aucune halte depuis le deploy », jamais
+/// « porte inerte » (R5).** Ce n'est pas une condition d'observabilité : le
+/// dénominateur reste la colonne `tasks.result`, où les deux populations — groom
+/// sain et halte — voyagent déjà. Vérifier que la porte vit se fait là, pas ici.
+/// Et l'absence de la ligne elle-même signifie un binaire antérieur au vol, pas
+/// une absence d'événement (motif mika#2340).
+pub(crate) const GROOM_PLAN_HALT_TOOL: &str = "groom_plan_halt_declared";
 
 /// Les deux champs positionnels de la ligne de motif : `(cause, stage)`.
 ///
