@@ -209,9 +209,23 @@ en **ajout seulement**. Jamais `>`, jamais une autre forme, jamais un autre nom,
 `Edit` qui recopierait les plages à la main : le mot pour mot reste prouvé **par construction**,
 comme pour les cinq suites.
 
-**Conséquence sur les deux nombres de D2(b) :** lignes écrites **84 → 132** (+42 d'en-tête de
-bibliothèque, +6 de `source` et de commentaire dans la famille 5), lignes déplacées
-**4 929 → 5 363** (+434). Les deux restent sous la borne de 429 lignes écrites par vol.
+**Conséquence sur les deux nombres de D2(b), relevés sur le diff livré et non estimés :** lignes
+écrites **84 estimées → 155 réelles**, lignes déplacées **4 929 → 5 363**. La décomposition, qui
+somme à `5 518` = le total de `git diff origin/main --numstat` hors `docs/` :
+
+| fichier | écrites | déplacées |
+|---|---|---|
+| `Makefile` | 15 | 0 |
+| `tests/lib-dispatch-lib-suite.sh` (état de premier niveau, cas 1) | 26 | 0 |
+| `tests/lib-dispatch-lib-groom-gate-fixtures.sh` | 42 | 434 |
+| `test_dispatch_lib_iterate_1271.sh` | 13 | 991 |
+| `test_dispatch_lib_escalate_1271.sh` | 13 | 846 |
+| `test_dispatch_lib_groom_gate_2811.sh` | 13 | 896 |
+| `test_dispatch_lib_push_divergence_1364.sh` | 13 | 1 117 |
+| `test_dispatch_lib_preflight_1472.sh` (20 d'en-tête : +6 pour le `source`) | 20 | 1 079 |
+| **total** | **155** | **5 363** |
+
+155 lignes écrites, sous la borne de 429.
 
 **Pour les vols 3 à 6 :** les deux dépendances ci-dessus sont les seules **mesurées** à ce vol.
 La leçon générale n'est pas une liste mais une méthode — **une famille extraite se lance avant
