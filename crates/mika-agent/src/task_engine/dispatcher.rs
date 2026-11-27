@@ -2105,6 +2105,11 @@ impl TaskDispatcher {
             // ce lecteur l'y lit. Même placement et même discipline que le
             // voisin ci-dessus : il n'arrête rien.
             try_report_groom_architect_unreadable(&self.db, task).await;
+            // mika#3176: la halte de plan, sur le même fil et avec la même
+            // discipline que son jumeau juste au-dessus. Deux lecteurs plutôt
+            // qu'un seul élargi : chacun lit SA population de causes, donc une
+            // cause future n'entre dans aucun des deux comptes par défaut.
+            try_report_groom_plan_halt(&self.db, task).await;
             // mika#965: Write a human-readable callback summary to task_messages
             // so the dispatch session's next rebuild_context() includes it.
             try_write_callback_summary(&self.db, task).await;
@@ -6730,6 +6735,104 @@ async fn try_report_groom_architect_unreadable(db: &AsyncDatabase, task: &Task) 
     }
 }
 
+/// Rapporter — jamais empêcher — une halte de plan déclarée au groom
+/// (mika#3176).
+///
+/// **La moitié moteur d'un couple à deux moitiés, et chacune tombe seule.** Le
+/// producteur est la porte de `_iterate_groom_loop` (`dispatch-lib.sh`,
+/// mika#3118 vol 2), qui route la convergence vers `_escalate_groom` et pose la
+/// ligne `Groom-halt-cause:` dans `RESULT` ; elle suffit à elle seule pour la
+/// lecture SQL sur `tasks.result`. Ce lecteur l'y lit et écrit la ligne
+/// `audit_events` qu'AC1 demande. Livrée seule, la moitié shell donne une
+/// surface SQL ; livré seul, ce lecteur n'a rien à lire et reste muet. **Aucune
+/// des deux ne peut produire un faux positif en l'absence de l'autre.**
+///
+/// Pourquoi un lecteur moteur du tout : `grep -n "audit_event\|log_audit"` sur
+/// `dispatch-lib.sh` rend **zéro ligne** — c'est du shell, sans accès à la base.
+/// Et son stderr est structurellement jeté sur un dispatch de groom (la boucle
+/// est appelée **après** `_run_claude_pilot`, donc hors de la redirection
+/// `2>"$STDERR_FILE"`, et un groom sort toujours en 0 donc le `Stdio::piped()`
+/// est lâché sans être lu — classe mika#2050, Signaux M et Q). Toute
+/// instrumentation qui passerait par `echo … >&2` serait **inerte**.
+///
+/// **Ce lecteur n'arrête rien** : la porte, elle, a déjà arrêté le vol. Ici
+/// c'est un confort de requêtage — que la halte se compte dans `audit_events`
+/// comme les autres refus du groom — et un échec d'audit avertit et rend la
+/// main. Patron : `try_report_groom_architect_unreadable` juste au-dessus.
+async fn try_report_groom_plan_halt(db: &AsyncDatabase, task: &Task) {
+    let result = match &task.result {
+        Some(r) if !r.is_empty() => r,
+        _ => return,
+    };
+
+    let Some((cause, stage)) = groom_halt_cause(result) else {
+        return;
+    };
+    // ÉGALITÉ sur chacune des deux causes, jamais un préfixe `plan_halt_` : un
+    // préfixe compterait d'avance toute cause future qui le porterait, et
+    // l'absorberait dans un `GROUP BY` que l'opérateur lit comme exact. C'est
+    // aussi l'autre moitié d'AC2 — `architect_unreadable` a son propre lecteur
+    // et ne doit pas entrer ici.
+    if cause != GROOM_HALT_CAUSE_PLAN_HALT_DECLARED
+        && cause != GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE
+    {
+        return;
+    }
+
+    // Une résolution impossible DÉGRADE la ligne, elle ne la supprime jamais :
+    // une halte dont le parent est illisible reste une halte, et la jeter
+    // rétrécirait la population en silence (motif mika#2496). Le `await` n'est
+    // atteint qu'ICI, c'est-à-dire déjà DANS la population — le chemin nominal
+    // d'un groom sain n'y touche pas.
+    let coords = parent_issue_coordinates(db, task).await;
+
+    warn!(
+        event = GROOM_PLAN_HALT_TOOL,
+        cause = cause,
+        stage = stage.unwrap_or("unknown"),
+        repo = coords.as_ref().map(|c| c.owner_repo.as_str()).unwrap_or("unknown"),
+        issue = coords.as_ref().map(|c| c.issue),
+        task_id = %task.id,
+        "engine: a groomed plan declared its own halt (or could not be read for one) — \
+         the groom halted on the PLAN'S OWN decision, not on an architect objection \
+         (measured, not prevented)"
+    );
+
+    // `target_key` = le ticket sous sa forme `issue:<owner>/<repo>#<n>`, par
+    // contrat avec `note_groom_proof_unbound_to_plan` : c'est ce qu'un opérateur
+    // recolle à la forge. `after_value` = la **cause**, ce qui fait de « les
+    // haltes par cause » un `GROUP BY after_value` — les deux populations
+    // restent soustractibles sous un seul `tool_name` (mika#2205).
+    //
+    // Le repli est `task:<id>` et non `issue:unknown#?` : une clé dégradée doit
+    // rester DISCRIMINANTE, sans quoi tous les parents illisibles se
+    // confondraient dans une seule ligne du `GROUP BY`.
+    let target_key = match &coords {
+        Some(c) => format!("issue:{}#{}", c.owner_repo, c.issue),
+        None => format!("task:{}", task.id),
+    };
+    let session_id = audit_session_id(task);
+    let reasoning = format!("task:{} stage:{}", task.id, stage.unwrap_or("unknown"));
+    if let Err(e) = db
+        .log_audit_event(
+            &session_id,
+            GROOM_PLAN_HALT_TOOL,
+            &target_key,
+            None,
+            Some(cause),
+            Some(&reasoning),
+            None,
+        )
+        .await
+    {
+        warn!(
+            task_id = %task.id,
+            error = %e,
+            "engine: failed to write groom_plan_halt_declared audit event"
+        );
+    }
+}
+
 /// Les coordonnées du ticket d'un dispatch, résolues depuis son PARENT.
 ///
 /// **La topologie est à deux lignes, et l'oublier est le défaut que mika#2279 et
@@ -9063,6 +9166,221 @@ mod tests {
             groom_halt_cause("Groom-halt-cause: architect_unreadable — prose libre"),
             Some(("architect_unreadable", None))
         );
+    }
+
+    // ===== try_report_groom_plan_halt (mika#3176) =====
+    //
+    // Les deux `RESULT` que `_escalate_groom` compose sur les causes de halte de
+    // plan, recopiés depuis le producteur shell (`dispatch-lib.sh`, bras
+    // `$GROOM_HALT_CAUSE_PLAN_HALT_DECLARED` et son pendant illisible). La
+    // synchronie des littéraux de cause est tenue par
+    // `canonical_tokens::tests::mika2641_the_halt_cause_wire_format_is_synchronised_shell_to_rust`,
+    // et ces fixtures sont ce qui exerce le LECTEUR. Ni l'une ni l'autre ne porte
+    // de ligne `Verdict:` — l'architecte a répondu `GROOMED`, et c'est le PLAN
+    // qui refuse.
+    const MIKA3176_PLAN_HALT_DECLARED_RESULT: &str = "GROOM ESCALATED (terminal): the plan converged on GROOMED but declares a halt \
+         of its own at second-pass-after-ready.\n\
+         Groom-halt-cause: plan_halt_declared second-pass-after-ready — the plan \
+         carries a halt heading, so it reserves a decision for the operator that \
+         grooming cannot take. mika-arch answered GROOMED; the plan's own halt \
+         overrides it.\n\
+         Session: probe-3176\n\
+         Architect findings preserved at: /tmp/x/.iterate/escalate-second-pass-after-ready.md\n\
+         Outcome: ESCALATE — second-pass-after-ready";
+
+    const MIKA3176_PLAN_HALT_UNREADABLE_RESULT: &str = "GROOM ESCALATED (terminal): the plan for this ticket was found but could not \
+         be read at second-pass-after-ready.\n\
+         Groom-halt-cause: plan_halt_unreadable second-pass-after-ready — whether \
+         the plan declares a halt is UNKNOWN, and a flight never departs because a \
+         read failed (mika#2981). This is NOT a halt the plan declared: do not read \
+         it as one.\n\
+         Session: probe-3176\n\
+         Architect findings preserved at: /tmp/x/.iterate/escalate-second-pass-after-ready.md\n\
+         Outcome: ESCALATE — second-pass-after-ready";
+
+    /// Le `RESULT` d'un groom SAIN. Il porte le `Outcome: PLAN_GROOMED` du
+    /// producteur et **aucune** ligne de motif.
+    const MIKA3176_HEALTHY_GROOM_RESULT: &str = "GROOM COMPLETE: mika-arch converged at second-pass-after-ready.\n\
+         Verdict: GROOMED\n\
+         Session: probe-3176\n\
+         Outcome: PLAN_GROOMED — docs/plans/2026-11-27-001-feat-3176-plan.md";
+
+    /// **T1 / AC1.** Une halte déclarée produit exactement une ligne, de
+    /// `target_key` le ticket groomé sous sa forme `issue:<owner>/<repo>#<n>` et
+    /// d'`after_value` la cause.
+    #[tokio::test]
+    async fn mika3176_une_halte_declaree_se_compte() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA3176_PLAN_HALT_DECLARED_RESULT).await;
+
+        try_report_groom_plan_halt(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_PLAN_HALT_TOOL)
+                .await
+                .unwrap(),
+            1,
+            "mika#3176 AC1 — la halte doit se compter dans audit_events comme les \
+             autres refus du groom"
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == GROOM_PLAN_HALT_TOOL)
+            .expect("la ligne d'audit doit être lisible depuis la session du callback");
+        // La forme COMPLÈTE du dépôt, par contrat avec
+        // `note_groom_proof_unbound_to_plan` : c'est ce qu'un opérateur recolle à
+        // la forge, et `gh issue view --repo mika` refuse le nom nu (mika#3141).
+        assert_eq!(row.target_key, "issue:senara-solutions/mika#2484");
+        // `after_value` = la CAUSE, ce qui fait de « les haltes par cause » un
+        // `GROUP BY after_value` — le SQL de la Mesure du ticket.
+        assert_eq!(row.after_value.as_deref(), Some("plan_halt_declared"));
+        let reasoning = row.reasoning.as_deref().unwrap_or("");
+        assert!(
+            reasoning.contains("stage:second-pass-after-ready"),
+            "l'étape enrichit la ligne sans occuper la dimension d'agrégation — \
+             reasoning: {reasoning}"
+        );
+    }
+
+    /// **T2 / AC1, seconde moitié.** La cause sœur a sa propre ligne, et les deux
+    /// populations restent SOUSTRACTIBLES sous un seul `tool_name` : deux lignes,
+    /// deux `after_value` distincts (mika#2205). Les fondre sous une seule valeur
+    /// rendrait « le plan déclare une halte » et « on n'a pas pu savoir » un seul
+    /// compte, de signe opposé.
+    #[tokio::test]
+    async fn mika3176_la_cause_soeur_a_sa_propre_ligne() {
+        let db = test_db();
+        let unreadable = mika2496_dispatch_pair(&db, MIKA3176_PLAN_HALT_UNREADABLE_RESULT).await;
+
+        try_report_groom_plan_halt(&db, &unreadable).await;
+
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == GROOM_PLAN_HALT_TOOL)
+            .expect("la cause sœur doit produire sa propre ligne");
+        assert_eq!(row.after_value.as_deref(), Some("plan_halt_unreadable"));
+
+        // Les deux fixtures sur la MÊME base : c'est la soustractibilité que la
+        // Mesure du ticket lit, et elle n'est pas observable sur une population
+        // d'une seule valeur. Second ticket, parce que `tasks` porte un UNIQUE
+        // sur `(agent_id, reference_url)` — et deux tickets distincts sont de
+        // toute façon la forme que l'opérateur agrège.
+        let declared = dispatch_pair_with_reference(
+            &db,
+            MIKA3176_PLAN_HALT_DECLARED_RESULT,
+            Some("https://github.com/senara-solutions/mika/issues/3176"),
+        )
+        .await;
+        try_report_groom_plan_halt(&db, &declared).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_PLAN_HALT_TOOL)
+                .await
+                .unwrap(),
+            2
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let mut causes: Vec<&str> = events
+            .iter()
+            .filter(|e| e.tool_name == GROOM_PLAN_HALT_TOOL)
+            .filter_map(|e| e.after_value.as_deref())
+            .collect();
+        causes.sort_unstable();
+        assert_eq!(causes, vec!["plan_halt_declared", "plan_halt_unreadable"]);
+    }
+
+    /// **T3 / AC2, première moitié.** Un groom SAIN n'en produit aucune. Sans ce
+    /// contrôle, « le lecteur décide » serait indistinguable de « le lecteur
+    /// écrit sur tout callback de groom », et le compte de la Mesure vaudrait le
+    /// nombre de grooms.
+    #[tokio::test]
+    async fn mika3176_un_groom_sain_nen_produit_aucune() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA3176_HEALTHY_GROOM_RESULT).await;
+
+        try_report_groom_plan_halt(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_PLAN_HALT_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#3176 AC2 — un `Outcome: PLAN_GROOMED` ne porte aucune ligne de \
+             motif, donc rien à compter"
+        );
+    }
+
+    /// **T4 / AC2, seconde moitié.** Une AUTRE cause n'entre pas ici — et c'est
+    /// vérifié dans les deux sens : ni ce lecteur ne compte
+    /// `architect_unreadable`, ni l'appel à ce lecteur ne pose une ligne sous le
+    /// `tool_name` du voisin. Deux lecteurs, deux populations ; les confondre
+    /// polluerait les deux comptes à la fois.
+    #[tokio::test]
+    async fn mika3176_une_autre_cause_nentre_pas_dans_cette_population() {
+        let db = test_db();
+        let task = mika2496_dispatch_pair(&db, MIKA2641_UNREADABLE_RESULT).await;
+
+        try_report_groom_plan_halt(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_PLAN_HALT_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "mika#3176 AC2 — `architect_unreadable` a son propre lecteur"
+        );
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_ARCHITECT_UNREADABLE_TOOL)
+                .await
+                .unwrap(),
+            0,
+            "ce lecteur n'écrit JAMAIS sous le `tool_name` du voisin"
+        );
+
+        // Le refus EXPLICITE de l'architecte ne porte aucune ligne de motif : il
+        // n'entre pas plus ici que dans la population de mika#2641.
+        let explicit = dispatch_pair_with_reference(
+            &db,
+            MIKA2641_EXPLICIT_ESCALATE_RESULT,
+            Some("https://github.com/senara-solutions/mika/issues/3176"),
+        )
+        .await;
+        try_report_groom_plan_halt(&db, &explicit).await;
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_PLAN_HALT_TOOL)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// **T5.** Des coordonnées illisibles DÉGRADENT la clé, elles ne suppriment
+    /// jamais la ligne : une halte dont le parent est illisible reste une halte
+    /// (motif mika#2496). Le repli reste DISCRIMINANT — sans quoi tous les
+    /// parents illisibles se confondraient dans une seule ligne du `GROUP BY`.
+    #[tokio::test]
+    async fn mika3176_un_parent_illisible_degrade_la_cle_et_garde_la_ligne() {
+        let db = test_db();
+        let task =
+            dispatch_pair_with_reference(&db, MIKA3176_PLAN_HALT_DECLARED_RESULT, None).await;
+
+        try_report_groom_plan_halt(&db, &task).await;
+
+        assert_eq!(
+            db.count_audit_events_by_tool_name(GROOM_PLAN_HALT_TOOL)
+                .await
+                .unwrap(),
+            1
+        );
+        let events = db.get_audit_events("callback-session").await.unwrap();
+        let row = events
+            .iter()
+            .find(|e| e.tool_name == GROOM_PLAN_HALT_TOOL)
+            .expect("la ligne dégradée doit exister");
+        assert_eq!(row.target_key, format!("task:{}", task.id));
+        assert_eq!(row.after_value.as_deref(), Some("plan_halt_declared"));
     }
 
     // ===== try_write_callback_summary tests (mika#965) =====
