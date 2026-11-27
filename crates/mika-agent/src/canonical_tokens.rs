@@ -6682,10 +6682,17 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
     /// à dire indistinguable d'un champ sain (classe mika#2205). Aucun test
     /// comportemental de l'un ou l'autre côté ne peut voir ça, puisque chacun
     /// reste correct dans son propre monde.
+    ///
+    /// **Trois causes synchronisées désormais** (mika#3176) : celle de mika#2641
+    /// et les deux haltes de plan de mika#3118 vol 2. Elles sont confrontées par
+    /// trois assertions de même forme plutôt que par une boucle sur une table :
+    /// chacune nomme sa constante Rust dans son message, et c'est ce message qui
+    /// dit quoi réaligner le jour où elle tire.
     #[test]
     fn mika2641_the_halt_cause_wire_format_is_synchronised_shell_to_rust() {
         use crate::task_engine::dispatcher::{
             GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE, GROOM_HALT_CAUSE_LINE_PREFIX,
+            GROOM_HALT_CAUSE_PLAN_HALT_DECLARED, GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE,
         };
 
         let shell = repo_root()
@@ -6713,6 +6720,12 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
         let expect_cause = format!(
             "GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE=\"{GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE}\""
         );
+        let expect_plan_halt = format!(
+            "GROOM_HALT_CAUSE_PLAN_HALT_DECLARED=\"{GROOM_HALT_CAUSE_PLAN_HALT_DECLARED}\""
+        );
+        let expect_plan_halt_unreadable = format!(
+            "GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE=\"{GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE}\""
+        );
 
         assert!(
             src.lines().any(|l| l == expect_prefix),
@@ -6729,6 +6742,24 @@ const LEGACY_POOL_IN_FLIGHT: &str = \"auto_feeder_pool_in_flight\";
              `{GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE}` et {rel} ne porte pas la ligne \
              `{expect_cause}`.\n\n\
              RÉSOLUTION : réaligner les deux littéraux."
+        );
+        assert!(
+            src.lines().any(|l| l == expect_plan_halt),
+            "mika#3176 — la cause de halte de plan a divergé : le Rust lit \
+             `{GROOM_HALT_CAUSE_PLAN_HALT_DECLARED}` et {rel} ne porte pas la ligne \
+             `{expect_plan_halt}`.\n\n\
+             RÉSOLUTION : réaligner les deux littéraux. Ne PAS élargir le lecteur \
+             Rust à une seconde orthographe — la population n'est exacte que tant \
+             que les deux moitiés sont le même octet."
+        );
+        assert!(
+            src.lines().any(|l| l == expect_plan_halt_unreadable),
+            "mika#3176 — la cause de plan illisible a divergé : le Rust lit \
+             `{GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE}` et {rel} ne porte pas la ligne \
+             `{expect_plan_halt_unreadable}`.\n\n\
+             RÉSOLUTION : réaligner les deux littéraux. Ne PAS élargir le lecteur \
+             Rust à une seconde orthographe — la population n'est exacte que tant \
+             que les deux moitiés sont le même octet."
         );
     }
 
