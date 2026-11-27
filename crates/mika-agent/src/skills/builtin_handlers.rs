@@ -4636,6 +4636,279 @@ async fn observe_pipeline_guard_execution(ctx: &ToolContext<'_>, target_key: &st
     }
 }
 
+/// Refuse a `gh pr review` whose body names a PR head SHA that this session's
+/// own `qa_pr_view` never rendered (mika#3135).
+///
+/// The measured defect: on 2026-11-22T15:37Z, a `hold[review]` on PR #3133
+/// cited `b7b34f12` as the head carrying a red check. That SHA is none of the
+/// PR's commits — the head at review time was `4cfd3e3b`. A reader who goes to
+/// check the red on `b7b34f12` finds nothing, and nothing in the body tells
+/// them whether they are reading another state of the world or a nonexistent
+/// one.
+///
+/// Fifth member of the pre-subprocess family, and the **last link that touches
+/// neither the network nor the forge**: its only input outside the body is the
+/// `headRefOid` already rendered in this session, read from the tool ledger.
+/// The classification, the regex, the three abstention causes and the operator
+/// switch live in `evidence::guards`'s mika#3135 section; this function is their
+/// application.
+///
+/// # What it gates on, and what it deliberately does not
+///
+/// A SHA **in head position** (`PR head`, `head`, `head_sha`, `headRefOid`,
+/// then at most 24 characters of the same line), never a bare hex run. An
+/// unanchored predicate would count the reverted commit of a diff analysis, the
+/// base SHA of a comparison, and the head of another PR cited as a
+/// counter-example (doctrine mika#2961).
+///
+/// It does **not** judge the *absence* of a citation. A body that names no head
+/// is out of population: the measured defect is a *false* head, not a *missing*
+/// one, and requiring the citation would be a second class on a population of
+/// several hundred verdicts a month.
+///
+/// # Fail-open, on three named causes
+///
+/// The arithmetic of mika#2455 holds here too: a false refusal makes a
+/// legitimate review unpostable and kills the turn with no review at all, while
+/// a false negative merely preserves today's regime. So each of
+/// [`crate::evidence::guards::CitedHeadAbstention`]'s three causes returns
+/// `Ok(())` and writes its own audit row — and the three stay three, because
+/// "the call never happened" and "the call happened and its output is mute" are
+/// two fleet states a `GROUP BY` must be able to separate (doctrine mika#2131).
+async fn validate_cited_head_grounding(
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    validate_cited_head_grounding_gated(
+        crate::evidence::guards::cited_head_gate_enabled(),
+        args,
+        repo,
+        ctx,
+    )
+    .await
+}
+
+/// The body of the guard, with the gate passed as a **fact** rather than read.
+///
+/// Same convention, and the same reason, as
+/// [`validate_pipeline_block_grounding_gated`]: the resolver is an env var
+/// cached in a `OnceLock`, resolved once per process by construction, so a test
+/// that wanted to exercise the disarmed branch by setting the variable would
+/// depend on being the first test in the binary to touch it. Passing the bit
+/// keeps both branches deterministic and exactly one site reading the
+/// environment.
+async fn validate_cited_head_grounding_gated(
+    gate_enabled: bool,
+    args: &[String],
+    repo: Option<&str>,
+    ctx: &ToolContext<'_>,
+) -> Result<(), ToolOutput> {
+    use crate::evidence::guards::{
+        CitedHeadOutcome, cited_head_citations, classify_cited_head_citation, pr_review_target,
+    };
+
+    if !gate_enabled {
+        return Ok(());
+    }
+
+    let Some(body) = extract_pr_review_body(args) else {
+        return Ok(());
+    };
+
+    // The free predicate **first**, and that order is the requirement: a body
+    // citing no head at all pays no database read. The population of review
+    // bodies naming a head is a fraction of the fleet's verdicts, so the ledger
+    // query is paid only where a decision depends on it.
+    let cited = cited_head_citations(&body);
+    if cited.is_empty() {
+        return Ok(());
+    }
+
+    let target = pr_review_target(args).unwrap_or_else(|| "unknown".to_string());
+    let target_key = format!("pr_review:{}#{}", repo.unwrap_or("__default__"), target);
+
+    let Some(head_oid) = reviewed_head_from_ledger(ctx, &target_key).await else {
+        // The abstention already wrote its WARN and its audit row, under its own
+        // thread-format cause. Nothing more is said here: a second line would
+        // split the population in two under two names.
+        return Ok(());
+    };
+
+    match classify_cited_head_citation(&cited, &head_oid) {
+        CitedHeadOutcome::Allowed => {
+            // The positive control, and the reason this branch writes a row
+            // rather than returning early: a population of zero allowed calls
+            // is how a guard that never runs looks exactly like a guard that
+            // never has to refuse (mika#2205).
+            audit_cited_head(
+                ctx,
+                &target_key,
+                "allowed",
+                "every head SHA cited in the body is a prefix of the head this session read",
+            )
+            .await;
+            Ok(())
+        }
+        CitedHeadOutcome::Refused { unknown } => {
+            let cited_unknown = unknown.join(", ");
+            tracing::warn!(
+                event = "cited_head_refused",
+                agent_id = %ctx.db.agent_id(),
+                session_id = %ctx.session_id,
+                target = %target_key,
+                cited_unknown = %cited_unknown,
+                reviewed_head = %head_oid,
+                "refused a review naming a PR head this session never read (mika#3135)"
+            );
+            audit_cited_head(
+                ctx,
+                &target_key,
+                "refused",
+                "the body names a head SHA that is not a prefix of the headRefOid rendered by \
+                 this session's qa_pr_view",
+            )
+            .await;
+
+            // The remedy **names the real head**, so the rewrite costs no
+            // further call — the one property that separates this refusal from
+            // a turn thrown away. It also says not to invent one: a refusal
+            // that only forbids pushes the model to try another SHA, which is
+            // the measured defect with one more step.
+            //
+            // No line of this text may START with the verdict label:
+            // `VERDICT_RE` is anchored on that line prefix, and a stray line
+            // would be re-read as a verdict by the next consumer of this
+            // payload.
+            let payload = serde_json::json!({
+                "error": "cited_head_not_the_reviewed_head",
+                "doctrine": "mika#3135",
+                "target": target_key,
+                "cited_unknown": unknown,
+                "reviewed_head": head_oid,
+                "remedy": format!(
+                    "This body names {n} head SHA that {verb} not a prefix of the head this \
+                     session actually read: {cited_unknown}. The head rendered by `qa_pr_view` \
+                     in this session is {head_oid}. Re-emit this call with every head citation \
+                     replaced by that SHA, or remove the citation. Do not invent a SHA, and do \
+                     not go fetch another one from the forge — the head this review is about is \
+                     the one already in this session's context.",
+                    n = unknown.len(),
+                    verb = if unknown.len() == 1 { "is" } else { "are" },
+                ),
+            });
+            Err(ToolOutput::error(payload.to_string()))
+        }
+    }
+}
+
+/// Write one `audit_events` row for a cited-head decision.
+///
+/// Warn-and-continue, on **every** outcome — allowed, refused, abstained — for
+/// the reason [`audit_pipeline_grounding`] carries: losing the ledger row must
+/// not change the guard's verdict in either direction, and an empty table must
+/// keep meaning "the link was never reached", never "nothing was refused"
+/// (mika#2205).
+async fn audit_cited_head(ctx: &ToolContext<'_>, target_key: &str, outcome: &str, reasoning: &str) {
+    use crate::evidence::guards::CITED_HEAD_AUDIT_TOOL;
+
+    if let Err(e) = ctx
+        .db
+        .log_audit_event(
+            ctx.session_id,
+            CITED_HEAD_AUDIT_TOOL,
+            target_key,
+            None,
+            Some(outcome),
+            Some(reasoning),
+            Some(ctx.trace_id),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to write cited-head audit row");
+    }
+}
+
+/// Which PR head did **this session** actually read?
+///
+/// The engine fact behind [`validate_cited_head_grounding`], read on the same
+/// ledger pattern as [`observe_pipeline_guard_execution`] — with one difference
+/// that matters: it reads each row's **output**, not its input. The head is
+/// what `qa_pr_view` *rendered*, never what the call asked for.
+///
+/// | ledger says | returned | why |
+/// |---|---|---|
+/// | the most recent `qa_pr_view` output carries `headRefOid` | `Some(head)` | the only state where a comparison is possible |
+/// | the read failed | `None` + `tool_ledger_unreadable` | a failed read is not an accusation |
+/// | zero `qa_pr_view` calls at all | `None` + `no_pr_view_recorded` | ledger disarmed (`MIKA_STORE_TOOL_CALLS`), or a review resumed on a build callback — which runs under a brand-new `session_id` (`dispatcher.rs`) and cannot see the original call |
+/// | calls exist, no output carries the field | `None` + `head_oid_absent` | truncated output, or a handler in error |
+///
+/// The last row is the one that does **not** merge into the others, and the
+/// reason it exists as its own cause: "the tool never ran" and "the tool ran
+/// for nothing" are two states of the fleet, and a single name over both would
+/// hide the second for ever (doctrine mika#2131).
+///
+/// The rows come back `ORDER BY created_at DESC`, so `find_map` reads the
+/// **most recent** output first — the head as of the latest look at the PR,
+/// which is the one the review is about.
+async fn reviewed_head_from_ledger(ctx: &ToolContext<'_>, target_key: &str) -> Option<String> {
+    use crate::evidence::guards::{
+        CITED_HEAD_PR_VIEW_TOOL, CitedHeadAbstention, PIPELINE_GROUNDING_WINDOW_SECS,
+        head_oid_from_pr_view,
+    };
+
+    async fn abstain(
+        ctx: &ToolContext<'_>,
+        target_key: &str,
+        reason: &'static str,
+    ) -> Option<String> {
+        tracing::warn!(
+            event = "cited_head_abstained",
+            agent_id = %ctx.db.agent_id(),
+            session_id = %ctx.session_id,
+            target = %target_key,
+            reason = reason,
+            "mika#3135: could not read the head this session rendered — the guard abstains and \
+             the body is posted as written"
+        );
+        audit_cited_head(ctx, target_key, "abstained", reason).await;
+        None
+    }
+
+    match ctx
+        .db
+        .find_recent_tool_invocation(
+            ctx.db.agent_id(),
+            ctx.session_id,
+            CITED_HEAD_PR_VIEW_TOOL,
+            PIPELINE_GROUNDING_WINDOW_SECS,
+        )
+        .await
+    {
+        Err(e) => {
+            tracing::warn!(
+                event = "cited_head_ledger_unreadable",
+                error = %e,
+                target = %target_key,
+                "mika#3135: the tool ledger did not answer"
+            );
+            abstain(ctx, target_key, CitedHeadAbstention::TOOL_LEDGER_UNREADABLE).await
+        }
+        Ok(rows) if rows.is_empty() => {
+            abstain(ctx, target_key, CitedHeadAbstention::NO_PR_VIEW_RECORDED).await
+        }
+        Ok(rows) => {
+            match rows
+                .iter()
+                .find_map(|row| row.output.as_deref().and_then(head_oid_from_pr_view))
+            {
+                Some(head) => Some(head),
+                None => abstain(ctx, target_key, CitedHeadAbstention::HEAD_OID_ABSENT).await,
+            }
+        }
+    }
+}
+
 /// Refuse a `gh pr review` whose body says `VERDICT: pass` while a **required**
 /// check is red on the PR's head (mika#2455).
 ///
@@ -5702,6 +5975,28 @@ async fn run_gh(input: &serde_json::Value, ctx: &ToolContext<'_>) -> ToolOutput 
     // `required_tool_arg_suffixes`: its subject is the body itself.
     if let Err(err) =
         validate_pipeline_block_grounding(&gh_args.args, gh_args.repo.as_deref(), ctx).await
+    {
+        return err;
+    }
+
+    // Verdict↔cited-head coherence (mika#3135): refuse a review whose body
+    // names, in head position, a SHA that is not a prefix of the `headRefOid`
+    // this session's own `qa_pr_view` rendered. Placed immediately after
+    // mika#2687/#2961 and BEFORE mika#2455, because it is now the last link in
+    // the chain that reads neither the network nor the forge — its only input
+    // outside the body is a row of this session's tool ledger, and the chain
+    // runs from the most local to the most committing. Spending a
+    // `gh pr checks` on a review this link is about to refuse would be paying
+    // for a decision already taken.
+    //
+    // Downstream of mika#2687/#2961 on purpose, and not interchangeable with
+    // it: that guard asks whether the body carries evidence at all, this one
+    // asks whether the evidence it carries points at the artefact under review.
+    // A `block[pipeline]` with no section and a fabricated head is refused by
+    // the nearer cause first. Like its four siblings it is NOT gated on
+    // `required_tool_arg_suffixes`: its subject is the body itself.
+    if let Err(err) =
+        validate_cited_head_grounding(&gh_args.args, gh_args.repo.as_deref(), ctx).await
     {
         return err;
     }
