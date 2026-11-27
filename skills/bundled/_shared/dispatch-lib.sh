@@ -11313,13 +11313,23 @@ GROOM_HALT_CAUSE_DISPOSITION_READER_REFUSED="disposition_reader_refused"
 # population fusionnée n'est plus soustractible — c'est la discipline que le vol 1
 # a appliquée à `ready_absent_at_autofire` contre `consent_unreadable_at_autofire`.
 #
-# AUCUNE CONSTANTE RUST NE LEUR RÉPOND, et c'est mesuré plutôt que supposé : le
-# parseur `groom_halt_cause` (`task_engine/dispatcher.rs`) lit une cause
-# QUELCONQUE — son test `some_future_cause` le pin — et les quatre scans
-# `mika2641_*` de `canonical_tokens.rs` sont ancrés nommément sur
-# `GROOM_HALT_CAUSE_LINE_PREFIX` et `GROOM_HALT_CAUSE_ARCHITECT_UNREADABLE`, donc
-# ils ne demandent rien aux valeurs voisines. Les deux causes voyagent dans la
-# même colonne `tasks.result` que le `Outcome: PLAN_GROOMED` d'un groom sain : le
+# DEUX CONSTANTES RUST LEUR RÉPONDENT DEPUIS mika#3181, et l'égalité est exigée
+# À L'OCTET. `task_engine/dispatcher.rs` porte les jumelles
+# `GROOM_HALT_CAUSE_PLAN_HALT_DECLARED` et
+# `GROOM_HALT_CAUSE_PLAN_HALT_UNREADABLE`, et son lecteur
+# `try_report_groom_plan_halt` les compare par ÉGALITÉ — jamais par préfixe
+# `plan_halt_` — pour écrire une ligne `audit_events` sous le `tool_name`
+# `groom_plan_halt_declared`, la cause en `after_value` (mika#3176). Le parseur
+# `groom_halt_cause`, lui, lit toujours une cause QUELCONQUE : son test
+# `some_future_cause` le pin.
+#
+# DONC CHANGER UNE VALEUR ICI SANS TOUCHER AU RUST FAIT ROUGIR LA CI : deux des
+# assertions de
+# `mika2641_the_halt_cause_wire_format_is_synchronised_shell_to_rust`
+# (`canonical_tokens.rs`) cherchent les DEUX lignes d'affectation ci-dessous
+# OCTET POUR OCTET — affectation en colonne 0, guillemets compris — et c'est
+# leur message qui dit quoi réaligner. Les deux causes voyagent dans la même
+# colonne `tasks.result` que le `Outcome: PLAN_GROOMED` d'un groom sain : le
 # recensement a son dénominateur sans ligne de sonde neuve (mika#3050).
 
 # Le plan porte un titre de halte. C'est une décision que le groom n'a pas prise
