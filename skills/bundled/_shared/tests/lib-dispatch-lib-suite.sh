@@ -88,6 +88,32 @@ SKIPPED=0
 # shellcheck source=skills/bundled/_shared/tests/lib-mika-bin.sh
 source "$SCRIPT_DIR/tests/lib-mika-bin.sh"
 
+# L'ÉTAT DE PREMIER NIVEAU QUE PLUSIEURS FAMILLES PARTAGENT (mika#3178, vol 2).
+#
+# Mesuré au vol 2, et le vol 1 ne l'avait pas vu : l'agrégat source
+# `dispatch-lib.sh` au premier niveau une seule fois, à sa ligne 730 — donc DANS
+# la famille 1 — et toutes les familles suivantes qui appellent une fonction au
+# premier niveau en dépendent. Extraite seule, la famille 2 meurt au premier
+# `_escalate_groom` : commande introuvable, stderr déjà redirigé vers /dev/null
+# par le bloc lui-même, donc une panne SILENCIEUSE sous `set -e`. C'est le cas
+# que le ticket tranche d'avance (« un helper utilisé par plusieurs familles va
+# dans cette bibliothèque ») : il vit ici, et la ligne 730 reste en place dans la
+# famille 1, où un second `source` est sans effet.
+#
+# Les trois marqueurs qui suivent sont dans le même cas, et l'agrégat le dit à sa
+# ligne 732 : définis en tête de la famille 1 « parce que la garde de dérive de
+# marqueur, plus bas dans ce fichier, les lit, et elle tourne même quand ce bloc
+# skippe ». Leurs lecteurs hors famille 1 sont mesurés : l. 1139 (famille 2) et
+# l. 6802/6820 (famille 8). Copiés mot pour mot de l'agrégat l. 730 et 737-739 ;
+# le jour où ils y changent, la garde de dérive de la famille 8 le dit.
+# shellcheck disable=SC1090
+source "$DISPATCH_LIB" 2>/dev/null || true
+
+# shellcheck disable=SC2034  # lus par les blocs déplacés, pas par ce fichier
+WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
+ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
+ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
+
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
     if [ "$expected" = "$actual" ]; then
