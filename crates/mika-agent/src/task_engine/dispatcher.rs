@@ -6489,11 +6489,13 @@ async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshol
 
     let turns = pilot.get("turns").and_then(|v| v.as_u64());
 
-    let (repo, issue) = parent_issue_coordinates(db, task).await;
+    let coords = parent_issue_coordinates(db, task).await;
+    let repo = coords.as_ref().map(|c| c.repo_short.as_str());
+    let issue = coords.as_ref().map(|c| c.issue);
 
     warn!(
         event = "pilot_cost_overrun",
-        repo = repo.as_deref().unwrap_or("unknown"),
+        repo = repo.unwrap_or("unknown"),
         issue = issue,
         task_id = %task.id,
         cost_usd = cost_usd,
@@ -6507,7 +6509,7 @@ async fn try_report_pilot_cost_overrun(db: &AsyncDatabase, task: &Task, threshol
     // averages. Repo/issue/turns ride in `reasoning`, which is free text.
     let reasoning = format!(
         "repo:{} issue:{} turns:{} threshold_usd:{threshold_usd}",
-        repo.as_deref().unwrap_or("unknown"),
+        repo.unwrap_or("unknown"),
         issue.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
         turns.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
     );
@@ -6679,11 +6681,13 @@ async fn try_report_groom_architect_unreadable(db: &AsyncDatabase, task: &Task) 
     // (motif `repo=unknown` de mika#2496). Le `await` n'est atteint qu'ICI,
     // c'est-à-dire déjà DANS la population — le chemin nominal d'un callback
     // sans ligne de motif n'y touche pas.
-    let (repo, issue) = parent_issue_coordinates(db, task).await;
+    let coords = parent_issue_coordinates(db, task).await;
+    let repo = coords.as_ref().map(|c| c.repo_short.as_str());
+    let issue = coords.as_ref().map(|c| c.issue);
 
     warn!(
         event = "groom_architect_unreadable",
-        repo = repo.as_deref().unwrap_or("unknown"),
+        repo = repo.unwrap_or("unknown"),
         issue = issue,
         stage = stage.unwrap_or("unknown"),
         task_id = %task.id,
@@ -6701,7 +6705,7 @@ async fn try_report_groom_architect_unreadable(db: &AsyncDatabase, task: &Task) 
     // Le repli est `task:<id>` et non `issue:unknown#?` : une clé dégradée doit
     // rester DISCRIMINANTE, sans quoi tous les parents illisibles se
     // confondraient dans une seule ligne du `GROUP BY`.
-    let target_key = match (repo.as_deref(), issue) {
+    let target_key = match (repo, issue) {
         (Some(r), Some(n)) => format!("issue:{r}#{n}"),
         _ => format!("task:{}", task.id),
     };
@@ -6734,33 +6738,36 @@ async fn try_report_groom_architect_unreadable(db: &AsyncDatabase, task: &Task) 
 /// **aucune ligne ne porte les deux**. Un lecteur qui conjoindrait les deux
 /// prédicats sur une seule ligne sélectionnerait l'ensemble vide.
 ///
-/// Une résolution impossible rend `(None, None)` — les appelants **dégradent**
-/// leur ligne (`repo=unknown`) et ne la suppriment jamais : un fait mesuré sur un
-/// dispatch dont le parent est illisible reste un fait mesuré, et le jeter
-/// rétrécirait la population en silence (motif mika#2496).
+/// Une résolution impossible rend `None` — les appelants **dégradent** leur ligne
+/// (`repo=unknown`) et ne la suppriment jamais : un fait mesuré sur un dispatch
+/// dont le parent est illisible reste un fait mesuré, et le jeter rétrécirait la
+/// population en silence (motif mika#2496).
 ///
-/// Le premier membre est le **nom court** ([`IssueCoordinates::repo_short`]) :
-/// ses deux appelants n'en font qu'un champ `repo=` de ligne de log, et le nom
-/// court est ce que les opérateurs y lisent depuis l'origine. Un appelant qui
-/// voudrait interroger la forge prend `owner_repo` au parseur, pas cette paire.
+/// **Rend les DEUX formes du dépôt, et ce n'est pas de la généralité gratuite**
+/// (mika#3176) : ses deux premiers appelants n'en faisaient qu'un champ `repo=`
+/// de ligne de log, donc le nom court suffisait ; le troisième
+/// (`try_report_groom_plan_halt`) compose un `target_key`
+/// `issue:<owner>/<repo>#<n>` par contrat avec `note_groom_proof_unbound_to_plan`,
+/// et l'`owner` n'est **pas dérivable** du nom court au point d'usage. Le
+/// recomposer avec [`GITHUB_ORG`] aurait rendu un `owner/repo` juste par
+/// coïncidence — exactement ce que mika#3141 a dû défaire. Chaque appelant
+/// projette donc le membre qu'il lit : `.repo_short` pour un champ de log,
+/// `.owner_repo` pour une clé qu'un opérateur recolle à la forge.
 ///
 /// Extrait parce que les deux lecteurs rétrospectifs de ce module
 /// (`try_report_pilot_cost_overrun`, `try_report_groom_architect_unreadable`) en
 /// portaient une copie **à l'octet près, commentaire compris**. Ce qui les
 /// distingue légitimement est ce qu'ils font du résultat — leur `warn!`, leur
 /// `target_key`, leur `reasoning` — pas la traversée.
-async fn parent_issue_coordinates(
-    db: &AsyncDatabase,
-    task: &Task,
-) -> (Option<String>, Option<u64>) {
+async fn parent_issue_coordinates(db: &AsyncDatabase, task: &Task) -> Option<IssueCoordinates> {
     if let Some(parent_id) = &task.parent_task_id
         && let Ok(Some(parent)) = db.get_task_unscoped(parent_id).await
         && let Some(url) = parent.reference_url.as_deref()
         && let Some(c) = parse_repo_issue_from_url(url)
     {
-        return (Some(c.repo_short), Some(c.issue));
+        return Some(c);
     }
-    (None, None)
+    None
 }
 
 /// La session sous laquelle un lecteur rétrospectif écrit sa ligne d'audit.
