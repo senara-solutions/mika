@@ -5435,6 +5435,191 @@ Raisonnement complet (la position du lien dans la chaîne, la population à deux
 membres et l'inversion de polarité) : `docs/agent-internals/tools.md` § *Un
 `block[pipeline]` cite une garde en échec*.
 
+### Une revue ne nomme pas une tête de PR que la session n'a pas lue (mika#3135, vol 1 sur 2)
+
+- `MIKA_CITED_HEAD_GATE` — **arme** le refus d'un `gh pr review` dont le corps
+  nomme, **en position de tête**, un SHA qui n'est pas un préfixe du
+  `headRefOid` que le `qa_pr_view` de cette session a rendu.
+  **Défaut : ARMÉ**, polarité de ses trois voisines de chaîne
+  (`MIKA_PIPELINE_GROUNDING_GATE`, `MIKA_QA_CI_COHERENCE_GATE`,
+  `MIKA_DEPENDABOT_VERDICT_GATE`) et **inverse** de celle de
+  `MIKA_QA_PASS_EVIDENCE_GATE` ci-dessus : seul un `0`/`false`/`off`/`no`
+  explicite désarme ; absente, vide ou **non reconnue** laissent **armé**, avec
+  un `cited_head_gate_unrecognized_value` nommant la valeur **entre
+  guillemets** (mika#2220) — sans elles un espace parasite est invisible. Lue
+  **une fois par process** et mise en cache : poser ou retirer la variable sur
+  un process déjà démarré n'a aucun effet, par construction. Le STOP est donc
+  *« poser `MIKA_CITED_HEAD_GATE=0` **et redémarrer** »*.
+
+**Le défaut, mesuré (n=1).** Le 2026-11-22T15:37:04Z, la revue `hold[review]` de
+`mika-platform-qa` sur la PR #3133 écrit *« CI check 'Egress Manifest Lint' is
+failing on PR head b7b34f12 »*. `b7b34f12` n'est aucun des commits de la PR : la
+tête au moment de la revue était `4cfd3e3b`, la tête finale `33a4f0df`. Un
+lecteur qui va vérifier le rouge sur `b7b34f12` ne trouve rien, et rien dans le
+corps ne lui dit s'il lit un autre état du monde ou un état inexistant.
+
+**Ce que ça fait, en une phrase.** Interrupteur armé, le refus tombe **avant tout
+sous-processus** — donc avant que `hold[review]` et sa tête fabriquée soient sur
+la forge, où seule une seconde revue pourrait les contredire — et le remède
+**nomme la tête réelle**, celle que la session a déjà en contexte, pour que la
+réécriture ne coûte aucun appel.
+
+**Le prédicat est ancré sur la position, jamais sur la forme d'un SHA.** Il lit
+les tokens `PR head`, `head`, `head_sha`, `headRefOid` suivis, dans une fenêtre
+non gourmande de 24 caractères qui ne franchit pas la fin de ligne, d'une chaîne
+hexadécimale de 7 à 40 caractères. Un `contains` nu compterait le commit reverté
+d'une analyse de diff, le SHA de base d'une comparaison et la tête d'une **autre**
+PR citée en contre-exemple (doctrine mika#2961). La comparaison est par
+**préfixe** à casse repliée : les revues citent 7, 8 ou 40 caractères, et une tête
+en majuscules est la même tête. Un filtre « au moins un chiffre » écarte
+`effaced`, `defaced`, `decade` et `facade` — des chaînes hexadécimales valides que
+la prose d'une revue produit.
+
+**Ce qu'il ne juge pas, et c'est délibéré.** L'**absence** de citation de tête :
+un corps qui n'en nomme aucune passe, et ne paie même pas la lecture du ledger —
+le prédicat textuel est évalué **avant** toute requête. Ni la justesse du reste du
+corps : la tête nommée est un préfixe de la bonne tête, ou elle ne l'est pas.
+
+**Fail-open sur trois causes nommées.** Si la tête que la session a lue n'est pas
+retrouvable, le garde **s'abstient** et le corps part tel quel. L'arithmétique est
+celle de `validate_qa_ci_coherence` (mika#2455) : un refus injustifié rend une
+revue légitime impostable et **tue le tour sans aucune revue postée**, tandis
+qu'un faux négatif se contente de préserver le régime d'aujourd'hui. Les trois
+causes sont distinctes au format de fil, parce que fusionner les deux dernières
+rendrait invisible le cas où l'outil a tourné pour rien (doctrine mika#2131) :
+
+| état du ledger (fenêtre de 2 h, même session) | `reason` | issue |
+|---|---|---|
+| un `qa_pr_view` dont la sortie porte un `headRefOid` | — | décision rendue : `allowed` ou `refused` |
+| la requête au ledger n'a pas répondu | `tool_ledger_unreadable` | `abstained` |
+| aucun `qa_pr_view` enregistré dans la fenêtre | `no_pr_view_recorded` | `abstained` |
+| des `qa_pr_view` enregistrés, aucune sortie ne porte de `headRefOid` | `head_oid_absent` | `abstained` |
+
+La tête est lue dans la **sortie** de la ligne de ledger, jamais dans son entrée :
+c'est ce que `qa_pr_view` a *rendu* qui fait foi. Les lignes reviennent en
+`ORDER BY created_at DESC`, donc la plus récente gagne. Une enveloppe tronquée
+rend `head_oid_absent` — une abstention — et jamais une erreur de parsing qui
+coûterait le tour : `gh pr view` ordonne ses clés alphabétiquement, donc `files`
+précède `headRefOid` et la troncature est un cas réel.
+
+#### Surfaces opérateur
+
+```bash
+# 1. Le garde a-t-il refusé une revue ? (nom d'événement DISTINCT de ceux de
+#    mika#2687 et de mika#2961 : trois populations sous un seul nom ne se
+#    soustraient pas — mika#2131)
+grep cited_head_refused "$MIKA_SPIRIT_LOG_FILE" \
+  | jq -c '{target, cited_unknown, reviewed_head, agent_id, session_id}'
+
+# 2. S'est-il abstenu, et sous laquelle des trois causes ?
+grep cited_head_abstained "$MIKA_SPIRIT_LOG_FILE" | jq -c '{target, reason}'
+
+# 3. La cause `tool_ledger_unreadable` porte l'erreur SQL à côté, sur sa propre
+#    ligne (l'abstention nomme la cause, celle-ci nomme le défaut)
+grep cited_head_ledger_unreadable "$MIKA_SPIRIT_LOG_FILE" | jq -c '{target, error}'
+
+# 4. Une valeur d'interrupteur illisible ? (régime attendu : VIDE ; une faute de
+#    frappe laisse ARMÉ, donc muet autrement)
+grep cited_head_gate_unrecognized_value "$MIKA_SPIRIT_LOG_FILE"
+```
+
+```sql
+-- CONTRÔLE POSITIF : le garde écrit une ligne sur les TROIS issues, `allowed`
+-- compris. Une table vide dit « le lien n'est jamais atteint », jamais « aucune
+-- revue n'a cité de fausse tête » (mika#2205).
+SELECT target_key, after_value, count(*) FROM audit_events
+ WHERE tool_name = 'cited_head_guard' GROUP BY 1, 2;
+```
+
+| surface | niveau | régime attendu | lecture |
+|---|---|---|---|
+| `after_value = 'allowed'` | audit | **non vide** | le contrôle positif : une revue a cité une tête, et c'était la bonne. Son absence seule ne prouve rien |
+| `cited_head_refused` | WARN | **décroissant vers 0** | le défaut mesuré du 2026-11-22. `cited_unknown` porte les SHA refusés, `reviewed_head` la tête réelle |
+| `reason = no_pr_view_recorded` | WARN | **rare** | une revue qui cite une tête sans avoir ouvert la PR dans la fenêtre : le corps part tel quel |
+| `reason = head_oid_absent` | WARN | **vide** | l'outil a tourné et sa sortie ne porte pas la tête — enveloppe tronquée, ou champ retiré de `SAFE_FIELDS` |
+| `reason = tool_ledger_unreadable` | WARN | **vide** | un défaut de base, pas un défaut de revue ; à lire avec la ligne n° 3 ci-dessus |
+| `cited_head_gate_unrecognized_value` | WARN | **vide** | la valeur est citée entre guillemets ; l'état reste armé |
+
+#### Sondes post-déploiement, et leurs trois haltes
+
+> **Préalable.** Ces mesures décrivent le **binaire servi** (classe mika#2340),
+> et l'interrupteur n'est lu qu'au démarrage. L'absence de toute ligne
+> `cited_head_*` ne veut pas dire « aucune revue n'a cité de tête » mais
+> « binaire antérieur au vol » : le garde est muet sur le chemin où aucune tête
+> n'est citée, donc le seul fait positif qui atteste qu'il tourne est une ligne
+> d'audit, `allowed` comprise. Avant toute conclusion : établir que le
+> `mika-spirit` qui tourne porte le correctif.
+
+**S1 — les têtes citées par les revues de la fenêtre sont-elles des têtes
+réelles ?** Le relevé hors ligne, sur les PR récentes du dépôt : pour chaque
+revue de `mika-platform-qa`, extraire les SHA en position de tête et les
+confronter aux commits de la PR. Cible : zéro SHA étranger.
+
+```sh
+gh pr list --repo senara-solutions/<repo> --state all --limit 60 \
+  --json number,headRefOid,commits,reviews \
+  --jq '[.[] | .number as $n | .headRefOid as $h
+         | ([.commits[].oid] + [$h]) as $vrais
+         | .reviews[]
+         | select(.author.login=="mika-platform-qa")
+         | [.body | scan("(?i)head[^0-9a-f]{0,24}?([0-9a-f]{7,40})") | .[0]]
+         | map(ascii_downcase) | unique
+         | map(select(. as $c | ($vrais | map(ascii_downcase)
+                                        | map(startswith($c)) | any) | not))
+         | select(length > 0) | {n: $n, etrangers: .}]'
+```
+
+**S2 — le compte des tours QA morts, à côté, sur la même fenêtre.** C'est l'autre
+moitié de la mesure, et elle n'est pas facultative : un S1 à zéro obtenu en tuant
+les tours n'est pas un succès. Le numérateur est `grep -c cited_head_refused`, à
+rapporter aux PR de la fenêtre dont aucune revue `mika-platform-qa` n'est jamais
+arrivée.
+
+*Halte 1 — un refus sur une revue qui citait la bonne tête.* Désarmer
+(`MIKA_CITED_HEAD_GATE=0` + redémarrage), **puis** diagnostiquer : un garde qui
+rend les revues légitimes impostables coûte plus que le défaut qu'il ferme.
+*Halte 2 — `head_oid_absent` non vide.* Le champ `headRefOid` a quitté la sortie
+de `qa_pr_view` (`handlers/qa_pr_view.sh`, `SAFE_FIELDS`) ou l'enveloppe est
+tronquée : le garde est fail-open, donc le défaut est silencieux côté revue et ne
+se voit que là.
+*Halte 3 — les deux sondes muettes.* Zéro refus **et** zéro ligne `allowed` ne
+prouve rien : il faut qu'une revue ait cité une tête depuis le déploiement. *Une
+garde que personne n'a exercée se lit exactement comme une garde qui marche*
+(mika#2205).
+
+#### Ce que ce travail n'achète PAS
+
+- **Il ne fait pas rejouer au relecteur les étapes du job rouge.** C'est le
+  second terme du constat du 2026-11-22 — la QA avait rejoué une seule des deux
+  étapes de `egress-manifest-lint`, puis conclu au flake sur un rouge
+  reproductible en local. Ce vol-ci ne traite que la tête citée ; le terme du
+  rejeu part au vol 2, sur mika#3135 elle-même, et la voie retenue pour lui est
+  une **décision d'opérateur** encore ouverte au 2026-11-27.
+- **Il n'émet aucune ligne de démarrage, et c'est assumé.** `MIKA_CITED_HEAD_GATE`
+  n'a pas d'équivalent de `pipeline_grounding_gate_disabled` : le WARN sur valeur
+  non reconnue et les trois issues d'audit suffisent à dire si le garde tourne, et
+  un sixième log d'init n'était pas le prix de ce vol. Conséquence à connaître :
+  **un désarmement délibéré ne laisse aucune trace dans le journal** — il se lit à
+  l'arrêt des lignes d'audit, jamais à une ligne qui l'annonce.
+- **Il n'annonce pas le refus dans le prompt.** Aucune ligne de
+  `skills/bundled/qa-review/system_prompt.md` n'est touchée : ce prompt déclare
+  déjà la section obligatoire que mika#2961 a mesurée à 0 ligne ancrée sur 261
+  verdicts `pass`, et une obligation contredite par le régime mesuré ne se répare
+  pas en la redéclarant. L'agent rencontre donc le refus sans l'avoir lu — d'où un
+  remède qui nomme la tête réelle et dit explicitement de ne pas en inventer une
+  ni d'aller la chercher sur la forge.
+- **Il ne rattrape aucune revue déjà publiée**, celle de la PR #3133 comprise. La
+  sonde est la **prochaine** occurrence.
+- **Aucune liste d'exemptions, et elle est vide par construction** : aucun label,
+  aucune constante, aucun dépôt ne permet de passer outre. L'échappatoire est la
+  variable ci-dessus, et elle n'est jamais silencieuse sur une valeur illisible.
+
+Raisonnement complet (la position du lien dans la chaîne, le choix de lire la
+*sortie* du ledger et la non-interchangeabilité avec mika#2687/#2961) : les
+doc-comments de `validate_cited_head_grounding` et `reviewed_head_from_ledger`
+(`crates/mika-agent/src/skills/builtin_handlers.rs`) et le bloc `cited_head` de
+`crates/mika-agent/src/evidence/guards.rs`.
+
 ### La porte de merge lit TOUS les checks, et cesse de déléguer le vert (mika#2617, phase A)
 
 **Aucune variable d'environnement, aucun interrupteur, aucune migration.** Cette

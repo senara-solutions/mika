@@ -5225,6 +5225,251 @@ pub fn negative_test_line_present(body: &str) -> bool {
     line_prefix_present(body, NEGATIVE_TEST_LINE_PREFIX)
 }
 
+// ---------------------------------------------------------------------------
+// mika#3135 — une revue nomme une tête de PR que la session n'a jamais lue
+// ---------------------------------------------------------------------------
+//
+// Mesure du 2026-11-22T15:37:04Z, `pulls/3133/reviews[0].body`, verdict
+// `hold[review]` de `mika-platform-qa` :
+//
+// ```text
+// - CI check 'Egress Manifest Lint' is failing on PR head b7b34f12, but the
+//   lint passes locally on the same branch.
+// ```
+//
+// `b7b34f12` n'est **aucun** des neuf commits de la PR. La tête au moment de la
+// revue était `4cfd3e3b`, la tête finale `33a4f0df`. Un lecteur qui va vérifier
+// le rouge sur `b7b34f12` ne trouve rien, et ne peut pas savoir si la revue
+// parle d'un autre état du monde ou d'un état inexistant.
+//
+// Ce n'est **pas** une phrase de prompt à ajouter. Step 2E de
+// `qa-review/system_prompt.md` déclare déjà la section `PIPELINE:` obligatoire,
+// et mika#2961 a mesuré 0 ligne `PIPELINE:` ancrée sur 261 verdicts `pass` : une
+// obligation déclarée dans le prompt et contredite par le régime mesuré ne se
+// répare pas en la redéclarant. Ce vol ne touche aucune ligne de
+// `system_prompt.md` ; il refuse **avant le subprocess**, là où l'appel est
+// encore réversible.
+
+/// Le nom d'outil sous lequel ce garde écrit ses décisions dans `audit_events`.
+///
+/// `audit_events.tool_name` est du TEXT libre — pas de migration pour un nom de
+/// plus. **Les deux** issues y entrent, le refus comme le nominal : sans la
+/// ligne du chemin sain, « zéro refus » ne distingue pas une flotte saine d'un
+/// garde mort (contrôle positif de mika#2205).
+pub const CITED_HEAD_AUDIT_TOOL: &str = "cited_head_guard";
+
+/// L'interrupteur opérateur de ce garde.
+///
+/// Contrat de lecture identique à [`PIPELINE_GROUNDING_GATE_ENV`] : armé par
+/// défaut, désarmé par le seul `0`/`false`/`off`/`no`, et le STOP est *« poser
+/// la variable **et redémarrer** »*.
+pub const CITED_HEAD_GATE_ENV: &str = "MIKA_CITED_HEAD_GATE";
+
+/// L'outil du ledger dont la sortie porte la tête que la session a **lue**.
+///
+/// Paramètre de la lecture et jamais littéral au site d'appel — même convention
+/// que [`PIPELINE_GROUNDING_SHELL_TOOL`] (mika#2565) : deux orthographes d'un
+/// nom d'outil feraient deux vérités. La fenêtre de la lecture est
+/// [`PIPELINE_GROUNDING_WINDOW_SECS`], réutilisée telle quelle : même session,
+/// même garde-fou, et un second réglage serait une variable qu'aucune décision
+/// ne consulte.
+pub const CITED_HEAD_PR_VIEW_TOOL: &str = "qa_pr_view";
+
+/// Un SHA cité **en position de tête**.
+///
+/// Le prédicat est ancré sur un token de position — `PR head`, `head`,
+/// `head_sha`, `headRefOid` — et non sur la forme d'un SHA : un `contains` nu
+/// compterait le commit reverté d'une analyse de diff, le SHA de base d'une
+/// comparaison et la tête d'une autre PR citée en contre-exemple (doctrine
+/// mika#2961, [`line_prefix_present`]). La fenêtre de 24 caractères est non
+/// gourmande : elle couvre `on PR head b7b34f12` (un espace) comme
+/// `head_sha is reported as b7b34f12`, et s'arrête avant la phrase suivante.
+/// `.` ne franchit pas une fin de ligne, donc la fenêtre ne saute pas d'une
+/// ligne à l'autre.
+static CITED_HEAD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:pr\s+head|head|head_sha|headrefoid)\b.{0,24}?\b([0-9a-f]{7,40})\b")
+        .expect("cited head pattern")
+});
+
+/// La tête rendue, lue dans la **sortie** d'un `qa_pr_view`.
+///
+/// Sur la sortie brute, par regex, et jamais par désérialisation de
+/// l'enveloppe : `gh pr view` ordonne ses clés alphabétiquement, donc `files`
+/// précède `headRefOid` et une sortie tronquée est un cas réel, pas une
+/// hypothèse. Une enveloppe tronquée doit rendre une **abstention**
+/// ([`CitedHeadAbstention::HEAD_OID_ABSENT`]), jamais une erreur de parsing qui
+/// coûterait le tour.
+static PR_VIEW_HEAD_OID_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?i)"headRefOid"\s*:\s*"([0-9a-f]{7,40})""#)
+        .expect("pr view headRefOid pattern")
+});
+
+/// Les causes pour lesquelles ce garde **s'abstient**.
+///
+/// Même doctrine que [`PipelineGroundingAbstention`] : **format de fil**. Ces
+/// chaînes partent dans `audit_events.after_value` et dans le champ `reason`
+/// d'un WARN `cited_head_abstained`, et un `GROUP BY` les compte ; deux
+/// orthographes d'une même cause scindent une population sans le dire (doctrine
+/// mika#2131).
+///
+/// Elles sont **trois** et non deux, parce que trois états de la flotte se
+/// distinguent ici :
+///
+/// - la base n'a pas répondu — un échec de lecture n'est pas un `false` ;
+/// - aucun `qa_pr_view` dans la session — ledger désarmé
+///   (`MIKA_STORE_TOOL_CALLS`), ou revue reprise sur un callback de build sous
+///   un `session_id` tout neuf ;
+/// - un `qa_pr_view` a bien eu lieu et sa sortie ne porte pas la tête — sortie
+///   tronquée, ou champ absent de la projection.
+///
+/// Fusionner les deux derniers rendrait le troisième invisible, et c'est
+/// précisément celui qui dit que l'outil a tourné pour rien.
+pub struct CitedHeadAbstention;
+
+impl CitedHeadAbstention {
+    /// Aucun `qa_pr_view` enregistré : ledger désarmé, ou session reprise.
+    pub const NO_PR_VIEW_RECORDED: &'static str = "no_pr_view_recorded";
+    /// La base n'a pas répondu — l'échec de lecture n'est pas un `false`.
+    pub const TOOL_LEDGER_UNREADABLE: &'static str = "tool_ledger_unreadable";
+    /// Le `qa_pr_view` a tourné, sa sortie ne porte pas `headRefOid`.
+    pub const HEAD_OID_ABSENT: &'static str = "head_oid_absent";
+}
+
+/// L'issue de la classification d'un corps de revue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CitedHeadOutcome {
+    /// Toute tête citée est un préfixe de la tête lue — ou le corps n'en cite
+    /// aucune. Les deux cas passent, et le garde ne juge **pas** l'absence de
+    /// citation : exiger la citation serait un autre ticket, avec son propre
+    /// régime mesuré.
+    Allowed,
+    /// Au moins une tête citée n'est pas un préfixe de la tête lue.
+    Refused {
+        /// Les têtes citées qui ne sont pas des préfixes, dédoublonnées à casse
+        /// repliée et dans l'ordre du corps — le refus les nomme toutes, pour
+        /// qu'un seul tour suffise à les corriger.
+        unknown: Vec<String>,
+    },
+}
+
+/// Les têtes citées par ce corps, dans l'ordre, dédoublonnées à casse repliée.
+///
+/// **Gratuit, et c'est le point** : un corps qui ne cite aucune tête rend un
+/// `Vec` vide, et l'appelant s'arrête là — sans lecture de base. Seule une revue
+/// qui cite une tête paie le ledger.
+///
+/// Le filtre *« au moins un chiffre »* n'est pas une coquetterie : `effaced`,
+/// `defaced`, `decade`, `facade` sont des chaînes hexadécimales valides de sept
+/// lettres, et la prose ordinaire d'une revue en produit. Sans le filtre, un
+/// faux refus rendrait une revue légitime impostable et tuerait le tour, du
+/// mauvais côté de l'arithmétique fail-open de mika#2455 ; avec lui, une tête
+/// réelle précédée d'un tel mot dans la même fenêtre est manquée — un faux
+/// négatif, qui ne fait que préserver le régime d'aujourd'hui.
+pub fn cited_head_citations(body: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for caps in CITED_HEAD_RE.captures_iter(body) {
+        let cite = caps[1].to_string();
+        if !cite.bytes().any(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let folded = cite.to_ascii_lowercase();
+        if seen.iter().any(|s| s.to_ascii_lowercase() == folded) {
+            continue;
+        }
+        seen.push(cite);
+    }
+    seen
+}
+
+/// La tête rendue par un `qa_pr_view`, ou `None` si sa sortie ne la porte pas.
+///
+/// `None` est une **abstention** de l'appelant, jamais un refus : la sortie peut
+/// être tronquée (voir [`PR_VIEW_HEAD_OID_RE`]).
+pub fn head_oid_from_pr_view(output: &str) -> Option<String> {
+    PR_VIEW_HEAD_OID_RE
+        .captures(output)
+        .map(|caps| caps[1].to_ascii_lowercase())
+}
+
+/// Chaque tête citée est-elle un préfixe de la tête que la session a lue ?
+///
+/// Comparaison par **préfixe à casse repliée** : les revues citent 7, 8 ou 40
+/// caractères selon l'humeur de l'outil qui les a produites, et une tête en
+/// majuscules est la même tête. Fonction pure, donc testable sans base et sans
+/// ordre de binaire.
+pub fn classify_cited_head_citation(cited: &[String], head_oid: &str) -> CitedHeadOutcome {
+    let head = head_oid.to_ascii_lowercase();
+    let unknown: Vec<String> = cited
+        .iter()
+        .filter(|cite| !head.starts_with(&cite.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        CitedHeadOutcome::Allowed
+    } else {
+        CitedHeadOutcome::Refused { unknown }
+    }
+}
+
+/// Le gate est-il armé ?
+///
+/// Polarité et vocabulaire de [`pipeline_grounding_gate_is_enabled`],
+/// délibérément à l'identique : armé par défaut, désarmé par le seul
+/// `0`/`false`/`off`/`no` explicite, et **toute valeur non reconnue laisse
+/// ARMÉ** avec un WARN qui nomme la valeur **entre guillemets** — sans les
+/// guillemets un espace parasite est invisible (mika#2220).
+pub fn cited_head_gate_is_enabled(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim) else {
+        return true;
+    };
+    if value.is_empty() {
+        return true;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => {
+            tracing::warn!(
+                event = "cited_head_gate_unrecognized_value",
+                value = %format!("{value:?}"),
+                "mika#3135: MIKA_CITED_HEAD_GATE porte une valeur non reconnue — le gate reste \
+                 ARMÉ (le défaut). Utiliser 0/false/off/no pour le désarmer."
+            );
+            true
+        }
+    }
+}
+
+/// Résolution unique par process, mise en cache.
+///
+/// Même contrat que [`pipeline_grounding_gate_enabled`] : lue une fois, donc
+/// poser ou retirer la variable sur un process déjà démarré n'a aucun effet.
+/// C'est pourquoi les tests passent par
+/// [`cited_head_gate_is_enabled`] — un test qui lirait l'environnement
+/// dépendrait de l'ordre des binaires.
+pub fn cited_head_gate_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        cited_head_gate_is_enabled(std::env::var(CITED_HEAD_GATE_ENV).ok().as_deref())
+    })
+}
+
+/// Dit au démarrage que le gate est désarmé — et ne dit rien s'il est armé.
+///
+/// Même raison d'être que [`log_pipeline_grounding_gate_state`] : le silence
+/// d'un gate désarmé se lit exactement comme le silence d'un gate sain
+/// (mika#2205).
+pub fn log_cited_head_gate_state() {
+    if !cited_head_gate_enabled() {
+        tracing::info!(
+            event = "cited_head_gate_disabled",
+            env = CITED_HEAD_GATE_ENV,
+            "mika#3135: le gate de la tête citée est DÉSARMÉ — une revue peut nommer une tête de \
+             PR que la session n'a jamais lue"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11547,6 +11792,236 @@ NEGATIVE-TEST: satisfied — mika2961_un_pass_qui_porte_la_section_mais_pas_la_l
             // sonde `grep` nomment cette chaîne. La renommer sans toucher les
             // trois est un changement muet.
             assert_eq!(PASS_EVIDENCE_GATE_ENV, "MIKA_QA_PASS_EVIDENCE_GATE");
+        }
+    }
+
+    /// Le module porte le nom du garde, pas celui du ticket — à la différence de
+    /// ses deux voisins `mika2687` et `mika2961`. C'est le chemin de test que le
+    /// contrat de vérification du plan nomme (`cargo test -p mika-agent
+    /// cited_head`), et le numéro de ticket reste sur chacun des huit tests.
+    mod cited_head {
+        use super::super::*;
+
+        /// La tête réelle de la PR #3133 au moment de la revue mesurée, lue
+        /// dans `pulls/3133/commits` : septième des neuf commits, et la tête
+        /// que `qa_pr_view` a rendue ce jour-là. La tête finale de la PR est
+        /// `33a4f0df…`, postérieure de deux commits — ce qui n'enlève rien au
+        /// constat : `b7b34f12` n'est **aucun** des neuf.
+        const TETE_REELLE_3133: &str = "4cfd3e3b36b6a01636b98b5034f9293089c92b18";
+
+        /// Extrait réel de `pulls/3133/reviews[0].body`, soumis le
+        /// 2026-11-22T15:37:04Z par `mika-platform-qa`, verdict `hold[review]`.
+        ///
+        /// Deux lignes, et les deux comptent. La ligne `REASON:` dit « *on PR
+        /// head,* » sans aucun SHA : c'est la forme que la fenêtre de 24
+        /// caractères doit laisser passer, et elle est dans le même corps que
+        /// le défaut. La puce `FINDINGS:` porte la tête fabriquée `b7b34f12`,
+        /// à un seul espace de son token de position.
+        const MESURE_15H37: &str = "\
+REASON: CI check 'Egress Manifest Lint' is failing on PR head, but the lint passes locally on the \
+                                   same branch — the PR diff does not touch egress-manifest.toml, \
+                                   egress scripts, or any network sinks. The failure appears to be \
+                                   a CI environment issue (likely Python version or flake), not a \
+                                   code-fixable defect.
+
+FINDINGS:
+- CI check 'Egress Manifest Lint' is failing on PR head b7b34f12, but the lint passes locally on \
+                                   the same branch. The PR diff does not touch \
+                                   docs/egress/egress-manifest.toml, \
+                                   scripts/verify-egress-manifest.sh, or any network sinks. The \
+                                   failure appears to be a CI environment issue — likely a Python \
+                                   version mismatch on the CI runner or a flake — not a \
+                                   code-fixable defect. Holding for CI resolution.
+";
+
+        // -- VC6 : le contrôle positif, sur le corps qui a motivé le vol --
+
+        #[test]
+        fn mika3135_le_corps_mesure_du_15h37_cite_une_tete_inconnue() {
+            let cited = cited_head_citations(MESURE_15H37);
+            assert_eq!(
+                cited,
+                vec!["b7b34f12".to_string()],
+                "la seule citation en position de tête du corps mesuré est la \
+                 tête fabriquée ; la ligne `REASON:` dit « on PR head, » sans \
+                 SHA et ne doit rien produire"
+            );
+            assert_eq!(
+                classify_cited_head_citation(&cited, TETE_REELLE_3133),
+                CitedHeadOutcome::Refused {
+                    unknown: vec!["b7b34f12".to_string()]
+                },
+                "`b7b34f12` n'est pas un préfixe de `{TETE_REELLE_3133}` — \
+                 c'est exactement la classe mesurée"
+            );
+        }
+
+        // -- VC7 : le contrôle négatif, sur le MÊME corps --
+
+        #[test]
+        fn mika3135_le_meme_corps_avec_la_vraie_tete_passe() {
+            // Un seul caractère de différence avec le test ci-dessus : la tête
+            // citée. C'est l'assertion qui rougit le jour où le prédicat cesse
+            // de reconnaître une citation légitime — un garde qui refuserait
+            // tout passerait le contrôle positif et échouerait ici.
+            let corrige = MESURE_15H37.replace("b7b34f12", "4cfd3e3b");
+            let cited = cited_head_citations(&corrige);
+            assert_eq!(cited, vec!["4cfd3e3b".to_string()]);
+            assert_eq!(
+                classify_cited_head_citation(&cited, TETE_REELLE_3133),
+                CitedHeadOutcome::Allowed
+            );
+        }
+
+        #[test]
+        fn mika3135_les_trois_longueurs_de_prefixe_et_la_casse_sont_acceptees() {
+            // AC3 : les revues citent 7, 8 ou 40 caractères, et une tête
+            // majuscule est la même tête. La comparaison est un préfixe à
+            // casse repliée, donc les quatre formes traversent.
+            let tete_majuscule = TETE_REELLE_3133.to_ascii_uppercase();
+            for cite in [
+                "4cfd3e3",
+                "4cfd3e3b",
+                TETE_REELLE_3133,
+                "4CFD3E3B",
+                tete_majuscule.as_str(),
+            ] {
+                let body = format!("FINDINGS:\n- reviewed at head {cite}.\n");
+                let cited = cited_head_citations(&body);
+                assert_eq!(cited.len(), 1, "{cite} est en position de tête");
+                assert_eq!(
+                    classify_cited_head_citation(&cited, TETE_REELLE_3133),
+                    CitedHeadOutcome::Allowed,
+                    "{cite} est un préfixe de la tête réelle"
+                );
+            }
+        }
+
+        // -- VC8 : l'anti-vacuité du prédicat --
+
+        #[test]
+        fn mika3135_un_sha_hors_position_de_tete_est_ignore() {
+            // R3 : le garde ne juge que la tête. Un commit reverté, un commit
+            // d'une autre PR dans une comparaison d'équivalence, un SHA de
+            // base — tous sont cités pour autre chose, et un `contains` nu les
+            // compterait (doctrine mika#2961, `line_prefix_present`).
+            for body in [
+                "FINDINGS:\n- the revert of deadbeef1 is not in this diff.\n",
+                "DIFF ANALYSIS:\n- equivalent to the change shipped in 8f2a0c91.\n",
+                "REASON: merge-base 1a2b3c4d5e differs from origin/main.\n",
+                "- CI failed on a commit b7b34f12 of another branch.\n",
+            ] {
+                assert!(
+                    cited_head_citations(body).is_empty(),
+                    "aucun de ces SHA n'est en position de tête : {body:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn mika3135_un_mot_sans_chiffre_nest_pas_un_sha() {
+            // Un mot anglais de sept lettres toutes dans `a-f` est une chaîne
+            // hexadécimale valide. Sans le filtre « au moins un chiffre », la
+            // prose ordinaire d'une revue deviendrait un refus — et un faux
+            // refus rend la revue impostable et tue le tour (arithmétique
+            // fail-open de mika#2455).
+            for body in [
+                "REASON: the head of the effaced branch is gone.\n",
+                "FINDINGS:\n- head: defaced by the rebase.\n",
+                "REASON: head decade-old facade cabbage.\n",
+            ] {
+                assert!(
+                    cited_head_citations(body).is_empty(),
+                    "aucun chiffre ⇒ ce n'est pas un SHA : {body:?}"
+                );
+            }
+        }
+
+        // -- temps 2 : la tête réelle, lue dans la sortie du `qa_pr_view` --
+
+        #[test]
+        fn mika3135_le_head_oid_se_lit_dans_la_sortie_du_pr_view() {
+            // La sortie de `gh pr view` ordonne ses clés alphabétiquement, donc
+            // `files` précède `headRefOid` et une troncature est un cas réel.
+            // Elle rend `None`, et l'appelant en fait l'abstention
+            // `head_oid_absent` — jamais une erreur de parsing, jamais un refus.
+            let sortie = format!(
+                r#"{{"files":[{{"path":"a.rs"}}],"headRefOid":"{TETE_REELLE_3133}","title":"x"}}"#
+            );
+            assert_eq!(
+                head_oid_from_pr_view(&sortie).as_deref(),
+                Some(TETE_REELLE_3133)
+            );
+            assert_eq!(
+                head_oid_from_pr_view(r#"{"files":[{"path":"a.rs"},{"path":"#),
+                None,
+                "une sortie tronquée avant `headRefOid` est une abstention"
+            );
+            assert_eq!(head_oid_from_pr_view(""), None);
+        }
+
+        // -- VC9 : les trois causes d'abstention --
+
+        #[test]
+        fn mika3135_les_causes_dabstention_sont_un_format_de_fil() {
+            // Même doctrine que `PipelineGroundingAbstention` : ces chaînes
+            // partent dans `audit_events.after_value` et dans le champ `reason`
+            // d'un WARN, un `GROUP BY` les compte. Deux orthographes d'une
+            // cause scindent une population sans le dire (mika#2131).
+            //
+            // Elles sont **trois** et non deux : « l'appel n'a pas eu lieu » et
+            // « l'appel a eu lieu et sa sortie est muette » sont deux états de
+            // la flotte, et les fusionner rendrait le second invisible.
+            assert_eq!(
+                CitedHeadAbstention::NO_PR_VIEW_RECORDED,
+                "no_pr_view_recorded"
+            );
+            assert_eq!(
+                CitedHeadAbstention::TOOL_LEDGER_UNREADABLE,
+                "tool_ledger_unreadable"
+            );
+            assert_eq!(CitedHeadAbstention::HEAD_OID_ABSENT, "head_oid_absent");
+            assert_eq!(CITED_HEAD_AUDIT_TOOL, "cited_head_guard");
+            assert_eq!(CITED_HEAD_GATE_ENV, "MIKA_CITED_HEAD_GATE");
+            assert_eq!(CITED_HEAD_PR_VIEW_TOOL, "qa_pr_view");
+        }
+
+        // -- VC10 : la polarité de l'interrupteur --
+
+        #[test]
+        fn mika3135_linterrupteur_est_arme_par_defaut_et_desarme_par_quatre_formes() {
+            // La polarité de mika#2687, pas celle de mika#2961 : ce garde
+            // atterrit ARMÉ, et seul un désarmement explicite le tait. Une
+            // valeur non reconnue laisse ARMÉ avec un WARN qui la cite entre
+            // guillemets (mika#2220) — un désarmement par coquille serait la
+            // panne silencieuse que ce travail ferme.
+            for raw in [
+                None,
+                Some(""),
+                Some("   "),
+                Some("1"),
+                Some("true"),
+                Some("ON"),
+                Some("yes"),
+            ] {
+                assert!(cited_head_gate_is_enabled(raw), "armé : {raw:?}");
+            }
+            for raw in [Some("frobnicate"), Some("oui"), Some("2"), Some("off!")] {
+                assert!(
+                    cited_head_gate_is_enabled(raw),
+                    "valeur non reconnue ⇒ reste ARMÉ, avec un WARN qui la \
+                     nomme : {raw:?}"
+                );
+            }
+            for raw in [
+                Some("0"),
+                Some("false"),
+                Some("off"),
+                Some("NO"),
+                Some(" off "),
+            ] {
+                assert!(!cited_head_gate_is_enabled(raw), "désarmé : {raw:?}");
+            }
         }
     }
 }
