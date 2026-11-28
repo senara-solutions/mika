@@ -116,11 +116,50 @@ Le geste : **lancer la suite**. Un `FAIL` non nul dont l'agrégat ne rend aucun 
 une dépendance de portée, jamais une assertion fautive — les assertions sont
 identiques par construction.
 
+## La troisième occurrence (vol 4, 2026-11-28) : la définition est hors de la fenêtre du vol
+
+Le motif est revenu au vol 4, et **son profil a changé**. Deux dépendances y ont
+été nommées à l'exécution :
+
+| dépendance | définie à | lue par |
+|---|---|---|
+| `_t2178_line_of`, `_t2178_after` | l. 7419-7431 (**famille 9**) | famille 13 |
+| `_gate_probe` | l. 6858-6920 (**famille 8**) | famille 14 |
+
+Au vol 2, les deux dépendances mesurées traversaient des familles **du même
+vol** : lire les cinq plages du vol suffisait à les voir. Au vol 4, les deux
+définitions sont **en amont de la fenêtre du vol** — les plages extraites
+commencent à la l. 8773, et les familles 8 et 9 sont parties au vol 3.
+
+Ce décalage retire au défaut son dernier lecteur plausible. La scission reste
+additive jusqu'au vol 7 : l'agrégat **porte encore** les l. 6858-6920 et
+7419-7431, donc le relire ne montre rien de manquant. Les suites du vol 3 les
+portent aussi — mais une suite du vol 4 ne `source` pas une suite du vol 3, et
+rien dans son texte ne dit qu'elle en aurait besoin. La relecture de l'agrégat
+courant est donc **vraie et inutile** : elle atteste une présence qui ne voyage
+pas jusqu'à la suite extraite.
+
+**Conséquence sur la fenêtre à balayer.** Chercher les dépendances de portée dans
+les plages du vol est insuffisant dès le second vol d'une scission par vols
+successifs. La fenêtre est **tout ce qui précède la première ligne du vol**, et
+elle s'allonge à chaque vol. Le geste qui la couvre reste le même, et il reste le
+seul : lancer chaque famille extraite avant de la croire.
+
+Remède identique à celui du vol 2, et pour les mêmes deux raisons de forme : une
+bibliothèque dédiée, `tests/lib-dispatch-lib-shared-probes-fixtures.sh`, remplie
+par le même `sed` en ajout seulement, sourcée par les seules familles 13 et 14.
+Les deux plages déplacées ne portent que des définitions de fonction — aucune
+assertion, aucun `echo` de section au premier niveau — donc les compteurs des
+familles 13 et 14 restent ceux de leurs plages.
+
 ## Réutilisation
 
-La scission de mika#3178 porte 7 vols ; les vols 3 à 6 extraient 20 familles de
-plus. Les deux dépendances ci-dessus sont les seules **mesurées** au vol 2 : la
-liste n'est pas close, et c'est la méthode qui se réutilise, pas la liste.
+La scission de mika#3178 porte 7 vols ; les vols 5 et 6 extraient 10 familles de
+plus. Quatre dépendances sont **mesurées** à ce jour — deux au vol 2, deux au
+vol 4, aucune au vol 3 : la liste n'est pas close, et c'est la méthode qui se
+réutilise, pas la liste. Ce que les trois occurrences ajoutent l'une à l'autre
+n'est pas un inventaire mais une **fenêtre qui s'élargit** : au vol *n*, une
+dépendance peut venir de n'importe laquelle des familles des vols 1 à *n*−1.
 
 Voir aussi : le gel de l'agrégat (mika#3179) qui empêche le défaut d'origine de
 se reproduire pendant la scission, et
