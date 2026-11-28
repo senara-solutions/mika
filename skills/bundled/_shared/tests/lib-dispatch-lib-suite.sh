@@ -114,6 +114,26 @@ WITHHELD_MARKER="Disposition-Withheld: REVIEW-ANCHOR-MISSING"
 ENGINE_FINDING_MARKER="(BLOCKING) [mika-engine] review-anchor:"
 ENGINE_LINE="F1: $ENGINE_FINDING_MARKER attestation withheld after the corrective re-prompt — anchors_found=3, anchors_valid=2, miss_reason=QuoteNotInBrief: paraphrase."
 
+# DEUX AUTRES VALEURS DE PREMIER NIVEAU QUE PLUSIEURS FAMILLES PARTAGENT
+# (mika#3178, vol 3). Même cas que le bloc ci-dessus, et comme lui nommé à
+# l'EXÉCUTION : extraites seules, les familles 7 et 9 meurent sur une `unbound
+# variable` sous `set -u`, sans imprimer un seul bloc `Results:`. La relecture ne
+# les avait pas vues.
+#
+# `GATE_SRC_3118` : agrégat l. 5977 (famille 6), lu l. 6086/6088/6101
+# (famille 7). `REPO_ROOT` : agrégat l. 6758 (famille 8), lu l. 7862/7876
+# (famille 9) et plus loin par les familles 13, 18 et 24 — l'agrégat le dit
+# lui-même à sa l. 7862 (« Checked here because this suite already resolves
+# REPO_ROOT »), donc le promouvoir ici sert aussi les vols 4 à 6.
+#
+# Copiées mot pour mot de l'agrégat ; leurs deux lignes d'origine y RESTENT en
+# place, où la ré-assignation est sans effet — c'est ce qui garde le `diff` de
+# déplacement exact, la suite restant sa plage plus l'ossature.
+# shellcheck disable=SC2034  # lues par les blocs déplacés, pas par ce fichier
+GATE_SRC_3118=$(declare -f _groom_plan_halt_gate)
+# shellcheck disable=SC2034  # lue par les blocs déplacés, pas par ce fichier
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
 assert_eq() {
     local label="$1" expected="$2" actual="$3"
     if [ "$expected" = "$actual" ]; then
