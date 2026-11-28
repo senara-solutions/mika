@@ -156,6 +156,14 @@ test: ## Run all tests
 	@bash skills/bundled/_shared/tests/test_dispatch_lib_groom_gate_2811.sh
 	@bash skills/bundled/_shared/tests/test_dispatch_lib_push_divergence_1364.sh
 	@bash skills/bundled/_shared/tests/test_dispatch_lib_preflight_1472.sh
+	# mika#3178 vol 3/7 — familles 6 à 10. Même raison de câblage direct que
+	# ci-dessus : `check-suite-wiring.sh` ne voit pas un appel fait depuis le
+	# corps d'une autre suite (mika#2761).
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_groom_callback_1772.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_gate_arms_3118.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_output_gate_1996.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_pr_state_2121.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_plan_callout_2120.sh
 	@bash skills/bundled/_shared/tests/test_rescue_closes_guard.sh
 	@bash skills/bundled/_shared/tests/test_rescue_pipeline_verified.sh
 	@bash skills/bundled/_shared/tests/test_handler_crash_step.sh
@@ -227,6 +235,13 @@ test-dispatch-lib: ## Run the dispatch-lib assertion suites (mika#1772 wired it 
 	@bash skills/bundled/_shared/tests/test_dispatch_lib_groom_gate_2811.sh
 	@bash skills/bundled/_shared/tests/test_dispatch_lib_push_divergence_1364.sh
 	@bash skills/bundled/_shared/tests/test_dispatch_lib_preflight_1472.sh
+	# mika#3178 vol 3/7 — familles 6 à 10. L'agrégat garde ses deux appels
+	# jusqu'au vol 7, donc les mêmes blocs tournent deux fois jusque-là.
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_groom_callback_1772.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_gate_arms_3118.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_output_gate_1996.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_pr_state_2121.sh
+	@bash skills/bundled/_shared/tests/test_dispatch_lib_plan_callout_2120.sh
 	# mika#3179 — et le gel qui rend la règle ci-dessus opposable AVANT la CI :
 	# le lint refuse toute croissance de l'agrégat et nomme le geste (une suite
 	# neuve sous `tests/`) plutôt que l'allowlist que `Secret Scan` suggère.
